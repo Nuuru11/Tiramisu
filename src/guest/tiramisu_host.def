@@ -1,0 +1,4 @@
+LIBRARY tiramisu_host
+EXPORTS
+    TiramisuHostQueryBuild
+    TiramisuHostLogU32

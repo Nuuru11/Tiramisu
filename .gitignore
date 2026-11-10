@@ -1,0 +1,10 @@
+# Longan runtime internals
+out/
+tests/out/
+*.obj
+*.msix
+*.pfx
+*.key
+*.pem
+*.cer
+__pycache__/
