@@ -10,7 +10,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
-namespace tiramisu {
+namespace longan {
 
 namespace {
 winrt::com_ptr<ID3D11Device1> g_device;
@@ -118,6 +118,9 @@ void swapchain_present() {
   if (g_swap) g_swap->Present(1, 0);
 }
 
+void* swapchain_dxgi() { return g_swap.get(); }
+void* swapchain_d3d() { return g_device.get(); }
+
 void swapchain_shutdown() {
   g_rtv = nullptr;
   g_swap = nullptr;
@@ -125,4 +128,4 @@ void swapchain_shutdown() {
   g_device = nullptr;
 }
 
-} // namespace tiramisu
+} // namespace longan

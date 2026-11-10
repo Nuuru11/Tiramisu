@@ -9,10 +9,12 @@ without an artifact.
 |---|---|
 | PE64 loader maps a real clang-built guest at preferred base | `tools/build-test.sh` case 1, ALL PASS |
 | Relocation pass is semantically correct (not just non-crashing) | case 2: delta != 0, 2 DIR64 fixups, guest reads pointer table, checksum identical across bases |
-| Import binding works through the module table | "import longan_host.dll bound=2" + import call reaches host fns |
+| Import binding works through the module table | "import tiramisu_host.dll bound=2" + import call reaches host fns |
 | W^X seal flips code to RX, no RWX ever | "SEALED" log + mprotect return codes |
 | Malformed PE fails named, no crash | corrupt-MZ case: TRT_ERR_BAD_DOS, no image leaked |
 | Win64 ABI execution of mapped guest code | entry returns 0x6494cb0d matching host-side model |
+| Input bridge: key/mouse/pad feed -> user32 getters + pump | `tests/test_input.cpp` ALL PASS (17 checks) |
+| First absolute mouse event positions without a false delta | mouse_init flag (found by the test) |
 | Host is a proper UWP image | objdump: Subsystem Windows GUI, DllCharacteristics 0x9160 (APPCONTAINER 0x1000 set) |
 | Package integrity | osslsigncode verify OK (trust anchor); makemsix round-trip unpack; manifest + guest present in packed msix |
 

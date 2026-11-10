@@ -6,14 +6,13 @@ acceptance line. The rung ladder (cheap -> hard) mirrors xboxnative's
 universal-boot ladder.
 
 ## M0 — skeleton on hardware (current)
-- Offline loader test PASS (done).
-- Signed Tiramisu.msix produced and verified (done).
-- **Acceptance:** on console — host boots, swapchain HRESULT 0, guest PE maps,
-  seals, entry returns 0x6494cb0d in `tiramisu.log`, screenshot shows the
-  animated gradient quad (proves present + compositor + app model).
-- Probe set in the same log: memory total/avail, CreateProcess verdict,
-  gamepad count. One TV look answers the four questions everything downstream
-  depends on.
+- Offline loader test PASS (done). Offline input-bridge test PASS (done).
+- Signed Tiramisu.msix produced and verified, now with the transfer server,
+  D2D shelf UI, QR, miniz, qrcodegen (done).
+- **Acceptance:** on console — host boots, swapchain HRESULT 0, selftest guest
+  maps + seals + returns 0x6494cb0d in `tiramisu.log`, screenshot shows the
+  shelf + QR. Phone test: open the URL, upload a small zip game (e.g. a
+  freeware DX11 indie), hit LAUNCH.
 
 ## M1 — user32 message pump (the keystone)
 Wine's spec files as the checklist: RegisterClassExW/CreateWindowExW as

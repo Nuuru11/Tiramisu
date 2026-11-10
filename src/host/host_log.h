@@ -6,7 +6,7 @@
 
 #include <string>
 
-namespace tiramisu {
+namespace longan {
 
 // resolve LocalState once and open the log file (append). Returns the
 // LocalState directory (UTF-8) for later use (drive_c mount), empty on fail.
@@ -14,6 +14,6 @@ std::string log_open(const std::string& package_path);
 void log_line(const char* line);
 void log_close();
 
-} // namespace tiramisu
+} // namespace longan
 
 #endif

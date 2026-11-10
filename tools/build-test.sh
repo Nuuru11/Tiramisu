@@ -44,3 +44,11 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   -o "$out/test_pe_loader"
 
 "$out/test_pe_loader" "$out/guest_hello.exe" "$out/guest_hello_reloc.exe"
+
+# --- 4. input bridge test (user32 surface the guests consume) ---
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_input.cpp \
+  src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
+  src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
+  -o "$out/test_input"
+"$out/test_input"

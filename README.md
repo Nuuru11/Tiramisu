@@ -21,10 +21,18 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 | Layer | State |
 |---|---|
 | Offline loader test (Linux, real PE guest executed) | **PASS** — mapping, DIR64/HIGHLOW relocation, import binding, W^X seal, entry execution, checksum-verified |
+| Offline input-bridge test | **PASS** — keyboard/mouse/pad feed -> user32 getters + message pump |
 | UWP host (CoreWindow/D3D11/XInput/LocalState log) | **BUILDS** — signed `Tiramisu.msix` produced and verified |
+| Phone transfer (QR on TV -> upload zip -> launch) | **BUILT** — ws2_32 HTTP server, miniz zip extraction, launch handoff; console verdict pending |
+| Keyboard + mouse | **BUILT** — CoreWindow events -> trt_input -> GetAsyncKeyState/GetKeyState/GetCursorPos + WM_ queue; gamepad-as-mouse mode (RS toggle, triggers = buttons) |
+| Controller | **BUILT** — XInput mirrored into trt_input + D-pad shelf navigation |
+| Steam | **BUILT (auth only)** — QR login via IAuthenticationService (own account), token saved to LocalState; depot download is M6 |
 | Console run | **PENDING** — `tools/deploy.sh install` then look at the TV |
-| user32 message loop / input / audio | skeleton only — the known keystone gap |
 | 32-bit | dead by console evidence (compat-mode `ljmp 0x23` = 0xc0000005 on Series S); needs an x86 engine later |
+
+v0.2 ceiling while a game runs: the guest owns the host thread; its builtin
+`GetMessageW` pump keeps input flowing, but the shelf UI freezes until the
+guest exits. One game at a time.
 
 ## Build (Linux, all cross)
 

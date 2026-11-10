@@ -56,14 +56,14 @@ extern "C" {
 
 // ---- guest-visible kernel32 surface (v0) ----
 
-void* TRT_STDCALL lgn_GetProcessHeap(void) { return (void*)(uintptr_t)0x1; }
+void* TRT_STDCALL trt_GetProcessHeap(void) { return (void*)(uintptr_t)0x1; }
 
-void* TRT_STDCALL lgn_HeapCreate(u32 flags, u64 init, u64 max) {
+void* TRT_STDCALL trt_HeapCreate(u32 flags, u64 init, u64 max) {
   (void)flags; (void)init; (void)max;
   return handle_alloc(0xCAFE, nullptr);  // heap handle: a record, not memory
 }
 
-void* TRT_STDCALL lgn_HeapAlloc(void* heap, u32 flags, u64 bytes) {
+void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   (void)heap;
   // backend alloc = RW memory; flags HEAP_ZERO_MEMORY = 0x8
   u8* p = (u8*)g_be.alloc((size_t)(bytes ? bytes : 1), 0);
@@ -71,13 +71,13 @@ void* TRT_STDCALL lgn_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   return p;
 }
 
-int TRT_STDCALL lgn_HeapFree(void* heap, u32 flags, void* p) {
+int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
   if (p) g_be.release(p, 0);  // backend tracks size internally (mmap/UWP)
   return 1;
 }
 
-void* TRT_STDCALL lgn_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
+void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   // v0: only MEM_COMMIT|MEM_RESERVE (0x3000) with RW or RWX-free protections
   if (!(type & 0x3000) || (prot & 0x40) /*PAGE_EXECUTE_READWRITE*/) {
     g_tls_last_error[g_tls_index_current_thread % 128] = 87; // ERROR_INVALID_PARAMETER
@@ -87,32 +87,32 @@ void* TRT_STDCALL lgn_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   return g_be.alloc((size_t)(bytes ? bytes : 4096), (u64)(uintptr_t)addr);
 }
 
-int TRT_STDCALL lgn_VirtualFree(void* addr, u64 bytes, u32 type) {
+int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
   if (type != 0x8000 /*MEM_RELEASE*/ || !addr) return 0;
   g_be.release(addr, bytes);
   return 1;
 }
 
-u32 TRT_STDCALL lgn_GetLastError(void) { return err_for_current_thread(); }
-void TRT_STDCALL lgn_SetLastError(u32 err) {
+u32 TRT_STDCALL trt_GetLastError(void) { return err_for_current_thread(); }
+void TRT_STDCALL trt_SetLastError(u32 err) {
   g_tls_last_error[g_tls_index_current_thread % 128] = err;
 }
 
-u32 TRT_STDCALL lgn_GetCurrentThreadId(void) { return g_tls_index_current_thread; }
-void* TRT_STDCALL lgn_GetCurrentProcess(void) { return (void*)(uintptr_t)-1; }
+u32 TRT_STDCALL trt_GetCurrentThreadId(void) { return g_tls_index_current_thread; }
+void* TRT_STDCALL trt_GetCurrentProcess(void) { return (void*)(uintptr_t)-1; }
 
-int TRT_STDCALL lgn_QueryPerformanceCounter(i64* out) {
+int TRT_STDCALL trt_QueryPerformanceCounter(i64* out) {
   if (!out) return 0;
   *out = now_qpc_ticks();
   return 1;
 }
-int TRT_STDCALL lgn_QueryPerformanceFrequency(i64* out) {
+int TRT_STDCALL trt_QueryPerformanceFrequency(i64* out) {
   if (!out) return 0;
   *out = 1000000000ll;  // nanosecond tick (matches QPC source above)
   return 1;
 }
 
-u32 TRT_STDCALL lgn_IsProcessorFeaturePresent(u32 feature) {
+u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32 feature) {
   // x64 baseline: SSE/SSE2/SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/NX present
   switch (feature) {
     case 0: case 1: case 6: case 7: case 8: case 9: case 10: case 23:
@@ -139,25 +139,208 @@ void trt_bridge_boot(const trt_backend* be) {
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 
+// ================= files on the VFS (the game-transfer path) ================
+namespace {
+
+struct file_rec { void* os; u8 mode; };  // os = FILE*
+file_rec g_files[32];
+
+FILE* file_os(void* h) {
+  const u32 v = (u32)(uintptr_t)h;
+  if ((v >> 20) != 0x777 /*'t handle tag'*/ || (v & 0xFFFFF) >= 32) return nullptr;
+  return (FILE*)g_files[v & 0xFFFFF].os;
+}
+
+void* file_alloc(FILE* os, u8 mode) {
+  for (int i = 0; i < 32; ++i) {
+    if (!g_files[i].os) {
+      g_files[i].os = os;
+      g_files[i].mode = mode;
+      return (void*)(uintptr_t)(0x77700000u | (u32)i);
+    }
+  }
+  return (void*)(uintptr_t)-1;
+}
+
+char g_cwd[512] = "C:\\";   // guest cwd
+char g_exepath[512] = "Z:\\game.exe";
+
+} // namespace
+
+void trt_bridge_set_exe_path(const char* zpath) {
+  strncpy(g_exepath, zpath, sizeof(g_exepath) - 1);
+}
+
+void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
+                                  void* sa, u32 disposition, u32 flags,
+                                  void* tmpl) {
+  (void)share; (void)sa; (void)disposition; (void)flags; (void)tmpl;
+  if (!name) return (void*)(uintptr_t)-1;
+  char host[1024];
+  if (trt_vfs_resolve_utf16(name, host, sizeof(host)) != 0) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 3; // PATH_NOT_FOUND
+    return (void*)(uintptr_t)-1;
+  }
+  const bool write = (access & 0x40000000u) != 0 || (access & 0x2u) != 0;
+  FILE* os = fopen(host, write ? "r+b" : "rb");
+  if (!os && write) os = fopen(host, "w+b");
+  if (!os) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 2; // FILE_NOT_FOUND
+    return (void*)(uintptr_t)-1;
+  }
+  return file_alloc(os, write ? 'w' : 'r');
+}
+
+int TRT_STDCALL trt_ReadFile(void* h, void* buf, u32 bytes, u32* read,
+                             void* overlapped) {
+  (void)overlapped;
+  FILE* os = file_os(h);
+  if (!os || !buf) { if (read) *read = 0; return 0; }
+  const size_t n = fread(buf, 1, bytes, os);
+  if (read) *read = (u32)n;
+  return 1;
+}
+
+int TRT_STDCALL trt_WriteFile(void* h, const void* buf, u32 bytes, u32* written,
+                              void* overlapped) {
+  (void)overlapped;
+  FILE* os = file_os(h);
+  if (!os || !buf) { if (written) *written = 0; return 0; }
+  const size_t n = fwrite(buf, 1, bytes, os);
+  if (written) *written = (u32)n;
+  return 1;
+}
+
+int TRT_STDCALL trt_CloseHandle(void* h) {
+  FILE* os = file_os(h);
+  if (!os) return 1;  // non-file handles: pretend closed
+  fclose(os);
+  const u32 i = (u32)(uintptr_t)h & 0xFFFFF;
+  g_files[i].os = nullptr;
+  return 1;
+}
+
+u32 TRT_STDCALL trt_GetFileSize(void* h, u32* hi);
+
+u32 TRT_STDCALL trt_SetFilePointer(void* h, i64 dist, i64* dist_hi, u32 method) {
+  (void)dist_hi;
+  FILE* os = file_os(h);
+  if (!os) return 0xFFFFFFFF;
+  const int whence = method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END;
+#ifdef _WIN32
+  if (_fseeki64(os, dist, whence)) return 0xFFFFFFFF;
+#else
+  if (fseek(os, (long)dist, whence)) return 0xFFFFFFFF;
+#endif
+  return trt_GetFileSize(h, nullptr);
+}
+
+u32 TRT_STDCALL trt_GetFileSize(void* h, u32* hi) {
+  FILE* os = file_os(h);
+  if (hi) *hi = 0;
+  if (!os) return 0xFFFFFFFF;
+  const long pos = ftell(os);
+  fseek(os, 0, SEEK_END);
+  const long sz = ftell(os);
+  fseek(os, pos, SEEK_SET);
+  return (u32)sz;
+}
+
+int TRT_STDCALL trt_SetCurrentDirectoryW(const u16* name) {
+  if (!name) return 0;
+  char host[1024];
+  // cwd stays a GUEST path (C:\...) so relative opens resolve through VFS
+  size_t i = 0;
+  for (; name[i] && i < sizeof(g_cwd) - 1; ++i) g_cwd[i] = (char)name[i];
+  g_cwd[i] = 0;
+  (void)host;
+  return 1;
+}
+
+int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
+  if (!buf || len == 0) return 0;
+  u32 i = 0;
+  for (; g_cwd[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_cwd[i];
+  buf[i] = 0;
+  return (int)i + 1;
+}
+
+const u16* TRT_STDCALL trt_GetEnvironmentStringsW() {
+  // fixed block: double-NUL terminated "NAME=VALUE" pairs, then block terminator
+  static u16 block[1024];
+  static bool built = false;
+  if (!built) {
+    built = true;
+    const char* pairs[] = {
+      "PATH=C:\\Windows\\System32;Z:\\",
+      "TEMP=C:\\Temp", "TMP=C:\\Temp",
+      "USERPROFILE=C:\\Users\\Player",
+      "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
+      "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
+      "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
+    };
+    size_t o = 0;
+    for (const char* p : pairs) {
+      for (const char* q = p; *q && o < 1020; ++q) block[o++] = (u16)(u8)*q;
+      if (o < 1020) block[o++] = 0;
+    }
+    if (o < 1024) block[o++] = 0;  // block terminator
+    if (o < 1024) block[o] = 0;
+  }
+  return block;
+}
+
+int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16*) { return 1; }
+
+u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
+  (void)mod;
+  if (!buf || !len) return 0;
+  u32 i = 0;
+  for (; g_exepath[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_exepath[i];
+  buf[i] = 0;
+  return i;
+}
+
+int TRT_STDCALL trt_GetSystemDirectoryW(u16* buf, u32 len) {
+  if (!buf || len < 18) return 18;
+  const char* s = "C:\\Windows\\System32";
+  u32 i = 0;
+  for (; s[i]; ++i) buf[i] = (u16)(u8)s[i];
+  buf[i] = 0;
+  return i;
+}
+
 void trt_bridge_new_thread_id(u32 id) {
   g_tls_index_current_thread = id % 128;
 }
 
 static const trt_named_fn k_kernel32_fns[] = {
-  {"GetProcessHeap", (void*)&lgn_GetProcessHeap},
-  {"HeapCreate", (void*)&lgn_HeapCreate},
-  {"HeapAlloc", (void*)&lgn_HeapAlloc},
-  {"HeapFree", (void*)&lgn_HeapFree},
-  {"VirtualAlloc", (void*)&lgn_VirtualAlloc},
-  {"VirtualFree", (void*)&lgn_VirtualFree},
-  {"GetLastError", (void*)&lgn_GetLastError},
-  {"SetLastError", (void*)&lgn_SetLastError},
-  {"GetCurrentThreadId", (void*)&lgn_GetCurrentThreadId},
-  {"GetCurrentProcess", (void*)&lgn_GetCurrentProcess},
-  {"QueryPerformanceCounter", (void*)&lgn_QueryPerformanceCounter},
-  {"QueryPerformanceFrequency", (void*)&lgn_QueryPerformanceFrequency},
-  {"IsProcessorFeaturePresent", (void*)&lgn_IsProcessorFeaturePresent},
+  {"GetProcessHeap", (void*)&trt_GetProcessHeap},
+  {"HeapCreate", (void*)&trt_HeapCreate},
+  {"HeapAlloc", (void*)&trt_HeapAlloc},
+  {"HeapFree", (void*)&trt_HeapFree},
+  {"VirtualAlloc", (void*)&trt_VirtualAlloc},
+  {"VirtualFree", (void*)&trt_VirtualFree},
+  {"GetLastError", (void*)&trt_GetLastError},
+  {"SetLastError", (void*)&trt_SetLastError},
+  {"GetCurrentThreadId", (void*)&trt_GetCurrentThreadId},
+  {"GetCurrentProcess", (void*)&trt_GetCurrentProcess},
+  {"QueryPerformanceCounter", (void*)&trt_QueryPerformanceCounter},
+  {"QueryPerformanceFrequency", (void*)&trt_QueryPerformanceFrequency},
+  {"IsProcessorFeaturePresent", (void*)&trt_IsProcessorFeaturePresent},
   {"Sleep", (void*)&trt_Sleep},
+  {"CreateFileW", (void*)&trt_CreateFileW},
+  {"ReadFile", (void*)&trt_ReadFile},
+  {"WriteFile", (void*)&trt_WriteFile},
+  {"CloseHandle", (void*)&trt_CloseHandle},
+  {"SetFilePointer", (void*)&trt_SetFilePointer},
+  {"GetFileSize", (void*)&trt_GetFileSize},
+  {"SetCurrentDirectoryW", (void*)&trt_SetCurrentDirectoryW},
+  {"GetCurrentDirectoryW", (void*)&trt_GetCurrentDirectoryW},
+  {"GetEnvironmentStringsW", (void*)&trt_GetEnvironmentStringsW},
+  {"FreeEnvironmentStringsW", (void*)&trt_FreeEnvironmentStringsW},
+  {"GetModuleFileNameW", (void*)&trt_GetModuleFileNameW},
+  {"GetSystemDirectoryW", (void*)&trt_GetSystemDirectoryW},
 };
 
 int trt_bridge_register_kernel32(void) {

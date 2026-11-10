@@ -9,7 +9,7 @@
 #include <cstdio>
 #include <string>
 
-namespace tiramisu {
+namespace longan {
 
 namespace {
 FILE* g_log = nullptr;
@@ -46,4 +46,4 @@ void log_close() {
   g_log = nullptr;
 }
 
-} // namespace tiramisu
+} // namespace longan

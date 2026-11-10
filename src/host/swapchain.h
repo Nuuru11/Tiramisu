@@ -7,7 +7,7 @@
 #include <winrt/base.h>
 #include <winrt/Windows.UI.Core.h>
 
-namespace tiramisu {
+namespace longan {
 
 struct swapchain_result {
   HRESULT device_hr;
@@ -20,10 +20,12 @@ struct swapchain_result {
 // BGRA: the only composition-friendly model on Xbox (no exclusive fullscreen).
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w);
 
-void swapchain_render_frame(float t);   // t in [0,1) animates the proof quad
+void swapchain_render_frame(float t);   // t in [0,1) animates the backdrop
+void* swapchain_dxgi();                 // IDXGISwapChain1* for the UI layer
+void* swapchain_d3d();                  // ID3D11Device1* for the UI layer
 void swapchain_present();
 void swapchain_shutdown();
 
-} // namespace tiramisu
+} // namespace longan
 
 #endif
