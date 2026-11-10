@@ -16,6 +16,7 @@
 #include <winrt/Windows.ApplicationModel.Core.h>
 #include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.Data.Json.h>
+#include <winrt/Windows.Devices.Input.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Networking.h>
@@ -423,11 +424,19 @@ struct tiramisu_host
     longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v);
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
-      trt_input_key_event((u16)a.VirtualKey(), true);
+      const auto s = a.KeyStatus();
+      trt_input_key_event2((u16)a.VirtualKey(), true, (u16)s.ScanCode,
+                           s.IsExtendedKey ? 1 : 0, s.WasKeyDown ? 1 : 0);
     });
     m_ku = window.KeyUp([](CoreWindow const&, KeyEventArgs const& a) {
-      trt_input_key_event((u16)a.VirtualKey(), false);
+      const auto s = a.KeyStatus();
+      trt_input_key_event2((u16)a.VirtualKey(), false, (u16)s.ScanCode,
+                           s.IsExtendedKey ? 1 : 0, 0);
     });
+    m_cr = window.CharacterReceived(
+        [](CoreWindow const&, CharacterReceivedEventArgs const& a) {
+          trt_input_char_event((u32)a.KeyCode());
+        });
     m_pp = window.PointerPressed([](CoreWindow const&,
                                     PointerEventArgs const& a) {
       const auto k = a.CurrentPoint().Properties().PointerUpdateKind();
@@ -458,6 +467,16 @@ struct tiramisu_host
       trt_input_wheel(
           (i32)a.CurrentPoint().Properties().MouseWheelDelta());
     });
+
+    // REAL relative mouse deltas — the Xbox UWP mouse API. The virtual
+    // cursor clamps at screen edges; this stream does not, which is what
+    // FPS/mouse-look games need. Falls back gracefully to pointer-diff.
+    namespace wdi = winrt::Windows::Devices::Input;
+    m_mm = wdi::MouseDevice::GetForCurrentView().MouseMoved(
+        [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+          const auto d = a.MouseDelta();
+          trt_input_mouse_delta_raw((i32)d.X, (i32)d.Y);
+        });
   }
 
   void boot_all() {
@@ -601,7 +620,8 @@ struct tiramisu_host
     }
   }
 
-  winrt::event_token m_kd{}, m_ku{}, m_pp{}, m_pr{}, m_pm{}, m_pw{};
+  winrt::event_token m_kd{}, m_ku{}, m_cr{}, m_pp{}, m_pr{}, m_pm{}, m_pw{},
+      m_mm{};
 };
 
 } // namespace

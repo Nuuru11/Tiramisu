@@ -3,6 +3,13 @@
 #include "../src/trt/input.h"
 
 #include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+
+extern "C" {
+int trt_RegisterRawInputDevices(const void*, u32, u32);
+unsigned long trt_GetRawInputData(void*, u32, void*, u32*, u32);
+}
 
 extern "C" {
 int trt_bridge_register_user32(void);
@@ -71,6 +78,55 @@ int main() {
   CHECK(trt_msg_peek(&m, true) && m.message == 0x0101 && m.wparam == 'A',
         "WM_KEYUP A");
   CHECK(!trt_msg_pending(), "queue drained");
+
+  // ---- game-grade surface ----
+  // scan codes ride WM_KEYDOWN lParam (games read lParam>>16)
+  {
+    trt_msg t{};
+    while (trt_msg_peek(&t, true)) {}
+    trt_input_key_event2(0x11 /*VK_W? no, VK 'W'=0x57*/, true, 0x11, 0, 0);
+    CHECK(trt_msg_peek(&t, true) && t.message == 0x0100 &&
+              (((u32)t.lparam) >> 16) == 0x11,
+          "scan code in KEYDOWN lParam");
+  }
+  // WM_CHAR from char events
+  {
+    trt_msg t{};
+    while (trt_msg_peek(&t, true)) {}
+    trt_input_char_event('h');
+    CHECK(trt_msg_peek(&t, true) && t.message == 0x0102 && t.wparam == 'h',
+          "WM_CHAR posted");
+  }
+  // Raw Input: register mouse+keyboard, raw deltas synthesize WM_INPUT with a
+  // handle that GetRawInputData decodes back to the deltas
+  {
+    struct rid { u16 page, usage; u32 flags; u64 hwnd; };
+    rid devs[2] = {{1, 2, 0, 0}, {1, 6, 0, 0}};  // mouse + keyboard
+    CHECK(trt_RegisterRawInputDevices(devs, 2, 16) == 1,
+          "RegisterRawInputDevices");
+    { trt_msg t{}; while (trt_msg_peek(&t, true)) {} }
+    trt_input_mouse_delta_raw(9, -7);
+    trt_msg t{};
+    CHECK(trt_msg_peek(&t, true) && t.message == 0x00FF, "WM_INPUT posted");
+    u8 buf[64];
+    u32 sz = sizeof(buf);
+    const unsigned long got =
+        trt_GetRawInputData((void*)(uintptr_t)t.lparam, 0x10000003, buf, &sz, 24);
+    CHECK(got == 48, "GetRawInputData returns RAWMOUSE size");
+    int rdx = 0, rdy = 0;
+    memcpy(&rdx, buf + 36, 4);
+    memcpy(&rdy, buf + 40, 4);
+    CHECK(rdx == 9 && rdy == -7, "RAWMOUSE lLastX/lLastY round-trip");
+    // size query form
+    u32 q = 0;
+    CHECK(trt_GetRawInputData((void*)(uintptr_t)t.lparam, 0x10000003, nullptr,
+                              &q, 24) == 48,
+          "GetRawInputData size query");
+    // stale handle -> -1 (0xFFFFFFFF), no crash
+    CHECK(trt_GetRawInputData((void*)(uintptr_t)0xdeadbeef, 0x10000003, buf,
+                              &sz, 24) == 0xFFFFFFFFu,
+          "stale hRawInput -> -1");
+  }
 
   printf(failures ? "\nRESULT: %d FAILURES\n" : "\nRESULT: ALL PASS\n",
          failures);

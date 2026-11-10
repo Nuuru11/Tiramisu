@@ -238,6 +238,59 @@ void* TRT_STDCALL trt_LoadIconW(void* inst, const wchar_t* name) {
   (void)inst; (void)name; return (void*)(uintptr_t)0x00030001;
 }
 
+// ---- Raw Input (the layer most PC engines use for mouse) ----
+int TRT_STDCALL trt_RegisterRawInputDevices(const void* devices, u32 count,
+                                            u32 size) {
+  if (size != 16) return 0;  // sizeof(RAWINPUTDEVICE) on x64
+  return trt_raw_register(devices, count) ? 1 : 0;
+}
+
+u32 TRT_STDCALL trt_GetRawInputData(void* hraw, u32 cmd, void* out,
+                                    u32* out_size, u32 header_size) {
+  if (!out_size) return (u32)-1;
+  const u8* blob = nullptr;
+  u32 blob_size = 0;
+  if (!trt_raw_blob((u64)(uintptr_t)hraw, &blob, &blob_size))
+    return (u32)-1;  // stale/unknown handle: real Windows also -1s this
+  if (cmd != 0x10000003 /*RID_INPUT*/) return (u32)-1;
+  if (!out) return blob_size;  // size query
+  if (*out_size < blob_size || header_size != 24) return (u32)-1;
+  memcpy(out, blob, blob_size);
+  return blob_size;
+}
+
+u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type) {
+  // type 0: VK->scan, 1: scan->VK, 2: VK->char, 3: scan->VK extended
+  if (type == 0) return trt_key_scan((u16)code);
+  if (type == 2) return code >= 0x41 && code <= 0x5A ? code - 0x41 + 'a' : 0;
+  return 0;  // scan->VK needs the layout table (M2)
+}
+
+int TRT_STDCALL trt_ShowCursor(int show) {
+  static int counter = 0;
+  counter += show >= 0 ? 1 : -1;
+  if (counter < 0) counter = 0;
+  trt_set_cursor_visible(counter > 0);
+  return counter;
+}
+
+void* TRT_STDCALL trt_SetCapture(void* hwnd) { return hwnd; }
+int TRT_STDCALL trt_ReleaseCapture(void) { return 1; }
+void* TRT_STDCALL trt_GetCapture(void) { return nullptr; }
+void* TRT_STDCALL trt_GetForegroundWindow(void) { return trt_GetActiveWindow(); }
+u64 TRT_STDCALL trt_GetKeyboardLayout(u32 tid) {
+  (void)tid;
+  return 0x04090409;  // en-US
+}
+i64 TRT_STDCALL trt_SendMessageW(void* hwnd, u32 msg, u64 wp, i64 lp) {
+  guest_msg m{};
+  m.hwnd = (u64)(uintptr_t)hwnd;
+  m.message = msg;
+  m.wParam = wp;
+  m.lParam = lp;
+  return trt_DispatchMessageW(&m);
+}
+
 static const trt_named_fn k_user32_fns[] = {
   {"RegisterClassExW", (void*)&trt_RegisterClassExW},
   {"CreateWindowExW", (void*)&trt_CreateWindowExW},
@@ -260,6 +313,16 @@ static const trt_named_fn k_user32_fns[] = {
   {"GetSystemMetrics", (void*)&trt_GetSystemMetrics},
   {"LoadCursorW", (void*)&trt_LoadCursorW},
   {"LoadIconW", (void*)&trt_LoadIconW},
+  {"RegisterRawInputDevices", (void*)&trt_RegisterRawInputDevices},
+  {"GetRawInputData", (void*)&trt_GetRawInputData},
+  {"MapVirtualKeyW", (void*)&trt_MapVirtualKeyW},
+  {"ShowCursor", (void*)&trt_ShowCursor},
+  {"SetCapture", (void*)&trt_SetCapture},
+  {"ReleaseCapture", (void*)&trt_ReleaseCapture},
+  {"GetCapture", (void*)&trt_GetCapture},
+  {"GetForegroundWindow", (void*)&trt_GetForegroundWindow},
+  {"GetKeyboardLayout", (void*)&trt_GetKeyboardLayout},
+  {"SendMessageW", (void*)&trt_SendMessageW},
 };
 
 int trt_bridge_register_user32(void) {

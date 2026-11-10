@@ -10,6 +10,7 @@ struct input_state {
   // keyboard
   u8  down[TRT_MAX_VK];      // current
   u8  pressed[TRT_MAX_VK];   // transitioned down this frame
+  u16 scan[TRT_MAX_VK];      // last scan code per VK (games read lParam)
   u16 last_vk;               // for GetAsyncKeyState bit15
   u32 char_q[64]; int char_count;
 
@@ -17,6 +18,7 @@ struct input_state {
   int mx, my;                // virtual-cursor position
   int dx_acc, dy_acc;        // accumulated deltas since last consume
   bool mouse_init;           // first absolute event positions, no delta
+  int rdx, rdy;              // last REAL mouse deltas (MouseDevice)
   u8  mbtn;                  // bit0 L, bit1 R, bit2 M
   i32 wheel_acc;
 
@@ -27,6 +29,16 @@ struct input_state {
 
   // display
   int dw, dh;
+
+  // cursor visibility hook (ShowCursor)
+  bool cursor_visible;
+
+  // raw input: registered devices + a small ring of RAWINPUT blobs
+  u8  raw_mouse_reg, raw_kbd_reg;
+  u64 raw_next_handle;
+  struct raw_rec { u64 handle; u8 blob[48]; u32 size; };
+  raw_rec raw_ring[16];
+  int raw_ring_len;
 
   // message ring
   trt_msg ring[TRT_MSG_RING];
@@ -49,17 +61,42 @@ int clamp_axis(i16 v) {  // deadzone ~8k, normalize to [-1,1]
 
 extern "C" {
 
+// raw-blob feeders (defined below; used by the host-feed section)
+void trt_raw_post_mouse(i32 dx, i32 dy, u8 mbtn, i32 wheel);
+void trt_raw_post_key(u16 vk, u16 scan, bool down);
+
 // ---------------- host feed ----------------
 void trt_input_key_event(u16 vk, bool down) {
+  trt_input_key_event2(vk, down, 0, 0, 0);
+}
+
+void trt_input_key_event2(u16 vk, bool down, u16 scan, u8 extended, u8 repeat) {
   if (vk >= TRT_MAX_VK) return;
   if (down && !g.down[vk]) g.pressed[vk] = 1;
   g.down[vk] = down ? 1 : 0;
+  if (scan) g.scan[vk] = scan;
   if (down) g.last_vk = vk;
-  trt_msg_post(down ? 0x0100 /*WM_KEYDOWN*/ : 0x0101 /*WM_KEYUP*/, vk, 0);
+  // WM_KEYDOWN/UP lParam: repeat(16) scan(9)<<16 ext(1)<<24 prev(1)<<30 up(1)<<31
+  const u32 lp = (u32)repeat | ((u32)scan << 16) | ((u32)(extended != 0) << 24) |
+                 (down ? 0 : 0xC0000000u);
+  trt_msg_post(down ? 0x0100 /*WM_KEYDOWN*/ : 0x0101 /*WM_KEYUP*/, vk,
+               (i64)(u64)lp);
+  if (g.raw_kbd_reg) trt_raw_post_key(vk, scan, down);
 }
 
 void trt_input_char_event(u32 ch) {
   if (g.char_count < 64) g.char_q[g.char_count++] = ch;
+  trt_msg_post(0x0102 /*WM_CHAR*/, ch, 0);
+}
+
+void trt_input_mouse_delta_raw(i32 dx, i32 dy) {
+  // real mouse (MouseDevice.MouseMoved): feed BOTH consumers
+  g.rdx = dx;
+  g.rdy = dy;
+  g.dx_acc += dx;  // GetCursorPos-based games + WM_MOUSEMOVE keep working
+  g.dy_acc += dy;
+  // synthesize WM_INPUT for engines on the Raw Input path
+  if (g.raw_mouse_reg) trt_raw_post_mouse(dx, dy, g.mbtn, g.wheel_acc);
 }
 
 void trt_input_mouse_move(int x, int y) {
@@ -127,6 +164,11 @@ void trt_mouse_delta(int* dx, int* dy) {
   g.dy_acc = 0;
 }
 
+void trt_mouse_delta_raw(int* dx, int* dy) {
+  if (dx) *dx = g.rdx;
+  if (dy) *dy = g.rdy;
+}
+
 bool trt_mouse_button(int btn) {
   return (btn >= 0 && btn <= 2) && (g.mbtn & (1 << btn)) != 0;
 }
@@ -155,6 +197,74 @@ int trt_display_size(int* w, int* h) {
   if (w) *w = g.dw ? g.dw : 1920;
   if (h) *h = g.dh ? g.dh : 1080;
   return 0;
+}
+
+u16 trt_key_scan(u16 vk) { return vk < TRT_MAX_VK ? g.scan[vk] : 0; }
+
+void trt_set_cursor_visible(bool v) { g.cursor_visible = v; }
+
+// ---------------- raw input (WM_INPUT path) ----------------
+// RAWINPUT blob: RAWINPUTHEADER(24) + RAWMOUSE(24) or RAWKEYBOARD(16)
+void trt_raw_post_mouse(i32 dx, i32 dy, u8 mbtn, i32 wheel) {
+  (void)mbtn; (void)wheel;  // buttons ride the WM_ path
+  input_state::raw_rec& r =
+      g.raw_ring[g.raw_ring_len < 16 ? g.raw_ring_len++ : 15];
+  r.handle = ++g.raw_next_handle;
+  r.size = 48;
+  memset(r.blob, 0, sizeof(r.blob));
+  const u32 type = 0;         // RIM_TYPEMOUSE
+  const u32 size = 48;
+  const u64 dev = 0, wp = 0;  // hDevice, wParam RIM_INPUT
+  const u16 flags = 0;        // MOUSE_MOVE_RELATIVE
+  const u32 none = 0;         // ulRawButtons
+  memcpy(r.blob + 0, &type, 4);
+  memcpy(r.blob + 4, &size, 4);
+  memcpy(r.blob + 8, &dev, 8);
+  memcpy(r.blob + 16, &wp, 8);
+  memcpy(r.blob + 24, &flags, 2);
+  memcpy(r.blob + 32, &none, 4);
+  memcpy(r.blob + 36, &dx, 4);   // lLastX
+  memcpy(r.blob + 40, &dy, 4);   // lLastY
+  trt_msg_post(0x00FF /*WM_INPUT*/, 0, (i64)r.handle);
+}
+
+void trt_raw_post_key(u16 vk, u16 scan, bool down) {
+  input_state::raw_rec& r =
+      g.raw_ring[g.raw_ring_len < 16 ? g.raw_ring_len++ : 15];
+  r.handle = ++g.raw_next_handle;
+  r.size = 40;
+  memset(r.blob, 0, sizeof(r.blob));
+  const u32 type = 1;          // RIM_TYPEKEYBOARD
+  const u32 size = 40;
+  const u32 msg = down ? 0x0100 : 0x0101;
+  memcpy(r.blob + 0, &type, 4);
+  memcpy(r.blob + 4, &size, 4);
+  memcpy(r.blob + 24, &scan, 2);  // MakeCode
+  memcpy(r.blob + 28, &vk, 2);    // VKey
+  memcpy(r.blob + 32, &msg, 4);   // Message
+  trt_msg_post(0x00FF /*WM_INPUT*/, 0, (i64)r.handle);
+}
+
+bool trt_raw_register(const void* devices, u32 count) {
+  if (!devices || count == 0 || count > 8) return false;
+  // RAWINPUTDEVICE: usUsagePage(2) usUsage(2) dwFlags(4) hwndTarget(8)
+  struct rid { u16 page; u16 usage; u32 flags; u64 hwnd; };
+  const rid* d = (const rid*)devices;
+  for (u32 i = 0; i < count; ++i) {
+    if (d[i].page == 1 && d[i].usage == 2) g.raw_mouse_reg = 1;  // mouse
+    if (d[i].page == 1 && d[i].usage == 6) g.raw_kbd_reg = 1;    // keyboard
+  }
+  return true;
+}
+
+bool trt_raw_blob(u64 hraw, const u8** blob, u32* size) {
+  for (int i = 0; i < g.raw_ring_len; ++i)
+    if (g.raw_ring[i].handle == hraw) {
+      if (blob) *blob = g.raw_ring[i].blob;
+      if (size) *size = g.raw_ring[i].size;
+      return true;
+    }
+  return false;
 }
 
 // ---------------- message queue ----------------
