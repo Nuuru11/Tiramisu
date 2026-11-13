@@ -44,7 +44,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
 
@@ -58,7 +58,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -78,7 +78,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
@@ -112,7 +112,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
@@ -144,7 +144,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
@@ -185,7 +185,7 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp \
   src/trt/bridge_user32.cpp \
@@ -220,7 +220,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/input.cpp \
   src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   -o "$out/test_reg"
@@ -273,7 +273,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/vfs.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_engine"
 DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
@@ -303,7 +303,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_dinput"
@@ -331,7 +331,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/bridge_dinput.cpp \
   src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_audio"
@@ -363,7 +363,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_steam"
@@ -384,8 +384,29 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_winmm"
 "$out/test_winmm" "$out/guest_winmm.exe"
+
+# --- 13. d3d9: the D3D9 -> D3D11 bridge (M5) --------------------------------
+rm -f "$out/d3d9.lib"
+"$LLD_LINK" /lib /def:src/guest/d3d9.def /out:"$out/d3d9.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_d3d9.c -o "$out/guest_d3d9.obj"
+"$LLD_LINK" "$out/guest_d3d9.obj" "$out/d3d9.lib" \
+  /NODEFAULTLIB /ENTRY:guest_d3d9_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1B00000 /OUT:"$out/guest_d3d9.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_d3d9.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
+  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
+  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
+  src/trt/input.cpp \
+  -o "$out/test_d3d9"
+"$out/test_d3d9" "$out/guest_d3d9.exe"

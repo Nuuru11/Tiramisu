@@ -291,7 +291,7 @@ void scan_compat(const std::string& path, char* out, unsigned cap) {
         // flag the ones that decide bootability
         const char* mark = "";
         if (!_strnicmp(nm, "steam_api", 9)) mark = "[steam-auth]";
-        else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9-shim-pending]";
+        else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9 OK]";
         else if (!_strnicmp(nm, "d3d11", 5)) mark = "[d3d11 OK]";
         else if (!_strnicmp(nm, "xaudio", 6)) mark = "[audio OK]";
         else if (!_strnicmp(nm, "xinput", 6)) mark = "[pad OK]";
@@ -355,7 +355,8 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_bridge_register_user32();
   trt_module_register("gdi32.dll", TRT_ROUTE_STUB, nullptr, 0);
   trt_module_register("winmm.dll", TRT_ROUTE_STUB, nullptr, 0);
-  trt_module_register("d3d9.dll", TRT_ROUTE_STUB, nullptr, 0);
+  // d3d9.dll is registered by trt_bridge_boot (BUILTIN, the D3D9->D3D11
+  // bridge) — do not downgrade it to STUB here.
   trt_module_register("ole32.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_module_register("d3d11.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_module_register("dxgi.dll", TRT_ROUTE_SYSTEM, nullptr, 0);

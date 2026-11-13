@@ -70,7 +70,7 @@ const dll_alias k_dll_aliases[] = {
     {"d3dcompiler_47.dll", "d3dcompiler_47.dll"},
     {"d3dcompiler_46.dll", "d3dcompiler_47.dll"},
     {"d3dcompiler_43.dll", "d3dcompiler_47.dll"},
-    // d3d9 has NO console component: keep it failing with a NAME (M5)
+    // d3d9: bridged by bridge_d3d9 (BUILTIN overrides this default)
     {"d3d9.dll", nullptr},
     // steam api: named failure until M6 (no DRM bypass, ever)
     {"steam_api64.dll", nullptr},
@@ -343,7 +343,9 @@ const mod_default k_defaults[] = {
     {"xinput1_4.dll", TRT_ROUTE_SYSTEM},
 
     // ---- no console equivalent: fail-visible work items ----
-    {"d3d9.dll", TRT_ROUTE_STUB},        // M5: needs a D3D9->D3D11 shim
+    // (d3d9/d3d9core default to STUB here; trt_bridge_boot upgrades them
+    // to the BUILTIN D3D9->D3D11 bridge)
+    {"d3d9.dll", TRT_ROUTE_STUB},
     {"d3d9core.dll", TRT_ROUTE_STUB},
     {"ddraw.dll", TRT_ROUTE_STUB},
     {"dsound.dll", TRT_ROUTE_STUB},
