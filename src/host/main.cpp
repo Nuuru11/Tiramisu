@@ -6,6 +6,7 @@
 //     including gamepad-as-mouse for KBM-only games
 //   * optional Steam QR login (own account; depot pipeline is M6)
 #include "host_log.h"
+#include "audio.h"
 #include "swapchain.h"
 #include "ui.h"
 #include "webxfer.h"
@@ -513,6 +514,9 @@ struct tiramisu_host
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
     run_probes();
+    longan::audio_init();
+    longan::audio_status(line, sizeof(line));
+    longan::log_line(line);
     const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
@@ -630,6 +634,9 @@ struct tiramisu_host
       lines.push_back(u82ws("guest: " + g_guest_status));
       lines.push_back(u82ws(g_steam_status +
                             (g_mouse_mode ? "  |  MOUSE MODE" : "")));
+      char audio_line[128];
+      longan::audio_status(audio_line, sizeof(audio_line));
+      lines.push_back(u82ws(audio_line));
       lines.push_back(L"D-pad: select   A: launch   Y: steam   RS: mouse mode");
       longan::ui_set_lines(lines);
       longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());

@@ -23,19 +23,19 @@ echo "offline loader test: PASS"
 UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --out "$out/layout/tiramisu.exe" --jobs "$(nproc)" \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
-  src/host/ui.cpp src/host/webxfer.cpp \
+  src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp \
   src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   src/host/vendor/miniz.c src/host/vendor/miniz_tdef.c \
   src/host/vendor/miniz_tinfl.c src/host/vendor/miniz_zip.c \
   src/host/vendor/qrcodegen.c \
   --link-arg d3d11.lib --link-arg dxgi.lib --link-arg xinput.lib \
-  --link-arg d3dcompiler.lib \
+  --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib \
   -- /MT /O2 /EHsc /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN \
      /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED
 

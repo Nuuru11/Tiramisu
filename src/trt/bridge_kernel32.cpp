@@ -11,6 +11,7 @@
 #include "bridge_mem.h"
 #include "bridge_thread.h"
 #include "bridge_sys.h"
+#include "bridge_winmm.h"
 #include "bridge_dinput.h"
 #include "bridge_audio.h"
 #include "bridge_steam.h"
@@ -173,6 +174,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_dinput();
   // XAudio2: how games play sound
   trt_bridge_register_audio();
+  // winmm: the multimedia clock (timeGetTime) and legacy-device probes
+  trt_bridge_register_winmm();
   // Steamworks: AUTH ONLY (no DRM bypass, ever)
   trt_bridge_register_steam();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;

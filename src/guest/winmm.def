@@ -1,0 +1,14 @@
+LIBRARY winmm.dll
+EXPORTS
+    timeGetTime
+    timeBeginPeriod
+    timeEndPeriod
+    timeGetDevCaps
+    waveOutGetNumDevs
+    waveOutGetDevCapsW
+    midiOutGetNumDevs
+    joyGetNumDevs
+    joyGetPosEx
+    mciSendStringW
+    GetProfileStringW
+    PlaySoundW
