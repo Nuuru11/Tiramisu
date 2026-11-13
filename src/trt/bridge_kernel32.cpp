@@ -28,6 +28,12 @@
 #include "bridge_steam.h"
 #include "bridge_comctl.h"
 #include "bridge_gdi.h"
+#include "bridge_wininet.h"
+#include "bridge_psapi.h"
+#include "bridge_iphlpapi.h"
+#include "bridge_imm32.h"
+#include "bridge_crypt32.h"
+#include "bridge_dbghelp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -218,6 +224,15 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_comctl();
   // gdi32: the GDI object/state surface (fonts, DC-coupled state)
   trt_bridge_register_gdi();
+  // STAGE 5 boot determinism: the 7 UNCERTAIN console DLLs converted to
+  // BUILTIN honest-runtime — the boot no longer depends on unproven
+  // console presence (wininet/psapi/iphlpapi/imm32/crypt32/dbghelp/dbgcore)
+  trt_bridge_register_wininet();
+  trt_bridge_register_psapi();
+  trt_bridge_register_iphlpapi();
+  trt_bridge_register_imm32();
+  trt_bridge_register_crypt32();
+  trt_bridge_register_dbghelp();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 

@@ -380,9 +380,10 @@ const mod_default k_defaults[] = {
     {"ws2_32.dll", TRT_ROUTE_SYSTEM},
     {"mswsock.dll", TRT_ROUTE_SYSTEM},
     {"winhttp.dll", TRT_ROUTE_SYSTEM},
-    {"wininet.dll", TRT_ROUTE_SYSTEM},
+    {"wininet.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: WinINet not available to
+                                          // UWP — honest-runtime bridge
     {"dnsapi.dll", TRT_ROUTE_SYSTEM},
-    {"iphlpapi.dll", TRT_ROUTE_SYSTEM},
+    {"iphlpapi.dll", TRT_ROUTE_BUILTIN},  // STAGE 5: honest no-data bridge
     {"netapi32.dll", TRT_ROUTE_SYSTEM},
     {"mpr.dll", TRT_ROUTE_SYSTEM},
     {"normaliz.dll", TRT_ROUTE_SYSTEM},
@@ -390,7 +391,8 @@ const mod_default k_defaults[] = {
     // ---- crypto / security / services ----
     {"bcrypt.dll", TRT_ROUTE_SYSTEM},
     {"ncrypt.dll", TRT_ROUTE_SYSTEM},
-    {"crypt32.dll", TRT_ROUTE_SYSTEM},
+    {"crypt32.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: no cert store on console
+                                          // — honest-fail bridge
     {"cryptui.dll", TRT_ROUTE_SYSTEM},
     {"secur32.dll", TRT_ROUTE_SYSTEM},
     {"sechost.dll", TRT_ROUTE_SYSTEM},
@@ -406,15 +408,18 @@ const mod_default k_defaults[] = {
     {"version.dll", TRT_ROUTE_SYSTEM},
     {"propsys.dll", TRT_ROUTE_SYSTEM},
     {"userenv.dll", TRT_ROUTE_SYSTEM},
-    {"psapi.dll", TRT_ROUTE_SYSTEM},
+    {"psapi.dll", TRT_ROUTE_BUILTIN},     // STAGE 5: real guest module list
+                                          // from the image registry
     {"hid.dll", TRT_ROUTE_SYSTEM},
     {"setupapi.dll", TRT_ROUTE_SYSTEM},
     {"avrt.dll", TRT_ROUTE_SYSTEM},
-    {"imm32.dll", TRT_ROUTE_SYSTEM},
+    {"imm32.dll", TRT_ROUTE_BUILTIN},     // STAGE 5: no IME on console —
+                                          // honest no-IME bridge
     {"usp10.dll", TRT_ROUTE_SYSTEM},
     {"wtsapi32.dll", TRT_ROUTE_SYSTEM},
-    {"dbghelp.dll", TRT_ROUTE_SYSTEM},
-    {"dbgcore.dll", TRT_ROUTE_SYSTEM},
+    {"dbghelp.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: symbol records + real
+                                          // text crash-report bridge
+    {"dbgcore.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: dump engine (same surface)
     {"dxcore.dll", TRT_ROUTE_SYSTEM},
     {"directxmath.dll", TRT_ROUTE_SYSTEM},
 

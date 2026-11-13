@@ -122,6 +122,15 @@ void trt_bridge_new_thread_id(u32 id);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 void trt_bridge_set_exe_path(const char* zpath);
+// STAGE 5 boot-determinism bridges (wininet/psapi/iphlpapi/imm32/crypt32/
+// dbghelp+dbgcore): honest-runtime surfaces for DLLs whose console presence
+// is unproven — bound BUILTIN so a game boots and the calls fail NAMED
+int trt_bridge_register_wininet(void);
+int trt_bridge_register_psapi(void);
+int trt_bridge_register_iphlpapi(void);
+int trt_bridge_register_imm32(void);
+int trt_bridge_register_crypt32(void);
+int trt_bridge_register_dbghelp(void);
 // UTF-16 -> UTF-8 helper (paths, strings)
 int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
 // the bytes behind a guest file handle (the memory-mapping bridge)

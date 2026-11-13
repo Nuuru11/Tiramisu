@@ -32,8 +32,18 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
 trt_image* trt_images_find(const char* name);      // case-insensitive
 trt_image* trt_images_by_handle(void* handle);
 trt_image* trt_images_first(void);                  // first loaded guest image
+// ---- enumeration (the psapi bridge exposes this as the REAL guest module
+// list: K32EnumProcessModules / EnumProcesses / MiniDumpWriteDump module
+// table all read from here) ----
+int trt_images_count(void);
+trt_image* trt_images_nth(int idx);
+const char* trt_images_nth_name(int idx);   // "engine.dll"
+const char* trt_images_nth_path(int idx);   // host path it was loaded from
 void* trt_images_handle(trt_image* img);
 const char* trt_images_name(void* handle);
+// Register the main guest image (the exe mapped directly via trt_map_pe, not
+// through trt_load_pe) so the psapi/dbghelp module list includes it.
+void trt_images_register_main(trt_image* img, const char* guest_name);
 
 // ---- loading ----
 // Map a PE from a host path, register it, seal it. If `run_entry` is set,

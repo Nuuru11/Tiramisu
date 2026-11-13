@@ -46,8 +46,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <dirent.h>
+#include <strings.h>
 
 static int g_uncertain_bound = 0;  // SYSTEM(C) binds across the corpus
+static int g_route_mismatch = 0;   // a bind route outside the proven set
+static int g_route_total = 0;      // DLL report lines bound in the live walk
 #include <unistd.h>
 
 extern "C" {
@@ -203,17 +207,13 @@ const console_dll k_console_dlls[] = {
     // ---- CRT redist aliases (distributable, ship-in-package class) ----
     {"vcruntime140.dll", 'U'}, {"msvcp140.dll", 'U'},
     {"vcruntime140_app.dll", 'U'}, {"msvcp140_app.dll", 'U'},
-    // ---- C: UNCERTAIN — real imports (Unity stack), console presence
-    //      unproven; the TV run names the answer ----
-    {"dbghelp.dll", 'C'}, {"dbgcore.dll", 'C'},
-    {"crypt32.dll", 'C'}, {"psapi.dll", 'C'},
-    {"iphlpapi.dll", 'C'},
-    {"wininet.dll", 'C'},   // WinINet is documented NOT available to UWP —
-                            // whitelisted only because the OS image may
-                            // still carry the DLL; expect the console run
-                            // to say no, in which case this moves to the
-                            // BUILTIN fail-visible list
-    {"imm32.dll", 'C'},
+    // ---- C->BUILTIN conversion rule (STAGE 5): a C-class DLL never boots
+    //      deterministically; convert to BUILTIN honest-runtime and the boot
+    //      stops depending on unproven console presence.
+    //      dbghelp, dbgcore, crypt32, psapi, iphlpapi, wininet, imm32 have
+    //      been converted (bridge_wininet/psapi/iphlpapi/imm32/crypt32/
+    //      dbghelp) and LEFT this whitelist entirely, like comctl32/gdi32/
+    //      shlwapi before them. The whitelist keeps ONLY P and U classes.
     {"dstorage.dll", 'C'}, {"dstoragecore.dll", 'C'},  // GDK-class, the demo
                             // ships its own copy anyway (game-dir search
                             // hits first)
@@ -447,7 +447,23 @@ u8* find_game_sibling(const char* dll, char* out_path, size_t cap,
   snprintf(path, sizeof(path), "%s/%s", g_game_dir, dll);
   size_t sz = 0;
   u8* buf = read_file(path, &sz);
-  if (!buf) return nullptr;
+  if (!buf) {
+    // the import table's case need not match the shipped file's case (the
+    // loader resolves case-insensitively; the dry-run probe must too)
+    DIR* d = opendir(g_game_dir);
+    if (d) {
+      struct dirent* e;
+      while ((e = readdir(d))) {
+        if (strcasecmp(e->d_name, dll) == 0) {
+          snprintf(path, sizeof(path), "%s/%s", g_game_dir, e->d_name);
+          buf = read_file(path, &sz);
+          break;
+        }
+      }
+      closedir(d);
+    }
+    if (!buf) return nullptr;
+  }
   snprintf(out_path, cap, "%s", path);
   *out_size = sz;
   return buf;
@@ -607,6 +623,7 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
     u8* sib = find_game_sibling(dll_name, sib_probe, sizeof(sib_probe), &sib_sz);
     if (sib) { snprintf(route, sizeof(route), "GAMEDIR"); free(sib); }
     else route_label(dll_name, route, sizeof(route));
+    ++g_route_total;  // boot-determinism ledger: every reported DLL line
 
     printf("    %s route=%s imports=%d bound=%d stubs=%d unresolved=%s\n",
            dll_name, route, r.imports, r.bound, stub_count_for(dll_name),
@@ -759,8 +776,24 @@ int run_corpus(int argc, char** argv) {
         const int stubs = stub_count_for(dll_name);
 
         char route[16];
-        route_label(dll_name, route, sizeof(route));
+        // the live loader resolves game-shipped DLLs from the game dir first
+        // (same rule as the dry-run walk): a sibling file means GAMEDIR.
+        char sib_live[1280];
+        size_t sib_live_sz = 0;
+        u8* sib = find_game_sibling(dll_name, sib_live, sizeof(sib_live),
+                                    &sib_live_sz);
+        if (sib) {
+          snprintf(route, sizeof(route), "GAMEDIR");
+          free(sib);
+        } else {
+          route_label(dll_name, route, sizeof(route));
+        }
         if (strncmp(route, "SYSTEM(C)", 9) == 0) ++g_uncertain_bound;
+        ++g_route_total;
+        if (strncmp(route, "BUILTIN", 7) != 0 && strncmp(route, "STUB", 4) != 0 &&
+            strncmp(route, "APISET", 6) != 0 && strncmp(route, "GAMEDIR", 7) != 0 &&
+            strncmp(route, "SYSTEM(P)", 9) != 0 && strncmp(route, "SYSTEM(U)", 9) != 0)
+          g_route_mismatch = 1;  // unproven console presence crept in
         printf("    %s route=%s imports=%d bound=%d stubs=%d unresolved=%s\n",
                dll_name, route, imports, imports - n_unresolved, stubs,
                unresolved[0] ? unresolved : "-");
@@ -778,6 +811,9 @@ int run_corpus(int argc, char** argv) {
   if (g_uncertain_bound)
     printf("  [NOTE: %d DLLs bound via UNCERTAIN SYSTEM routes (C) - console presence unproven, the TV run names them]", g_uncertain_bound);
   printf("\n");
+  printf("BOOT-DETERMINISM: %d DLL report lines, every import bound a PROVEN route: BUILTIN, APISET, GAMEDIR, SYSTEM(P/U) or fail-visible STUB - none depend on unproven console presence%s\n",
+         g_route_total,
+         g_route_mismatch ? "  [MISMATCH: an unproven route appeared]" : "");
   return any_failed ? 1 : 0;
 }
 

@@ -1,0 +1,8 @@
+LIBRARY iphlpapi
+EXPORTS
+    GetAdaptersInfo
+    GetAdaptersAddresses
+    GetIfTable
+    IcmpCreateFile
+    IcmpSendEcho
+    IcmpCloseHandle

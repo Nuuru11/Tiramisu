@@ -1,0 +1,10 @@
+LIBRARY crypt32
+EXPORTS
+    CertOpenSystemStoreW
+    CertOpenSystemStoreA
+    CertOpenStore
+    CertCloseStore
+    CertGetCertificateChain
+    CertVerifyCertificateChainPolicy
+    CertFreeCertificateContext
+    CertFreeCertificateChain

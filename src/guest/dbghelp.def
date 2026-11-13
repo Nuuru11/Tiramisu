@@ -1,0 +1,6 @@
+LIBRARY dbghelp
+EXPORTS
+    SymInitialize
+    SymFromAddr
+    SymLoadModuleEx
+    MiniDumpWriteDump

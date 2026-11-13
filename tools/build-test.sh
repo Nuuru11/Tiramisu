@@ -44,7 +44,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
@@ -59,7 +59,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -79,7 +79,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_game_boot"
@@ -114,7 +114,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_real_load"
@@ -158,7 +158,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
   -o "$out/test_libload"
@@ -200,7 +200,7 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp \
@@ -239,7 +239,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp \
@@ -302,7 +302,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/vfs.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_kernel32.cpp src/trt/input.cpp \
   -o "$out/test_engine"
@@ -333,7 +333,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
   src/trt/input.cpp \
@@ -362,7 +362,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/bridge_dinput.cpp \
   src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
   src/trt/input.cpp \
@@ -395,7 +395,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
   src/trt/input.cpp \
@@ -417,7 +417,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
   src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
   src/trt/bridge_user32.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
   src/trt/input.cpp \
@@ -436,7 +436,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_d3d9.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
   src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
@@ -457,7 +457,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_d3d8.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -479,7 +479,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_openal.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -502,7 +502,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_ole.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -524,7 +524,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_shell.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -546,7 +546,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_shlwapi.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -572,7 +572,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
   src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp \
   src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
-  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
+  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
   src/trt/bridge_user32.cpp \
   src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
@@ -599,7 +599,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
   src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp \
   src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
-  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
+  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
   src/trt/bridge_user32.cpp \
   src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
@@ -622,7 +622,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_dsound.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -644,7 +644,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_ddraw.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -666,7 +666,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_d3dx9.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -690,7 +690,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_mmedia.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
   src/trt/bridge_user32.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
@@ -715,3 +715,71 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/module_table.cpp src/trt/thunk.cpp src/trt/vfs.cpp src/trt/apiset.cpp \
   -o "$out/test_d3dx"
 "$out/test_d3dx"
+
+# --- 27. STAGE 5 boot-determinism bridges (wininet/psapi/iphlpapi/imm32/
+#         crypt32/dbghelp+dbgcore): the 7 UNCERTAIN console DLLs converted
+#         to BUILTIN honest-runtime. Guests run the import surface through
+#         the IAT; the dbghelp guest writes a REAL text crash report.
+rm -f "$out/wininet.lib" "$out/psapi.lib" "$out/iphlpapi.lib" \
+      "$out/imm32.lib" "$out/crypt32.lib" "$out/dbghelp.lib"
+"$LLD_LINK" /lib /def:src/guest/wininet.def /out:"$out/wininet.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/psapi.def /out:"$out/psapi.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/iphlpapi.def /out:"$out/iphlpapi.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/imm32.def /out:"$out/imm32.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/crypt32.def /out:"$out/crypt32.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/dbghelp.def /out:"$out/dbghelp.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_wininet.c -o "$out/guest_wininet.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_psapi.c -o "$out/guest_psapi.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_iphlpapi.c -o "$out/guest_iphlpapi.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_imm32.c -o "$out/guest_imm32.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_crypt32.c -o "$out/guest_crypt32.obj"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_dbghelp.c -o "$out/guest_dbghelp.obj"
+"$LLD_LINK" "$out/guest_wininet.obj" "$out/wininet.lib" \
+  /NODEFAULTLIB /ENTRY:guest_wininet_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2400000 /OUT:"$out/guest_wininet.exe"
+"$LLD_LINK" "$out/guest_psapi.obj" "$out/psapi.lib" \
+  /NODEFAULTLIB /ENTRY:guest_psapi_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2500000 /OUT:"$out/guest_psapi.exe"
+"$LLD_LINK" "$out/guest_iphlpapi.obj" "$out/iphlpapi.lib" \
+  /NODEFAULTLIB /ENTRY:guest_iphlpapi_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2600000 /OUT:"$out/guest_iphlpapi.exe"
+"$LLD_LINK" "$out/guest_imm32.obj" "$out/imm32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_imm32_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2700000 /OUT:"$out/guest_imm32.exe"
+"$LLD_LINK" "$out/guest_crypt32.obj" "$out/crypt32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_crypt32_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2800000 /OUT:"$out/guest_crypt32.exe"
+"$LLD_LINK" "$out/guest_dbghelp.obj" "$out/dbghelp.lib" \
+  /NODEFAULTLIB /ENTRY:guest_dbghelp_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2900000 /OUT:"$out/guest_dbghelp.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_stage5.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
+  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
+  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
+  src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
+  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp \
+  src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
+  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
+  src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
+  src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp \
+  src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp \
+  src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
+  src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
+  -o "$out/test_stage5"
+S5DIR="$out/stage5-gamedir"; rm -rf "$S5DIR"; mkdir -p "$S5DIR"
+"$out/test_stage5" "$out/guest_wininet.exe" 0x3ff
+"$out/test_stage5" "$out/guest_psapi.exe" 0x017
+"$out/test_stage5" "$out/guest_iphlpapi.exe" 0x03f
+"$out/test_stage5" "$out/guest_imm32.exe" 0x03f
+"$out/test_stage5" "$out/guest_crypt32.exe" 0x07f
+"$out/test_stage5" "$out/guest_dbghelp.exe" 0x00f "$S5DIR"

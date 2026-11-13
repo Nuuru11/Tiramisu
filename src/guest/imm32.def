@@ -1,0 +1,9 @@
+LIBRARY imm32
+EXPORTS
+    ImmGetContext
+    ImmAssociateContext
+    ImmAssociateContextEx
+    ImmReleaseContext
+    ImmGetCompositionStringW
+    ImmNotifyIME
+    ImmGetConversionStatus

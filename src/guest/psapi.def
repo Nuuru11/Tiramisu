@@ -1,0 +1,7 @@
+LIBRARY psapi
+EXPORTS
+    K32EnumProcessModules
+    K32GetModuleFileNameExW
+    K32GetModuleBaseNameW
+    EnumProcesses
+    GetProcessMemoryInfo

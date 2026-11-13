@@ -107,6 +107,33 @@ trt_image* trt_images_first(void) {
   return g_image_count > 0 ? g_images[0].img : nullptr;
 }
 
+void trt_images_register_main(trt_image* img, const char* guest_name) {
+  if (!img || g_image_count >= TRT_MAX_GUEST_IMAGES) return;
+  const char* base = base_name(guest_name ? guest_name : "main.exe");
+  guest_image& g = g_images[g_image_count];
+  memset(&g, 0, sizeof(g));
+  snprintf(g.name, sizeof(g.name), "%s", base);
+  snprintf(g.path, sizeof(g.path), "<mapped>");
+  g.img = img;
+  g.handle = (void*)(uintptr_t)(TRT_HANDLE_TAG | (u32)g_image_count);
+  ++g_image_count;
+}
+
+// enumeration for the psapi/dbghelp bridges (the REAL guest module list)
+int trt_images_count(void) { return g_image_count; }
+
+trt_image* trt_images_nth(int idx) {
+  return (idx >= 0 && idx < g_image_count) ? g_images[idx].img : nullptr;
+}
+
+const char* trt_images_nth_name(int idx) {
+  return (idx >= 0 && idx < g_image_count) ? g_images[idx].name : nullptr;
+}
+
+const char* trt_images_nth_path(int idx) {
+  return (idx >= 0 && idx < g_image_count) ? g_images[idx].path : nullptr;
+}
+
 void* trt_images_handle(trt_image* img) {
   for (int i = 0; i < g_image_count; ++i)
     if (g_images[i].img == img) return g_images[i].handle;

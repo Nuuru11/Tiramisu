@@ -1,0 +1,12 @@
+LIBRARY wininet
+EXPORTS
+    InternetOpenW
+    InternetOpenA
+    InternetConnectA
+    HttpOpenRequestA
+    HttpSendRequestA
+    InternetReadFile
+    InternetCloseHandle
+    HttpQueryInfoA
+    InternetCrackUrlA
+    InternetSetStatusCallback
