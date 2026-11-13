@@ -20,6 +20,7 @@
 #include "bridge_openal.h"
 #include "bridge_ole.h"
 #include "bridge_shell.h"
+#include "bridge_shlwapi.h"
 #include "bridge_mmedia.h"
 #include "bridge_d3dx.h"
 #include "bridge_dinput.h"
@@ -203,6 +204,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_ole();
   // shell32: SHGetFolderPath/KnownFolderPath for save-game dirs
   trt_bridge_register_shell();
+  // shlwapi: Path* string/file helpers
+  trt_bridge_register_shlwapi();
   // msacm32/msvfw32/winspool: codec + printer boot probes (M6 coverage)
   trt_bridge_register_mmedia();
   // d3dx10/11: texture/shader helpers for the D3D10/11 generation (M7)

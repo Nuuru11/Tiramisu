@@ -321,7 +321,7 @@ const mod_default k_defaults[] = {
     {"credui.dll", TRT_ROUTE_SYSTEM},
 
     // ---- shell / env / misc ----
-    {"shlwapi.dll", TRT_ROUTE_SYSTEM},
+    {"shlwapi.dll", TRT_ROUTE_BUILTIN},  // M7: Path* helpers (bridge_shlwapi)
     {"shell32.dll", TRT_ROUTE_BUILTIN},  // M7: SHGetFolderPath (bridge_shell)
     {"shfolder.dll", TRT_ROUTE_BUILTIN},  // M7: shim onto SHGetFolderPath
     {"shcore.dll", TRT_ROUTE_SYSTEM},

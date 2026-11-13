@@ -1,0 +1,11 @@
+LIBRARY shlwapi.dll
+EXPORTS
+    PathFileExistsW
+    PathIsDirectoryW
+    PathFindFileNameW
+    PathCombineW
+    PathAppendW
+    PathStripPathW
+    PathFindExtensionW
+    PathRemoveExtensionW
+    PathIsRelativeW
