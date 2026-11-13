@@ -131,6 +131,18 @@ else
   echo "SKIP corpus load matrix: corpus-local/ absent or empty"
 fi
 
+# --- 6c. STAGE 6 run-depth: EXECUTE real DllMain code on the corpus --------
+# Same corpus-conditional as 6b: builds tests/test_corpus_run.cpp and runs
+# each corpus DLL's real entry point (Win64 ABI, fault handlers installed,
+# one attempt each). Verdicts RUN OK / RUN FAILED / SKIP(x86) — a named
+# fault is a discovery outcome and never fails the gate; a missing verdict
+# does. Without corpus-local/ the gate stays green.
+if [[ -d corpus-local ]] && [[ -n "$(find corpus-local -maxdepth 2 -type f 2>/dev/null)" ]]; then
+  bash tools/corpus-run.sh
+else
+  echo "SKIP corpus run-depth: corpus-local/ absent or empty"
+fi
+
 # --- 7. guest DLL loading: the DLLs a game ships with it ---
 cat > "$out/guestdll.def" <<'DEOF'
 LIBRARY guestdll

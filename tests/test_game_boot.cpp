@@ -94,130 +94,30 @@ int failures = 0;
     else { printf("  FAIL %s\n", msg); ++failures; }                 \
   } while (0)
 
-// ---- Win64 -> SysV trampolines (TEST HARNESS ONLY) ----
-// On the console host and guest share the Win64 ABI and these do not exist.
-// Patterns per arg count; all preserve rdi/rsi (Win64-nonvolatile, SysV-
-// caller-saved) and forward 5+ args from the Win64 stack to the SysV stack.
-// Win64 entry: rsp=E (E≡8), shadow [E+8..E+40], args5+ at [E+40...].
-asm(
-  ".text\n"
-  // ---- 4 args: rcx->rdi rdx->rsi r8->rdx r9->rcx ----
-  ".macro W64_4 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $40, %rsp\n"           // E-40 ≡ 0 mod 16 (E≡8)
-  "\tmovq %rdi, (%rsp)\n"
-  "\tmovq %rsi, 8(%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tmovq %rdx, %rsi\n"
-  "\tmovq %r8, %rdx\n"
-  "\tmovq %r9, %rcx\n"
-  "\tcall \\target\n"
-  "\tmovq (%rsp), %rdi\n"
-  "\tmovq 8(%rsp), %rsi\n"
-  "\taddq $40, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-  // ---- 5 args: arg5 -> r8 (SysV) ----
-  ".macro W64_5 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $56, %rsp\n"
-  "\tmovq %rdi, (%rsp)\n"
-  "\tmovq %rsi, 8(%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tmovq %rdx, %rsi\n"
-  "\tmovq %r8, %rdx\n"
-  "\tmovq %r9, %rcx\n"
-  "\tmovq 96(%rsp), %r8\n"
-  "\tcall \\target\n"
-  "\tmovq (%rsp), %rdi\n"
-  "\tmovq 8(%rsp), %rsi\n"
-  "\taddq $56, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-  // ---- 7 args: arg5->r8, arg6->r9, arg7->[rsp] (SysV stack starts at arg7)
-  ".macro W64_7 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $72, %rsp\n"
-  "\tmovq %rdi, 32(%rsp)\n"
-  "\tmovq %rsi, 40(%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tmovq %rdx, %rsi\n"
-  "\tmovq %r8, %rdx\n"
-  "\tmovq %r9, %rcx\n"
-  "\tmovq 112(%rsp), %r8\n"
-  "\tmovq 120(%rsp), %r9\n"
-  "\tmovq 128(%rsp), %rax\n"
-  "\tmovq %rax, (%rsp)\n"
-  "\tcall \\target\n"
-  "\tmovq 32(%rsp), %rdi\n"
-  "\tmovq 40(%rsp), %rsi\n"
-  "\taddq $72, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-  // ---- 12 args: arg5->r8, arg6->r9, args7-12 (6 qwords) [E+56..104] ->
-  // [rsp+224..272] -> [rsp+0..40] ----
-  ".macro W64_12 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $168, %rsp\n"
-  "\tmovq %rdi, 64(%rsp)\n"
-  "\tmovq %rsi, 72(%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tmovq %rdx, %rsi\n"
-  "\tmovq %r8, %rdx\n"
-  "\tmovq %r9, %rcx\n"
-  "\tmovq 208(%rsp), %r8\n"
-  "\tmovq 216(%rsp), %r9\n"
-  "\txorl %ecx, %ecx\n"
-  "1:\n"
-  "\tmovq 224(%rsp,%rcx,8), %rax\n"
-  "\tmovq %rax, (%rsp,%rcx,8)\n"
-  "\tincl %ecx\n"
-  "\tcmpl $6, %ecx\n"
-  "\tjl 1b\n"
-  "\tcall \\target\n"
-  "\tmovq 64(%rsp), %rdi\n"
-  "\tmovq 72(%rsp), %rsi\n"
-  "\taddq $168, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-
-  "W64_4 w64_GetProcessHeap, trt_GetProcessHeap\n"
-  "W64_4 w64_HeapAlloc, trt_HeapAlloc\n"
-  "W64_4 w64_QueryPerformanceCounter, trt_QueryPerformanceCounter\n"
-  "W64_4 w64_CloseHandle, trt_CloseHandle\n"
-  "W64_4 w64_GetEnvironmentStringsW, trt_GetEnvironmentStringsW\n"
-  "W64_4 w64_GetModuleFileNameW, trt_GetModuleFileNameW\n"
-  "W64_4 w64_RegisterClassExW, trt_RegisterClassExW\n"
-  "W64_4 w64_GetAsyncKeyState, trt_GetAsyncKeyState\n"
-  "W64_4 w64_GetCursorPos, trt_GetCursorPos\n"
-  "W64_4 w64_TranslateMessage, trt_TranslateMessage\n"
-  "W64_4 w64_DispatchMessageW, trt_DispatchMessageW\n"
-  "W64_5 w64_WriteFile, trt_WriteFile\n"
-  "W64_5 w64_PeekMessageW, trt_PeekMessageW\n"
-  "W64_7 w64_CreateFileW, trt_CreateFileW\n"
-  "W64_12 w64_CreateWindowExW, trt_CreateWindowExW\n"
-);
-
+// ---- bridge entry points (STAGE 6) ----
+// The bridges are TRT_STDCALL = ms_abi (Win64) on the Linux test host — the
+// same ABI the guest uses — so the guest IAT can point at them DIRECTLY.
+// The old hand-written Win64->SysV asm trampolines are gone: they translated
+// arguments into SysV registers, corrupting every call after the ms_abi
+// change (GetModuleFileNameW got buf/len in the wrong registers -> SIGSEGV).
 extern "C" {
-void* w64_GetProcessHeap();
-void* w64_HeapAlloc();
-unsigned long w64_QueryPerformanceCounter();
-unsigned long w64_CloseHandle();
-const unsigned short* w64_GetEnvironmentStringsW();
-unsigned int w64_GetModuleFileNameW();
-unsigned short w64_RegisterClassExW();
-short w64_GetAsyncKeyState();
-unsigned long w64_GetCursorPos();
-unsigned long w64_TranslateMessage();
-long long w64_DispatchMessageW();
-unsigned long w64_WriteFile();
-unsigned long w64_PeekMessageW();
-void* w64_CreateFileW();
-void* w64_CreateWindowExW();
+void* TRT_STDCALL trt_GetProcessHeap(void);
+void* TRT_STDCALL trt_HeapAlloc(void*, u32, u64);
+int TRT_STDCALL trt_QueryPerformanceCounter(i64*);
+int TRT_STDCALL trt_CloseHandle(void*);
+const u16* TRT_STDCALL trt_GetEnvironmentStringsW();
+u32 TRT_STDCALL trt_GetModuleFileNameW(void*, u16*, u32);
+u16 TRT_STDCALL trt_RegisterClassExW(const void*);
+i16 TRT_STDCALL trt_GetAsyncKeyState(int);
+int TRT_STDCALL trt_GetCursorPos(void*);
+int TRT_STDCALL trt_TranslateMessage(const void*);
+i64 TRT_STDCALL trt_DispatchMessageW(const void*);
+int TRT_STDCALL trt_WriteFile(void*, const void*, u32, u32*, void*);
+int TRT_STDCALL trt_PeekMessageW(void*, void*, u32, u32, u32);
+void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+void* TRT_STDCALL trt_CreateWindowExW(u32, const wchar_t*, const wchar_t*,
+                                      u32, int, int, int, int, void*,
+                                      void*, void*, void*);
 }
 
 } // namespace
@@ -238,21 +138,21 @@ int main(int argc, char** argv) {
   trt_resolver_default(&def);
   struct sym { const char* n; void* f; };
   static const sym k_thunks[] = {
-      {"GetProcessHeap", (void*)&w64_GetProcessHeap},
-      {"HeapAlloc", (void*)&w64_HeapAlloc},
-      {"QueryPerformanceCounter", (void*)&w64_QueryPerformanceCounter},
-      {"CloseHandle", (void*)&w64_CloseHandle},
-      {"GetEnvironmentStringsW", (void*)&w64_GetEnvironmentStringsW},
-      {"GetModuleFileNameW", (void*)&w64_GetModuleFileNameW},
-      {"RegisterClassExW", (void*)&w64_RegisterClassExW},
-      {"GetAsyncKeyState", (void*)&w64_GetAsyncKeyState},
-      {"GetCursorPos", (void*)&w64_GetCursorPos},
-      {"TranslateMessage", (void*)&w64_TranslateMessage},
-      {"DispatchMessageW", (void*)&w64_DispatchMessageW},
-      {"WriteFile", (void*)&w64_WriteFile},
-      {"PeekMessageW", (void*)&w64_PeekMessageW},
-      {"CreateFileW", (void*)&w64_CreateFileW},
-      {"CreateWindowExW", (void*)&w64_CreateWindowExW},
+      {"GetProcessHeap", (void*)&trt_GetProcessHeap},
+      {"HeapAlloc", (void*)&trt_HeapAlloc},
+      {"QueryPerformanceCounter", (void*)&trt_QueryPerformanceCounter},
+      {"CloseHandle", (void*)&trt_CloseHandle},
+      {"GetEnvironmentStringsW", (void*)&trt_GetEnvironmentStringsW},
+      {"GetModuleFileNameW", (void*)&trt_GetModuleFileNameW},
+      {"RegisterClassExW", (void*)&trt_RegisterClassExW},
+      {"GetAsyncKeyState", (void*)&trt_GetAsyncKeyState},
+      {"GetCursorPos", (void*)&trt_GetCursorPos},
+      {"TranslateMessage", (void*)&trt_TranslateMessage},
+      {"DispatchMessageW", (void*)&trt_DispatchMessageW},
+      {"WriteFile", (void*)&trt_WriteFile},
+      {"PeekMessageW", (void*)&trt_PeekMessageW},
+      {"CreateFileW", (void*)&trt_CreateFileW},
+      {"CreateWindowExW", (void*)&trt_CreateWindowExW},
   };
   static trt_resolver rs;
   rs.user = &def;

@@ -56,7 +56,7 @@ extern "C" {
 // ---- system information ----
 
 // GetVersionExW(OSVERSIONINFOW*)
-u32 trt_GetVersionExW(void* info) {
+u32 TRT_STDCALL trt_GetVersionExW(void* info) {
   if (!info) return 0;
   // LPOSTROSVERSIONINFOW: dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion,
   // dwBuildNumber, dwPlatformId, szCSDVersion[128]
@@ -69,13 +69,13 @@ u32 trt_GetVersionExW(void* info) {
   return 1;
 }
 
-u32 trt_GetVersion(void) {
+u32 TRT_STDCALL trt_GetVersion(void) {
   // Win10 = 0x0A000006 (major 10, minor 0)
   return 0x0A000006u;
 }
 
 // GetSystemInfo(SYSTEM_INFO*)
-void trt_GetSystemInfo(void* si) {
+void TRT_STDCALL trt_GetSystemInfo(void* si) {
   if (!si) return;
   // SYSTEM_INFO: u16 alignment, u16 pad, u32 pageSize, u32 minApp, u32 maxApp,
   // u32 dwMask, u32 processors, u32 processorType, u32 allocationGranularity,
@@ -96,12 +96,12 @@ void trt_GetSystemInfo(void* si) {
 }
 
 // GetNativeSystemInfo(SYSTEM_INFO*) - same numbers, no WOW64 downgrade
-void trt_GetNativeSystemInfo(void* si) {
+void TRT_STDCALL trt_GetNativeSystemInfo(void* si) {
   trt_GetSystemInfo(si);
 }
 
 // GetSystemTimes(idle, kernel, user)
-int trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
+int TRT_STDCALL trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
   const u64 now = (u64)clock() / (CLOCKS_PER_SEC / 1000);
   if (idle) *idle = now / 2;
   if (kernel) *kernel = now;
@@ -109,7 +109,7 @@ int trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
   return 1;
 }
 
-u32 trt_GetEnvironmentVariableW(const u16* name, u16* buf,
+u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
                                                u32 size) {
   if (!name) return 0;
   char n[256];
@@ -124,7 +124,7 @@ u32 trt_GetEnvironmentVariableW(const u16* name, u16* buf,
   return need;
 }
 
-u32 trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
+u32 TRT_STDCALL trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
                                                 u32 size) {
   if (!in) return 0;
   char src[1024], dst[2048];
@@ -138,14 +138,14 @@ u32 trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
   return need;
 }
 
-u32 trt_GetACP(void) { return 1252; }
-u32 trt_GetOEMCP(void) { return 437; }
-u32 trt_GetUserDefaultLCID(void) { return 0x0409; }
-u32 trt_GetUserDefaultLangID(void) { return 0x0409; }
-u32 trt_GetSystemDefaultLCID(void) { return 0x0409; }
-u32 trt_GetSystemDefaultLangID(void) { return 0x0409; }
+u32 TRT_STDCALL trt_GetACP(void) { return 1252; }
+u32 TRT_STDCALL trt_GetOEMCP(void) { return 437; }
+u32 TRT_STDCALL trt_GetUserDefaultLCID(void) { return 0x0409; }
+u32 TRT_STDCALL trt_GetUserDefaultLangID(void) { return 0x0409; }
+u32 TRT_STDCALL trt_GetSystemDefaultLCID(void) { return 0x0409; }
+u32 TRT_STDCALL trt_GetSystemDefaultLangID(void) { return 0x0409; }
 
-int trt_GetComputerNameW(u16* buf, u32* size) {
+int TRT_STDCALL trt_GetComputerNameW(u16* buf, u32* size) {
   const char* host = getenv("COMPUTERNAME");
   if (!host) host = "TIRAMISU";
   const u32 need = (u32)strlen(host) + 1;
@@ -161,7 +161,7 @@ int trt_GetComputerNameW(u16* buf, u32* size) {
 // ---- wide/ANSI conversion ----
 
 // MultiByteToWideChar(codepage, flags, src, srclen, dst, dstlen)
-int trt_MultiByteToWideChar(u32 codepage, u32 flags,
+int TRT_STDCALL trt_MultiByteToWideChar(u32 codepage, u32 flags,
                                           const char* src, int srclen,
                                           u16* dst, int dstlen) {
   (void)codepage; (void)flags;
@@ -186,7 +186,7 @@ int trt_MultiByteToWideChar(u32 codepage, u32 flags,
 }
 
 // WideCharToMultiByte(codepage, flags, src, srclen, dst, dstlen, def, used)
-int trt_WideCharToMultiByte(u32 codepage, u32 flags,
+int TRT_STDCALL trt_WideCharToMultiByte(u32 codepage, u32 flags,
                                           const u16* src, int srclen, char* dst,
                                           int dstlen, const char* def,
                                           void* used) {
@@ -215,7 +215,7 @@ int trt_WideCharToMultiByte(u32 codepage, u32 flags,
 
 // ---- files and directories ----
 
-u32 trt_GetTempPathW(u32 size, u16* buf) {
+u32 TRT_STDCALL trt_GetTempPathW(u32 size, u16* buf) {
   const char* t = getenv("TMPDIR");
   if (!t || !*t) t = "/tmp";
   char tmp[512];
@@ -228,7 +228,7 @@ u32 trt_GetTempPathW(u32 size, u16* buf) {
   return need;
 }
 
-u32 trt_GetTempFileNameW(const u16* dir, const u16* prefix,
+u32 TRT_STDCALL trt_GetTempFileNameW(const u16* dir, const u16* prefix,
                                        u32 unique, u16* buf) {
   char d[256], p[64];
   utf16_to_utf8(dir, d, sizeof(d));
@@ -242,7 +242,7 @@ u32 trt_GetTempFileNameW(const u16* dir, const u16* prefix,
   return need;
 }
 
-u32 trt_GetWindowsDirectoryW(u16* buf, u32 size) {
+u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {
   const char* w = "C:\\Windows";
   const u32 need = (u32)strlen(w) + 1;
   if (buf && size >= need)
@@ -250,7 +250,7 @@ u32 trt_GetWindowsDirectoryW(u16* buf, u32 size) {
   return need;
 }
 
-u32 trt_GetFileAttributesW(const u16* path) {
+u32 TRT_STDCALL trt_GetFileAttributesW(const u16* path) {
   char p[512];
   utf16_to_utf8(path, p, sizeof(p));
   FILE* f = fopen(p, "rb");
@@ -259,31 +259,31 @@ u32 trt_GetFileAttributesW(const u16* path) {
   return 0x80;  // FILE_ATTRIBUTE_NORMAL
 }
 
-int trt_SetFileAttributesW(const u16* path, u32 attrs) {
+int TRT_STDCALL trt_SetFileAttributesW(const u16* path, u32 attrs) {
   (void)path; (void)attrs;
   return 1;
 }
 
-int trt_DeleteFileW(const u16* path) {
+int TRT_STDCALL trt_DeleteFileW(const u16* path) {
   char p[512];
   utf16_to_utf8(path, p, sizeof(p));
   return remove(p) == 0 ? 1 : 0;
 }
 
-int trt_CreateDirectoryW(const u16* path, void* sa) {
+int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa) {
   (void)sa;
   char p[512];
   utf16_to_utf8(path, p, sizeof(p));
   return mkdir_portable(p);
 }
 
-int trt_RemoveDirectoryW(const u16* path) {
+int TRT_STDCALL trt_RemoveDirectoryW(const u16* path) {
   char p[512];
   utf16_to_utf8(path, p, sizeof(p));
   return rmdir_portable(p);
 }
 
-int trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
+int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
   (void)fail;
   char s[512], d[512];
   utf16_to_utf8(src, s, sizeof(s));

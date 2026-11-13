@@ -18,47 +18,16 @@ int trt_bridge_register_shell(void);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
 }
 
-// ---- Win64 -> SysV trampolines (TEST HARNESS ONLY) ----
-// kernel32 bridge fns are host-ABI (see test_engine.cpp); the guest calls
-// them through the IAT, so this Linux harness must marshal Win64->SysV and
-// preserve rdi/rsi (nonvolatile in Win64 — the guest keeps state in them).
-extern "C" void shell_generic_w64_to_sysv(void);
-asm(
-  ".text\n"
-  ".globl shell_generic_w64_to_sysv\n"
-  "shell_generic_w64_to_sysv:\n"
-  "  subq $104, %rsp\n"
-  "  movq %rdi, 72(%rsp)\n"
-  "  movq %rsi, 80(%rsp)\n"
-  "  movq %rcx, %rdi\n"        // arg1
-  "  movq %rdx, %rsi\n"        // arg2
-  "  movq %r8, %rdx\n"         // arg3
-  "  movq %r9, %rcx\n"         // arg4
-  "  movq 144(%rsp), %r8\n"     // arg5 (Win64 stack)
-  "  movq 152(%rsp), %r9\n"     // arg6
-  "  movq 160(%rsp), %rax\n"    // arg7 -> SysV stack slot 0
-  "  movq %rax, (%rsp)\n"
-  "  movq 168(%rsp), %rax\n"    // arg8 -> SysV stack slot 1
-  "  movq %rax, 8(%rsp)\n"
-  "  call *%r11\n"
-  "  movq 72(%rsp), %rdi\n"
-  "  movq 80(%rsp), %rsi\n"
-  "  addq $104, %rsp\n"
-  "  ret\n"
-);
-#define SHELL_TRAMP(sym, target)                     \
-  extern "C" void sym();                             \
-  asm(".globl " #sym "\n" #sym ":\n"                \
-      "  movq $" #target ", %r11\n"                 \
-      "  jmp shell_generic_w64_to_sysv\n");
+// ---- bridge entry points (STAGE 6b) ----
+// The bridges are TRT_STDCALL = ms_abi (Win64) on the Linux test host — the
+// same ABI the guest uses — so the guest IAT binds the bridge addresses
+// DIRECTLY (exactly like the console). The old Win64->SysV asm trampolines
+// are gone.
 extern "C" {
-void* trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
-i32 trt_WriteFile(void*, const void*, u32, u32*, void*);
-i32 trt_CloseHandle(void*);
+void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+int TRT_STDCALL trt_WriteFile(void*, const void*, u32, u32*, void*);
+int TRT_STDCALL trt_CloseHandle(void*);
 }
-SHELL_TRAMP(w_sCreateFileW, trt_CreateFileW)
-SHELL_TRAMP(w_sWriteFile, trt_WriteFile)
-SHELL_TRAMP(w_sCloseHandle, trt_CloseHandle)
 
 namespace {
 
@@ -161,13 +130,13 @@ int main(int argc, char** argv) {
   snprintf(drive, sizeof(drive), "/tmp/opencode/shell-test-%d", getpid());
   trt_vfs_mount("c:", drive);
 
-  // the guest's file calls go through the harness trampolines (host-ABI
-  // bridge fns; see test_engine.cpp for the same pattern)
+  // the guest binds the bridge addresses DIRECTLY (ms_abi = guest ABI,
+  // exactly like the console IAT)
   {
     static const trt_named_fn k_k32_extra[] = {
-        {"CreateFileW", (void*)&w_sCreateFileW},
-        {"WriteFile", (void*)&w_sWriteFile},
-        {"CloseHandle", (void*)&w_sCloseHandle},
+        {"CreateFileW", (void*)&trt_CreateFileW},
+        {"WriteFile", (void*)&trt_WriteFile},
+        {"CloseHandle", (void*)&trt_CloseHandle},
     };
     trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_k32_extra,
                         (int)(sizeof(k_k32_extra) / sizeof(k_k32_extra[0])));

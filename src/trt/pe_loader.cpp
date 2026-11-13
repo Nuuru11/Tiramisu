@@ -275,8 +275,13 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls dir out of image");
     const trt_tls_directory64* tls = (const trt_tls_directory64*)(img.base + tls_va);
     // callbacks array is addressed by VA; after relocation it points at the
-    // runtime image, so translate through the actual base.
-    const u64 arr_rva = (u64)tls->address_of_callbacks - preferred;
+    // RUNTIME image (new base + rva), so translate through the actual base —
+    // NOT the preferred ImageBase. Subtracting `preferred` only worked when
+    // the image loaded at its preferred base (delta==0); the first relocated
+    // TLS-bearing DLL (baselib.dll inside GameAssembly's run) produced a
+    // huge bogus rva and died TLS_BOUNDS. STAGE 6 run-depth found it.
+    const u64 arr_rva =
+        (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
     if (arr_rva + 8 > size_of_image)
       return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
     for (u64 c = arr_rva; c + 8 <= size_of_image &&

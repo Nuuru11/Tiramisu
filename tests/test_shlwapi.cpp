@@ -18,45 +18,15 @@ int trt_bridge_register_shlwapi(void);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
 }
 
-// ---- Win64 -> SysV trampolines (TEST HARNESS ONLY) ----
-// kernel32 bridge fns are host-ABI; see test_engine.cpp. The guest's
-// file calls (CreateFileW/CloseHandle for the existence check) need
-// marshalling here.
-extern "C" void shlw_generic_w64_to_sysv(void);
-asm(
-  ".text\n"
-  ".globl shlw_generic_w64_to_sysv\n"
-  "shlw_generic_w64_to_sysv:\n"
-  "  subq $104, %rsp\n"
-  "  movq %rdi, 72(%rsp)\n"
-  "  movq %rsi, 80(%rsp)\n"
-  "  movq %rcx, %rdi\n"
-  "  movq %rdx, %rsi\n"
-  "  movq %r8, %rdx\n"
-  "  movq %r9, %rcx\n"
-  "  movq 144(%rsp), %r8\n"
-  "  movq 152(%rsp), %r9\n"
-  "  movq 160(%rsp), %rax\n"
-  "  movq %rax, (%rsp)\n"
-  "  movq 168(%rsp), %rax\n"
-  "  movq %rax, 8(%rsp)\n"
-  "  call *%r11\n"
-  "  movq 72(%rsp), %rdi\n"
-  "  movq 80(%rsp), %rsi\n"
-  "  addq $104, %rsp\n"
-  "  ret\n"
-);
-#define SHLW_TRAMP(sym, target)                      \
-  extern "C" void sym();                             \
-  asm(".globl " #sym "\n" #sym ":\n"                \
-      "  movq $" #target ", %r11\n"                 \
-      "  jmp shlw_generic_w64_to_sysv\n");
+// ---- bridge entry points (STAGE 6b) ----
+// The bridges are TRT_STDCALL = ms_abi (Win64) on the Linux test host — the
+// same ABI the guest uses — so the guest IAT binds the bridge addresses
+// DIRECTLY (exactly like the console). The old Win64->SysV asm trampolines
+// are gone.
 extern "C" {
-void* trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
-i32 trt_CloseHandle(void*);
+void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+int TRT_STDCALL trt_CloseHandle(void*);
 }
-SHLW_TRAMP(w_lCreateFileW, trt_CreateFileW)
-SHLW_TRAMP(w_lCloseHandle, trt_CloseHandle)
 
 namespace {
 
@@ -160,8 +130,8 @@ int main(int argc, char** argv) {
   trt_vfs_mount("c:", drive);
   {
     static const trt_named_fn k_k32_extra[] = {
-        {"CreateFileW", (void*)&w_lCreateFileW},
-        {"CloseHandle", (void*)&w_lCloseHandle},
+        {"CreateFileW", (void*)&trt_CreateFileW},
+        {"CloseHandle", (void*)&trt_CloseHandle},
     };
     trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_k32_extra,
                         (int)(sizeof(k_k32_extra) / sizeof(k_k32_extra[0])));

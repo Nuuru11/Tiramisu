@@ -21,103 +21,47 @@ int trt_bridge_register_user32(void);
 
 namespace {
 
-// ---- Win64 -> SysV trampolines (TEST HARNESS ONLY) ----
-// The bridge is host-ABI (the console host is Win64, where no marshalling is
-// needed); this Linux harness needs it. One generic marshaller plus a
-// one-instruction stub per symbol: the stub loads the target into r11 and
-// jumps into the marshaller, which moves rcx/rdx/r8/r9 (+ stack) into the
-// SysV registers and preserves rdi/rsi (they are NONVOLATILE in Win64).
-#define TRAMP_STUB(sym, target)                       \
-  extern "C" void sym();                             \
-  asm(".globl " #sym "\n" #sym ":\n"                \
-      "  movq $" #target ", %r11\n"                 \
-      "  jmp generic_w64_to_sysv\n");
-extern "C" void generic_w64_to_sysv(void);
-asm(
-  ".text\n"
-  ".globl generic_w64_to_sysv\n"
-  "generic_w64_to_sysv:\n"
-  "  subq $104, %rsp\n"
-  "  movq %rdi, 72(%rsp)\n"
-  "  movq %rsi, 80(%rsp)\n"
-  "  movq %rcx, %rdi\n"        // arg1
-  "  movq %rdx, %rsi\n"        // arg2
-  "  movq %r8, %rdx\n"         // arg3
-  "  movq %r9, %rcx\n"         // arg4
-  "  movq 144(%rsp), %r8\n"     // arg5 (Win64 stack)
-  "  movq 152(%rsp), %r9\n"     // arg6
-  "  movq 160(%rsp), %rax\n"    // arg7 -> SysV stack slot 0
-  "  movq %rax, (%rsp)\n"
-  "  movq 168(%rsp), %rax\n"    // arg8 -> SysV stack slot 1
-  "  movq %rax, 8(%rsp)\n"
-  "  call *%r11\n"
-  "  movq 72(%rsp), %rdi\n"
-  "  movq 80(%rsp), %rsi\n"
-  "  addq $104, %rsp\n"
-  "  ret\n"
-);
-
+// ---- bridge entry points (STAGE 6b) ----
+// The bridges are TRT_STDCALL = ms_abi (Win64) on the Linux test host — the
+// same ABI the guest uses — so the guest IAT binds the bridge addresses
+// DIRECTLY, exactly like the console (which has zero trampolines). The old
+// hand-written Win64->SysV asm trampolines are gone.
 extern "C" {
-void* trt_CreateFileMappingW(void*, void*, u32, u32, u32, const u16*);
-void* trt_MapViewOfFile(void*, u32, u32, u32, u64);
-int trt_UnmapViewOfFile(void*);
-void* trt_CreateThread(void*, void*, void*, void*, u32, u32*);
-u32 trt_WaitForSingleObject(void*, u32);
-void* trt_CreateEventW(void*, u32, u32, const u16*);
-int trt_SetEvent(void*);
-int trt_ResetEvent(void*);
-void trt_InitializeCriticalSection(void*);
-void trt_EnterCriticalSection(void*);
-void trt_LeaveCriticalSection(void*);
-i32 trt_GetVersionExW(void*);
-void trt_GetSystemInfo(void*);
-i32 trt_MultiByteToWideChar(u32, u32, const char*, i32, u16*, i32);
-i32 trt_WideCharToMultiByte(u32, u32, const u16*, i32, char*, i32, const char*, void*);
-u32 trt_GetTempPathW(u32, u16*);
-u64 trt_GetTickCount64(void);
-void trt_PostQuitMessage(i32);
-void* trt_SetFocus(void*);
-void* trt_GetFocus(void);
-int trt_GetClientRect(void*, void*);
-void* trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
-i32 trt_WriteFile(void*, const void*, u32, u32*, void*);
-i32 trt_CloseHandle(void*);
-void* trt_GetStdHandle(u32);
-int trt_SetStdHandle(u32, void*);
-int trt_GetConsoleMode(void*, u32*);
-int trt_SetConsoleCtrlHandler(void*, int);
-int trt_ReadConsoleW(void*, void*, u32, u32*, void*);
-int trt_WriteConsoleW(void*, const void*, u32, u32*, void*);
-int trt_CreateProcessW(const u16*, u16*, void*, void*, int, u32, void*,
-                       const u16*, const void*, void*);
-void trt_SetLastError(u32);
-u32 trt_GetLastError(void);
+void* TRT_STDCALL trt_CreateFileMappingW(void*, void*, u32, u32, u32, const u16*);
+void* TRT_STDCALL trt_MapViewOfFile(void*, u32, u32, u32, u64);
+int TRT_STDCALL trt_UnmapViewOfFile(void*);
+u64 TRT_STDCALL trt_CreateThread(void*, void*, void*, void*, u32, u32*);
+u32 TRT_STDCALL trt_WaitForSingleObject(u64, u32);
+void* TRT_STDCALL trt_CreateEventW(void*, u32, u32, const u16*);
+int TRT_STDCALL trt_SetEvent(u64);
+int TRT_STDCALL trt_ResetEvent(u64);
+int TRT_STDCALL trt_InitializeCriticalSection(void*);
+int TRT_STDCALL trt_EnterCriticalSection(void*);
+int TRT_STDCALL trt_LeaveCriticalSection(void*);
+u32 TRT_STDCALL trt_GetVersionExW(void*);
+void TRT_STDCALL trt_GetSystemInfo(void*);
+int TRT_STDCALL trt_MultiByteToWideChar(u32, u32, const char*, i32, u16*, i32);
+int TRT_STDCALL trt_WideCharToMultiByte(u32, u32, const u16*, i32, char*, i32, const char*, void*);
+u32 TRT_STDCALL trt_GetTempPathW(u32, u16*);
+u64 TRT_STDCALL trt_GetTickCount64(void);
+void TRT_STDCALL trt_PostQuitMessage(i32);
+void* TRT_STDCALL trt_SetFocus(void*);
+void* TRT_STDCALL trt_GetFocus(void);
+int TRT_STDCALL trt_GetClientRect(void*, void*);
+void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+int TRT_STDCALL trt_WriteFile(void*, const void*, u32, u32*, void*);
+int TRT_STDCALL trt_CloseHandle(void*);
+void* TRT_GUEST_ABI trt_GetStdHandle(u32);
+int TRT_GUEST_ABI trt_SetStdHandle(u32, void*);
+int TRT_GUEST_ABI trt_GetConsoleMode(void*, u32*);
+int TRT_GUEST_ABI trt_SetConsoleCtrlHandler(void*, int);
+int TRT_GUEST_ABI trt_ReadConsoleW(void*, void*, u32, u32*, void*);
+int TRT_GUEST_ABI trt_WriteConsoleW(void*, const void*, u32, u32*, void*);
+int TRT_GUEST_ABI trt_CreateProcessW(const u16*, u16*, void*, void*, int, u32, void*,
+                        const u16*, const void*, void*);
+void TRT_STDCALL trt_SetLastError(u32);
+u32 TRT_STDCALL trt_GetLastError(void);
 }
-
-TRAMP_STUB(w_CreateFileMappingW, trt_CreateFileMappingW)
-TRAMP_STUB(w_MapViewOfFile, trt_MapViewOfFile)
-TRAMP_STUB(w_UnmapViewOfFile, trt_UnmapViewOfFile)
-TRAMP_STUB(w_CreateThread, trt_CreateThread)
-TRAMP_STUB(w_WaitForSingleObject, trt_WaitForSingleObject)
-TRAMP_STUB(w_CreateEventW, trt_CreateEventW)
-TRAMP_STUB(w_SetEvent, trt_SetEvent)
-TRAMP_STUB(w_ResetEvent, trt_ResetEvent)
-TRAMP_STUB(w_InitializeCriticalSection, trt_InitializeCriticalSection)
-TRAMP_STUB(w_EnterCriticalSection, trt_EnterCriticalSection)
-TRAMP_STUB(w_LeaveCriticalSection, trt_LeaveCriticalSection)
-TRAMP_STUB(w_GetVersionExW, trt_GetVersionExW)
-TRAMP_STUB(w_GetSystemInfo, trt_GetSystemInfo)
-TRAMP_STUB(w_MultiByteToWideChar, trt_MultiByteToWideChar)
-TRAMP_STUB(w_WideCharToMultiByte, trt_WideCharToMultiByte)
-TRAMP_STUB(w_GetTempPathW, trt_GetTempPathW)
-TRAMP_STUB(w_GetTickCount64, trt_GetTickCount64)
-TRAMP_STUB(w_PostQuitMessage, trt_PostQuitMessage)
-TRAMP_STUB(w_SetFocus, trt_SetFocus)
-TRAMP_STUB(w_GetFocus, trt_GetFocus)
-TRAMP_STUB(w_GetClientRect, trt_GetClientRect)
-TRAMP_STUB(w_CreateFileW, trt_CreateFileW)
-TRAMP_STUB(w_WriteFile, trt_WriteFile)
-TRAMP_STUB(w_CloseHandle, trt_CloseHandle)
 
 
 struct extent { void* base; size_t len; };
@@ -214,29 +158,30 @@ int main(int argc, char** argv) {
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
 
-  // the guest calls these through the trampolines (harness only)
+  // the guest binds the bridge addresses DIRECTLY (ms_abi = the guest's
+  // own ABI — exactly like the console IAT, zero trampolines)
   {
     static const trt_named_fn k_k32[] = {
-        {"CreateFileMappingW", (void*)&w_CreateFileMappingW},
-        {"MapViewOfFile", (void*)&w_MapViewOfFile},
-        {"UnmapViewOfFile", (void*)&w_UnmapViewOfFile},
-        {"CreateThread", (void*)&w_CreateThread},
-        {"WaitForSingleObject", (void*)&w_WaitForSingleObject},
-        {"CreateEventW", (void*)&w_CreateEventW},
-        {"SetEvent", (void*)&w_SetEvent},
-        {"ResetEvent", (void*)&w_ResetEvent},
-        {"InitializeCriticalSection", (void*)&w_InitializeCriticalSection},
-        {"EnterCriticalSection", (void*)&w_EnterCriticalSection},
-        {"LeaveCriticalSection", (void*)&w_LeaveCriticalSection},
-        {"GetVersionExW", (void*)&w_GetVersionExW},
-        {"GetSystemInfo", (void*)&w_GetSystemInfo},
-        {"MultiByteToWideChar", (void*)&w_MultiByteToWideChar},
-        {"WideCharToMultiByte", (void*)&w_WideCharToMultiByte},
-        {"GetTempPathW", (void*)&w_GetTempPathW},
-        {"GetTickCount64", (void*)&w_GetTickCount64},
-        {"CreateFileW", (void*)&w_CreateFileW},
-        {"WriteFile", (void*)&w_WriteFile},
-        {"CloseHandle", (void*)&w_CloseHandle},
+        {"CreateFileMappingW", (void*)&trt_CreateFileMappingW},
+        {"MapViewOfFile", (void*)&trt_MapViewOfFile},
+        {"UnmapViewOfFile", (void*)&trt_UnmapViewOfFile},
+        {"CreateThread", (void*)&trt_CreateThread},
+        {"WaitForSingleObject", (void*)&trt_WaitForSingleObject},
+        {"CreateEventW", (void*)&trt_CreateEventW},
+        {"SetEvent", (void*)&trt_SetEvent},
+        {"ResetEvent", (void*)&trt_ResetEvent},
+        {"InitializeCriticalSection", (void*)&trt_InitializeCriticalSection},
+        {"EnterCriticalSection", (void*)&trt_EnterCriticalSection},
+        {"LeaveCriticalSection", (void*)&trt_LeaveCriticalSection},
+        {"GetVersionExW", (void*)&trt_GetVersionExW},
+        {"GetSystemInfo", (void*)&trt_GetSystemInfo},
+        {"MultiByteToWideChar", (void*)&trt_MultiByteToWideChar},
+        {"WideCharToMultiByte", (void*)&trt_WideCharToMultiByte},
+        {"GetTempPathW", (void*)&trt_GetTempPathW},
+        {"GetTickCount64", (void*)&trt_GetTickCount64},
+        {"CreateFileW", (void*)&trt_CreateFileW},
+        {"WriteFile", (void*)&trt_WriteFile},
+        {"CloseHandle", (void*)&trt_CloseHandle},
         {"GetStdHandle", (void*)&trt_GetStdHandle},
         {"SetStdHandle", (void*)&trt_SetStdHandle},
         {"GetConsoleMode", (void*)&trt_GetConsoleMode},
@@ -248,10 +193,10 @@ int main(int argc, char** argv) {
         {"GetLastError", (void*)&trt_GetLastError},
     };
     static const trt_named_fn k_u32[] = {
-        {"PostQuitMessage", (void*)&w_PostQuitMessage},
-        {"SetFocus", (void*)&w_SetFocus},
-        {"GetFocus", (void*)&w_GetFocus},
-        {"GetClientRect", (void*)&w_GetClientRect},
+        {"PostQuitMessage", (void*)&trt_PostQuitMessage},
+        {"SetFocus", (void*)&trt_SetFocus},
+        {"GetFocus", (void*)&trt_GetFocus},
+        {"GetClientRect", (void*)&trt_GetClientRect},
     };
     trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_k32,
                          (int)(sizeof(k_k32) / sizeof(k_k32[0])));

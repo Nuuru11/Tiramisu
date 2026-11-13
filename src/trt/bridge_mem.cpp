@@ -55,7 +55,7 @@ mapping* map_for(u64 h) {
 extern "C" {
 
 // CreateFileMappingW(hFile, attrs, protect, maxHigh, maxLow, name)
-u64 trt_CreateFileMappingW(u64 hfile, void* attrs, u32 protect,
+u64 TRT_STDCALL trt_CreateFileMappingW(u64 hfile, void* attrs, u32 protect,
                                           u32 max_high, u32 max_low,
                                           const u16* name) {
   (void)attrs; (void)name;  // named mappings are not shared across images
@@ -87,7 +87,7 @@ u64 trt_CreateFileMappingW(u64 hfile, void* attrs, u32 protect,
   return slot;
 }
 
-u64 trt_CreateFileMappingA(u64 hfile, void* attrs, u32 protect,
+u64 TRT_STDCALL trt_CreateFileMappingA(u64 hfile, void* attrs, u32 protect,
                                           u32 max_high, u32 max_low,
                                           const char* name) {
   (void)attrs; (void)name;
@@ -96,7 +96,7 @@ u64 trt_CreateFileMappingA(u64 hfile, void* attrs, u32 protect,
 }
 
 // MapViewOfFile(h, access, offHigh, offLow, bytes)
-void* trt_MapViewOfFile(u64 h, u32 access, u32 off_high,
+void* TRT_STDCALL trt_MapViewOfFile(u64 h, u32 access, u32 off_high,
                                       u32 off_low, u64 bytes) {
   mapping* m = map_for(h);
   char line[192];
@@ -112,24 +112,24 @@ void* trt_MapViewOfFile(u64 h, u32 access, u32 off_high,
   return (u8*)m->base + offset;
 }
 
-int trt_UnmapViewOfFile(void* view) {
+int TRT_STDCALL trt_UnmapViewOfFile(void* view) {
   (void)view;
   return 1;  // the copy lives as long as the mapping
 }
 
-int trt_FlushViewOfFile(void* view, u64 bytes) {
+int TRT_STDCALL trt_FlushViewOfFile(void* view, u64 bytes) {
   (void)view; (void)bytes;
   return 1;
 }
 
-u64 trt_OpenFileMappingW(u32 access, bool inherit,
+u64 TRT_STDCALL trt_OpenFileMappingW(u32 access, bool inherit,
                                         const u16* name) {
   (void)access; (void)inherit; (void)name;
   return 0;  // mappings are private to the guest image
 }
 
 // VirtualProtect(addr, size, newProtect, oldProtect)
-int trt_VirtualProtect(void* addr, u64 size, u32 new_protect,
+int TRT_STDCALL trt_VirtualProtect(void* addr, u64 size, u32 new_protect,
                                      u32* old_protect) {
   const trt_backend* be = trt_core_backend();
   if (!be || !be->protect) return 0;

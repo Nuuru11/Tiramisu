@@ -70,52 +70,23 @@ u32 g_build_value = 0x0042u;
 u32 g_log_tag = 0, g_log_value = 0;
 bool g_log_called = false;
 
-extern "C" u32 sysv_query_build() { return g_build_value; }
-extern "C" void sysv_log_u32(u32 tag, u32 value) {
+extern "C" u32 TRT_STDCALL sysv_query_build() { return g_build_value; }
+extern "C" void TRT_STDCALL sysv_log_u32(u32 tag, u32 value) {
   g_log_tag = tag;
   g_log_value = value;
   g_log_called = true;
 }
 
-// Win64-ABI trampolines: guest calls these with rcx/rdx/r8/r9; they forward
-// to the SysV functions. SysV clobbers rdi/rsi (caller-saved there) but they
-// are NONVOLATILE in Win64 — so the trampolines preserve them. This exact
-// class of bug is why xboxnative routes console-native DLLs directly: on the
-// console host and guest share the Win64 ABI and no trampoline exists.
-extern "C" u32 w64_QueryBuild();
-extern "C" void w64_LogU32();
-asm(
-  ".text\n"
-  ".globl w64_QueryBuild\n"
-  "w64_QueryBuild:\n"
-  "\tsubq $56, %rsp\n"          // shadow space + rdi/rsi save area
-  "\tmovq %rdi, (%rsp)\n"
-  "\tmovq %rsi, 8(%rsp)\n"
-  "\tcall sysv_query_build\n"
-  "\tmovq (%rsp), %rdi\n"
-  "\tmovq 8(%rsp), %rsi\n"
-  "\taddq $56, %rsp\n"
-  "\tret\n"
-  ".globl w64_LogU32\n"
-  "w64_LogU32:\n"
-  "\tsubq $56, %rsp\n"
-  "\tmovq %rdi, 16(%rsp)\n"
-  "\tmovq %rsi, 24(%rsp)\n"
-  "\tmovl %ecx, %edi\n"
-  "\tmovl %edx, %esi\n"
-  "\tcall sysv_log_u32\n"
-  "\tmovq 16(%rsp), %rdi\n"
-  "\tmovq 24(%rsp), %rsi\n"
-  "\taddq $56, %rsp\n"
-  "\tret\n"
-);
+// The test fakes carry TRT_STDCALL = ms_abi (Win64) so the guest binds their
+// addresses directly — the console-exact path (host and guest share Win64,
+// no trampoline needed).
 
 void* test_resolve(void* user, const char* module, const char* symbol,
                    u16 ordinal) {
   (void)user; (void)ordinal;
   if (strcmp(module, "tiramisu_host.dll") == 0) {
-    if (strcmp(symbol, "TiramisuHostQueryBuild") == 0) return (void*)&w64_QueryBuild;
-    if (strcmp(symbol, "TiramisuHostLogU32") == 0) return (void*)&w64_LogU32;
+    if (strcmp(symbol, "TiramisuHostQueryBuild") == 0) return (void*)&sysv_query_build;
+    if (strcmp(symbol, "TiramisuHostLogU32") == 0) return (void*)&sysv_log_u32;
   }
   return nullptr;
 }

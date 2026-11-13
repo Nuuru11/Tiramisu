@@ -108,11 +108,13 @@ void* thread_trampoline(void* raw) {
 
 extern "C" {
 
-u64 trt_GetTickCount64(void);
-void trt_Sleep(u32 ms);
+// ABI rule (see pe.h): every declaration of a TRT_STDCALL function must
+// itself carry TRT_STDCALL — these are defined ms_abi in bridge_kernel32.cpp.
+u64 TRT_STDCALL trt_GetTickCount64(void);
+void TRT_STDCALL trt_Sleep(u32 ms);
 
 // CreateThread(attrs, stack, start, param, flags, tid)
-u64 trt_CreateThread(void* attrs, void* stack_size, void* routine,
+u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
                                     void* param, u32 flags, u32* tid) {
   (void)attrs; (void)flags;
   if (!routine) return 0;
@@ -151,14 +153,14 @@ u64 trt_CreateThread(void* attrs, void* stack_size, void* routine,
   return obj;
 }
 
-u32 trt_ExitThread(u32 code) {
+u32 TRT_STDCALL trt_ExitThread(u32 code) {
 #if defined(_WIN32)
   ExitThread(code);
 #endif
   return code;
 }
 
-int trt_TerminateThread(u64 thread, u32 code) {
+int TRT_STDCALL trt_TerminateThread(u64 thread, u32 code) {
   sync_object* o = object_for(thread);
   if (!o) return 0;
   o->alive = false;
@@ -174,7 +176,7 @@ int trt_TerminateThread(u64 thread, u32 code) {
 }
 
 // WaitForSingleObject(handle, ms): 0 signalled, 1 timeout, 2 abandoned
-u32 trt_WaitForSingleObject(u64 handle, u32 ms) {
+u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
   sync_object* o = object_for(handle);
   if (!o) return 1;
 #if defined(_WIN32)
@@ -208,7 +210,7 @@ u32 trt_WaitForSingleObject(u64 handle, u32 ms) {
   }
 }
 
-u32 trt_WaitForMultipleObjects(u32 count, const u64* handles,
+u32 TRT_STDCALL trt_WaitForMultipleObjects(u32 count, const u64* handles,
                                              bool wait_all, u32 ms) {
   u32 start = (u32)trt_GetTickCount64();
   for (;;) {
@@ -228,7 +230,7 @@ u32 trt_WaitForMultipleObjects(u32 count, const u64* handles,
   }
 }
 
-int trt_GetExitCodeThread(u64 thread, u32* code) {
+int TRT_STDCALL trt_GetExitCodeThread(u64 thread, u32* code) {
   sync_object* o = object_for(thread);
   if (!o) return 0;
   if (code) *code = 0;
@@ -236,7 +238,7 @@ int trt_GetExitCodeThread(u64 thread, u32* code) {
 }
 
 // --- events ---
-u64 trt_CreateEventW(void* attrs, bool manual, bool initial,
+u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
                                     const u16* name) {
   (void)attrs; (void)name;
   const u64 h = alloc_object(OBJ_EVENT);
@@ -247,21 +249,21 @@ u64 trt_CreateEventW(void* attrs, bool manual, bool initial,
   return h;
 }
 
-int trt_SetEvent(u64 handle) {
+int TRT_STDCALL trt_SetEvent(u64 handle) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
   o->signalled = true;
   return 1;
 }
 
-int trt_ResetEvent(u64 handle) {
+int TRT_STDCALL trt_ResetEvent(u64 handle) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
   o->signalled = false;
   return 1;
 }
 
-int trt_PulseEvent(u64 handle) {
+int TRT_STDCALL trt_PulseEvent(u64 handle) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
   o->signalled = false;
@@ -269,7 +271,7 @@ int trt_PulseEvent(u64 handle) {
 }
 
 // --- mutex ---
-u64 trt_CreateMutexW(void* attrs, bool initial_owner,
+u64 TRT_STDCALL trt_CreateMutexW(void* attrs, bool initial_owner,
                                    const u16* name) {
   (void)attrs; (void)name;
   const u64 h = alloc_object(OBJ_MUTEX);
@@ -279,7 +281,7 @@ u64 trt_CreateMutexW(void* attrs, bool initial_owner,
   return h;
 }
 
-int trt_ReleaseMutex(u64 handle) {
+int TRT_STDCALL trt_ReleaseMutex(u64 handle) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
   o->lock_count = 0;
@@ -287,7 +289,7 @@ int trt_ReleaseMutex(u64 handle) {
 }
 
 // --- semaphore ---
-u64 trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
+u64 TRT_STDCALL trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
                                         const u16* name) {
   (void)attrs; (void)name;
   const u64 h = alloc_object(OBJ_SEMAPHORE);
@@ -297,7 +299,7 @@ u64 trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
   return h;
 }
 
-int trt_ReleaseSemaphore(u64 handle, u32 count,
+int TRT_STDCALL trt_ReleaseSemaphore(u64 handle, u32 count,
                                        u32* previous) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
@@ -313,13 +315,13 @@ struct crit_section {
 };
 static thread_local u32 g_tls_self = 0;
 
-int trt_InitializeCriticalSection(void* cs) {
+int TRT_STDCALL trt_InitializeCriticalSection(void* cs) {
   if (!cs) return 0;
   memset(cs, 0, sizeof(crit_section));
   return 1;
 }
 
-int trt_EnterCriticalSection(void* cs) {
+int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
   if (!cs) return 0;
   crit_section* c = (crit_section*)cs;
   while (c->locked && c->owner != g_tls_self) trt_Sleep(1);
@@ -328,42 +330,42 @@ int trt_EnterCriticalSection(void* cs) {
   return 1;
 }
 
-int trt_LeaveCriticalSection(void* cs) {
+int TRT_STDCALL trt_LeaveCriticalSection(void* cs) {
   if (!cs) return 0;
   crit_section* c = (crit_section*)cs;
   c->locked = false;
   return 1;
 }
 
-int trt_DeleteCriticalSection(void* cs) {
+int TRT_STDCALL trt_DeleteCriticalSection(void* cs) {
   (void)cs;
   return 1;
 }
 
 // --- TLS ---
-u32 trt_TlsAlloc(void) {
+u32 TRT_STDCALL trt_TlsAlloc(void) {
   static u32 next = 1;
   return next++;
 }
 
-int trt_TlsGetValue(u32 index) {
+int TRT_STDCALL trt_TlsGetValue(u32 index) {
   (void)index;
   return 0;
 }
 
-int trt_TlsSetValue(u32 index, void* value) {
+int TRT_STDCALL trt_TlsSetValue(u32 index, void* value) {
   (void)index; (void)value;
   return 1;
 }
 
-int trt_TlsFree(u32 index) {
+int TRT_STDCALL trt_TlsFree(u32 index) {
   (void)index;
   return 1;
 }
 
 // close a synchronisation object (the kernel32 CloseHandle calls this first,
 // then falls through to the file handles)
-int trt_sync_close(u64 handle) {
+int TRT_STDCALL trt_sync_close(u64 handle) {
   sync_object* o = object_for(handle);
   if (!o) return 0;
   destroy_object(o);

@@ -131,42 +131,12 @@ void* fake_system_load(const char* module, const char* symbol) {
   return nullptr;
 }
 
-// ---- Win64 -> SysV trampolines for the builtin bridges (TEST HARNESS ONLY) ----
-extern "C" void* trt_LoadLibraryW(const u16*);
-extern "C" void* trt_GetProcAddress(void*, const char*);
-extern "C" void* trt_GetProcessHeap(void);
-extern "C" void* w64_LoadLibraryW(void*);
-extern "C" void* w64_GetProcAddress(void*, void*);
-asm(
-  ".text\n"
-  ".macro W64_1 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $40, %rsp\n"
-  "\tmovq %rdi, (%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tcall \\target\n"
-  "\tmovq (%rsp), %rdi\n"
-  "\taddq $40, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-  ".macro W64_2 name, target\n"
-  ".globl \\name\n"
-  "\\name:\n"
-  "\tsubq $40, %rsp\n"
-  "\tmovq %rdi, (%rsp)\n"
-  "\tmovq %rsi, 8(%rsp)\n"
-  "\tmovq %rcx, %rdi\n"
-  "\tmovq %rdx, %rsi\n"
-  "\tcall \\target\n"
-  "\tmovq (%rsp), %rdi\n"
-  "\tmovq 8(%rsp), %rsi\n"
-  "\taddq $40, %rsp\n"
-  "\tret\n"
-  ".endm\n"
-  "W64_1 w64_LoadLibraryW, trt_LoadLibraryW\n"
-  "W64_2 w64_GetProcAddress, trt_GetProcAddress\n"
-);
+// ---- builtin bridges: the bridges are TRT_STDCALL = ms_abi (Win64) on the
+// Linux test host, so the guest binds their addresses directly in the IAT
+// (on the console both sides are Win64 and this is the exact same path) ----
+extern "C" void* TRT_STDCALL trt_LoadLibraryW(const u16*);
+extern "C" void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
+extern "C" void* TRT_STDCALL trt_GetProcessHeap(void);
 
 // NOTE: the arguments are read through MEMORY constraints and BEFORE %rsp
 // is adjusted. With register constraints the compiler may pick a register
@@ -220,8 +190,8 @@ int main(int argc, char** argv) {
   {
     static const trt_named_fn k_test_k32[] = {
         {"GetProcessHeap", (void*)&trt_GetProcessHeap},
-        {"LoadLibraryW", (void*)&w64_LoadLibraryW},
-        {"GetProcAddress", (void*)&w64_GetProcAddress},
+        {"LoadLibraryW", (void*)&trt_LoadLibraryW},
+        {"GetProcAddress", (void*)&trt_GetProcAddress},
     };
     trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_test_k32, 3);
   }
@@ -242,7 +212,9 @@ int main(int argc, char** argv) {
     printf("  host call %u: tag=0x%llx value=0x%llx from 0x%llx\n", i,
            (unsigned long long)g_ring_rcx[i], (unsigned long long)g_ring_rdx[i],
            (unsigned long long)g_ring_caller[i]);
-  CHECK(ret == 0x6B00000Full, "static cross-image import + LoadLibrary + GetProcAddress");
+  // bits 0xF (static import, LoadLibrary, GetProcAddress, indirect call);
+  // the raw dll_add sum (42) rides in the high byte per guest_libload.c.
+  CHECK(ret == 0x6B002A0Full, "static cross-image import + LoadLibrary + GetProcAddress");
 
   CHECK(log_has("loading guest DLL guestdll.dll"),
         "runtime loaded the DLL the game ships");

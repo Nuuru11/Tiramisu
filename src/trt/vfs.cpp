@@ -66,6 +66,11 @@ void trt_vfs_mount(const char* drive_prefix, const char* host_path) {
 
 // translate "C:\foo\bar" -> "<host>/foo/bar". Returns 0 on hit, -1 no mount.
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap) {
+  // Fail-visible: real DllMain code (baselib.dll, UnityPlayer.dll) calls
+  // path APIs with NULL and expects the error return, never a fault. The
+  // internal utf16_to_utf8 is unchecked on purpose; the public boundary
+  // guards so a NULL guest path becomes a named error, not a SIGSEGV.
+  if (!guest_path || !out || out_cap == 0) return -1;
   char utf8[1024];
   utf16_to_utf8(guest_path, utf8, sizeof(utf8));
   if (utf8[0] >= 'A' && utf8[0] <= 'Z' && utf8[1] == ':') {

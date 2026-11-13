@@ -1,14 +1,18 @@
 // tiramisu/tests/test_input.cpp
 // Offline proof for the input bridge: host feed -> user32 getters + pump.
 #include "../src/trt/input.h"
+#include "../src/trt/pe.h"  // TRT_STDCALL: these are guest-ABI bridge fns —
+                            // the local declaration MUST match the
+                            // definition's convention or the arguments
+                            // arrive in the wrong registers (STAGE 6)
 
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
 
 extern "C" {
-int trt_RegisterRawInputDevices(const void*, u32, u32);
-unsigned long trt_GetRawInputData(void*, u32, void*, u32*, u32);
+int TRT_STDCALL trt_RegisterRawInputDevices(const void*, u32, u32);
+u32 TRT_STDCALL trt_GetRawInputData(void*, u32, void*, u32*, u32);
 }
 
 extern "C" {
@@ -110,7 +114,7 @@ int main() {
     CHECK(trt_msg_peek(&t, true) && t.message == 0x00FF, "WM_INPUT posted");
     u8 buf[64];
     u32 sz = sizeof(buf);
-    const unsigned long got =
+    const u32 got =
         trt_GetRawInputData((void*)(uintptr_t)t.lparam, 0x10000003, buf, &sz, 24);
     CHECK(got == 48, "GetRawInputData returns RAWMOUSE size");
     int rdx = 0, rdy = 0;

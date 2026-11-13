@@ -282,10 +282,15 @@ u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d) {
   return ((guest_fn)fn)(a, b, c, d);
 #else
   // Linux test harness: the host is SysV, the guest is Win64. Marshal
-  // rcx/rdx/r8/r9 and keep the stack 16-byte aligned for the callee.
-  //
-  // Two traps this avoids (both bit us, both were silent):
-  //  - the args are read through MEMORY constraints, because with a
+  // rcx/rdx/r8/r9 and keep the stack correct for the Win64 callee:
+  //   - Win64 requires rsp % 16 == 0 AT THE CALL INSTRUCTION, so the callee
+  //     enters with rsp % 16 == 8. The old "subq $40" left rsp % 16 == 8 at
+  //     the call (entry rsp % 16 == 0) — the guest booted "fine" until real
+  //     MSVC code (dstorage.dll DllMain -> QueryPerformanceCounter) ran a
+  //     movaps prologue and faulted. STAGE 6 run-depth found this; the
+  //     load-only corpus never could (it never executed the entry).
+  //   - 32 bytes of shadow space, exactly what Win64 guarantees.
+  //   - the args are read through MEMORY constraints, because with a
   //    register constraint the compiler may allocate the base pointer to
   //    rcx and the first "mov 0(%[buf]), %rcx" would destroy the pointer
   //    before the next argument is read;
@@ -299,9 +304,9 @@ u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d) {
       "movq %[a1], %%rdx\n"
       "movq %[a2], %%r8\n"
       "movq %[a3], %%r9\n"
-      "subq $40, %%rsp\n"
+      "subq $32, %%rsp\n"
       "call *%[fn]\n"
-      "addq $40, %%rsp\n"
+      "addq $32, %%rsp\n"
       : "=a"(ret)
       : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
         [a3] "m"(args[3]), [fn] "r"(fn)

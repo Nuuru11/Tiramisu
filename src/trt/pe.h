@@ -15,11 +15,29 @@ typedef int64_t  i64;
 typedef int16_t  i16;
 typedef int32_t  i32;
 
-// __stdcall exists only on Windows targets; builtin bridge impls keep the
-// host ABI elsewhere (Win64↔SysV forwarding is the trampolines' job).
+// __stdcall exists only on Windows targets. STAGE 6 correction: these
+// builtin bridge functions are the ADDRESSES the runtime resolver hands to
+// real guest code (images.cpp trt_resolve_full -> IAT), so on a Linux test
+// host they must carry the Win64 (ms_abi) convention — a SysV body called
+// through a guest IAT receives its arguments in the wrong registers and
+// reads garbage pointers (discovered live: baselib.dll's DllMain called
+// LoadLibraryW and the "path" arrived in rcx, which SysV code never reads).
+// Win64↔SysV forwarding is the trampolines' job only for SYNTHETIC test
+// guests; runtime bridge surfaces are called by the guest directly.
+//
+// ABI RULE (STAGE 6b, regression-proof): every DECLARATION of a
+// TRT_STDCALL function MUST itself be TRT_STDCALL — a SysV call into an
+// ms_abi body reads garbage args (measured live under gdb:
+// bridge_thread.cpp declared trt_Sleep/trt_GetTickCount64 plain, the
+// internal call passed 1 in %edi, the ms_abi body read %rcx = garbage,
+// and Sleep(1) slept 41.8 days; ms_abi callees also write 32 bytes of
+// shadow space over a SysV caller's frame locals). Prefer declaring the
+// function ONCE in trt.h / a bridge header and including it everywhere.
 #ifndef TRT_STDCALL
 #  if defined(_WIN32)
 #    define TRT_STDCALL __stdcall
+#  elif defined(__x86_64__) && defined(__clang__)
+#    define TRT_STDCALL __attribute__((ms_abi))
 #  else
 #    define TRT_STDCALL
 #  endif

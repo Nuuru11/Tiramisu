@@ -339,7 +339,7 @@ void* trt_file_bytes(void* handle, size_t* size) {
   return buf;
 }
 
-int trt_sync_close(u64 handle);
+int TRT_STDCALL trt_sync_close(u64 handle);
 
 int TRT_STDCALL trt_CloseHandle(void* h) {
   // a synchronisation object (event/mutex/thread) or a file?
