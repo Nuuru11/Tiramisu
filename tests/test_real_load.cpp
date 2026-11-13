@@ -223,7 +223,16 @@ int main(int argc, char** argv) {
         "advapi32 is a real module now (the registry bridge)");
   CHECK(log_has("DELAY d3dcompiler_47.dll!D3DCompile called (unimplemented)"),
         "delay-import call site names itself");
-  CHECK(g_fake_calls >= 2, "contract-resolved calls reached the real functions");
+  // HISTORY: this used to be g_fake_calls >= 2 — both contracts fell
+  // through to the test's fake SYSTEM loader because the kernel32 merge
+  // table silently dropped its tail at 128 slots (WaitOnAddress among
+  // them). The audit caught the cap; now synch binds the REAL bridge
+  // (bit 0x1 proves it returned WAIT_OK) and only combase — genuinely
+  // console-resolved — routes to the fake. Exactly 1 fake call is the
+  // honest count.
+  CHECK(g_fake_calls == 1,
+        "synch contract binds the REAL bridge (fake count == 1: combase "
+        "only)");
 
   trt_unmap(&be, img);
   free(file);

@@ -268,6 +268,9 @@ bool trt_raw_blob(u64 hraw, const u8** blob, u32* size) {
 }
 
 // ---------------- message queue ----------------
+unsigned long g_msg_dispatched_count = 0;  // STAGE 7 pump-dispatch counter
+unsigned trt_msg_dispatched(void);         // (definition below, in trt.h ABI)
+
 bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
   if (g.ring_count >= TRT_MSG_RING) return false;
   const int tail = (g.ring_head + g.ring_count) % TRT_MSG_RING;
@@ -282,10 +285,13 @@ bool trt_msg_peek(trt_msg* out, bool remove) {
   if (remove) {
     g.ring_head = (g.ring_head + 1) % TRT_MSG_RING;
     --g.ring_count;
+    ++g_msg_dispatched_count;
   }
   return true;
 }
 
 bool trt_msg_pending() { return g.ring_count > 0; }
+
+unsigned trt_msg_dispatched(void) { return (unsigned)g_msg_dispatched_count; }
 
 } // extern "C"

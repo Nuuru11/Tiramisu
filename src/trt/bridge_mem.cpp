@@ -129,15 +129,36 @@ u64 TRT_STDCALL trt_OpenFileMappingW(u32 access, bool inherit,
 }
 
 // VirtualProtect(addr, size, newProtect, oldProtect)
+// newProtect is Win32 PAGE_* codes, NOT trt bits:
+//   PAGE_NOACCESS=1 READONLY=2 READWRITE=4 WRITECOPY=8
+//   PAGE_EXECUTE=0x10 EXECUTE_READ=0x20 EXECUTE_READWRITE=0x40
+//   EXECUTE_WRITECOPY=0x80; modifiers (PAGE_GUARD=0x100, NOCACHE=0x200,
+//   WRITECOMBINE=0x400) are masked off (documented gap: no guard pages).
+static void win32_prot_to_trt(u32 page, unsigned* prot, u32* old_code) {
+  switch (page & 0xff) {
+    case 0x01: *prot = 0; *old_code = 0x01; break;
+    case 0x02: *prot = TRT_PROT_R; *old_code = 0x02; break;
+    case 0x04: *prot = TRT_PROT_R | TRT_PROT_W; *old_code = 0x04; break;
+    case 0x08: *prot = TRT_PROT_R | TRT_PROT_W; *old_code = 0x08; break;  // WRITECOPY ~ RW
+    case 0x10: *prot = TRT_PROT_X; *old_code = 0x10; break;
+    case 0x20: *prot = TRT_PROT_R | TRT_PROT_X; *old_code = 0x20; break;
+    case 0x40: *prot = TRT_PROT_R | TRT_PROT_W | TRT_PROT_X; *old_code = 0x40; break;
+    case 0x80: *prot = TRT_PROT_R | TRT_PROT_W | TRT_PROT_X; *old_code = 0x80; break;
+    default: *prot = 0; *old_code = 0x01; break;
+  }
+}
+
 int TRT_STDCALL trt_VirtualProtect(void* addr, u64 size, u32 new_protect,
                                      u32* old_protect) {
   const trt_backend* be = trt_core_backend();
   if (!be || !be->protect) return 0;
+  // new_protect is a Win32 PAGE_* code, NOT trt bits: misreading it made
+  // PAGE_READWRITE(4) execute-only and the guest faulted writing its own
+  // .data (dstorage.dll boot, measured live). Translate honestly.
   unsigned prot = 0;
-  if (new_protect & 0x01) prot |= TRT_PROT_R;
-  if (new_protect & 0x02) prot |= TRT_PROT_W;
-  if (new_protect & 0x04) prot |= TRT_PROT_X;
-  if (old_protect) *old_protect = 0x04;  // PAGE_READWRITE-ish
+  u32 old_code = 0x01;
+  win32_prot_to_trt(new_protect, &prot, &old_code);
+  if (old_protect) *old_protect = old_code;
   return be->protect(addr, (size_t)size, prot) == 0 ? 1 : 0;
 }
 

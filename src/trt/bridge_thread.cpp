@@ -178,14 +178,14 @@ int TRT_STDCALL trt_TerminateThread(u64 thread, u32 code) {
 // WaitForSingleObject(handle, ms): 0 signalled, 1 timeout, 2 abandoned
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
   sync_object* o = object_for(handle);
-  if (!o) return 1;
+  if (!o) return 0xFFFFFFFF;  // WAIT_FAILED: named, no last-error plumbing
 #if defined(_WIN32)
   if (o->kind == OBJ_THREAD && o->win_handle) {
     // the console host has a real thread: wait on the real handle
     const DWORD r = ::WaitForSingleObject(o->win_handle, ms);
     if (r == WAIT_OBJECT_0) return 0;
-    if (r == WAIT_ABANDONED) return 2;
-    return 1;
+    if (r == WAIT_ABANDONED) return 0x80;  // WAIT_ABANDONED
+    return 0x102;                          // WAIT_TIMEOUT
   }
 #endif
   const u32 start = (u32)trt_GetTickCount64();
@@ -203,9 +203,9 @@ u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
       --o->lock_count;
       return 0;
     }
-    if (ms == 0) return 1;
+    if (ms == 0) return 0x102;  // WAIT_TIMEOUT
     const u32 now = (u32)trt_GetTickCount64();
-    if ((now - start) >= ms) return 1;
+    if ((now - start) >= ms) return 0x102;  // WAIT_TIMEOUT
     trt_Sleep(1);
   }
 }
@@ -224,8 +224,8 @@ u32 TRT_STDCALL trt_WaitForMultipleObjects(u32 count, const u64* handles,
     }
     if (wait_all ? (signalled == count) : (signalled > 0))
       return 0;
-    if (ms == 0) return 1;
-    if (((u32)trt_GetTickCount64() - start) >= ms) return 1;
+    if (ms == 0) return 0x102;  // WAIT_TIMEOUT
+    if (((u32)trt_GetTickCount64() - start) >= ms) return 0x102;  // WAIT_TIMEOUT
     trt_Sleep(1);
   }
 }

@@ -49,7 +49,6 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-core-appmodel", "combase.dll"},
     {"api-ms-win-core-weakref", "combase.dll"},
     {"api-ms-win-com", "combase.dll"},
-
     // ---- kernel32 families ----
     {"api-ms-win-core-synch", "kernel32.dll"},
     {"api-ms-win-core-interlocked", "kernel32.dll"},
@@ -75,6 +74,24 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-core-libraryloader", "kernel32.dll"},
     {"api-ms-win-core-xact", "kernel32.dll"},
     {"api-ms-win-core-errorcodehelper", "kernel32.dll"},
+    // STAGE 7 (corpus-run DLL phase regression, root-caused): dstorage.dll's
+    // DllMain now RUNS (image_code_run=1) and imports GetCommandLineW via
+    // api-ms-win-core-processenvironment-l1-1-0.dll — a family that was NOT
+    // in this table, so the import never reached the kernel32 BUILTIN surface
+    // (which has a real answer) and fell to the blanket-0 SYSTEM bind; the
+    // guest derived a struct from the NULL answer and SIGSEGV'd. These are
+    // the contract families the whole run corpus (gonext, gow, ortmm) imports
+    // that had NO exact rule AND no covering prefix rule.
+    {"api-ms-win-core-errorhandling", "kernel32.dll"},
+    {"api-ms-win-core-handle", "kernel32.dll"},
+    {"api-ms-win-core-io", "kernel32.dll"},
+    {"api-ms-win-core-processenvironment", "kernel32.dll"},
+    {"api-ms-win-core-registry", "kernel32.dll"},
+    {"api-ms-win-core-threadpool", "kernel32.dll"},
+    {"api-ms-win-core-version", "kernel32.dll"},
+    {"api-ms-win-core-winrt-robuffer", "combase.dll"},
+    {"api-ms-win-eventing-provider", "ntdll.dll"},
+    {"api-ms-win-shcore-scaling", "shcore.dll"},
     {"api-ms-win-core-nt", "ntdll.dll"},
     {"api-ms-win-core-rtlsupport", "ntdll.dll"},
     {"api-ms-win-downlevel-kernel32", "kernel32.dll"},
@@ -85,6 +102,11 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-security-basecrypt", "bcrypt.dll"},
     {"api-ms-win-security-cryptui", "cryptui.dll"},
     {"api-ms-win-security-sspi", "secur32.dll"},
+    // STAGE 7 (dstoragecore): its obfuscation runtime lazy-loads
+    // api-ms-win-security-systemfunctions-l1-1-0 for advapi32's
+    // SystemFunction036 (RtlGenRandom). On real Windows the contract
+    // resolves to advapi32; here it must reach the advapi32 bridge.
+    {"api-ms-win-security-systemfunctions", "advapi32.dll"},
     {"api-ms-win-service-core", "sechost.dll"},
     {"api-ms-win-service", "sechost.dll"},
 

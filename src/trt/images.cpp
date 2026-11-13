@@ -96,7 +96,12 @@ trt_image* trt_images_find(const char* name) {
 }
 
 trt_image* trt_images_by_handle(void* handle) {
-  const u32 v = (u32)(uintptr_t)handle;
+  if (!handle) return nullptr;
+  // STAGE 7: HMODULE == image base (guest code dereferences handles as a
+  // PE header pointer); fall back to the legacy synthetic tag
+  const u64 v = (u64)(uintptr_t)handle;
+  for (int i = 0; i < g_image_count; ++i)
+    if ((u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].img;
   if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
   const int idx = (int)(v & 0xFFFFu);
   if (idx >= g_image_count) return nullptr;
@@ -115,7 +120,10 @@ void trt_images_register_main(trt_image* img, const char* guest_name) {
   snprintf(g.name, sizeof(g.name), "%s", base);
   snprintf(g.path, sizeof(g.path), "<mapped>");
   g.img = img;
-  g.handle = (void*)(uintptr_t)(TRT_HANDLE_TAG | (u32)g_image_count);
+  // STAGE 7: HMODULE == image base on Windows (guest code dereferences it:
+  // UnityCrashHandler64's CRT does cmp $0x5a4d,(%rax) on the handle right
+  // after GetModuleHandleW — a synthetic tag faults there)
+  g.handle = (void*)(uintptr_t)img->base;
   ++g_image_count;
 }
 
@@ -141,11 +149,59 @@ void* trt_images_handle(trt_image* img) {
 }
 
 const char* trt_images_name(void* handle) {
-  const u32 v = (u32)(uintptr_t)handle;
-  if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
-  const int idx = (int)(v & 0xFFFFu);
-  if (idx >= g_image_count) return nullptr;
-  return g_images[idx].name;
+  if (handle) {
+    // STAGE 7: HMODULE == image base; fall back to the legacy tag
+    const u64 v = (u64)(uintptr_t)handle;
+    for (int i = 0; i < g_image_count; ++i)
+      if ((u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].name;
+    if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
+    const int idx = (int)(v & 0xFFFFu);
+    if (idx >= g_image_count) return nullptr;
+    return g_images[idx].name;
+  }
+  return nullptr;
+}
+
+// ---- synthetic system-module handles (STAGE 7, OrTMM) ---------------------
+// LoadLibraryW("kernel32.dll") / GetModuleHandleW("api-ms-win-core-...") on
+// modules the runtime implements but that exist as no host file. The handle
+// is a TRT_HANDLE_TAG-tagged value registered in a small side table so
+// GetProcAddress can route back to the module table and psapi can list it.
+#define TRT_MAX_SYNTH_MODULES 32
+struct synth_module {
+  char name[64];
+  void* handle;
+};
+synth_module g_synth[TRT_MAX_SYNTH_MODULES];
+int g_synth_count = 0;
+
+void* trt_images_synthetic_handle(const char* module_name) {
+  if (!module_name || !module_name[0]) return nullptr;
+  // stable: same name -> same handle for the process lifetime
+  for (int i = 0; i < g_synth_count; ++i)
+    if (ieq(g_synth[i].name, module_name)) return g_synth[i].handle;
+  if (g_synth_count >= TRT_MAX_SYNTH_MODULES) return nullptr;
+  synth_module& s = g_synth[g_synth_count];
+  memset(&s, 0, sizeof(s));
+  snprintf(s.name, sizeof(s.name), "%s", module_name);
+  s.handle = (void*)(uintptr_t)(TRT_HANDLE_TAG |
+                               (u64)(0x1000 + g_synth_count));
+  ++g_synth_count;
+  return s.handle;
+}
+
+int trt_images_is_synthetic(void* handle) {
+  if (!handle) return 0;
+  const u64 v = (u64)(uintptr_t)handle;
+  if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return 0;
+  const int idx = (int)(v & 0xFFFFu) - 0x1000;
+  return idx >= 0 && idx < g_synth_count;
+}
+
+const char* trt_images_synth_name(void* handle) {
+  if (!trt_images_is_synthetic(handle)) return nullptr;
+  const int idx = (int)(((u64)(uintptr_t)handle) & 0xFFFFu) - 0x1000;
+  return g_synth[idx].name;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +254,21 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
 trt_image* trt_load_pe(const char* host_path, const char* guest_name,
                        int run_entry) {
   if (!g_be || !host_path) return nullptr;
+  // STAGE 7 guard: re-entrant trt_load_pe (the exe's static CRT init or a
+  // DllMain loads a DLL) would run tls callbacks again for the SAME image
+  // object that already ran them — each pass burns a TEB TLS index and the
+  // exe's index slot would end up pointing at the FIRST block while later
+  // callbacks write later blocks. The load is the same file: skip the
+  // callback/entry re-run, return the already-mapped image.
+  for (int i = 0; i < g_image_count; ++i)
+    if (strcmp(g_images[i].path, host_path) == 0 ||
+        strcmp(g_images[i].name, base_name(guest_name ? guest_name : host_path)) == 0) {
+      char line[320];
+      snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
+               g_images[i].name, i);
+      trt_core_log(line);
+      return g_images[i].img;
+    }
   size_t size = 0;
   u8* file = read_whole_file(host_path, &size);
   if (!file) {
@@ -230,7 +301,8 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     snprintf(g.name, sizeof(g.name), "%s", base);
     snprintf(g.path, sizeof(g.path), "%s", host_path);
     g.img = img;
-    g.handle = (void*)(uintptr_t)(TRT_HANDLE_TAG | (u32)g_image_count);
+    // STAGE 7: HMODULE == image base (see trt_images_register_main)
+    g.handle = (void*)(uintptr_t)img->base;
     ++g_image_count;
   }
 
@@ -246,7 +318,7 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   if (g_run_image_code)
     for (int i = 0; i < img->tls_callback_count; ++i) {
       void* cb = img->base + img->tls_callback_rvas[i];
-      trt_call_guest(cb, (u64)(uintptr_t)img->base, 1, 0, 0);
+      trt_call_guest_img(cb, img, (u64)(uintptr_t)img->base, 1, 0, 0);
     }
   if (run_entry && g_run_image_code && img->entry_rva) {
     void* handle = trt_images_handle(img);
@@ -255,7 +327,7 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
              "trt: %s entry call handle=%p reason=1 (DLL_PROCESS_ATTACH)",
              base, handle);
     trt_core_log(line);
-    const u64 rc_entry = trt_call_guest(img->base + img->entry_rva,
+    const u64 rc_entry = trt_call_guest_img(img->base + img->entry_rva, img,
                                         (u64)(uintptr_t)handle, 1, 0, 0);
     snprintf(line, sizeof(line), "trt: %s entry returned 0x%llx", base,
              (unsigned long long)rc_entry);
@@ -275,10 +347,15 @@ void trt_images_reset(void) { g_image_count = 0; }
 // ---------------------------------------------------------------------------
 
 u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d) {
+  return trt_call_guest_img(fn, nullptr, a, b, c, d);
+}
+
+u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
   if (!fn) return 0;
 #if defined(_WIN32)
   // the host IS Win64: the guest ABI is the host ABI
   using guest_fn = u64 (*)(u64, u64, u64, u64);
+  (void)img;
   return ((guest_fn)fn)(a, b, c, d);
 #else
   // Linux test harness: the host is SysV, the guest is Win64. Marshal
@@ -299,17 +376,54 @@ u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d) {
   //    first makes every address stale (the guest then gets garbage).
   u64 args[4] = {a, b, c, d};
   u64 ret = 0;
+  // STAGE 7: if the image has a guest TEB (TLS directory), point the guest
+  // gs base at it for the duration of the call and restore the host gs
+  // base after (the host is libc/glibc: its gs base is the thread pointer
+  // and MUST come back). r11 is caller-saved in Win64, so it also carries
+  // the saved host gs base across the guest call.
+  //
+  // STAGE 7 (second): the harness rsp is NOT guaranteed 16-aligned at this
+  // asm. Win64 requires rsp % 16 == 0 AT the call instruction; a skewed
+  // caller makes the ENTIRE guest stack skewed and the first movaps in any
+  // bridge function faults (measured live under gdb: UnityCrashHandler64
+  // CRT startup -> QueryPerformanceCounter -> movaps %xmm15,0xa0(%rsp)
+  // SIGSEGV). Align rsp, save the original on the guest stack, restore
+  // with popq %rsp (pop into rsp: the +8 is overridden by the popped value).
+  const u64 teb =
+      (img && img->guest_teb) ? (u64)(uintptr_t)img->guest_teb
+      // STAGE 7: even images without their own TLS directory get the shared
+      // process TEB when it exists — UnityPlayer reads gs:[0x10] for stack
+      // checks inside UnityMain2 even when the exe has no TLS dir.
+      // STAGE 7 (second): acquire it LAZILY — a child that maps ONE image
+      // with no TLS dir (dstorage.dll in the corpus DLL phase) previously
+      // got teb=0 and ran on the HOST gs base; the MSVC stack probe
+      // `mov r11,gs:0x10` faulted at address 0x10 (measured live).
+          : (u64)(uintptr_t)trt_guest_teb_acquire(nullptr);
   asm volatile(
       "movq %[a0], %%rcx\n"
       "movq %[a1], %%rdx\n"
       "movq %[a2], %%r8\n"
       "movq %[a3], %%r9\n"
+      "movq %%rsp, %%r10\n"
+      "andq $-16, %%rsp\n"
+      "subq $8, %%rsp\n"
+      "pushq %%r10\n"             // original rsp, recovered with popq %%rsp
       "subq $32, %%rsp\n"
+      "testq %[teb], %[teb]\n"
+      "jnz 7f\n"
       "call *%[fn]\n"
+      "jmp 8f\n"
+      "7:\n"
+      "rdgsbase %%r11\n"          // save the host thread pointer
+      "wrgsbase %[teb]\n"         // guest gs -> the TEB
+      "call *%[fn]\n"
+      "wrgsbase %%r11\n"          // host gs back (any guest clobber dies here)
+      "8:\n"
       "addq $32, %%rsp\n"
+      "popq %%rsp\n"              // exact original rsp back
       : "=a"(ret)
       : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
-        [a3] "m"(args[3]), [fn] "r"(fn)
+        [a3] "m"(args[3]), [fn] "r"(fn), [teb] "r"(teb)
       : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
   return ret;
 #endif

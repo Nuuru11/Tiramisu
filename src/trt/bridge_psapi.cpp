@@ -41,13 +41,14 @@ int TRT_GUEST_ABI psapi_K32EnumProcessModules(void* proc, void** lphandle,
     return 0;
   }
   const int n = trt_images_count();
-  // cb is in bytes; each entry is a HANDLE (8 bytes on x64)
+  // cb is in bytes; each entry is a HANDLE (8 bytes on x64).
+  // STAGE 7: handles are the real image bases (HMODULE == base).
   const u32 fit = cb / 8;
   const u32 count = (n < 0 || (u32)n < fit) ? (u32)(n < 0 ? 0 : n) : fit;
-  for (u32 i = 0; i < count; ++i)
-    lphandle[i] = (void*)trt_images_nth_name((int)i) ? (void*)(uintptr_t)(
-        0x4D000000u | (u32)i)
-                                                     : nullptr;
+  for (u32 i = 0; i < count; ++i) {
+    trt_image* im = trt_images_nth((int)i);
+    lphandle[i] = im ? im->base : nullptr;
+  }
   if (needed) *needed = (u32)(n < 0 ? 0 : n) * 8u;
   // real semantics: if the buffer was too small, fail with the needed size
   if ((u32)(n < 0 ? 0 : n) > fit) {

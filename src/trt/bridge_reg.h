@@ -22,6 +22,10 @@ void trt_registry_set_hive_path(const u16* guest_path);
 // Register advapi32.dll's registry functions.
 int trt_bridge_register_registry(void);
 
+// advapi32!SystemFunction036 (RtlGenRandom) honest bridge; also bound by the
+// test harness for dstoragecore's unbound delay-import-style IAT slot.
+void* trt_bridge_SystemFunction036(void* buf, unsigned long len);
+
 #ifdef __cplusplus
 }
 #endif

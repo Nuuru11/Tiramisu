@@ -149,7 +149,8 @@ int main(int argc, char** argv) {
   CHECK((ret & 0x800ull) != 0,
         "GetTokenInformation(unsupported class) fails named");
   CHECK((ret & 0x1000ull) != 0,
-        "SDDL conversion -> ERROR_CALL_NOT_IMPLEMENTED (no security model)");
+        "SDDL conversion -> real self-relative SD (NULL DACL, logged "
+        "no-security-model)");
   CHECK((ret & 0x2000ull) != 0, "garbage token handle fails (INVALID_HANDLE)");
 
   // the hive must exist on disk and carry the value

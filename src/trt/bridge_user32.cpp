@@ -57,11 +57,15 @@ u32 now_ticks() {
 #endif
 }
 
-guest_window* find_win(u64 hwnd) {
-  for (int i = 0; i < g_win_count; ++i)
+guest_window* find_win(u64 hwnd) {  for (int i = 0; i < g_win_count; ++i)
     if (g_wins[i].handle == hwnd) return &g_wins[i];
   return nullptr;
 }
+
+// extern-C accessors for the gap bridge (bridge_user32_gap.cpp): the window
+// record table. The gap bridge mirrors the struct with a static_assert.
+extern "C" void* trt_u32_windows(void) { return (void*)g_wins; }
+extern "C" int* trt_u32_win_count(void) { return &g_win_count; }
 
 using wndproc_t = i64 (*)(void* hwnd, u32 msg, u64 wp, i64 lp);
 
@@ -435,6 +439,134 @@ int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc) {
   return trt_user32_dc_release(hdc);
 }
 
+// ---- STAGE 7: UnityCrashHandler64 dialog/rect/icon surface ----
+// Honest-minimal: dialogs do not exist offline (no message-loop host for
+// DLGTEMPLATE), rect math is real, icons are record handles.
+namespace {
+struct rect16 { i32 l, t, r, b; };
+} // namespace
+
+void* TRT_STDCALL trt_AdjustWindowRect(void* rect, u32 style, int menu) {
+  (void)style; (void)menu;
+  if (!rect) return nullptr;
+  log_line("user32: AdjustWindowRect -> identity (record window)");
+  return (void*)(uintptr_t)1;
+}
+
+void* TRT_STDCALL trt_GetDlgItem(void* dlg, int id) {
+  char line[96];
+  snprintf(line, sizeof(line),
+           "user32: GetDlgItem(dlg=%p id=%d) -> NULL (no dialog host)", dlg, id);
+  log_line(line);
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_SendDlgItemMessageA(void* dlg, int id, u32 msg, u64 wp,
+                                          i64 lp) {
+  char line[128];
+  snprintf(line, sizeof(line),
+           "user32: SendDlgItemMessageA(dlg=%p id=%d msg=0x%x) -> 0 (no "
+           "dialog host)", dlg, id, msg);
+  log_line(line);
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_DialogBoxParamA(void* inst, const char* tmpl, void* parent,
+                                      void* proc, i64 init) {
+  char line[160];
+  snprintf(line, sizeof(line),
+           "user32: DialogBoxParamA(tmpl=%s) -> -1 (no dialog host; the "
+           "crash handler UI is a named gap)",
+           tmpl ? tmpl : "(ord)");
+  log_line(line);
+  (void)inst; (void)parent; (void)proc; (void)init;
+  return (void*)(uintptr_t)-1;  // -1 = dialog creation failed (IDCANCEL won't do)
+}
+
+int TRT_STDCALL trt_EndDialog(void* dlg, i64 result) {
+  (void)dlg; (void)result;
+  return 1;
+}
+
+void* TRT_STDCALL trt_GetWindowLongA(void* hwnd, int idx) {
+  (void)hwnd; (void)idx;
+  return nullptr;  // record windows carry no GWL_* data
+}
+
+i64 TRT_STDCALL trt_SetWindowTextW(void* hwnd, const u16* text) {
+  char utf8[128];
+  if (text) trt_utf16_to_utf8(text, utf8, sizeof(utf8));
+  else snprintf(utf8, sizeof(utf8), "(null)");
+  char line[192];
+  snprintf(line, sizeof(line), "user32: SetWindowTextW(%p,'%s') -> TRUE", hwnd,
+           utf8);
+  log_line(line);
+  return 1;
+}
+
+int TRT_STDCALL trt_OffsetRect(void* rect, int dx, int dy) {
+  if (!rect) return 0;
+  rect16* r = (rect16*)rect;
+  r->l += dx; r->r += dx; r->t += dy; r->b += dy;
+  return 1;
+}
+
+int TRT_STDCALL trt_InflateRect(void* rect, int dx, int dy) {
+  if (!rect) return 0;
+  rect16* r = (rect16*)rect;
+  r->l -= dx; r->r += dx; r->t -= dy; r->b += dy;
+  return 1;
+}
+
+int TRT_STDCALL trt_UnionRect(void* out, const void* a, const void* b) {
+  if (!out || !a || !b) return 0;
+  const rect16* ra = (const rect16*)a;
+  const rect16* rb = (const rect16*)b;
+  rect16* o = (rect16*)out;
+  o->l = ra->l < rb->l ? ra->l : rb->l;
+  o->t = ra->t < rb->t ? ra->t : rb->t;
+  o->r = ra->r > rb->r ? ra->r : rb->r;
+  o->b = ra->b > rb->b ? ra->b : rb->b;
+  return (o->l < o->r && o->t < o->b) ? 1 : 0;  // empty union -> FALSE
+}
+
+void* TRT_STDCALL trt_GetIconInfo(void* icon, void* info) {
+  (void)icon;
+  log_line("user32: GetIconInfo -> FALSE (icon records carry no bitmap)");
+  return (void*)(uintptr_t)0;
+}
+
+void* TRT_STDCALL trt_CreateIconFromResourceEx(const u8* bits, u32 len, int icon,
+                                               u32 ver, int w, int h, u32 flags) {
+  (void)bits; (void)len; (void)icon; (void)ver; (void)w; (void)h; (void)flags;
+  log_line("user32: CreateIconFromResourceEx -> NULL (no GDI icon decode)");
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_LoadImageA(void* inst, const char* name, u32 type, int cx,
+                                 int cy, u32 flags) {
+  char line[160];
+  snprintf(line, sizeof(line),
+           "user32: LoadImageA(inst=%p name=%s type=%u %dx%d) -> NULL (no "
+           "image decode offline)", inst, name ? name : "(null)", type, cx, cy);
+  log_line(line);
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_SetForegroundWindow(void* hwnd) {
+  (void)hwnd;
+  return (void*)(uintptr_t)1;  // TRUE: the record window is always foreground
+}
+
+int TRT_STDCALL trt_LookupIconIdFromDirectoryEx(const u8* bits, int icon,
+                                                int w, int h, u32 flags) {
+  (void)bits; (void)icon; (void)flags;
+  // pick the entry closest to the requested size: v0 returns the first
+  // (16x16 default is the smallest legitimate answer)
+  (void)w; (void)h;
+  return 1;
+}
+
 static const trt_named_fn k_user32_fns[] = {
   {"PostQuitMessage", (void*)&trt_PostQuitMessage},
   {"SetFocus", (void*)&trt_SetFocus},
@@ -478,11 +610,32 @@ static const trt_named_fn k_user32_fns[] = {
   {"SendMessageW", (void*)&trt_SendMessageW},
   {"GetDC", (void*)&trt_GetDC},
   {"ReleaseDC", (void*)&trt_ReleaseDC},
+  // ---- STAGE 7: UnityCrashHandler64 surface ----
+  {"AdjustWindowRect", (void*)&trt_AdjustWindowRect},
+  {"GetDlgItem", (void*)&trt_GetDlgItem},
+  {"SendDlgItemMessageA", (void*)&trt_SendDlgItemMessageA},
+  {"DialogBoxParamA", (void*)&trt_DialogBoxParamA},
+  {"EndDialog", (void*)&trt_EndDialog},
+  {"GetWindowLongA", (void*)&trt_GetWindowLongA},
+  {"SetWindowTextW", (void*)&trt_SetWindowTextW},
+  {"OffsetRect", (void*)&trt_OffsetRect},
+  {"InflateRect", (void*)&trt_InflateRect},
+  {"UnionRect", (void*)&trt_UnionRect},
+  {"GetIconInfo", (void*)&trt_GetIconInfo},
+  {"CreateIconFromResourceEx", (void*)&trt_CreateIconFromResourceEx},
+  {"LoadImageA", (void*)&trt_LoadImageA},
+  {"SetForegroundWindow", (void*)&trt_SetForegroundWindow},
+  {"LookupIconIdFromDirectoryEx", (void*)&trt_LookupIconIdFromDirectoryEx},
 };
 
 int trt_bridge_register_user32(void) {
   trt_module_register("user32.dll", TRT_ROUTE_BUILTIN, k_user32_fns,
                       (int)(sizeof(k_user32_fns) / sizeof(k_user32_fns[0])));
+  // the OrTMM-audit gap batch (window longs, message pump, UI honesty)
+  {
+    extern void trt_u32_gap_register(void);
+    trt_u32_gap_register();
+  }
   return 0;
 }
 

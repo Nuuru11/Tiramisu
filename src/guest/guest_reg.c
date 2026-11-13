@@ -176,15 +176,21 @@ u32 GSTD reg_boot(u64 a, u64 b, u64 c) {
       bits |= 0x800u;
   }
 
-  // 8f. SDDL conversion fails visibly: ERROR_CALL_NOT_IMPLEMENTED (no
-  //     security model on console)
+  // 8f. SDDL conversion returns a REAL self-relative SECURITY_DESCRIPTOR
+  //     (NULL DACL = allow-all; the console has no security model — the
+  //     bridge says so in its log). Garbage input must still fail named.
   {
-    const u16 sddl[] = {'D', ':', 'P', 0};
+    const u16 sddl[] = {'D', ':', '(', 'A', ';', ';', 'F', 'A', ';', ';',
+                        ';', 'S', '-', '1', '-', '3', '-', '4', ')', 0};
     void* sd = 0;
     u32 sl = 0;
     if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl, 1 /*SDDL_REVISION_1*/, &sd, &sl) == 0 && sd == 0 && sl == 0)
-      bits |= 0x1000u;
+            sddl, 1 /*SDDL_REVISION_1*/, &sd, &sl) != 0 && sd && sl >= 32) {
+      const u8* b = (const u8*)sd;
+      // self-relative: revision 1, SE_SELF_RELATIVE (0x8000) set,
+      // owner+group offsets inside the blob
+      if (b[0] == 1 && (b[2] | (b[3] << 8)) == 0x8000) bits |= 0x1000u;
+    }
   }
 
   // 8g. a garbage token handle fails (ERROR_INVALID_HANDLE)

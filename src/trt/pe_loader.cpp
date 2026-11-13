@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
+#include <string>
 
 namespace {
 
@@ -19,6 +21,62 @@ u64 rd64(const u8* p) { u64 v; memcpy(&v, p, 8); return v; }
 
 void logf_be(const trt_backend* be, const char* msg) {
   if (be && be->log) be->log(msg);
+}
+
+// ---------------------------------------------------------------------------
+// STAGE 7: shared guest TEB (one per process, like a real thread's TEB).
+// Guest code reads:
+//   gs:[0x08] StackLimit, gs:[0x10] StackBase  (MSVC stack checks:
+//     UnityPlayer!UnityMain2 faults on `mov %gs:0x10,%r11` when the base
+//     is 0 — measured live),
+//   gs:[0x30] Self pointer (NTDLL-style code compares it),
+//   gs:[0x58] ThreadLocalStoragePointer -> array[index] = module block.
+// One TEB means every mapped image's TLS block is visible to every other
+// image's code, and guest->bridge->guest dispatches (WNDPROC etc.) that
+// lose the gs swap still see the correct TEB.
+// ---------------------------------------------------------------------------
+#define TRT_TEB_SIZE 0x4000u          // 16 KiB: room for a big TLS array
+#define TRT_TEB_TLS_ARRAY_OFF 0x600u  // gs:[0x58] points here
+#define TRT_TEB_MAX_TLS_SLOTS \
+  ((TRT_TEB_SIZE - TRT_TEB_TLS_ARRAY_OFF) / sizeof(void*))
+
+} // namespace
+
+// STAGE 7 shared guest TEB — file-scope so images.cpp can install it for
+// any guest call, even when the called image has no TLS directory of its
+// own (the exe with no TLS dir still calls into UnityPlayer.dll, which
+// reads gs:[0x10] for stack checks).
+static u8* g_guest_teb = nullptr;
+static u32 g_guest_tls_next = 0;  // Windows allocates index 0 first
+
+void* trt_guest_teb_acquire(u32* out_index) {
+  if (!g_guest_teb) {
+    g_guest_teb = (u8*)calloc(1, TRT_TEB_SIZE);
+    if (!g_guest_teb) return nullptr;
+    void** tls_array = (void**)(g_guest_teb + TRT_TEB_TLS_ARRAY_OFF);
+    // generous fake stack bounds so guest stack checks pass; the guest
+    // runs on the HOST stack (several MiB) — point at a wide plausible
+    // window ending at the TEB allocation
+    *(u64*)(g_guest_teb + 0x08) = (u64)(uintptr_t)g_guest_teb - 0x100000; // StackLimit
+    *(u64*)(g_guest_teb + 0x10) = (u64)(uintptr_t)g_guest_teb;           // StackBase
+    // gs:[0x60] = PEB pointer (guest CRT reads it: gs:0x60 -> PEB+0x20
+    //NumberOfProcessors etc.). Build a minimal PEB right after the TEB.
+    u8* peb = g_guest_teb + 0x2000;
+    *(u64*)(g_guest_teb + 0x60) = (u64)(uintptr_t)peb;
+    // PEB+0x20 = ProcessParameters (a POINTER the CRT dereferences: Unity-
+    // CrashHandler reads [peb+0x20] then [pp+8]); point at a zeroed block
+    static u8* s_pp;  // one PEB per process, one ProcessParameters block
+    if (!s_pp) s_pp = (u8*)calloc(1, 0x400);
+    *(u64*)(peb + 0x20) = (u64)(uintptr_t)s_pp;
+    *(u64*)(peb + 0x28) = 0;  // no debug heap markers
+    *(u64*)(g_guest_teb + 0x30) = (u64)(uintptr_t)g_guest_teb;           // Self
+    *(void**)(g_guest_teb + 0x58) = (void*)tls_array;
+  }
+  if (out_index && g_guest_tls_next < TRT_TEB_MAX_TLS_SLOTS) {
+    // caller plugs tls_array[idx] right after we return the TEB
+    *out_index = g_guest_tls_next++;
+  }
+  return g_guest_teb;
 }
 
 // fail: record stage detail, release mapping, return error code
@@ -42,8 +100,6 @@ int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
 // seal flips exec to RX)
 unsigned section_prot(bool exec) { return exec ? (TRT_PROT_R | TRT_PROT_X)
                                                : (TRT_PROT_R | TRT_PROT_W); }
-
-} // namespace
 
 extern "C" const char* trt_errstr(int code) {
   switch (code) {
@@ -127,6 +183,17 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   img.size_of_image = size_of_image;
   img.entry_rva = entry_rva;
   img.section_count = nsec;
+  // exception directory (.pdata) — an array of RUNTIME_FUNCTION sorted by
+  // BeginRva; the image copies it verbatim so unwind lookups can binary
+  // search it after seal.
+  {
+    const u64 pd_va = dirs[TRT_PE_DIR_EXCEPTION].virtual_address;
+    const u64 pd_sz = dirs[TRT_PE_DIR_EXCEPTION].size;
+    if (pd_va && pd_sz >= 12 && pd_va + pd_sz <= size_of_image) {
+      img.pdata = img.base + pd_va;
+      img.pdata_count = (u32)(pd_sz / 12);
+    }
+  }
 
   // ---- 4. headers + sections ----
   if (size_headers > size_of_image || size_headers > file_size)
@@ -296,6 +363,68 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     char line[96];
     snprintf(line, sizeof(line), "trt: tls callbacks=%d", img.tls_callback_count);
     logf_be(be, line);
+
+    // ---- 7b. guest TLS array (STAGE 7): Windows stores a per-thread pointer
+    // to an array of module TLS blocks at gs:[0x58] (the TEB's
+    // ThreadLocalStoragePointer), and the module's TLS *index* at the
+    // address_of_index slot. Guest code compiled with __declspec(thread)
+    // reads its block as gs:[0x58] -> array -> array[index]. Without gs
+    // pointing at a TEB, the first such access faults (measured live under
+    // gdb: UnityPlayer.dll DllMain, mov %gs:0x58,%rax). We build the real
+    // structure: index slot = the next free TLS slot, block = the raw TLS
+    // data (copy + zero-fill) in a never-freed allocation, TEB slot = the
+    // array. trt_tls_set_gs_base() installs the TEB as the guest gs base
+    // before the entry runs (host gs must be preserved, so the guest gs
+    // base is set per-call in trt_call_guest and restored after).
+    {
+      struct tls_dir_full {
+        u64 start, end, index_va, callbacks_va;
+        u32 zero_fill, chars;
+      };
+      const tls_dir_full* tf = (const tls_dir_full*)(img.base + tls_va);
+      const u64 raw_start_rva = (u64)tf->start - (u64)(uintptr_t)img.base;
+      const u64 raw_end_rva = (u64)tf->end - (u64)(uintptr_t)img.base;
+      const u64 raw_size =
+          raw_end_rva > raw_start_rva ? raw_end_rva - raw_start_rva : 0;
+      const u64 block_size = raw_size + tf->zero_fill;
+      const u64 index_rva = (u64)tf->index_va - (u64)(uintptr_t)img.base;
+      char probe[160];
+      snprintf(probe, sizeof(probe),
+               "trt: tls dir probe: start_rva=%llx end_rva=%llx index_rva=%llx zero_fill=%u block=%llu",
+               (unsigned long long)raw_start_rva,
+               (unsigned long long)raw_end_rva,
+               (unsigned long long)index_rva, tf->zero_fill,
+               (unsigned long long)block_size);
+      logf_be(be, probe);
+      if (index_rva + 4 <= size_of_image && block_size > 0) {
+        u8* block = (u8*)malloc((size_t)(block_size ? block_size : 1));
+        if (block) {
+          if (raw_size) memcpy(block, img.base + raw_start_rva, (size_t)raw_size);
+          memset(block + raw_size, 0, (size_t)(block_size - raw_size));
+          // STAGE 7 fix: the old per-image hash index
+          // (0x100 + (base>>20 & 0xFFFF)) produced indices like 5376/6400
+          // that overflowed the 64-slot ThreadLocalStoragePointer inside a
+          // 4 KiB per-image TEB (measured live: UnityCrashHandler64 read
+          // tls_array[5376] = NULL and faulted). Now: ONE shared process
+          // TEB for every image (all modules see each other's TLS blocks,
+          // like a real Windows thread) with a small sequential index.
+          u32 tls_index = 0;
+          img.guest_teb = trt_guest_teb_acquire(&tls_index);
+          if (img.guest_teb) {
+            // NOTE: index 0 is legitimate (Windows allocates 0 first), so
+            // the guard is on the TEB pointer, not the index
+            *(u32*)(img.base + index_rva) = tls_index;
+            *(void**)((u8*)img.guest_teb + TRT_TEB_TLS_ARRAY_OFF +
+                      (size_t)tls_index * sizeof(void*)) = block;
+            char tline[128];
+            snprintf(tline, sizeof(tline),
+                     "trt: tls block size=%llu index=%u (shared process TEB)",
+                     (unsigned long long)block_size, tls_index);
+            logf_be(be, tline);
+          }
+        }
+      }
+    }
   }
 
   // ---- 8. delay imports (delay-load directory) ----
@@ -436,4 +565,192 @@ extern "C" void trt_unmap(const trt_backend* be, trt_image* img) {
   if (!be || !img) return;
   if (img->base) be->release(img->base, (size_t)img->size_of_image);
   free(img);
+}
+
+// ---------------------------------------------------------------------------
+// Boot audit: parse import + delay-import tables IN FILE SPACE and push
+// every module!symbol through the REAL resolver. No mapping, no execution,
+// the file bytes are never modified. This is the offline gate for real
+// games: it converts "should boot" into a measured, named list.
+// ---------------------------------------------------------------------------
+namespace {
+// file-space RVA -> file offset (headers only; no allocation)
+struct file_view {
+  const u8* file;
+  size_t size;
+  u64 sec_off;   // file offset of section headers
+  u32 nsec;
+};
+
+bool fv_rva2off(const file_view& fv, u64 rva, u64* out_off) {
+  for (u32 s = 0; s < fv.nsec; ++s) {
+    const u8* sh = fv.file + fv.sec_off + (size_t)s * 40;
+    const u32 vsize = rd32(sh + 8);
+    const u32 vaddr = rd32(sh + 12);
+    const u32 rawsz = rd32(sh + 16);
+    const u32 raw = rd32(sh + 20);
+    if (vaddr <= rva && rva < vaddr + (vsize ? vsize : rawsz)) {
+      if (rva - vaddr >= rawsz && rawsz) return false;  // in virtual padding
+      *out_off = raw + (rva - vaddr);
+      return *out_off < fv.size;
+    }
+  }
+  return false;
+}
+}  // namespace
+
+using ::trt_resolve_module;
+
+extern "C" int trt_audit_imports(const u8* file, size_t file_size,
+                                  void* missing_out) {
+  if (!file || file_size < sizeof(trt_dos_header) || !missing_out)
+    return TRT_ERR_BAD_ARGS;
+  std::vector<std::string>* missing = (std::vector<std::string>*)missing_out;
+  missing->clear();
+
+  const trt_dos_header* dos = (const trt_dos_header*)file;
+  if (rd16(file) != 0x5A4D) return TRT_ERR_BAD_DOS;
+  const u64 nt_off = dos->e_lfanew;
+  if (nt_off + sizeof(trt_nt_headers64) > file_size) return TRT_ERR_BAD_DOS;
+  const trt_nt_headers64* nt = (const trt_nt_headers64*)(file + nt_off);
+  if (rd32((const u8*)&nt->signature) != 0x00004550) return TRT_ERR_BAD_PE;
+  if (rd16((const u8*)&nt->file_header.machine) != TRT_PE_MACHINE_X64 ||
+      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT64_MAGIC)
+    return TRT_ERR_NOT_PE64;
+  const u32 nsec = rd16((const u8*)&nt->file_header.number_of_sections);
+  if (nsec == 0 || nsec > 96) return TRT_ERR_NO_SECTIONS;
+  const u64 size_of_image =
+      rd32((const u8*)&nt->optional_header.size_of_image);
+  const u64 preferred =
+      rd64((const u8*)&nt->optional_header.image_base);
+  const trt_data_directory* dirs = nt->optional_header.directories;
+  const u64 sec_off = (u64)((const u8*)&nt->optional_header +
+      rd16((const u8*)&nt->file_header.size_of_optional_header) - file);
+  file_view fv{file, file_size, sec_off, nsec};
+
+  // the real resolver — identical to trt_map_pe's import bind
+  trt_resolver rs;
+  trt_resolver_default(&rs);
+
+  u64 total = 0, resolved = 0;
+  char line[256];
+
+  // ---- regular imports (these are hard: the loader fails the map) ----
+  const u64 imp_va = dirs[TRT_PE_DIR_IMPORT].virtual_address;
+  const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
+  if (imp_va && imp_sz) {
+    for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
+         d += sizeof(trt_import_descriptor)) {
+      u64 doff;
+      if (!fv_rva2off(fv, imp_va + d, &doff)) break;
+      const trt_import_descriptor desc = [&] {
+        trt_import_descriptor v;
+        memcpy(&v, file + doff, sizeof(v));
+        return v;
+      }();
+      if (!desc.first_thunk && !desc.name) break;
+      u64 name_off, thunk_off;
+      if (!fv_rva2off(fv, desc.name, &name_off)) {
+        missing->push_back("<bad>DLL-name-unreadable");
+        continue;
+      }
+      if (name_off >= file_size) break;
+      const char* mod_name = (const char*)(file + name_off);
+      if (strnlen(mod_name, 256) == 256) break;
+      for (u64 t = 0;; t += 8) {
+        u64 toff;
+        if (!fv_rva2off(fv, desc.first_thunk + t, &toff)) break;
+        if (toff + 8 > file_size) break;
+        const u64 thunk = rd64(file + toff);
+        if (thunk == 0) break;
+        const char* sym_name = nullptr;
+        u16 ordinal = 0;
+        if (thunk >> 63) {
+          ordinal = (u16)(thunk & 0xFFFF);
+        } else {
+          u64 hoff;
+          if (!fv_rva2off(fv, thunk & 0x7fffffffULL, &hoff) ||
+              hoff + 2 >= file_size)
+            break;
+          sym_name = (const char*)(file + hoff + 2);
+          if (strnlen(sym_name, 256) == 256) break;
+        }
+        ++total;
+        // resolve WITHOUT a system loader (the console g_system_load is
+        // set at runtime; offline we audit bridges + module defaults)
+        void* fn = trt_resolve_module(nullptr, mod_name, sym_name, ordinal);
+        if (fn) {
+          ++resolved;
+        } else {
+          snprintf(line, sizeof(line), "%s!%s", mod_name,
+                   sym_name ? sym_name : "#ordinal");
+          missing->push_back(line);
+        }
+      }
+    }
+  }
+
+  // ---- delay imports (soft: the loader stubs these fail-visibly) ----
+  const u64 dd_va = dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address;
+  const u64 dd_sz = dirs[TRT_PE_DIR_DELAY_IMPORT].size;
+  if (dd_va && dd_sz) {
+    u64 delay_missing = 0;
+    for (u64 d = 0; d + sizeof(trt_delayload_descriptor) <= (dd_sz ? dd_sz : 4096);
+         d += sizeof(trt_delayload_descriptor)) {
+      u64 doff;
+      if (!fv_rva2off(fv, dd_va + d, &doff)) break;
+      if (doff + sizeof(trt_delayload_descriptor) > file_size) break;
+      trt_delayload_descriptor dd;
+      memcpy(&dd, file + doff, sizeof(dd));
+      if (!dd.name_rva && !dd.iat_rva) break;
+      const int rva_based = (dd.attributes & 1u) != 0;
+      const u64 name_rva = rva_based ? dd.name_rva
+                                     : (u64)dd.name_rva - preferred;
+      const u64 int_rva = rva_based ? dd.int_rva
+                                    : (u64)dd.int_rva - preferred;
+      u64 name_off;
+      if (name_rva >= size_of_image ||
+          !fv_rva2off(fv, name_rva, &name_off))
+        break;
+      const char* mod_name = (const char*)(file + name_off);
+      if (strnlen(mod_name, 256) == 256) break;
+      for (u64 t = 0;; t += 8) {
+        u64 toff;
+        if (!fv_rva2off(fv, int_rva + t, &toff)) break;
+        if (toff + 8 > file_size) break;
+        const u64 thunk = rd64(file + toff);
+        if (thunk == 0) break;
+        const char* sym_name = nullptr;
+        u16 ordinal = 0;
+        if (thunk >> 63) {
+          ordinal = (u16)(thunk & 0xFFFF);
+        } else {
+          u64 hoff;
+          if (!fv_rva2off(fv, thunk & 0x7fffffffULL, &hoff) ||
+              hoff + 2 >= file_size)
+            break;
+          sym_name = (const char*)(file + hoff + 2);
+          if (strnlen(sym_name, 256) == 256) break;
+        }
+        ++total;
+        // delay imports get fail-visible stubs at load: never a boot blocker
+        if (trt_resolve_module(nullptr, mod_name, sym_name, ordinal))
+          ++resolved;
+        else
+          ++delay_missing;
+      }
+    }
+    if (delay_missing) {
+      snprintf(line, sizeof(line),
+               "(delay imports unresolved: %llu — stubbed fail-visible at "
+               "load, not boot-blocking)",
+               (unsigned long long)delay_missing);
+      missing->push_back(line);
+    }
+  }
+
+  snprintf(line, sizeof(line), "audit: %llu/%llu imports resolve",
+           (unsigned long long)resolved, (unsigned long long)total);
+  trt_core_log(line);
+  return TRT_OK;
 }

@@ -67,7 +67,22 @@ typedef struct trt_image {
   int  tls_callback_count;
   u32  section_count;
   char last_detail[256];  // human-readable detail of last error/stage
-} trt_image;
+  // STAGE 7: the guest TEB (ThreadLocalStoragePointer at gs:[0x58]) built
+  // for images with a TLS directory; the guest gs base points here while
+  // guest code runs (host gs is restored after). NULL = no guest TLS.
+  void* guest_teb;
+  // STAGE 7: exception directory (.pdata) for RtlLookupFunctionEntry scans
+  void* pdata;            // image-relative pointer (base+pdr_va)
+  u32   pdata_count;      // number of RUNTIME_FUNCTION entries
+ } trt_image;
+
+// STAGE 7: the shared process guest TEB (gs:[0x08] StackLimit, gs:[0x10]
+// StackBase, gs:[0x30] Self, gs:[0x58] ThreadLocalStoragePointer). One TEB
+// per process: every image's TLS block is visible to every other image's
+// code, and guest->bridge->guest dispatches keep working. Created on first
+// use (acquire) — images with no TLS directory still need it installed.
+void* trt_guest_teb_acquire(u32* out_index);
+void* trt_guest_teb_shared(void);
 
 // Map a PE64 from a file image. Read-only view of [file, file+file_size).
 // Stages: validate -> alloc -> headers+sections -> relocs -> imports -> TLS.
@@ -78,6 +93,17 @@ int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
 // Flip sections to final protections (code -> RX). Call once after
 // relocation/import/TLS writes are complete. Returns TRT_OK or TRT_ERR_SEAL.
 int trt_seal_image(const trt_backend* be, trt_image* img);
+
+// ---- boot audit (offline gate for REAL games) ----------------------------
+// Parses a PE64's import + delay-import tables IN FILE SPACE (no mapping,
+// no execution, the file bytes are never modified) and pushes every
+// module!symbol through the REAL resolver — the same code path trt_map_pe
+// uses to bind imports. On return *missing lists every "module!symbol"
+// that failed to resolve, in table order.
+// Returns TRT_OK when the audit ran (check *missing to decide bootability);
+// TRT_ERR_* for malformed PEs / usage errors.
+int trt_audit_imports(const u8* file, size_t file_size,
+                      void* missing_out /* std::vector<std::string>* */);
 
 // free the image and its mapping
 void trt_unmap(const trt_backend* be, trt_image* img);
@@ -109,6 +135,10 @@ int trt_module_query_ordinal(const char* module, u16 ordinal);
 void trt_resolver_default(trt_resolver* out);
 typedef void* (*trt_system_load)(const char* module, const char* symbol);
 void trt_set_system_loader(trt_system_load fn);
+// resolve one module!symbol through the module table (the resolver's
+// implementation; exposed for the boot audit)
+void* trt_resolve_module(void* user, const char* module, const char* symbol,
+                         u16 ordinal);
 extern void trt_stub_thunk(void);
 
 // Register the module coverage a real PC game imports (SYSTEM/STUB routes).
@@ -139,6 +169,19 @@ int trt_bridge_register_user32(void);
 // host pump: called from the builtin GetMessageW while the guest blocks, so
 // CoreWindow events + XInput keep flowing after the guest owns the thread
 void trt_set_pump(void (*fn)(void));
+
+// ---- STAGE 7 EXE-entry boot harness hooks ----
+// TEST-HARNESS ONLY. The offline EXE boot harness installs these to catch
+// guest process-exit calls (ExitProcess / TerminateProcess) and fatal guest
+// exceptions (RaiseException) by longjmp-ing back into the harness. The
+// console host NEVER installs them: there ExitProcess really ends the
+// process (UWP semantics unchanged). NULL (default) on every host build.
+extern void (*trt_boot_exit_trap)(int code);   // ExitProcess/TerminateProcess
+extern void (*trt_boot_raise_trap)(u32 code);  // RaiseException (no SEH walk)
+
+// how many messages the builtin user32 pump has actually dispatched
+// (removed from the ring) — the boot report's "N messages dispatched"
+unsigned trt_msg_dispatched(void);
 
 #ifdef __cplusplus
 }

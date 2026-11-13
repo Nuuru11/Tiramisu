@@ -21,3 +21,6 @@ EXPORTS
     SetConsoleCtrlHandler
     SetLastError
     GetLastError
+    VirtualProtect
+    RtlCaptureContext
+    RtlLookupFunctionEntry

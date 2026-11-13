@@ -7,6 +7,7 @@
 // through the VFS, and queries the OS version. The assertions check that
 // each of those reached the runtime.
 #include "../src/trt/trt.h"
+#include "../src/trt/images.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,14 @@ int TRT_GUEST_ABI trt_CreateProcessW(const u16*, u16*, void*, void*, int, u32, v
                         const u16*, const void*, void*);
 void TRT_STDCALL trt_SetLastError(u32);
 u32 TRT_STDCALL trt_GetLastError(void);
+u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32);
+int TRT_STDCALL trt_GetCPInfo(u32, void*);
+void* TRT_STDCALL trt_LoadLibraryW(const u16*);
+void* TRT_STDCALL trt_GetProcAddress(void*, const char*);
+u32 TRT_STDCALL trt_FlsAlloc(void*);
+void* TRT_STDCALL trt_FlsGetValue(u32);
+void* TRT_STDCALL trt_FlsGetValue2(u32);
+int TRT_STDCALL trt_FlsSetValue(u32, void*);
 }
 
 
@@ -134,6 +143,17 @@ u64 win64_call(void* fn, u64 a, u64 b, u64 c) {
   return ret;
 }
 
+// Linux-host stand-in for RtlAddFunctionTable (mirrors test_corpus_run.cpp).
+// The console host registers .pdata with the real RtlAddFunctionTable; the
+// trt_RtlLookupFunctionEntry bridge scans img->pdata directly, so a no-op
+// success here keeps the backend contract honest without a libgcc unwind
+// dependency in this test.
+static int linux_register_unwind(void* image_base, const void* pdata,
+                                 u32 count) {
+  (void)image_base; (void)pdata; (void)count;
+  return 0;
+}
+
 int failures = 0;
 #define CHECK(cond, msg)                                             \
   do {                                                               \
@@ -152,8 +172,14 @@ int main(int argc, char** argv) {
   u8* file = read_file(argv[1], &size);
   if (!file) { printf("cannot read %s\n", argv[1]); return 2; }
 
+  // STAGE 7: the SEH/unwind guest (argv[3], optional) exercises the
+  // unwind-edit surface OrTMM's CRT startup runs before WinMain
+  u8* seh_file = nullptr;
+  size_t seh_size = 0;
+  if (argc >= 4) seh_file = read_file(argv[3], &seh_size);
+
   trt_backend be{&linux_alloc, &linux_protect, &linux_release, &linux_log,
-                 nullptr};
+                 &linux_register_unwind};
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
@@ -191,6 +217,7 @@ int main(int argc, char** argv) {
         {"CreateProcessW", (void*)&trt_CreateProcessW},
         {"SetLastError", (void*)&trt_SetLastError},
         {"GetLastError", (void*)&trt_GetLastError},
+        {"IsProcessorFeaturePresent", (void*)&trt_IsProcessorFeaturePresent},
     };
     static const trt_named_fn k_u32[] = {
         {"PostQuitMessage", (void*)&trt_PostQuitMessage},
@@ -248,6 +275,94 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x80000u, "SetConsoleCtrlHandler -> FALSE");
   CHECK(ret & 0x100000u, "ReadConsoleW -> FALSE (no console)");
   CHECK(ret & 0x200000u, "WriteConsoleW -> FALSE (no console)");
+  // STAGE 7 (OrTMM): the CRT startup gate. PF_FASTFAIL_AVAILABLE (0x17)
+  // MUST answer present — a 0 sent _set_Fflag to __fastfail and the EXE
+  // died with int 0x29 before WinMain (measured at OrTMM+0xd1d4).
+  CHECK(win64_call((void*)&trt_IsProcessorFeaturePresent, 0x17, 0, 0) == 1,
+        "IsProcessorFeaturePresent(PF_FASTFAIL_AVAILABLE) -> 1 (CRT startup gate)");
+  CHECK(win64_call((void*)&trt_IsProcessorFeaturePresent, 0, 0, 0) == 1,
+        "IsProcessorFeaturePresent(PF_COMPARABLE_EXCEPT) -> 1");
+  CHECK(win64_call((void*)&trt_IsProcessorFeaturePresent, 0x30, 0, 0) == 0,
+        "IsProcessorFeaturePresent(unknown) -> 0 (honest no)");
+
+  // ---- STAGE 7: GetCPInfo writes EXACTLY sizeof(CPINFO)=18 bytes ----------
+  // MAX_LEADBYTES is 12 (winnls.h), not 126. A 132-byte memset here zeroed
+  // the MSVC /GS cookie the CRT keeps 0x18 bytes past its frame-local
+  // CPINFO — every corpus DLL + OrTMM died in __raise_securityfailure
+  // (int 0x29) before WinMain/DllMain finished (pinned under gdb).
+  {
+    u8 guard_buf[64];
+    memset(guard_buf, 0xA5, sizeof(guard_buf));
+    // Win64 ABI: rcx=codepage, rdx=cpinfo buffer
+    win64_call((void*)&trt_GetCPInfo, 1252, (u64)(uintptr_t)guard_buf, 0);
+    int ok = 1;
+    for (size_t i = 20; i < sizeof(guard_buf); ++i)
+      if (guard_buf[i] != 0xA5) ok = 0;  // anything past 20 = stack overwrite
+    CHECK(ok, "GetCPInfo(1252) wrote only sizeof(CPINFO)=20 (no /GS cookie kill)");
+    CHECK(((u32*)guard_buf)[0] == 1, "GetCPInfo(1252) MaxCharSize=1 (SBCS)");
+  }
+
+  // ---- STAGE 7: FLS surface roundtrip incl. FlsGetValue2 ------------------
+  // OrTMM's UCRT resolves FlsGetValue2 BY NAME via GetProcAddress; before the
+  // bridge export existed the blanket-0 stub answered NULL forever and the CRT
+  // locale/FLS init storm-allocated 968 bytes x716k (2.9GB, watchdog exit 43).
+  {
+    const u64 fls_idx = win64_call((void*)&trt_FlsAlloc, 0, 0, 0);
+    CHECK(fls_idx != 0xFFFFFFFFull, "FlsAlloc returned a valid index");
+    const u64 cookie = 0xC0FFEE123456789ull;
+    CHECK(win64_call((void*)&trt_FlsSetValue, fls_idx, cookie, 0) == 1,
+          "FlsSetValue(idx,cookie) -> nonzero");
+    CHECK(win64_call((void*)&trt_FlsGetValue, fls_idx, 0, 0) == cookie,
+          "FlsGetValue(idx) == cookie (roundtrip)");
+    CHECK(win64_call((void*)&trt_FlsGetValue2, fls_idx, 0, 0) == cookie,
+          "FlsGetValue2(idx) == cookie (the OrTMM storm fix)");
+    CHECK(win64_call((void*)&trt_FlsGetValue2, 0xFFFFFFFFull, 0, 0) == 0,
+          "FlsGetValue2(invalid) -> NULL");
+    CHECK(win64_call((void*)&trt_FlsSetValue, 0xFFFFFFFFull, 0, 0) == 0,
+          "FlsSetValue(invalid) -> 0");
+  }
+
+  // ---- STAGE 7: LoadLibraryW bare-name miss falls back to system modules --
+  // dstoragecore's obfuscation runtime calls LoadLibraryExW("advapi32");
+  // trt_LoadLibraryW resolves the bare name to <gamedir>/advapi32 (which does
+  // not exist) and used to return NULL without trying the synthetic system
+  // module table — the runtime then aborted via int 0x29(ec=7).
+  {
+    // UTF-16 by hand: clang on Linux makes L"" literals UTF-32 (4 bytes per
+    // unit) — a literal here would hand the bridge a 'a',0x0,... string
+    const u16 advapi32_w[] = {'a','d','v','a','p','i','3','2',0};
+    const int ll_ok = (int)win64_call((void*)&trt_LoadLibraryW,
+                                      (u64)(uintptr_t)advapi32_w, 0, 0);
+    CHECK(ll_ok != 0, "LoadLibraryW(\"advapi32\") -> non-NULL (system-module fallback)");
+    // and the obfuscation runtime's actual target resolves by name
+    const u64 gpa = win64_call((void*)&trt_GetProcAddress, ll_ok,
+                               (u64)(uintptr_t)"SystemFunction036", 0);
+    CHECK(gpa != 0, "GetProcAddress(advapi32, SystemFunction036) -> non-NULL");
+  }
+
+
+  // ---- STAGE 7: the SEH/unwind guest (OrTMM's CRT startup surface) ----
+  if (seh_file) {
+    trt_resolver rs2;
+    trt_resolver_default(&rs2);
+    trt_image* img2 = nullptr;
+    const int rc2 = trt_map_pe(&be, &rs2, seh_file, seh_size, &img2);
+    CHECK(rc2 == TRT_OK, "SEH guest PE maps");
+    if (rc2 == TRT_OK && img2) {
+      // the console host registers the main guest image (HMODULE == base);
+      // RtlLookupFunctionEntry walks exactly that registry
+      trt_images_register_main(img2, "guest_seh.exe");
+      CHECK(trt_seal_image(&be, img2) == TRT_OK, "SEH image sealed (W^X)");
+      const u64 sret = win64_call(img2->base + img2->entry_rva, 0, 0, 0);
+      printf("  SEH guest returned 0x%llx (want 0xf)\n", (unsigned long long)sret);
+
+      CHECK((sret & 0x3u) == 0x3u, "VirtualProtect RW->R dance (honest PAGE_* codes)");
+      CHECK(sret & 0x4u, "page writable again after the protect dance");
+      CHECK(sret & 0x8u, "VirtualProtect restored RW after R");
+      CHECK(sret & 0x10u, "RtlLookupFunctionEntry answered for a live RIP");
+    }
+    free(seh_file);
+  }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;

@@ -33,8 +33,12 @@ struct builtin_mod {
   trt_route route;
   // the function table is OWNED by the module: several bridges add to the
   // same module (kernel32 gets memory, thread, system and core functions),
-  // so registering must MERGE, not replace
-  trt_named_fn fns[128];
+  // so registering must MERGE, not replace. Capacity 256: kernel32's merged
+  // surface passed 156 (core 98 + mem 7 + sys 25 + thread 26) and the old
+  // cap of 128 SILENTLY dropped the tail — games importing the dropped
+  // tail (GetSystemTimeAsFileTime, EncodePointer, GetCommandLineW...) died
+  // at bind with no named cause. OrTMM audit found it.
+  trt_named_fn fns[256];
   int fn_count;
 };
 // The table must hold every module a game might import: the defaults
@@ -223,9 +227,20 @@ void trt_module_register(const char* name, trt_route route,
             break;
           }
         }
-        if (!replaced &&
-            m->fn_count < (int)(sizeof(m->fns) / sizeof(m->fns[0])))
+        if (!replaced) {
+          if (m->fn_count >= (int)(sizeof(m->fns) / sizeof(m->fns[0]))) {
+            // fail-visible: a silently-dropped symbol is a boot death with
+            // no named cause (the exact bug class the OrTMM audit caught)
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "trt: MODULE TABLE OVERFLOW - %s!%s NOT registered "
+                     "(raise builtin_mod::fns capacity)",
+                     name, fns[i].name);
+            trt_core_log(line);
+            continue;
+          }
           m->fns[m->fn_count++] = fns[i];
+        }
       }
       return;
     }

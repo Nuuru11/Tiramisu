@@ -41,6 +41,12 @@ const char* trt_images_nth_name(int idx);   // "engine.dll"
 const char* trt_images_nth_path(int idx);   // host path it was loaded from
 void* trt_images_handle(trt_image* img);
 const char* trt_images_name(void* handle);
+// STAGE 7: synthetic handles for system modules that exist as no host file
+// (kernel32, api-set contracts, ...): LoadLibraryW/GetModuleHandleW hand
+// these out so the CRT startup's module probes succeed like real Windows.
+void* trt_images_synthetic_handle(const char* module_name);
+int trt_images_is_synthetic(void* handle);
+const char* trt_images_synth_name(void* handle);
 // Register the main guest image (the exe mapped directly via trt_map_pe, not
 // through trt_load_pe) so the psapi/dbghelp module list includes it.
 void trt_images_register_main(trt_image* img, const char* guest_name);
@@ -55,6 +61,10 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
 // (On the console host this is a plain call; in the Linux test harness the
 // argument registers differ, so we marshal them.)
 u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d);
+// STAGE 7: same, but with the image's guest TEB installed as the guest gs
+// base for the call (host gs restored after) — needed by any image with a
+// TLS directory whose code reads gs:[0x58].
+u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d);
 
 // Load-only mode toggle: 0 = map/bind/seal without running TLS callbacks or
 // DllMain (corpus dry-run), 1 (default) = full boot semantics.
