@@ -357,7 +357,12 @@ const mod_default k_defaults[] = {
     {"advapi32.dll", TRT_ROUTE_STUB},    // M4: registry (HKLM/HKCU hive)
     {"msacm32.dll", TRT_ROUTE_STUB},
     {"winspool.drv", TRT_ROUTE_STUB},
-    {"d3dx9_43.dll", TRT_ROUTE_STUB},    // usually shipped with the game
+    {"d3dx9_43.dll", TRT_ROUTE_BUILTIN}, // M6: D3DX math/textures/sprites
+    {"d3dx9_40.dll", TRT_ROUTE_BUILTIN},
+    {"d3dx9_36.dll", TRT_ROUTE_BUILTIN},
+    {"d3dx9_34.dll", TRT_ROUTE_BUILTIN},
+    {"d3dx9_32.dll", TRT_ROUTE_BUILTIN},
+    {"d3dx9_30.dll", TRT_ROUTE_BUILTIN},
     {"d3dx10_43.dll", TRT_ROUTE_STUB},
     {"d3dx11_43.dll", TRT_ROUTE_STUB},
     {"d3dx11_47.dll", TRT_ROUTE_STUB},

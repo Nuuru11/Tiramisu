@@ -292,6 +292,7 @@ void scan_compat(const std::string& path, char* out, unsigned cap) {
         const char* mark = "";
         if (!_strnicmp(nm, "steam_api", 9)) mark = "[steam-auth]";
         else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9 OK]";
+        else if (!_strnicmp(nm, "d3dx9", 5)) mark = "[d3dx9 OK]";
         else if (!_strnicmp(nm, "dsound", 6)) mark = "[dsound OK]";
         else if (!_strnicmp(nm, "ddraw", 5)) mark = "[ddraw OK]";
         else if (!_strnicmp(nm, "d3d11", 5)) mark = "[d3d11 OK]";

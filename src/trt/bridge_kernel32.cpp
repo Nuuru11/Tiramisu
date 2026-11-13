@@ -15,6 +15,7 @@
 #include "bridge_d3d9.h"
 #include "bridge_dsound.h"
 #include "bridge_ddraw.h"
+#include "bridge_d3dx9.h"
 #include "bridge_dinput.h"
 #include "bridge_audio.h"
 #include "bridge_steam.h"
@@ -185,6 +186,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_dsound();
   // ddraw: DirectDraw -> backend present (M6 coverage)
   trt_bridge_register_ddraw();
+  // d3dx9: D3DX math/textures/sprites (M6 coverage) — most-versions
+  trt_bridge_register_d3dx9();
   // Steamworks: AUTH ONLY (no DRM bypass, ever)
   trt_bridge_register_steam();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
