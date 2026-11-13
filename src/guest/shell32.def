@@ -1,0 +1,8 @@
+LIBRARY shell32.dll
+EXPORTS
+    SHGetFolderPathW
+    SHGetFolderPathA
+    SHGetKnownFolderPath
+    SHGetMalloc
+    ShellExecuteExW
+    ShellExecuteW

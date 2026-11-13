@@ -322,7 +322,8 @@ const mod_default k_defaults[] = {
 
     // ---- shell / env / misc ----
     {"shlwapi.dll", TRT_ROUTE_SYSTEM},
-    {"shfolder.dll", TRT_ROUTE_SYSTEM},
+    {"shell32.dll", TRT_ROUTE_BUILTIN},  // M7: SHGetFolderPath (bridge_shell)
+    {"shfolder.dll", TRT_ROUTE_BUILTIN},  // M7: shim onto SHGetFolderPath
     {"shcore.dll", TRT_ROUTE_SYSTEM},
     {"version.dll", TRT_ROUTE_SYSTEM},
     {"propsys.dll", TRT_ROUTE_SYSTEM},

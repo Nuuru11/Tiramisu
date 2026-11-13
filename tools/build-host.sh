@@ -31,7 +31,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
   src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp \
+  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   src/host/vendor/miniz.c src/host/vendor/miniz_tdef.c \
   src/host/vendor/miniz_tinfl.c src/host/vendor/miniz_zip.c \

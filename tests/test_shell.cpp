@@ -1,0 +1,220 @@
+// tiramisu/tests/test_shell.cpp
+// The shell32 bridge: a guest runs the folder-lookup boot path
+// (SHGetFolderPath W/A, SHGetKnownFolderPath, IMalloc, ShellExecute)
+// through the IAT; the VFS verifies the created directory works.
+#include "../src/trt/trt.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+extern "C" {
+int trt_bridge_register_kernel32(void);
+int trt_bridge_register_user32(void);
+int trt_bridge_register_shell(void);
+void trt_vfs_mount(const char* drive_prefix, const char* host_path);
+}
+
+// ---- Win64 -> SysV trampolines (TEST HARNESS ONLY) ----
+// kernel32 bridge fns are host-ABI (see test_engine.cpp); the guest calls
+// them through the IAT, so this Linux harness must marshal Win64->SysV and
+// preserve rdi/rsi (nonvolatile in Win64 — the guest keeps state in them).
+extern "C" void shell_generic_w64_to_sysv(void);
+asm(
+  ".text\n"
+  ".globl shell_generic_w64_to_sysv\n"
+  "shell_generic_w64_to_sysv:\n"
+  "  subq $104, %rsp\n"
+  "  movq %rdi, 72(%rsp)\n"
+  "  movq %rsi, 80(%rsp)\n"
+  "  movq %rcx, %rdi\n"        // arg1
+  "  movq %rdx, %rsi\n"        // arg2
+  "  movq %r8, %rdx\n"         // arg3
+  "  movq %r9, %rcx\n"         // arg4
+  "  movq 144(%rsp), %r8\n"     // arg5 (Win64 stack)
+  "  movq 152(%rsp), %r9\n"     // arg6
+  "  movq 160(%rsp), %rax\n"    // arg7 -> SysV stack slot 0
+  "  movq %rax, (%rsp)\n"
+  "  movq 168(%rsp), %rax\n"    // arg8 -> SysV stack slot 1
+  "  movq %rax, 8(%rsp)\n"
+  "  call *%r11\n"
+  "  movq 72(%rsp), %rdi\n"
+  "  movq 80(%rsp), %rsi\n"
+  "  addq $104, %rsp\n"
+  "  ret\n"
+);
+#define SHELL_TRAMP(sym, target)                     \
+  extern "C" void sym();                             \
+  asm(".globl " #sym "\n" #sym ":\n"                \
+      "  movq $" #target ", %r11\n"                 \
+      "  jmp shell_generic_w64_to_sysv\n");
+extern "C" {
+void* trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
+i32 trt_WriteFile(void*, const void*, u32, u32*, void*);
+i32 trt_CloseHandle(void*);
+}
+SHELL_TRAMP(w_sCreateFileW, trt_CreateFileW)
+SHELL_TRAMP(w_sWriteFile, trt_WriteFile)
+SHELL_TRAMP(w_sCloseHandle, trt_CloseHandle)
+
+namespace {
+
+struct extent { void* base; size_t len; };
+extent g_extents[16];
+int g_extent_count = 0;
+
+void* linux_alloc(size_t bytes, u64 preferred_base) {
+  void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
+                 bytes, PROT_READ | PROT_WRITE,
+                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                                : (MAP_PRIVATE | MAP_ANONYMOUS),
+                 -1, 0);
+  if (p == MAP_FAILED) return nullptr;
+  if (g_extent_count < 16) {
+    g_extents[g_extent_count].base = p;
+    g_extents[g_extent_count].len = bytes;
+    ++g_extent_count;
+  }
+  return p;
+}
+int linux_protect(void* base, size_t bytes, unsigned prot) {
+  int p = 0;
+  if (prot & TRT_PROT_R) p |= PROT_READ;
+  if (prot & TRT_PROT_W) p |= PROT_WRITE;
+  if (prot & TRT_PROT_X) p |= PROT_EXEC;
+  const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  const uintptr_t b = (uintptr_t)base & ~(uintptr_t)(page - 1);
+  const size_t len = ((uintptr_t)base + bytes - b + page - 1) & ~(uintptr_t)(page - 1);
+  return mprotect((void*)b, len, p);
+}
+void linux_release(void* base, size_t) {
+  for (int i = 0; i < g_extent_count; ++i)
+    if (g_extents[i].base == base) {
+      munmap(base, g_extents[i].len);
+      g_extents[i].base = nullptr;
+      return;
+    }
+}
+void linux_log(const char* line) { printf("  [trt] %s\n", line); }
+
+u8* read_file(const char* path, size_t* size) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return nullptr;
+  fseek(f, 0, SEEK_END);
+  const long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  u8* buf = (u8*)malloc((size_t)n);
+  const size_t got = fread(buf, 1, (size_t)n, f);
+  fclose(f);
+  *size = got;
+  return buf;
+}
+
+u64 win64_call(void* fn, u64 a, u64 b, u64 c) {
+  u64 args[3] = {a, b, c};
+  u64 ret;
+  asm volatile(
+    "movq %[a0], %%rcx\n"
+    "movq %[a1], %%rdx\n"
+    "movq %[a2], %%r8\n"
+    "subq $48, %%rsp\n"
+    "call *%[fn]\n"
+    "addq $48, %%rsp\n"
+    : "=a"(ret)
+    : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
+      [fn] "r"(fn)
+    : "rcx", "rdx", "r8", "r9", "r10", "r11",
+      "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "memory", "cc");
+  return ret;
+}
+
+int failures = 0;
+#define CHECK(cond, msg)                                             \
+  do {                                                               \
+    if (cond) printf("  PASS %s\n", msg);                            \
+    else { printf("  FAIL %s\n", msg); ++failures; }                 \
+  } while (0)
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    printf("usage: test_shell <guest.exe>\n");
+    return 2;
+  }
+  size_t size = 0;
+  u8* file = read_file(argv[1], &size);
+  if (!file) { printf("cannot read %s\n", argv[1]); return 2; }
+
+  trt_backend be{&linux_alloc, &linux_protect, &linux_release, &linux_log,
+                 nullptr};
+  trt_bridge_boot(&be);
+  trt_bridge_register_kernel32();
+  trt_bridge_register_user32();
+  trt_bridge_register_shell();
+
+  // mount C: into a scratch dir so FLAG_CREATE lands somewhere real
+  char drive[64];
+  snprintf(drive, sizeof(drive), "/tmp/opencode/shell-test-%d", getpid());
+  trt_vfs_mount("c:", drive);
+
+  // the guest's file calls go through the harness trampolines (host-ABI
+  // bridge fns; see test_engine.cpp for the same pattern)
+  {
+    static const trt_named_fn k_k32_extra[] = {
+        {"CreateFileW", (void*)&w_sCreateFileW},
+        {"WriteFile", (void*)&w_sWriteFile},
+        {"CloseHandle", (void*)&w_sCloseHandle},
+    };
+    trt_module_register("kernel32.dll", TRT_ROUTE_BUILTIN, k_k32_extra,
+                        (int)(sizeof(k_k32_extra) / sizeof(k_k32_extra[0])));
+  }
+
+  printf("tiramisu shell32 bridge test\n");
+
+  trt_resolver rs;
+  trt_resolver_default(&rs);
+  trt_image* img = nullptr;
+  const int rc = trt_map_pe(&be, &rs, file, size, &img);
+  CHECK(rc == TRT_OK, "guest PE maps (shell32 bound)");
+  if (rc != TRT_OK || !img) {
+    printf("  map failed: %s\n", trt_errstr(rc));
+    free(file);
+    return 1;
+  }
+  CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
+
+  const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
+  printf("  guest returned 0x%llx (want 0x1fd)\n", (unsigned long long)ret);
+
+  // dump the whole guest .data (0x50 bytes at RVA 0x3000) as u32s
+
+  CHECK(ret & 0x001u, "SHGetFolderPathW(MYDOCUMENTS) -> Documents path");
+  CHECK(ret & 0x004u, "SHGetFolderPathW(LOCAL_APPDATA) -> AppData/Local");
+  CHECK(ret & 0x008u, "SHGetFolderPathA matches the W form");
+  CHECK(ret & 0x010u, "SHGetKnownFolderPath(SavedGames) -> Saved Games");
+  CHECK(ret & 0x020u, "unknown csidl -> E_FAIL (fail-visible)");
+  CHECK(ret & 0x040u, "SHGetMalloc -> Alloc/Free round-trip");
+  CHECK(ret & 0x080u, "ShellExecuteExW -> FALSE (no shell, named)");
+  CHECK(ret & 0x100u, "FLAG_CREATE: save.cfg written into the created dir");
+
+  // host-side observation: the directory tree really exists
+  char docs[128], save[160];
+  snprintf(docs, sizeof(docs), "%s/users/player/Documents", drive);
+  snprintf(save, sizeof(save), "%s/users/player/Documents/save.cfg", drive);
+  struct stat st;
+  CHECK(stat(docs, &st) == 0, "host: Documents dir exists on the VFS mount");
+  CHECK(stat(save, &st) == 0 && st.st_size == 4,
+        "host: save.cfg exists with 4 bytes");
+
+  free(file);
+  if (failures) {
+    printf("RESULT: %d FAIL\n", failures);
+    return 1;
+  }
+  printf("RESULT: ALL PASS\n");
+  return 0;
+}
