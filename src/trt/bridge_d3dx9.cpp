@@ -341,6 +341,44 @@ void TRT_GUEST_ABI dx_QuatSlerp(vec4 out, const vec4 a, const vec4 b,
 // containers fail visibly.
 struct tex_peek { u32 w, h, bpp; const u8* px; };
 
+// forward (bridge_img.cpp): PNG + DDS -> RGBA8
+typedef struct trt_img { u32 w, h; u8* rgba; } trt_img_;
+int trt_img_parse(const void* data, u32 bytes, trt_img_* out);
+
+// forward: sprite-batch texture-size registry (defined with the sprite)
+constexpr u32 k_sprite_max = 1024;
+struct tex_size { d3d9_handle handle; u32 w, h; };
+static tex_size g_tex_sizes[k_sprite_max];
+static u32 g_tex_size_count = 0;
+
+// shared upload: RGBA8 rows -> create_tex + lock + unlock
+static int tex_upload_rgba(u32 w, u32 h, const u8* rgba, void** out_tex) {
+  const d3d9_hooks* hk = trt_d3d9_hooks_get();
+  if (!hk || !hk->create_tex) return E_NOTIMPL_DX;
+  // D3DFMT_A8R8G8B8 = 21
+  const d3d9_handle th = hk->create_tex(w, h, 1, 0, 21, hk->user);
+  if (th == D3D9_HANDLE_NULL) return E_NOTIMPL_DX;
+  void* bits = hk->lock(th, 0, 0, w * h * 4, hk->user);
+  if (bits) {
+    // RGBA8 (memory order R,G,B,A) -> the backend's A8R8G8B8 expectation
+    // is RGBA bytes in memory order; hooks marshal as-is (RGBA8 = the
+    // D3D convention where byte 0 is channel 0 of the format name read
+    // left-to-right). The d3d9 hooks doc says "RGBA8, top-down".
+    memcpy(bits, rgba, (size_t)w * h * 4);
+    hk->unlock(th, hk->user);
+  }
+  // record the size for the sprite batch (D3DXCreateSprite's Draw needs
+  // the tex dims when the src rect is 0)
+  if (g_tex_size_count < k_sprite_max) {
+    g_tex_sizes[g_tex_size_count].handle = th;
+    g_tex_sizes[g_tex_size_count].w = w;
+    g_tex_sizes[g_tex_size_count].h = h;
+    ++g_tex_size_count;
+  }
+  *out_tex = (void*)(uintptr_t)th;
+  return 0;
+}
+
 int TRT_GUEST_ABI dx_CreateTextureFromFileInMemory(void* dev,
                                                    const void* data,
                                                    u32 bytes,
@@ -348,6 +386,19 @@ int TRT_GUEST_ABI dx_CreateTextureFromFileInMemory(void* dev,
   (void)dev;
   if (!data || !bytes || !out_tex) return E_NOTIMPL_DX;
   const u8* d = (const u8*)data;
+
+  // PNG + DDS first (the two containers every commercial engine ships)
+  trt_img_ img{};
+  if (bytes >= 8 && (memcmp(d, "\x89PNG", 4) == 0 || memcmp(d, "DDS ", 4) == 0)) {
+    const int rc = trt_img_parse(d, bytes, &img);
+    if (rc == 0) {
+      const int up = tex_upload_rgba(img.w, img.h, img.rgba, out_tex);
+      free(img.rgba);
+      return up;
+    }
+    return rc;  // named failure from the parser
+  }
+
   tex_peek t{};
   // BMP: 'BM' + 54-byte BITMAPINFOHEADER (most games use 32-bit BMPs)
   if (bytes >= 54 && d[0] == 'B' && d[1] == 'M') {
@@ -381,34 +432,29 @@ int TRT_GUEST_ABI dx_CreateTextureFromFileInMemory(void* dev,
     snprintf(line, sizeof(line),
              "d3dx9: CreateTextureFromFileInMemory (container unparsed)");
     log_line(line);
-    return E_NOTIMPL_DX;  // fail-visible: PNG/DDS/JPG parsers are M7
+    return E_NOTIMPL_DX;  // fail-visible: JPG and exotic containers
   }
-  const d3d9_hooks* hk = trt_d3d9_hooks_get();
-  if (!hk || !hk->create_tex) return E_NOTIMPL_DX;
-  // D3DFMT_A8R8G8B8 = 21
-  const d3d9_handle h = hk->create_tex(t.w, t.h, 1, 0, 21, hk->user);
-  if (h == D3D9_HANDLE_NULL) return E_NOTIMPL_DX;
-  // upload pixels via lock
-  void* bits = hk->lock(h, 0, 0, t.w * t.h * 4, hk->user);
-  if (bits) {
-    for (u32 y = 0; y < t.h; ++y) {
-      u8* row = (u8*)bits + (size_t)y * t.w * 4;
-      const u8* src = t.px + (size_t)y * t.w * t.bpp;
-      if (t.bpp == 4) {
-        memcpy(row, src, (size_t)t.w * 4);
-      } else {
-        for (u32 x = 0; x < t.w; ++x) {
-          row[x * 4 + 0] = src[x * 3 + 2];  // B
-          row[x * 4 + 1] = src[x * 3 + 1];  // G
-          row[x * 4 + 2] = src[x * 3 + 0];  // R
-          row[x * 4 + 3] = 0xFF;
-        }
+  // build an RGBA8 buffer from the BMP/TGA rows and use the shared upload
+  u8* rgba = (u8*)malloc((size_t)t.w * t.h * 4);
+  for (u32 y = 0; y < t.h; ++y) {
+    // BMP bottom-up rows; TGA rows come top-down when the descriptor
+    // bit says so — M6 treats both as top-down (t.px already normalized)
+    const u8* src = t.px + (size_t)y * t.w * t.bpp;
+    u8* dst = rgba + (size_t)y * t.w * 4;
+    if (t.bpp == 4) {
+      memcpy(dst, src, (size_t)t.w * 4);
+    } else {
+      for (u32 x = 0; x < t.w; ++x) {
+        dst[x*4+0] = src[x*3+2];  // B -> R? No: BMP is B,G,R in memory;
+        dst[x*4+1] = src[x*3+1];  // RGBA memory order needs R,G,B
+        dst[x*4+2] = src[x*3+0];
+        dst[x*4+3] = 0xFF;
       }
     }
-    hk->unlock(h, hk->user);
   }
-  *out_tex = (void*)(uintptr_t)h;
-  return 0;
+  const int up = tex_upload_rgba(t.w, t.h, rgba, out_tex);
+  free(rgba);
+  return up;
 }
 
 // D3DXCreateTexture(dev, w, h, levels, usage, fmt, pool, tex)
@@ -491,6 +537,13 @@ int TRT_GUEST_ABI dx_AssembleShader(const char* src, u32 len,
 // ---- sprite (ID3DXSprite, SDK order per Wine's d3dx9core.h: 14 slots) ----
 // QI AR Rel GetDevice GetTransform SetTransform SetWorldViewRH
 // SetWorldViewLH Begin Draw Flush End OnLostDevice OnResetDevice
+
+// sprite batch state: quads accumulate as XYZ|TEX1 verts (20 bytes each)
+constexpr u32 k_sprite_vcount = k_sprite_max * 6;  // verts
+static u8 g_sprite_verts[k_sprite_vcount * 20];
+static u32 g_sprite_count = 0;
+static void* g_sprite_tex = nullptr;
+
 struct sprite_obj {
   const void* vtbl;
   u32 ref;
@@ -509,17 +562,95 @@ u32 TRT_GUEST_ABI dxs_Rel(void* self) {
   if (o->ref == 0) { free(o); return 0; }
   return o->ref;
 }
-int TRT_GUEST_ABI dxs_Begin(void*) { return 0; }
-int TRT_GUEST_ABI dxs_Draw(void*, void* tex, const void* src_rect,
-                           const void* center, const void* pos, u32 color) {
-  // a sprite draw = a textured quad through the d3d9 hooks' draw path;
-  // the host backend's UP-draw path takes the transformed vertices.
-  // M6: count/log only (visible), full batching is M7.
-  (void)tex; (void)src_rect; (void)center; (void)pos; (void)color;
+int TRT_GUEST_ABI dxs_Begin(void* self) {
+  // reset the batch; quads accumulate until Flush/End
+  g_sprite_count = 0;
+  g_sprite_tex = nullptr;
   return 0;
 }
-int TRT_GUEST_ABI dxs_Flush(void*) { return 0; }
-int TRT_GUEST_ABI dxs_End(void*) { return 0; }
+int TRT_GUEST_ABI dxs_Draw(void* self, void* tex, const void* src_rect,
+                           const void* center, const void* pos, u32 color) {
+  // D3DXSPRITE texture-space quad: src rect (u32[4] = x,y,w,h in texels
+  // or 0 = whole texture), position (float[3]), color (ARGB).
+  // The batch: each draw appends 2 triangles (6 verts, FVF XYZ|TEX1).
+  if (!tex || !pos) return 0;
+  if (g_sprite_count >= k_sprite_max) return 0;  // batch full: dropped visibly
+  // texture size: the d3d9 hooks don't expose tex dims; D3DX sprites
+  // pass the src rect in texels — when it's 0 we need the size. Keep a
+  // registration the texture-upload path fills (tex_upload_rgba records
+  // the size per handle).
+  u32 tw = 0, th = 0;
+  const d3d9_handle thandle = (d3d9_handle)(uintptr_t)tex;
+  for (u32 i = 0; i < k_sprite_max; ++i)
+    if (g_tex_sizes[i].handle == thandle) { tw = g_tex_sizes[i].w; th = g_tex_sizes[i].h; break; }
+  if (!tw || !th) return 0;  // unknown texture: dropped (log at Flush)
+  u32 sx = 0, sy = 0, sw = tw, sh = th;
+  if (src_rect) {
+    const u32* r = (const u32*)src_rect;
+    // RECT is i32[4]: left, top, right, bottom
+    sx = (u32)r[0];
+    sy = (u32)r[1];
+    sw = (u32)(r[2] - r[0]);
+    sh = (u32)(r[3] - r[1]);
+  }
+  const float* p = (const float*)pos;
+  float cx = 0.0f, cy = 0.0f;
+  if (center) {
+    const float* c = (const float*)center;
+    cx = c[0];
+    cy = c[1];
+  }
+  // screen-space quad: texture is drawn 1:1 at pos (rotation via the
+  // sprite transform is M-later; the D3DTS_WORLD hook covers most 2D UI)
+  const float l = p[0] - cx, t = p[1] - cy;
+  const float r = l + (float)sw, b = t + (float)sh;
+  const float u0 = (float)sx / (float)tw, v0 = (float)sy / (float)th;
+  const float u1 = (float)(sx + sw) / (float)tw, v1 = (float)(sy + sh) / (float)th;
+  const float z = 0.5f;
+  // FVF XYZ|TEX1: x,y,z,u,v = 5 floats = 20 bytes/vertex
+  const u32 base = g_sprite_count * 6;
+  struct sv { float x, y, z, u, v; };
+  sv* q = (sv*)(g_sprite_verts + base * 5 * 4);
+  const sv verts[6] = {
+      {l, t, z, u0, v0}, {r, t, z, u1, v0}, {r, b, z, u1, v1},
+      {l, t, z, u0, v0}, {r, b, z, u1, v1}, {l, b, z, u0, v1},
+  };
+  for (u32 i = 0; i < 6; ++i) q[i] = verts[i];
+  g_sprite_tex = tex;
+  ++g_sprite_count;
+  (void)color;  // per-vertex tint: M-later (needs D3DCOLOR modulate)
+  return 0;
+}
+int TRT_GUEST_ABI dxs_Flush(void* self) {
+  (void)self;
+  if (!g_sprite_count) return 0;
+  const d3d9_hooks* hk = trt_d3d9_hooks_get();
+  if (hk && hk->set_texture && hk->create_buf && hk->lock && hk->draw) {
+    // upload the batch as a dynamic vertex buffer and draw TRIANGLELIST
+    const u32 vcount = g_sprite_count * 6;
+    const u32 vbytes = vcount * 20;
+    const d3d9_handle vb = hk->create_buf(vbytes, 0, hk->user);
+    if (vb != D3D9_HANDLE_NULL) {
+      void* bits = hk->lock(vb, 0, 0, vbytes, hk->user);
+      if (bits) {
+        memcpy(bits, g_sprite_verts, vbytes);
+        hk->unlock(vb, hk->user);
+        hk->set_texture(0, (d3d9_handle)(uintptr_t)g_sprite_tex, hk->user);
+        // FVF XYZ|TEX1 is set by the game between Begin/Draw in real
+        // d3dx9; the bridge sets it here (host hook)
+        if (hk->set_fvf) hk->set_fvf(0x142, hk->user);  // XYZ|TEX1
+        hk->draw(4 /*TRIANGLELIST*/, vb, 0, 0, 0, vcount, 0,
+                 g_sprite_count * 2, hk->user);
+      }
+    }
+  }
+  g_sprite_count = 0;
+  return 0;
+}
+int TRT_GUEST_ABI dxs_End(void* self) {
+  // End = Flush + restore device state (nothing to restore on the bridge)
+  return dxs_Flush(self);
+}
 int TRT_GUEST_ABI dxs_OnResetDevice(void*) { return 0; }
 int TRT_GUEST_ABI dxs_OnLostDevice(void*) { return 0; }
 int TRT_GUEST_ABI dxs_GetDevice(void*, void** out) {

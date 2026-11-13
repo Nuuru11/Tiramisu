@@ -36,6 +36,7 @@ without an artifact.
 | DirectDraw reaches the backend present | `tests/test_ddraw.cpp`: the guest creates an IDirectDraw7, sets display mode, creates the primary surface, locks and writes a gradient, creates an offscreen surface, BltFast copies it onto the primary, Flips — the host present hook fired twice (Unlock + Flip) (guest 0xfff) |
 | D3DX9 math is exact and textures upload | `tests/test_d3dx9.cpp`: MatrixIdentity/Multiply/PerspectiveFovLH/Inverse/Transpose verified against hand-computed values, Vec3 normalize/cross/dot exact, a 32-bit BMP in memory became a texture through the d3d9 hooks (2 create_tex + 1 lock observed), shader source round-tripped through a real ID3DXBuffer, sprite Begin/End (guest 0x3ff) |
 | Codec/printer boot probes answer the no-hardware shape | `tests/test_mmedia.cpp`: ACM PCM->PCM streams open and convert, ADPCM fails ACMERR_NOTPOSSIBLE (engine falls back to PCM), ICInfo/ICOpen/DrawDibOpen report no codecs (AVI logos skipped), EnumPrinters/OpenPrinter report no printers (guest 0x1ff) |
+| PNG + DDS parse to RGBA8 with named failures | `tests/test_img.cpp`: a hand-built 2x2 RGBA PNG and a gray PNG inflate (miniz) + unfilter to exact pixels, truncated/bad-signature fail named; DDS X8R8G8B8 with bitmask extraction decodes exact colors; a DXT5 4x4 block decodes to opaque red (alpha indices 001, color idx 0); GIF fails named |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 
