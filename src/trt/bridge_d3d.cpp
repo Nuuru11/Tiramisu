@@ -25,6 +25,72 @@ trt_gpu_hooks g_hooks;
 
 constexpr int TRT_E_NOTIMPL = 0x80004001;  // E_NOTIMPL
 constexpr int TRT_E_NOINTERFACE = 0x80004002;
+constexpr int TRT_E_INVALIDARG = 0x80070057;  // E_INVALIDARG (TRT_-prefixed: never a Win32 macro name)
+
+// Windows semantics: D3D11CreateDevice walks pFeatureLevels IN ORDER and
+// returns the FIRST level the device actually supports. We mirror that with
+// the host's real capability (g_hooks.feature_level). Constants are TRT_-
+// prefixed (never D3D_FEATURE_LEVEL_*: winnt.h/wingdi.h macro collisions are
+// invisible to the offline gate).
+constexpr u32 TRT_FL_9_1 = 0x9100;
+constexpr u32 TRT_FL_9_2 = 0x9200;
+constexpr u32 TRT_FL_9_3 = 0x9300;
+constexpr u32 TRT_FL_10_0 = 0xa000;
+constexpr u32 TRT_FL_10_1 = 0xa100;
+constexpr u32 TRT_FL_11_0 = 0xb000;
+constexpr u32 TRT_FL_11_1 = 0xb100;
+constexpr u32 TRT_FL_12_0 = 0xc000;
+constexpr u32 TRT_FL_12_1 = 0xc100;
+
+// Apply the feature-level contract against the host's real level.
+// Returns S_OK and writes the negotiated level, or E_INVALIDARG when the
+// guest's minimum cannot be met (a modern engine booting past the console's
+// GPU fails visibly, never silently at a lower level).
+static int trt_apply_fl_contract(const void* feature_levels, u32 count,
+                                 u32* out_level) {
+  const u32 host_max = g_hooks.feature_level;
+  if (feature_levels && count) {
+    const u32* levels = (const u32*)feature_levels;
+    for (u32 i = 0; i < count; ++i) {
+      const u32 requested = levels[i];
+      // Only the SDK's defined levels are contract-legal; anything else is
+      // an invalid request (Windows validates the array the same way).
+      const bool known = requested == TRT_FL_9_1 || requested == TRT_FL_9_2 ||
+                         requested == TRT_FL_9_3 || requested == TRT_FL_10_0 ||
+                         requested == TRT_FL_10_1 || requested == TRT_FL_11_0 ||
+                         requested == TRT_FL_11_1 || requested == TRT_FL_12_0 ||
+                         requested == TRT_FL_12_1;
+      if (!known) return TRT_E_INVALIDARG;
+      if (requested <= host_max) {
+        if (out_level) *out_level = requested;
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "d3d: FL contract -> 0x%04X (requested %u levels)", requested,
+                 count);
+        trt_core_log(line);
+        return 0;  // S_OK
+      }
+      char line[192];
+      snprintf(line, sizeof(line),
+               "d3d: guest requests FL 0x%04X, host max 0x%04X - skipped",
+               requested, host_max);
+      trt_core_log(line);
+    }
+    // every requested level is above the host's capability
+    if (out_level) *out_level = 0;
+    char line[224];
+    snprintf(line, sizeof(line),
+             "d3d: guest minimum FL 0x%04X unmet (host max 0x%04X) -> "
+             "E_INVALIDARG (modern engine needs newer GPU than console "
+             "provides)",
+             levels[0], host_max);
+    trt_core_log(line);
+    return TRT_E_INVALIDARG;
+  }
+  // pFeatureLevels == NULL: Windows semantics are "give me the best you have"
+  if (out_level) *out_level = host_max;
+  return 0;  // S_OK
+}
 
 // ---------------------------------------------------------------------------
 // the fake factory: a COM object with the real IDXGIFactory2 vtable
@@ -190,7 +256,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
                           u32 feature_level_count, u32 sdk_version,
                           void** out_device, u32* out_level, void** out_context) {
   (void)adapter; (void)driver_type; (void)software; (void)flags;
-  (void)feature_levels; (void)feature_level_count; (void)sdk_version;
+  (void)sdk_version;
   if (!g_hooks.device || !g_hooks.context) {
     char line[160];
     snprintf(line, sizeof(line),
@@ -198,9 +264,13 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
     trt_core_log(line);
     return 0x887A0004;  // DXGI_ERROR_UNSUPPORTED
   }
+  u32 negotiated = 0;
+  const int hr = trt_apply_fl_contract(feature_levels, feature_level_count,
+                                       &negotiated);
+  if (hr != 0) return hr;
   if (out_device) *out_device = g_hooks.device;
   if (out_context) *out_context = g_hooks.context;
-  if (out_level) *out_level = g_hooks.feature_level;
+  if (out_level) *out_level = negotiated;
   return 0;  // S_OK
 }
 

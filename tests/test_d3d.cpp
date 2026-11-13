@@ -26,6 +26,17 @@
 extern "C" {
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_user32(void);
+int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_type, void* software,
+                                        u32 flags, const void* feature_levels,
+                                        u32 feature_level_count, u32 sdk_version,
+                                        void** out_device, u32* out_level, void** out_context);
+int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u32 driver_type,
+                                        void* software, u32 flags,
+                                        const void* feature_levels,
+                                        u32 feature_level_count, u32 sdk_version,
+                                        void* swapchain_desc, void** out_swapchain,
+                                        void** out_device, u32* out_level,
+                                        void** out_context);
 }
 
 // ---------------- mmap backend ----------------
@@ -34,6 +45,15 @@ namespace {
 struct extent { void* base; size_t len; };
 extent g_extents[16];
 int g_extent_count = 0;
+
+// named log-line capture (the feature-level contract is diagnosed by log)
+char g_log_capture[64][256];
+int g_log_capture_used = 0;
+int log_contains(const char* needle) {
+  for (int i = 0; i < g_log_capture_used; ++i)
+    if (strstr(g_log_capture[i], needle)) return 1;
+  return 0;
+}
 
 void* linux_alloc(size_t bytes, u64 preferred_base) {
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
@@ -68,7 +88,14 @@ void linux_release(void* base, size_t bytes) {
     }
   (void)bytes;
 }
-void linux_log(const char* line) { printf("  [trt] %s\n", line); }
+void linux_log(const char* line) {
+  // capture for contract assertions (feature-level negotiation logs)
+  if (g_log_capture_used < (int)(sizeof(g_log_capture) / sizeof(g_log_capture[0]))) {
+    snprintf(g_log_capture[g_log_capture_used++], sizeof(g_log_capture[0]),
+             "%s", line);
+  }
+  printf("  [trt] %s\n", line);
+}
 
 // ---------------- the fake host GPU ----------------
 // Every fake object is { vtable pointer } - the COM layout the guest expects.
@@ -296,7 +323,7 @@ int main(int argc, char** argv) {
   hooks.context = g_fake_context;
   hooks.swapchain = g_fake_swapchain;
   hooks.factory = &g_real_factory_obj;
-  hooks.feature_level = 0xb100;  // D3D_FEATURE_LEVEL_11_0
+  hooks.feature_level = 0xb000;  // D3D_FEATURE_LEVEL_11_0 (Series-class host)
   hooks.width = 1280;
   hooks.height = 720;
   trt_gpu_set_hooks(&hooks);
@@ -333,6 +360,70 @@ int main(int argc, char** argv) {
   CHECK(g_drew == 1, "guest issued a draw on the host's context");
   CHECK(g_presented == 1,
         "guest presented into the HOST's swapchain (not its own)");
+
+  // ---- Stage 3: D3D11 feature-level contract (direct bridge calls) ----
+  printf("\nfeature-level contract (Windows semantics):\n");
+  g_log_capture_used = 0;
+  void* dev = nullptr;
+  void* ctx = nullptr;
+  u32 got_level = 0;
+
+  // {12_1, 11_1, 11_0} on an 11_0 host -> falls through to 11_0, S_OK
+  const u32 req_modern[] = {0xc100, 0xb100, 0xb000};
+  int hr = trt_D3D11CreateDevice(nullptr, 1, nullptr, 0, req_modern, 3, 7,
+                                 &dev, &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0xb000,
+        "request {12_1, 11_1, 11_0} on FL 11_0 host -> S_OK, FL 0xb000");
+  CHECK(log_contains("d3d: guest requests FL 0xC100, host max 0xB000 - skipped") &&
+            log_contains("d3d: guest requests FL 0xB100, host max 0xB000 - skipped"),
+        "skipped levels each get the named skip log");
+
+  // {11_1} only on an 11_0 host -> E_INVALIDARG + the named unmet log
+  g_log_capture_used = 0;
+  const u32 req_111[] = {0xb100};
+  got_level = 0xdeadbeef;
+  hr = trt_D3D11CreateDevice(nullptr, 1, nullptr, 0, req_111, 1, 7, &dev,
+                             &got_level, &ctx);
+  CHECK((u32)hr == 0x80070057u,
+        "request {11_1} only on FL 11_0 host -> E_INVALIDARG");
+  CHECK(got_level == 0xdeadbeef, "out_level untouched on contract failure");
+  CHECK(log_contains("d3d: guest minimum FL 0xB100 unmet (host max 0xB000) -> "
+                     "E_INVALIDARG"),
+        "unmet minimum logs the modern-engine diagnosis line");
+
+  // NULL request -> host real level, S_OK (existing behavior kept)
+  got_level = 0;
+  hr = trt_D3D11CreateDevice(nullptr, 1, nullptr, 0, nullptr, 0, 7, &dev,
+                             &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0xb000,
+        "NULL request -> S_OK with the host's real level");
+
+  // {10_1, 10_0} -> first supported is 10_1
+  const u32 req_legacy[] = {0xa100, 0xa000};
+  got_level = 0;
+  hr = trt_D3D11CreateDevice(nullptr, 1, nullptr, 0, req_legacy, 2, 7, &dev,
+                             &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0xa100,
+        "request {10_1, 10_0} -> S_OK with FL 0xa100 (first supported)");
+  CHECK(log_contains("d3d: FL contract -> 0xA100 (requested 2 levels)"),
+        "final pick logged as the contract line");
+
+  // AndSwapChain: {11_1, 11_0} -> 11_0 + host swapchain
+  void* sc = nullptr;
+  const u32 req_asc[] = {0xb100, 0xb000};
+  got_level = 0;
+  hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_asc, 2, 7,
+                                         nullptr, &sc, &dev, &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0xb000 && sc == g_fake_swapchain,
+        "AndSwapChain {11_1, 11_0} -> S_OK, FL 0xb000, HOST swapchain");
+
+  // AndSwapChain: {9_1} -> 9_1
+  const u32 req_91[] = {0x9100};
+  got_level = 0;
+  hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_91, 1, 7,
+                                         nullptr, &sc, &dev, &got_level, &ctx);
+  CHECK(hr == 0 && got_level == 0x9100,
+        "AndSwapChain {9_1} -> S_OK, FL 0x9100");
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;

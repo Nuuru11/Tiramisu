@@ -13,7 +13,7 @@ routing evidence + Wine spec analysis; update after every console run.
 | user32.dll | STUB | M1 — the keystone (message pump on CoreWindow) |
 | gdi32.dll | BUILTIN (M7 corpus) | GDI object handle table: CreateFontIndirectW (LOGFONTW record), SelectObject/DeleteObject, GetStockObject, state setters; DCs shared with the user32 bridge. Real gdi32 is NOT loadable in a console AppContainer — the corpus test models that and games must bind the BUILTIN surface |
 | comctl32.dll | BUILTIN (M7 corpus) | InitCommonControls/Ex + ordinal #380 (the x64 export OrTMM imports by bare ordinal); the requested dwICC flags are logged |
-| winmm.dll | STUB | donor candidate once user32 exists |
+| winmm.dll | BUILTIN | timeGetTime/timeBeginPeriod/timeGetDevCaps (bridge_winmm); legacy waveOut/midi/joy probes answer "no devices", MCI fails visibly (263) |
 | ole32.dll | BUILTIN | M7 COM boot (bridge_ole); console UWP ole32 lacks the full PC surface |
 | d3d11.dll | SYSTEM | real on console (DX11 FL 11.0 both modes) |
 | dxgi.dll | SYSTEM | real on console |
