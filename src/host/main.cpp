@@ -201,9 +201,104 @@ void run_probes() {
 struct game_entry {
   std::string name;
   std::string exe;
+  std::string compat;  // static PE analysis, shown before launch
 };
 std::vector<game_entry> g_games;
 int g_selected = 0;
+
+// Static compatibility scan of a game's exe: machine type + import table.
+// This is the "setup UI" honesty layer: the launcher tells you what will
+// happen BEFORE the launch, from the PE itself — not guesswork.
+void scan_compat(const std::string& path, char* out, unsigned cap) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { snprintf(out, cap, "compat: exe unreadable"); return; }
+  u8 hdr[4096] = {};
+  f.read((char*)hdr, sizeof(hdr));
+  const size_t got = (size_t)f.gcount();
+  if (got < 0x40 || hdr[0] != 'M' || hdr[1] != 'Z') {
+    snprintf(out, cap, "compat: not a PE"); return;
+  }
+  u32 e_lfanew = 0;
+  memcpy(&e_lfanew, hdr + 0x3C, 4);
+  if (e_lfanew + 24 > got || hdr[e_lfanew] != 'P' || hdr[e_lfanew + 1] != 'E') {
+    snprintf(out, cap, "compat: PE signature missing"); return;
+  }
+  const u16 machine = (u16)(hdr[e_lfanew + 4] | (hdr[e_lfanew + 5] << 8));
+  const u16 opt_magic = (u16)(hdr[e_lfanew + 24] | (hdr[e_lfanew + 25] << 8));
+  const char* arch;
+  if (machine == 0x8664 && opt_magic == 0x20B) arch = "x64";
+  else if (machine == 0x014C) arch = "x86 32-bit (unsupported)";
+  else if (machine == 0xAA64) arch = "ARM64 (unsupported)";
+  else arch = "unknown arch";
+
+  // import directory -> module names (bounded by the 4 KB we read)
+  u32 imp_rva = 0, imp_sz = 0;
+  const u16 opt_size = (u16)(hdr[e_lfanew + 20] | (hdr[e_lfanew + 21] << 8));
+  const u32 opt_off = e_lfanew + 24;
+  if (opt_magic == 0x20B) {       // PE32+
+    memcpy(&imp_rva, hdr + opt_off + 120, 4);
+    memcpy(&imp_sz, hdr + opt_off + 124, 4);
+  } else if (opt_magic == 0x10B) {  // PE32
+    memcpy(&imp_rva, hdr + opt_off + 104, 4);
+    memcpy(&imp_sz, hdr + opt_off + 108, 4);
+  }
+  char mods[256] = "";
+  if (imp_rva && opt_size >= 72 && got >= sizeof(hdr)) {
+    // section table: translate RVA -> file offset
+    const u32 sec_off = opt_off + opt_size;
+    u32 imp_file = 0;
+    for (u32 s = 0; s < 96; ++s) {
+      const u32 so = sec_off + s * 40;
+      if (so + 40 > got) break;
+      u32 vaddr = 0, vsize = 0, raw = 0, rawsz = 0;
+      memcpy(&vsize, hdr + so + 8, 4);
+      memcpy(&vaddr, hdr + so + 12, 4);
+      memcpy(&rawsz, hdr + so + 16, 4);
+      memcpy(&raw, hdr + so + 20, 4);
+      if (imp_rva >= vaddr && imp_rva < vaddr + vsize) {
+        imp_file = raw + (imp_rva - vaddr);
+        if (imp_file + 8 > got) imp_file = 0;
+        break;
+      }
+      if (raw == 0 && rawsz == 0 && vaddr == 0 && vsize == 0) break;
+    }
+    if (imp_file) {
+      size_t o = 0;
+      for (u32 d = 0; d < 96 && o + 40 < sizeof(mods); ++d) {
+        const u32 doff = imp_file + d * 20;
+        if (doff + 20 > got) break;
+        u32 name_rva = 0;
+        memcpy(&name_rva, hdr + doff + 12, 4);
+        if (!name_rva) break;
+        // translate again (string RVA)
+        u32 name_file = 0;
+        for (u32 s = 0; s < 96; ++s) {
+          const u32 so = sec_off + s * 40;
+          if (so + 40 > got) break;
+          u32 vaddr = 0, vsize = 0, raw = 0;
+          memcpy(&vsize, hdr + so + 8, 4);
+          memcpy(&vaddr, hdr + so + 12, 4);
+          memcpy(&raw, hdr + so + 20, 4);
+          if (name_rva >= vaddr && name_rva < vaddr + vsize) {
+            name_file = raw + (name_rva - vaddr);
+            break;
+          }
+        }
+        if (!name_file || name_file + 32 > got) break;
+        const char* nm = (const char*)hdr + name_file;
+        // flag the ones that decide bootability
+        const char* mark = "";
+        if (!_strnicmp(nm, "steam_api", 9)) mark = "[steam-auth]";
+        else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9-shim-pending]";
+        else if (!_strnicmp(nm, "d3d11", 5)) mark = "[d3d11 OK]";
+        else if (!_strnicmp(nm, "xaudio", 6)) mark = "[audio OK]";
+        else if (!_strnicmp(nm, "xinput", 6)) mark = "[pad OK]";
+        o += (size_t)snprintf(mods + o, sizeof(mods) - o, " %s%s", nm, mark);
+      }
+    }
+  }
+  snprintf(out, cap, "compat: %s;%s", arch, mods[0] ? mods : " no imports");
+}
 
 void rescan_games() {
   g_games.clear();
@@ -229,7 +324,12 @@ void rescan_games() {
       if (sz > best_sz) { best = e; best_sz = sz; }
     } while (FindNextFileA(hx, &fx));
     FindClose(hx);
-    if (!best.empty()) g_games.push_back({n, best});
+    if (!best.empty()) {
+      char compat[280];
+      scan_compat(g_games_dir + "\\" + n + "\\" + best, compat,
+                  (unsigned)sizeof(compat));
+      g_games.push_back({n, best, compat});
+    }
   } while (FindNextFileA(h, &fd));
   FindClose(h);
   if (g_selected >= (int)g_games.size()) g_selected = 0;
@@ -637,6 +737,10 @@ struct tiramisu_host
       char audio_line[128];
       longan::audio_status(audio_line, sizeof(audio_line));
       lines.push_back(u82ws(audio_line));
+      // the selected game's static compat scan: what will happen on launch
+      if (!g_games.empty() && g_selected < (int)g_games.size()) {
+        lines.push_back(u82ws(g_games[g_selected].compat));
+      }
       lines.push_back(L"D-pad: select   A: launch   Y: steam   RS: mouse mode");
       longan::ui_set_lines(lines);
       longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
