@@ -4,6 +4,8 @@
 // v0 scope: heap/memory/sync-primitive/file-io/clock/error/TLS basics.
 #include "trt.h"
 #include "thunk.h"
+#include "images.h"
+#include "pe_exports.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -319,6 +321,95 @@ void trt_bridge_new_thread_id(u32 id) {
   g_tls_index_current_thread = id % 128;
 }
 
+// ================= the loader surface (guest DLLs) ==========================
+// A shipped game is not one file: it brings engine DLLs and helper DLLs,
+// and often its own version.dll/winmm.dll shims. LoadLibrary is how the
+// guest reaches them, so it is as load-critical as kernel32 itself.
+namespace {
+
+// "C:\\dir\\engine.dll" / "engine.dll" -> a host path we can open
+bool guest_path_to_host(const u16* guest_path, char* out, size_t cap) {
+  char utf8[1024];
+  if (trt_utf16_to_utf8(guest_path, utf8, sizeof(utf8)) != 0) return false;
+  if (utf8[0] && utf8[1] == ':') {
+    // absolute guest path: through the VFS
+    return trt_vfs_resolve_utf16(guest_path, out, cap) == 0;
+  }
+  // bare name: the game's own directory (the runtime's search dir)
+  const char* base = utf8;
+  for (const char* p = utf8; *p; ++p)
+    if (*p == '\\' || *p == '/') base = p + 1;
+  const char* dir = trt_runtime_search_dir();
+  if (!dir || !dir[0]) return false;
+  snprintf(out, cap, "%s/%s", dir, base);
+  return true;
+}
+
+} // namespace
+
+void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
+  if (!path) return nullptr;
+  char host[1024];
+  if (!guest_path_to_host(path, host, sizeof(host))) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 2;  // FILE_NOT_FOUND
+    return nullptr;
+  }
+  // already loaded? Windows returns the same handle
+  const char* base = strrchr(host, '/');
+  base = base ? base + 1 : host;
+  if (trt_image* img = trt_images_find(base)) return trt_images_handle(img);
+
+  trt_image* img = trt_load_pe(host, base, 1);
+  if (!img) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 126;  // MOD_NOT_FOUND
+    return nullptr;
+  }
+  return trt_images_handle(img);
+}
+
+void* TRT_STDCALL trt_LoadLibraryExW(const u16* path, void* file, u32 flags) {
+  (void)file; (void)flags;
+  return trt_LoadLibraryW(path);
+}
+
+int TRT_STDCALL trt_FreeLibrary(void* handle) {
+  (void)handle;
+  return 1;  // images live for the process lifetime
+}
+
+void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
+  if (!name) return nullptr;
+  trt_image* img = handle ? trt_images_by_handle(handle) : nullptr;
+  if (!img) {
+    // NULL handle means "search every module" on Windows; we only know the
+    // guest images, so search those.
+    for (trt_image* it = trt_images_first(); it; it = nullptr) break;
+    return nullptr;
+  }
+  // a low value means "export by ordinal"
+  const u32 v = (u32)(uintptr_t)name;
+  if (v < 0x10000) {
+    const u16 ord = (u16)v;
+    return trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(),
+                              img, nullptr, ord);
+  }
+  return trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(), img,
+                            name, 0);
+}
+
+void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
+  if (!name || !name[0]) {
+    trt_image* first = trt_images_first();
+    return first ? trt_images_handle(first) : nullptr;
+  }
+  char utf8[256];
+  if (trt_utf16_to_utf8(name, utf8, sizeof(utf8)) != 0) return nullptr;
+  const char* base = strrchr(utf8, '\\');
+  base = base ? base + 1 : utf8;
+  trt_image* img = trt_images_find(base);
+  return img ? trt_images_handle(img) : nullptr;
+}
+
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
   {"HeapCreate", (void*)&trt_HeapCreate},
@@ -346,6 +437,11 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"FreeEnvironmentStringsW", (void*)&trt_FreeEnvironmentStringsW},
   {"GetModuleFileNameW", (void*)&trt_GetModuleFileNameW},
   {"GetSystemDirectoryW", (void*)&trt_GetSystemDirectoryW},
+  {"LoadLibraryW", (void*)&trt_LoadLibraryW},
+  {"LoadLibraryExW", (void*)&trt_LoadLibraryExW},
+  {"FreeLibrary", (void*)&trt_FreeLibrary},
+  {"GetProcAddress", (void*)&trt_GetProcAddress},
+  {"GetModuleHandleW", (void*)&trt_GetModuleHandleW},
 };
 
 int trt_bridge_register_kernel32(void) {

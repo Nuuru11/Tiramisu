@@ -17,6 +17,10 @@ without an artifact.
 | First absolute mouse event positions without a false delta | mouse_init flag (found by the test) |
 | Host is a proper UWP image | objdump: Subsystem Windows GUI, DllCharacteristics 0x9160 (APPCONTAINER 0x1000 set) |
 | Package integrity | osslsigncode verify OK (trust anchor); makemsix round-trip unpack; manifest + guest present in packed msix |
+| api-set contract imports resolve to the DLL that implements them | `tests/test_real_load.cpp`: "apiset api-ms-win-core-synch-l1-2-0.dll -> kernel32.dll", call reaches the real function |
+| A missing optional DLL does not kill the load | delay import d3dcompiler_47 bound to a fail-visible stub; load continues; the call site names itself |
+| A game can load the DLLs it ships | `tests/test_libload.cpp`: guestdll.dll loaded on demand from the game's directory, its own imports bound, DllMain ran with the right arguments, its export called across the image boundary, LoadLibraryW + GetProcAddress work |
+| Guest-call ABI hazards are closed | the loader's Win64 call helper reads its arguments through memory constraints and before touching %rsp (a register-constrained version silently corrupted the guest's arguments; the test caught it) |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 

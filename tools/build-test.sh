@@ -19,7 +19,8 @@ LLVM_DLLTOOL="$LLVM_BIN/llvm-dlltool"
 "$CLANG" --version | head -1
 
 # --- 1. import library for the guest (tiramisu_host.dll) ---
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/tiramisu_host.lib" -d src/guest/tiramisu_host.def
+rm -f "$out/tiramisu_host.lib"
+"$LLD_LINK" /lib /def:src/guest/tiramisu_host.def /out:"$out/tiramisu_host.lib" /machine:x64 /noentry
 
 # --- 2. guest PE64: freestanding, imports bound at load time by trt ---
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
@@ -40,7 +41,7 @@ file "$out/guest_hello.exe"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_pe_loader.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
 
@@ -51,13 +52,15 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_input.cpp \
   src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
   src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
   -o "$out/test_input"
 "$out/test_input"
 
 # --- 5. THE launch-path proof: game-shaped PE through the full pipeline ---
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/kernel32.lib" -d src/guest/kernel32.def
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/user32.lib" -d src/guest/user32.def
+rm -f "$out/kernel32.lib"
+"$LLD_LINK" /lib /def:src/guest/kernel32.def /out:"$out/kernel32.lib" /machine:x64 /noentry
+rm -f "$out/user32.lib"
+"$LLD_LINK" /lib /def:src/guest/user32.def /out:"$out/user32.lib" /machine:x64 /noentry
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
   -c src/guest/guest_game.c -o "$out/guest_game.obj"
 "$LLD_LINK" "$out/guest_game.obj" "$out/kernel32.lib" "$out/user32.lib" \
@@ -66,7 +69,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_game_boot.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
@@ -74,13 +77,18 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
 # --- 6. real-game load path: api-sets, delay imports, fail-visible stubs ---
 # A guest that imports contract names (api-ms-win-*), a module the console
 # does not have (advapi32) and a DELAY-loaded DLL (d3dcompiler_47).
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/api-ms-win-core-synch-l1-2-0.lib" \
-  -d src/guest/api-ms-win-core-synch-l1-2-0.def
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/api-ms-win-core-winrt-l1-1-0.lib" \
-  -d src/guest/api-ms-win-core-winrt-l1-1-0.def
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/advapi32.lib" -d src/guest/advapi32.def
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/d3dcompiler_47.lib" -d src/guest/d3dcompiler_47.def
-"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/delayimp.lib" -d src/guest/delayimp.def
+rm -f "$out/api-ms-win-core-synch-l1-2-0.lib"
+"$LLD_LINK" /lib /def:src/guest/api-ms-win-core-synch-l1-2-0.def \
+  /out:"$out/api-ms-win-core-synch-l1-2-0.lib" /machine:x64 /noentry
+rm -f "$out/api-ms-win-core-winrt-l1-1-0.lib"
+"$LLD_LINK" /lib /def:src/guest/api-ms-win-core-winrt-l1-1-0.def \
+  /out:"$out/api-ms-win-core-winrt-l1-1-0.lib" /machine:x64 /noentry
+rm -f "$out/advapi32.lib"
+"$LLD_LINK" /lib /def:src/guest/advapi32.def /out:"$out/advapi32.lib" /machine:x64 /noentry
+rm -f "$out/d3dcompiler_47.lib"
+"$LLD_LINK" /lib /def:src/guest/d3dcompiler_47.def /out:"$out/d3dcompiler_47.lib" /machine:x64 /noentry
+rm -f "$out/delayimp.lib"
+"$LLD_LINK" /lib /def:src/guest/delayimp.def /out:"$out/delayimp.lib" /machine:x64 /noentry
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
   -c src/guest/guest_realload.c -o "$out/guest_realload.obj"
 "$LLD_LINK" "$out/guest_realload.obj" \
@@ -92,7 +100,37 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_real_load.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
-  src/trt/bridge_user32.cpp src/trt/input.cpp \
+  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
+
+# --- 7. guest DLL loading: the DLLs a game ships with it ---
+cat > "$out/guestdll.def" <<'DEOF'
+LIBRARY guestdll
+EXPORTS
+    dll_add
+DEOF
+rm -f "$out/guestdll.lib"
+"$LLD_LINK" /lib /def:"$out/guestdll.def" /out:"$out/guestdll.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_dll.c -o "$out/guest_dll.obj"
+# NOTE: /def on a DLL link makes lld write an import library next to the
+# output - name it apart so it cannot clobber the one the exe links against
+"$LLD_LINK" "$out/guest_dll.obj" "$out/tiramisu_host.lib" \
+  /NODEFAULTLIB /ENTRY:dll_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1B00000 /DEF:"$out/guestdll.def" \
+  /implib:"$out/guestdll.dll.lib" /OUT:"$out/guestdll.dll"
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_libload.c -o "$out/guest_libload.obj"
+"$LLD_LINK" "$out/guest_libload.obj" "$out/guestdll.lib" "$out/kernel32.lib" \
+  /NODEFAULTLIB /ENTRY:libload_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_libload.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_libload.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
+  src/trt/input.cpp \
+  -o "$out/test_libload"
+"$out/test_libload" "$out/guest_libload.exe" "$out"

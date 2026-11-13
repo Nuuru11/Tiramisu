@@ -142,17 +142,23 @@ u8* read_file(const char* path, size_t* size) {
 }
 
 // call a Win64 function: shadow space + rcx/rdx/r8 args, result in rax
+// NOTE: the arguments are read through MEMORY constraints and BEFORE %rsp
+// is adjusted. With register constraints the compiler may pick a register
+// that a later mov overwrites; and if %rsp moves first, the compiler's
+// memory addresses become stale (the callee then gets garbage).
 u64 win64_call(void* fn, u64 a, u64 b, u64 c) {
+  u64 args[3] = {a, b, c};
   u64 ret;
   asm volatile(
+    "movq %[a0], %%rcx\n"
+    "movq %[a1], %%rdx\n"
+    "movq %[a2], %%r8\n"
     "subq $48, %%rsp\n"
-    "movq %1, %%rcx\n"
-    "movq %2, %%rdx\n"
-    "movq %3, %%r8\n"
-    "call *%4\n"
+    "call *%[fn]\n"
     "addq $48, %%rsp\n"
     : "=a"(ret)
-    : "r"(a), "r"(b), "r"(c), "r"(fn)
+    : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
+      [fn] "r"(fn)
     : "rcx", "rdx", "r8", "r9", "r10", "r11",
       "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "memory", "cc");
   return ret;

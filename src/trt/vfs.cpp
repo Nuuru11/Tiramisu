@@ -49,6 +49,13 @@ void utf16_to_utf8(const u16* in, char* out, size_t out_cap) {
 
 extern "C" {
 
+// UTF-16 -> UTF-8 (shared with the loader bridge: LoadLibraryW paths)
+int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap) {
+  if (!in || !out || out_cap == 0) return -1;
+  utf16_to_utf8(in, out, out_cap);
+  return 0;
+}
+
 void trt_vfs_mount(const char* drive_prefix, const char* host_path) {
   if (g_mount_count >= 8) return;
   vfs_mount& m = g_mounts[g_mount_count++];

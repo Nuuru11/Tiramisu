@@ -101,6 +101,8 @@ void trt_bridge_new_thread_id(u32 id);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 void trt_bridge_set_exe_path(const char* zpath);
+// UTF-16 -> UTF-8 helper (paths, strings)
+int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
 int trt_bridge_register_user32(void);
 // host pump: called from the builtin GetMessageW while the guest blocks, so
 // CoreWindow events + XInput keep flowing after the guest owns the thread

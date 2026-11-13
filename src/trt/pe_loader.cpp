@@ -250,6 +250,12 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           return fail(&img, be, TRT_ERR_IMPORT, det);
         }
         memcpy(img.base + t, &fn, 8);  // bind IAT
+        if (n_symbols == 0) {
+          char line[256];
+          snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
+                   sym_name ? sym_name : "#ordinal", fn);
+          logf_be(be, line);
+        }
         ++bound; ++n_symbols;
       }
       char line[160];

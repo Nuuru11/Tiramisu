@@ -22,11 +22,18 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 |---|---|
 | Offline loader test (Linux, real PE guest executed) | **PASS** — mapping, DIR64/HIGHLOW relocation, import binding, W^X seal, entry execution, checksum-verified |
 | Offline input-bridge test | **PASS** — keyboard/mouse/pad feed -> user32 getters + message pump |
+| Offline real-game load-path test | **PASS** — api-set contracts redirected, delay imports bound, unresolved symbols fail *visibly* |
+| Offline guest-DLL test | **PASS** — a DLL the game ships is loaded on demand, its imports bound, DllMain runs, its export is called across the image boundary, LoadLibrary/GetProcAddress work |
 | UWP host (CoreWindow/D3D11/XInput/LocalState log) | **BUILDS** — signed `Tiramisu.msix` produced and verified |
 | Phone transfer (QR on TV -> upload zip -> launch) | **BUILT** — ws2_32 HTTP server, miniz zip extraction, launch handoff; console verdict pending |
 | Keyboard + mouse | **BUILT** — CoreWindow events -> trt_input -> GetAsyncKeyState/GetKeyState/GetCursorPos + WM_ queue; gamepad-as-mouse mode (RS toggle, triggers = buttons) |
 | Controller | **BUILT** — XInput mirrored into trt_input + D-pad shelf navigation |
 | Steam | **BUILT (auth only)** — QR login via IAuthenticationService (own account), token saved to LocalState; depot download is M6 |
+| Guest DLLs (the DLLs a game ships) | **BUILT** — loaded on demand from the game's own directory, imports bound recursively, DllMain run, exports resolvable by name and ordinal |
+| API-set contracts (`api-ms-win-*`) | **BUILT** — redirected to the DLL that implements them (synch->kernel32, winrt/com->combase, crt->ucrtbase, d3d11/dxgi/gdi/user/ole...) |
+| Delay imports | **BUILT** — bound eagerly; a missing optional DLL no longer kills the load, the call site names itself instead |
+| Registry (advapi32) | **STUB** — games that read HKLM/HKCU settings get a named stub, not a silent zero |
+| D3D11 swapchain for the guest | **PENDING** — the guest's own d3d11/dxgi calls are not yet bridged onto the host's CoreWindow swapchain (the next keystone) |
 | Console run | **PENDING** — `tools/deploy.sh install` then look at the TV |
 | 32-bit | dead by console evidence (compat-mode `ljmp 0x23` = 0xc0000005 on Series S); needs an x86 engine later |
 

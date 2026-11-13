@@ -8,3 +8,7 @@ EXPORTS
     CloseHandle
     GetEnvironmentStringsW
     GetModuleFileNameW
+    LoadLibraryW
+    GetProcAddress
+    GetModuleHandleW
+    FreeLibrary

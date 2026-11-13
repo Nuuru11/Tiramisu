@@ -35,7 +35,10 @@ struct builtin_mod {
   const builtin_fn* fns;
   int fn_count;
 };
-builtin_mod g_modules[64];
+// The table must hold every module a game might import: the defaults
+// (70+) plus the builtin bridges. Overflow is a bug, not a shrug - it is
+// logged, because a dropped registration means an unresolved import.
+builtin_mod g_modules[256];
 int g_module_count = 0;
 
 // host-installed binding for SYSTEM-route modules (UWP: LoadLibraryW +
@@ -178,8 +181,13 @@ void trt_module_register(const char* name, trt_route route,
   if (existing >= 0) {
     m = &g_modules[existing];
   } else {
-    if (g_module_count >= (int)(sizeof(g_modules) / sizeof(g_modules[0])))
+    if (g_module_count >= (int)(sizeof(g_modules) / sizeof(g_modules[0]))) {
+      char line[160];
+      snprintf(line, sizeof(line),
+               "trt: MODULE TABLE FULL - %s was NOT registered", name);
+      trt_core_log(line);
       return;
+    }
     m = &g_modules[g_module_count++];
   }
   memset(m, 0, sizeof(*m));
@@ -199,6 +207,13 @@ void trt_set_system_loader(trt_system_load fn) { g_system_load = fn; }
 void trt_resolver_default(trt_resolver* out) {
   out->user = nullptr;
   out->resolve = &resolve_through_table;
+}
+
+// exported so the guest-image resolver (images.cpp) can fall back to the
+// module table for system modules
+void* trt_resolve_module(void* user, const char* module, const char* symbol,
+                         u16 ordinal) {
+  return resolve_through_table(user, module, symbol, ordinal);
 }
 
 // stub entry point: one shared address; host-side logging wraps real call
