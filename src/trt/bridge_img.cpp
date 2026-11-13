@@ -20,6 +20,16 @@
 
 // vendored miniz (zlib license) — tinfl is the raw-inflate core
 #include "../host/vendor/miniz.h"
+// vendored stb_image (public domain) — the fallback loader for JPG/GIF/
+// PSD and every container variant the hand parsers reject
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_GIF
+#define STBI_ONLY_PSD
+#define STBI_ONLY_PIC
+#define STBI_ONLY_PNM
+#define STBI_NO_STDIO
+#define STB_IMAGE_IMPLEMENTATION
+#include "../host/vendor/stb_image.h"
 
 extern "C" {
 
@@ -352,8 +362,26 @@ int trt_img_parse(const void* data, u32 bytes, trt_img* out) {
     }
     return rc;
   }
-  log_line("img: container not PNG/DDS (BMP/TGA stay in bridge_d3dx9)");
-  return (int)0x8007000D;
+  // everything else (JPG, GIF, PSD, PIC, PNM, robust PNG/TGA/BMP variants
+  // the hand parsers reject): vendored stb_image (public domain). RGBA
+  // request forces 4-channel output regardless of source channels.
+  int w = 0, h = 0, channels = 0;
+  u8* rgba = stbi_load_from_memory(d, (int)bytes, &w, &h, &channels, 4);
+  if (!rgba) {
+    char line[160];
+    snprintf(line, sizeof(line), "img: stb_image also failed: %s",
+             stbi_failure_reason());
+    log_line(line);
+    return (int)0x8007000D;  // corrupt/unsupported
+  }
+  char line[96];
+  snprintf(line, sizeof(line),
+           "img: stb %ux%u (%d src channels -> RGBA) parsed", w, h, channels);
+  log_line(line);
+  out->w = (u32)w;
+  out->h = (u32)h;
+  out->rgba = rgba;
+  return 0;
 }
 
 }  // extern "C"

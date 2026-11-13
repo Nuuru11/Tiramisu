@@ -428,11 +428,20 @@ int TRT_GUEST_ABI dx_CreateTextureFromFileInMemory(void* dev,
     log_line(line);
   }
   if (!t.w || !t.h || !t.bpp || !t.px) {
+    // not BMP/TGA/PNG/DDS: stb fallback inside trt_img_parse covers JPG,
+    // GIF, PSD and exotic variants — try it before failing
+    trt_img_ img{};
+    const int rc = trt_img_parse(d, bytes, &img);
+    if (rc == 0) {
+      const int up = tex_upload_rgba(img.w, img.h, img.rgba, out_tex);
+      free(img.rgba);
+      return up;
+    }
     char line[96];
     snprintf(line, sizeof(line),
              "d3dx9: CreateTextureFromFileInMemory (container unparsed)");
     log_line(line);
-    return E_NOTIMPL_DX;  // fail-visible: JPG and exotic containers
+    return rc;  // the parser's named failure
   }
   // build an RGBA8 buffer from the BMP/TGA rows and use the shared upload
   u8* rgba = (u8*)malloc((size_t)t.w * t.h * 4);

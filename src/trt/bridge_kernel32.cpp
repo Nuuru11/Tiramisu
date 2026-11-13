@@ -16,6 +16,7 @@
 #include "bridge_dsound.h"
 #include "bridge_ddraw.h"
 #include "bridge_d3dx9.h"
+#include "bridge_d3d8.h"
 #include "bridge_mmedia.h"
 #include "bridge_d3dx.h"
 #include "bridge_dinput.h"
@@ -190,6 +191,8 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_ddraw();
   // d3dx9: D3DX math/textures/sprites (M6 coverage) — most-versions
   trt_bridge_register_d3dx9();
+  // d3d8: the 2001-2004 generation on the same backend hooks (M7)
+  trt_bridge_register_d3d8();
   // msacm32/msvfw32/winspool: codec + printer boot probes (M6 coverage)
   trt_bridge_register_mmedia();
   // d3dx10/11: texture/shader helpers for the D3D10/11 generation (M7)

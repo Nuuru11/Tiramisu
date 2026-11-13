@@ -347,6 +347,7 @@ const mod_default k_defaults[] = {
     // to the BUILTIN D3D9->D3D11 bridge)
     {"d3d9.dll", TRT_ROUTE_STUB},
     {"d3d9core.dll", TRT_ROUTE_STUB},
+    {"d3d8.dll", TRT_ROUTE_BUILTIN},     // M7: D3D8 -> same backend hooks
     {"dsound.dll", TRT_ROUTE_BUILTIN},   // M6: DirectSound -> console sink
     {"ddraw.dll", TRT_ROUTE_BUILTIN},    // M6: DirectDraw -> backend present
     {"opengl32.dll", TRT_ROUTE_STUB},    // console has no GL
