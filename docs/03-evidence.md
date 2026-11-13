@@ -27,6 +27,10 @@ without an artifact.
 | XAudio2 works | `tests/test_audio.cpp`: engine, mastering + source voices, PCM submit; the host sink received the guest's 48kHz stereo 16-bit buffer and `GetState`/`Flush` track the queue |
 | Steamworks auth works | `tests/test_steam.cpp`: the boot lifecycle succeeds for a non-DRM'd build; ownership checks answer 0 *visibly* (no license server, no DRM bypass) |
 | The guest has a working registry | `tests/test_reg.cpp`: HKCU/HKLM keys open and create, a string value round-trips, a missing value fails with ERROR_FILE_NOT_FOUND (not a silent zero), subkeys enumerate, and the hive is persisted to the guest's C: drive in a form that survives UTF-16 |
+| winmm timing works (the frame clock) | `tests/test_winmm.cpp`: timeBeginPeriod accepted, timeGetTime nondecreasing AND advancing during a busy-spin, waveOutGetNumDevs answers 0, TIMECAPS sane, MCI fails visibly with 263 |
+| The launcher has a real setup UI | `src/host/ui.cpp` `ui_set_setup` + `main.cpp` `boot_all`: live checklist (storage → D3D11 → gamepads → audio → transfer → shelf → self-test), A opens the shelf |
+| The launcher scans compatibility before launch | `main.cpp` `scan_compat`: reads each game's PE machine type + full import table (RVA→file-offset through the section table), flags [steam-auth]/[d3d9-shim-pending]/[d3d11 OK] on the shelf |
+| The console has real audio output | `src/host/audio.cpp`: XAudio2 2.8 mastering + per-format source voices, 8-slot PCM ring wired to `trt_audio_set_hooks`; offline side proven by `tests/test_audio.cpp` sink receipt |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 
