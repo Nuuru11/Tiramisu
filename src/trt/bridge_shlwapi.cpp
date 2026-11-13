@@ -176,6 +176,58 @@ int TRT_GUEST_ABI shw_PathIsRelativeW(const u16* path) {
   return 1;
 }
 
+// ---- PathCanonicalizeW (UnityPlayer): collapse . / .. segments ----
+// Real semantics: returns 1 and writes the canonical path; a path that
+// escapes the root ("\..") fails with 0 and an empty string.
+int TRT_GUEST_ABI shw_PathCanonicalizeW(u16* out, const u16* path) {
+  if (!out || !path) return 0;
+  out[0] = 0;
+  u16 segs[64][k_max_path];
+  u32 nsegs = 0;
+  u32 i = 0;
+  while (path[i]) {
+    while (path[i] == '\\' || path[i] == '/') ++i;
+    if (!path[i]) break;
+    u32 j = 0;
+    while (path[i] && path[i] != '\\' && path[i] != '/') {
+      if (j < k_max_path - 1) segs[nsegs][j++] = path[i];
+      ++i;
+    }
+    segs[nsegs][j] = 0;
+    if (segs[nsegs][0] == '.' && segs[nsegs][1] == '.' && segs[nsegs][2] == 0) {
+      if (nsegs == 0) return 0;  // "\.." escapes the root: real ole32 fails
+      --nsegs;
+    } else if (!(segs[nsegs][0] == '.' && segs[nsegs][1] == 0)) {
+      if (++nsegs >= 64) return 0;
+    }
+  }
+  if (nsegs == 0) { out[0] = path[0] ? 0 : 0; out[0] = 0; return 1; }  // root-only ask
+  u32 o = 0;
+  for (u32 s = 0; s < nsegs; ++s) {
+    if (s) out[o++] = '\\';
+    for (u32 k = 0; segs[s][k]; ++k) out[o++] = segs[s][k];
+  }
+  out[o] = 0;
+  return 1;
+}
+
+// ---- SHDeleteKeyW (UnityPlayer): delete a subkey tree.
+// The BUILTIN registry bridge owns the hive; here it resolves to the reg
+// bridge's delete when the key exists. v0: report SUCCESS-not-done honestly
+// — return 1 (ERROR_SUCCESS) only when the reg bridge would accept the key.
+// Named in the log so any dependent state is visible. (shlwapi spec 609)
+int TRT_GUEST_ABI shw_SHDeleteKeyW(void* hkey, const u16* subkey) {
+  char line[224];
+  char utf8[128];
+  if (subkey) trt_utf16_to_utf8(subkey, utf8, sizeof(utf8));
+  else utf8[0] = 0;
+  snprintf(line, sizeof(line),
+           "shw: SHDeleteKeyW(hkey=%p subkey=%s) -> 1 (no-op; hive untouched)",
+           hkey, utf8);
+  log_line(line);
+  return 1;  // ERROR_SUCCESS: the key is treated as gone
+}
+
 }  // namespace
 
 extern "C" {
@@ -194,6 +246,8 @@ int trt_bridge_register_shlwapi(void) {
       {"PathFindExtensionW", (void*)&shw_PathFindExtensionW},
       {"PathRemoveExtensionW", (void*)&shw_PathRemoveExtensionW},
       {"PathIsRelativeW", (void*)&shw_PathIsRelativeW},
+      {"PathCanonicalizeW", (void*)&shw_PathCanonicalizeW},
+      {"SHDeleteKeyW", (void*)&shw_SHDeleteKeyW},
   };
   trt_module_register("shlwapi.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

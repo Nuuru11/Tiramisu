@@ -1,25 +1,44 @@
 // tiramisu/tests/test_corpus.cpp
-// The real-game corpus load matrix, hardware-free:
+// The real-game corpus load matrix, hardware-free — with the STAGE 4
+// FILE-LEVEL DRY-RUN audit:
 //
-//   for every PE on argv: read the file, check MZ + machine (x86 guests are
-//   SKIPped — the M7 x86 engine is not present), then walk the EXACT load
-//   path test_real_load proves: mmap backend -> trt_map_pe -> trt_seal_image
-//   through trt_resolver_default + trt_modules_register_defaults.
+//   for every PE on argv: read the file bytes, check MZ + machine (x86
+//   guests are SKIPped), then DRY-RUN the import directory DIRECTLY FROM
+//   THE FILE (no mapping, no code execution): parse the PE import table
+//   in-place and bind-simulate every import:
 //
-//   After binding, the image import table is walked and one line is printed
-//   per imported DLL:
+//     BUILTIN binds iff the symbol is registered  -> trt_module_query /
+//                                                   trt_module_query_ordinal
+//     APISET contracts                            -> trt_apiset_target, then
+//                                                   the target module
+//     SYSTEM binds iff on the console whitelist   -> whitelist_has()
+//     the PE file's OWN DIRECTORY is searched FIRST for game-shipped DLLs
+//       (mirror of the console host searching the game dir via VFS): a
+//       sibling DLL binds whatever it exports (export table check via the
+//       same on-file walk; a sibling that itself fails the dry-run reports
+//       its own gap line)
+//     everything else fails NAMED
 //
-//     <dll> route=<SYSTEM|BUILTIN|STUB|APISET> imports=<n> bound=<n> unresolved=<names-or-dash>
+//   The dry-run prints one report line per imported DLL REGARDLESS of what
+//   the live map does afterwards:
 //
-//   STUB thunks count as bound: they are fail-visible at CALL time (the
-//   thunk names its module!symbol), never at load time. The per-DLL lines
-//   ARE the work list — every STUB and every unresolved name is roadmap.
+//     <dll> route=<SYSTEM|BUILTIN|STUB|APISET|GAMEDIR> imports=<n> bound=<n>
+//           unresolved=<names-or-dash>
 //
-//   Verdict per PE: "LOAD OK <name>" (every import bound through its route)
-//   or "LOAD FAILED <name>: <reason>" (the loader names module!symbol).
+//   Then the LIVE map attempt runs (the exact path test_real_load proves:
+//   mmap backend -> trt_map_pe -> trt_seal_image through
+//   trt_resolver_default + trt_modules_register_defaults + the game-dir
+//   image loader). Verdict per PE:
+//     LOAD OK <name>                       live map succeeded
+//     LOAD FAILED <name>: <first named failure>
+//   The PER-DLL REPORT EXISTS EITHER WAY — that is what turns a boot
+//   failure into the complete work list offline.
+//
 //   Summary: "CORPUS: <n> ok, <m> failed, <k> skipped". Exit 0 iff no
 //   LOAD FAILED.
 #include "../src/trt/trt.h"
+#include "../src/trt/images.h"
+#include "../src/trt/pe.h"
 #include "../src/trt/thunk.h"
 #include "../src/trt/apiset.h"
 
@@ -27,6 +46,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+
+static int g_uncertain_bound = 0;  // SYSTEM(C) binds across the corpus
 #include <unistd.h>
 
 extern "C" {
@@ -133,6 +154,9 @@ void linux_log(const char* line) {
 //   - xboxnative console evidence (the k_defaults SYSTEM set in
 //     module_table.cpp): hid, setupapi, version, shcore, avrt, d3d11, dxgi,
 //     d2d1, dwrite, dcomp, xinput1_4 (as XINPUTUAP), ws2_32, ucrtbase.
+//   - STAGE 4 addition, module_table.cpp: d3d12.dll / d3d12core.dll (Xbox
+//     UWP ships D3D12 — UWP API set) and dstorage.dll / dstoragecore.dll
+//     (games normally ship their own; SYSTEM is the console fallback).
 //   - api-ms-win-* contracts: not files on the console; the apiset layer
 //     (apiset.cpp) redirects them to their implementing DLL BEFORE the
 //     system loader is consulted, so every contract prefix is accepted.
@@ -154,18 +178,45 @@ void linux_log(const char* line) {
 //   the Reg* surface only — token APIs (OpenProcessToken & co) fall through
 //   to BUILTIN-symbol-missing -> system loader, which also says no: the
 //   import fails NAMED. That is the honest work list, not a fake bind.
-const char* const k_console_dlls[] = {
-    "hid.dll", "setupapi.dll", "version.dll", "shcore.dll", "avrt.dll",
-    "d3d11.dll", "dxgi.dll", "d2d1.dll", "dwrite.dll", "dcomp.dll",
-    "xinput1_4.dll", "ws2_32.dll",
-    "kernel32.dll", "kernelbase.dll", "ntdll.dll", "ucrtbase.dll",
-    "combase.dll", "user32.dll",
-    "vcruntime140.dll", "msvcp140.dll", "vcruntime140_app.dll",
-    "msvcp140_app.dll",
-    // advapi32: the token/security half is UWP-allowed on console
-    // (OpenProcessToken/GetTokenInformation/ConvertStringSecurityDescriptor*);
-    // the registry half is our BUILTIN bridge (bridge_reg).
-    "advapi32.dll",
+// Provenance classes for the offline console model. The class rides the
+// report line so a LOAD OK can never be misread as "console-boot-proven"
+// for a DLL whose console presence is only assumed:
+//   P = PROVEN    — the xboxnative donor lane loaded it on console hardware
+//   U = UWP       — in the documented UWP API family (OS ships it for
+//                   AppContainer processes; the surface is the OS's)
+//   C = UNCERTAIN — a real game imports it; console presence unproven.
+//                   The console run decides (a named LoadLibrary failure
+//                   there is the answer, and the corpus already predicted it)
+struct console_dll { const char* name; char cls; };
+const console_dll k_console_dlls[] = {
+    // ---- P: xboxnative donor lane (hardware-proven) ----
+    {"hid.dll", 'P'}, {"setupapi.dll", 'P'}, {"version.dll", 'P'},
+    {"shcore.dll", 'P'}, {"avrt.dll", 'P'},
+    // ---- U: documented UWP API family ----
+    {"d3d11.dll", 'U'}, {"dxgi.dll", 'U'}, {"d2d1.dll", 'U'},
+    {"dwrite.dll", 'U'}, {"dcomp.dll", 'U'}, {"xinput1_4.dll", 'U'},
+    {"ws2_32.dll", 'U'}, {"d3d12.dll", 'U'}, {"d3d12core.dll", 'U'},
+    {"bcrypt.dll", 'U'}, {"winhttp.dll", 'U'},
+    {"kernel32.dll", 'U'}, {"kernelbase.dll", 'U'}, {"ntdll.dll", 'U'},
+    {"ucrtbase.dll", 'U'}, {"combase.dll", 'U'}, {"user32.dll", 'U'},
+    {"advapi32.dll", 'U'},  // token half UWP-documented; registry half is BUILTIN
+    // ---- CRT redist aliases (distributable, ship-in-package class) ----
+    {"vcruntime140.dll", 'U'}, {"msvcp140.dll", 'U'},
+    {"vcruntime140_app.dll", 'U'}, {"msvcp140_app.dll", 'U'},
+    // ---- C: UNCERTAIN — real imports (Unity stack), console presence
+    //      unproven; the TV run names the answer ----
+    {"dbghelp.dll", 'C'}, {"dbgcore.dll", 'C'},
+    {"crypt32.dll", 'C'}, {"psapi.dll", 'C'},
+    {"iphlpapi.dll", 'C'},
+    {"wininet.dll", 'C'},   // WinINet is documented NOT available to UWP —
+                            // whitelisted only because the OS image may
+                            // still carry the DLL; expect the console run
+                            // to say no, in which case this moves to the
+                            // BUILTIN fail-visible list
+    {"imm32.dll", 'C'},
+    {"dstorage.dll", 'C'}, {"dstoragecore.dll", 'C'},  // GDK-class, the demo
+                            // ships its own copy anyway (game-dir search
+                            // hits first)
     // NOTE: gdi32 / comctl32 / shlwapi are NOT here — desktop-shell DLLs,
     // console LoadLibrary fails in an AppContainer. They are BUILTIN
     // bridges now; whitelisting them would fake the bind.
@@ -183,6 +234,13 @@ bool wl_ieq(const char* a, const char* b) {
   return *a == *b;
 }
 
+char whitelist_class(const char* module) {
+  if (!module) return '?';
+  for (const console_dll& d : k_console_dlls)
+    if (wl_ieq(d.name, module)) return d.cls;
+  return '?';
+}
+
 bool whitelist_has(const char* module) {
   if (!module) return false;
   // api-ms-win-* contracts: accepted by prefix (the apiset layer usually
@@ -191,8 +249,8 @@ bool whitelist_has(const char* module) {
       wl_lower(module[2]) == 'i' && module[3] == '-' && module[4] == 'm' &&
       module[5] == 's')
     return true;
-  for (const char* d : k_console_dlls)
-    if (wl_ieq(d, module)) return true;
+  for (const console_dll& d : k_console_dlls)
+    if (wl_ieq(d.name, module)) return true;
   return false;
 }
 
@@ -249,12 +307,316 @@ const char* base_name(const char* path) {
 void route_label(const char* dll, char* out, size_t cap) {
   if (trt_apiset_is_contract(dll)) { snprintf(out, cap, "APISET"); return; }
   switch (trt_module_route(dll)) {
-    case TRT_ROUTE_SYSTEM:  snprintf(out, cap, "SYSTEM");  break;
+    case TRT_ROUTE_SYSTEM: {
+      char c = whitelist_class(dll);
+      snprintf(out, cap, c == 'P' ? "SYSTEM(P)" : (c == 'U' ? "SYSTEM(U)" : "SYSTEM(C)"));
+      break;
+    }
     case TRT_ROUTE_BUILTIN: snprintf(out, cap, "BUILTIN"); break;
     case TRT_ROUTE_STUB:    snprintf(out, cap, "STUB");    break;
     default:                snprintf(out, cap, "SYSTEM");  break; // console-real
   }
 }
+
+// ---------------------------------------------------------------------------
+// STAGE 4: FILE-LEVEL DRY-RUN AUDIT
+//
+// Parse the import directory directly from the file bytes (RVA -> file
+// offset via the section table) and bind-simulate every import. Prints the
+// same per-DLL report lines as the live walk, plus the first named gap.
+// Returns 0 iff every import binds; *first_gap gets "<dll>!<sym>".
+//
+// Bind simulation, in loader order (mirrors trt_resolve_full +
+// resolve_through_table):
+//   1. game-dir sibling DLL that exports the symbol (the console host
+//      searches the game dir FIRST via VFS)
+//   2. APISET contract -> target module, then module table query
+//   3. BUILTIN iff trt_module_query says the fn is registered
+//   4. STUB always binds (fail-visible thunk)
+//   5. SYSTEM iff on the console whitelist
+//   6. otherwise NAMED failure
+// ---------------------------------------------------------------------------
+
+// File PE header accessors through the packed trt_* structs (no raw offset
+// math — the struct layout IS the PE layout, pack(1)).
+struct file_pe {
+  const u8* file; size_t size;
+  const trt_nt_headers64* nt;
+  const trt_section_header* secs; u32 nsec;
+};
+bool file_pe_open(const u8* file, size_t size, file_pe* out) {
+  if (size < 0x40 + 8 || rd16b(file) != 0x5A4D) return false;
+  const u64 nt_off = rd32b(file + 0x3C);
+  if (nt_off + sizeof(trt_nt_headers64) > size ||
+      rd32b(file + nt_off) != 0x00004550)
+    return false;
+  out->file = file;
+  out->size = size;
+  out->nt = (const trt_nt_headers64*)(file + nt_off);
+  out->nsec = rd16b((const u8*)&out->nt->file_header.number_of_sections);
+  if (out->nsec == 0 || out->nsec > 96) return false;
+  out->secs = (const trt_section_header*)(
+      (const u8*)&out->nt->optional_header +
+      rd16b((const u8*)&out->nt->file_header.size_of_optional_header));
+  if ((const u8*)out->secs + (size_t)out->nsec * sizeof(trt_section_header) >
+      file + size)
+    return false;
+  return true;
+}
+
+// RVA -> file offset through the section table (fall back to the headers
+// region where RVA == file offset). 0 = unreadable (BSS tail / out of file).
+u64 rva_to_file(const u8* file, size_t size, const trt_section_header* secs,
+                u32 nsec, u64 rva) {
+  for (u32 i = 0; i < nsec; ++i) {
+    const u64 va = rd32b((const u8*)&secs[i].virtual_address);
+    const u64 vsz = rd32b((const u8*)&secs[i].virtual_size);
+    const u64 rsz = rd32b((const u8*)&secs[i].size_of_raw_data);
+    const u64 roff = rd32b((const u8*)&secs[i].pointer_to_raw_data);
+    if (rva >= va && rva < va + (vsz ? vsz : rsz)) {
+      const u64 delta = rva - va;
+      if (delta < rsz && roff + delta < size) return roff + delta;
+      return 0;  // in BSS tail / out of file: no bytes to inspect
+    }
+  }
+  // headers region: RVA == file offset
+  if (rva + 1 < size) return rva;
+  return 0;
+}
+
+// Does a file PE export this name or ordinal? (dry-run export table walk)
+// MSVC-mangled imports ("?CreateDXGIFactory2@@...") also match the export
+// whose decorated name starts with the same base between '?' and the first
+// '@' (the same fallback resolve_through_table applies).
+bool file_exports(const u8* file, size_t size, const u8* sec_base, u32 nsec,
+                  const char* name, u16 ordinal) {
+  file_pe pe;
+  if (!file_pe_open(file, size, &pe)) return false;
+  (void)sec_base; (void)nsec;
+  const trt_data_directory* dir =
+      &pe.nt->optional_header.directories[TRT_PE_DIR_EXPORT];
+  if (!dir->virtual_address || !dir->size) return false;
+  const u64 ed_off =
+      rva_to_file(file, size, pe.secs, pe.nsec, dir->virtual_address);
+  if (!ed_off || ed_off + 40 > size) return false;
+  const u32 n_funcs = rd32b(file + ed_off + 20);
+  const u32 n_names = rd32b(file + ed_off + 24);
+  const u32 ord_base = rd32b(file + ed_off + 16);
+  if (n_funcs > (1u << 20) || n_names > (1u << 20)) return false;
+
+  if (name) {
+    const u64 names_off = rva_to_file(file, size, pe.secs, pe.nsec,
+                                      rd32b(file + ed_off + 32));
+    if (!names_off) return false;
+    char base[128];
+    const char* base_at = nullptr;
+    if (name[0] == '?') {
+      const char* at = strstr(name, "@@");
+      if (at && (size_t)(at - name) < 128) {
+        const size_t len = (size_t)(at - name - 1);
+        memcpy(base, name + 1, len);
+        base[len] = 0;
+        base_at = base;
+      }
+    }
+    for (u32 i = 0; i < n_names; ++i) {
+      const u64 nm_rva = rd32b(file + names_off + (size_t)i * 4);
+      const u64 nm_off = rva_to_file(file, size, pe.secs, pe.nsec, nm_rva);
+      if (!nm_off || nm_off >= size) continue;
+      const char* sym = (const char*)(file + nm_off);
+      if (strncmp(sym, name, 256) == 0) return true;
+      if (base_at && strncmp(sym, base_at, strlen(base_at)) == 0 &&
+          (sym[strlen(base_at)] == '@' || sym[strlen(base_at)] == 0))
+        return true;
+    }
+    return false;
+  }
+  // ordinal import: within [base, base + count)
+  return ordinal >= ord_base && (u32)ordinal - ord_base < n_funcs;
+}
+
+// The game dir being tested (set before each PE). Sibling search = the
+// console host searching the game dir via VFS.
+char g_game_dir[1024] = "";
+
+// Sibling DLL file in the game dir, or nullptr. Caller frees.
+u8* find_game_sibling(const char* dll, char* out_path, size_t cap,
+                      size_t* out_size) {
+  if (!g_game_dir[0]) return nullptr;
+  char path[1280];
+  snprintf(path, sizeof(path), "%s/%s", g_game_dir, dll);
+  size_t sz = 0;
+  u8* buf = read_file(path, &sz);
+  if (!buf) return nullptr;
+  snprintf(out_path, cap, "%s", path);
+  *out_size = sz;
+  return buf;
+}
+
+// A file PE's section table (for rva_to_file on siblings) — struct-based.
+bool file_sec_table(const u8* file, size_t size, const trt_section_header** secs,
+                    u32* nsec) {
+  file_pe pe;
+  if (!file_pe_open(file, size, &pe)) return false;
+  *secs = pe.secs;
+  *nsec = pe.nsec;
+  return true;
+}
+
+struct dry_result {
+  int imports = 0;
+  int bound = 0;
+  char unresolved[512];
+  char first_gap[224];
+};
+
+// dry-run one import descriptor's thunks (file offsets, not RVAs)
+void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
+                u32 nsec, const char* dll_name, u64 int_off, u64 iat_off,
+                dry_result* out) {
+  out->unresolved[0] = 0;
+  out->first_gap[0] = 0;
+  if (!int_off || int_off + 8 > size) return;  // nothing readable to walk
+  for (u64 t = 0;; t += 8) {
+    const u64 t_off = int_off + t;
+    if (t_off + 8 > size) break;
+    const u64 thunk = rd64b(file + t_off);
+    if (thunk == 0) break;
+    ++out->imports;
+    const char* sym_name = nullptr;
+    u16 ordinal = 0;
+    if (thunk >> 63) {
+      ordinal = (u16)(thunk & 0xFFFF);
+    } else {
+      const u64 hn_off = rva_to_file(file, size, secs,
+                                     nsec, (u32)(thunk & 0x7FFFFFFFu));
+      if (!hn_off || hn_off + 2 >= size) {
+        char one[160];
+        snprintf(one, sizeof(one), "%s!<bad hint/name rva>", dll_name);
+        if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
+        if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
+        strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+        continue;
+      }
+      sym_name = (const char*)(file + hn_off + 2);
+      if (strnlen(sym_name, 256) == 256) {
+        char one[160];
+        snprintf(one, sizeof(one), "%s!<unterminated symbol>", dll_name);
+        if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
+        if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
+        strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+        continue;
+      }
+    }
+    (void)iat_off;
+
+    bool binds = false;
+
+    // ---- 1. game-dir sibling FIRST (console host searches the game dir
+    //         via VFS before consulting the system) ----
+    char sib_path[1280];
+    size_t sib_size = 0;
+    u8* sib = find_game_sibling(dll_name, sib_path, sizeof(sib_path), &sib_size);
+    if (sib) {
+      const u8* sib_sec = nullptr;
+      u32 sib_nsec = 0;
+      const trt_section_header* sib_secs = nullptr;
+      if (rd16b(sib) == 0x5A4D &&
+          file_sec_table(sib, sib_size, &sib_secs, &sib_nsec)) {
+        binds = file_exports(sib, sib_size, (const u8*)sib_secs, sib_nsec,
+                             sym_name, ordinal);
+      }
+      free(sib);
+    }
+
+    // ---- 2/3/4. module table (+ apiset redirect), STUB always binds ----
+    if (!binds && sym_name) {
+      binds = trt_module_query(dll_name, sym_name) != 0;
+    } else if (!binds && ordinal) {
+      binds = trt_module_query_ordinal(dll_name, ordinal) != 0;
+    }
+
+    // ---- 5. SYSTEM iff on the console whitelist ----
+    if (!binds && whitelist_has(dll_name)) binds = true;
+
+    if (binds) {
+      ++out->bound;
+    } else {
+      char one[160];
+      if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
+      else snprintf(one, sizeof(one), "%s!#%u", dll_name, (unsigned)ordinal);
+      if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
+      if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
+      strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+    }
+  }
+}
+
+void dry_run_pe(const char* path, const char* name, const u8* file,
+                size_t size) {
+  (void)path;
+  file_pe pe;
+  if (!file_pe_open(file, size, &pe)) {
+    printf("  dry-run: PE HEADERS UNREADABLE\n");
+    return;
+  }
+  const trt_data_directory* imp_dir =
+      &pe.nt->optional_header.directories[TRT_PE_DIR_IMPORT];
+  const u32 imp_va = imp_dir->virtual_address;
+  const u32 imp_sz = imp_dir->size;
+  if (!imp_va || !imp_sz) {
+    printf("  dry-run: (no import directory)\n");
+    return;
+  }
+  const u64 imp_off = rva_to_file(file, size, pe.secs, pe.nsec, imp_va);
+  if (!imp_off) {
+    printf("  dry-run: IMPORT DIR UNREADABLE (rva=%x)\n", imp_va);
+    return;
+  }
+
+  printf("  dry-run (file-level import audit, game dir first):\n");
+  for (u32 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz &&
+                  imp_off + d + sizeof(trt_import_descriptor) <= size;
+       d += sizeof(trt_import_descriptor)) {
+    const u8* dp = file + imp_off + d;
+    const u32 oft = rd32b(dp);
+    const u32 name_rva = rd32b(dp + 12);
+    const u32 iat_rva = rd32b(dp + 16);
+    if (!iat_rva && !name_rva) break;  // terminator
+    const u64 nm_off = rva_to_file(file, size, pe.secs, pe.nsec, name_rva);
+    if (!nm_off || nm_off >= size) {
+      printf("    <bad dll name rva %x> route=? imports=0 bound=0\n", name_rva);
+      continue;
+    }
+    char dll_name[96];
+    snprintf(dll_name, sizeof(dll_name), "%s", (const char*)(file + nm_off));
+    const u64 int_off = rva_to_file(file, size, pe.secs, pe.nsec,
+                                    oft ? oft : iat_rva);
+    dry_result r;
+    if (int_off) {
+      dry_thunks(file, size, pe.secs, pe.nsec, dll_name, int_off, 0, &r);
+    } else {
+      r.imports = 0; r.bound = 0;
+      r.unresolved[0] = 0; r.first_gap[0] = 0;
+    }
+
+    // route label: a dll the game ships in its own dir reports GAMEDIR
+    char route[16];
+    char sib_probe[1280];
+    size_t sib_sz = 0;
+    u8* sib = find_game_sibling(dll_name, sib_probe, sizeof(sib_probe), &sib_sz);
+    if (sib) { snprintf(route, sizeof(route), "GAMEDIR"); free(sib); }
+    else route_label(dll_name, route, sizeof(route));
+
+    printf("    %s route=%s imports=%d bound=%d stubs=%d unresolved=%s\n",
+           dll_name, route, r.imports, r.bound, stub_count_for(dll_name),
+           r.unresolved[0] ? r.unresolved : "-");
+  }
+}
+
+// ---------------------------------------------------------------------------
+// live map + bound-import walk (unchanged discipline from STAGE 3)
+// ---------------------------------------------------------------------------
 
 int run_corpus(int argc, char** argv) {
   trt_backend be{&linux_alloc, &linux_protect, &linux_release, &linux_log,
@@ -265,9 +627,8 @@ int run_corpus(int argc, char** argv) {
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
   trt_set_system_loader(&console_system_load);
-
-  trt_resolver rs;
-  trt_resolver_default(&rs);
+  // Load-only: map/bind/seal game DLLs, never run their DllMain/TLS
+  trt_set_image_code_run(0);
 
   printf("tiramisu real-game corpus load matrix\n");
 
@@ -277,6 +638,26 @@ int run_corpus(int argc, char** argv) {
   for (int a = 1; a < argc; ++a) {
     const char* path = argv[a];
     const char* name = base_name(path);
+
+    // the game dir for this PE = the directory containing it (the console
+    // host searches the game dir via VFS). The runtime resolver uses it to
+    // load game-shipped DLLs on demand (images.cpp try_load_sibling).
+    {
+      const char* slash = strrchr(path, '/');
+      if (slash) {
+        const size_t dlen = (size_t)(slash - path);
+        if (dlen < sizeof(g_game_dir)) {
+          memcpy(g_game_dir, path, dlen);
+          g_game_dir[dlen] = 0;
+        } else {
+          g_game_dir[0] = 0;
+        }
+      } else {
+        g_game_dir[0] = '.';
+        g_game_dir[1] = 0;
+      }
+    }
+    trt_runtime_init(&be, g_game_dir);
 
     size_t size = 0;
     u8* file = read_file(path, &size);
@@ -302,20 +683,23 @@ int run_corpus(int argc, char** argv) {
       ++n_skipped; free(file); continue;
     }
 
-    // ---- map + seal, exactly like test_real_load ----
+    // ---- STAGE 4: the file-level dry-run audit runs BEFORE the live map
+    // and produces the full per-DLL report even when the live load dies.
+    // Fresh guest-image registry per PE: a stale sibling from the previous
+    // game dir must never satisfy this game's imports.
+    trt_images_reset();
     stub_reset();  // per-PE stub counts (the report is per-DLL per-PE)
-    trt_image* img = nullptr;
-    const int rc = trt_map_pe(&be, &rs, file, size, &img);
-    if (rc != TRT_OK || !img) {
-      printf("LOAD FAILED %s: map: %s (%s)\n", name, trt_errstr(rc),
-             img ? img->last_detail : "no image");
+    printf("-- %s --\n", name);
+    dry_run_pe(path, name, file, size);
+
+    // ---- live map + seal: the exe goes through the runtime loader
+    // (game-dir sibling search), exactly like test_libload / the console
+    // host. Preferred base 0 = the image's own ImageBase.
+    stub_reset();  // fresh per-PE stub observation for the live report
+    trt_image* img = trt_load_pe(path, name, 0);
+    if (!img) {
+      printf("LOAD FAILED %s: map (see [trt] lines above for the named gap)\n", name);
       ++n_failed; any_failed = true; free(file); continue;
-    }
-    const int seal_rc = trt_seal_image(&be, img);
-    if (seal_rc != TRT_OK) {
-      printf("LOAD FAILED %s: seal: %s\n", name, trt_errstr(seal_rc));
-      trt_unmap(&be, img); free(file);
-      ++n_failed; any_failed = true; continue;
     }
 
     // ---- walk the bound image's import table: one line per DLL ----
@@ -327,6 +711,7 @@ int run_corpus(int argc, char** argv) {
     const u64 imp_sz = rd32b((const u8*)&nt->optional_header.directories[1].size);
 
     if (imp_va && imp_sz && imp_va + imp_sz <= size_of_image) {
+      printf("  live (bound image import walk):\n");
       for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
            d += sizeof(trt_import_descriptor)) {
         const trt_import_descriptor* desc =
@@ -375,21 +760,24 @@ int run_corpus(int argc, char** argv) {
 
         char route[16];
         route_label(dll_name, route, sizeof(route));
-        printf("%s route=%s imports=%d bound=%d stubs=%d unresolved=%s\n",
+        if (strncmp(route, "SYSTEM(C)", 9) == 0) ++g_uncertain_bound;
+        printf("    %s route=%s imports=%d bound=%d stubs=%d unresolved=%s\n",
                dll_name, route, imports, imports - n_unresolved, stubs,
                unresolved[0] ? unresolved : "-");
       }
     } else {
-      printf("  (no import directory)\n");
+      printf("  live: (no import directory)\n");
     }
 
     printf("LOAD OK %s\n", name);
     ++n_ok;
-    trt_unmap(&be, img);
     free(file);
   }
 
-  printf("\nCORPUS: %d ok, %d failed, %d skipped\n", n_ok, n_failed, n_skipped);
+  printf("\nCORPUS: %d ok, %d failed, %d skipped", n_ok, n_failed, n_skipped);
+  if (g_uncertain_bound)
+    printf("  [NOTE: %d DLLs bound via UNCERTAIN SYSTEM routes (C) - console presence unproven, the TV run names them]", g_uncertain_bound);
+  printf("\n");
   return any_failed ? 1 : 0;
 }
 

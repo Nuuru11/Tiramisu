@@ -252,6 +252,56 @@ trt_route trt_module_route(const char* name) {
   return mi < 0 ? TRT_ROUTE_MISSING : g_modules[mi].route;
 }
 
+// ---- offline bind-simulation query (corpus dry-run) -----------------------
+// Same lookup discipline as resolve_through_table: apiset redirect first,
+// then the registered table. Returns nonzero iff a BUILTIN route can bind
+// the NAMED symbol (or the route always binds: STUB thunk / SYSTEM host).
+// Unknown module or unknown BUILTIN symbol -> 0: the caller decides via its
+// SYSTEM whitelist / game-dir search, exactly like the live loader would.
+int trt_module_query(const char* module, const char* symbol) {
+  if (!module) return 0;
+  const char* target = trt_apiset_target(module);
+  if (!target) target = module;
+  const int mi = find_module(target);
+  if (mi < 0) return 0;
+  const builtin_mod& m = g_modules[mi];
+  if (m.route == TRT_ROUTE_STUB || m.route == TRT_ROUTE_SYSTEM) return 1;
+  if (m.route != TRT_ROUTE_BUILTIN || !symbol) return 0;
+  for (int i = 0; i < m.fn_count; ++i)
+    if (strcmp(m.fns[i].name, symbol) == 0) return 1;
+  // MSVC-mangled imports: match the base name between '?' and '@@'
+  // (same fallback resolve_through_table applies)
+  if (symbol[0] == '?') {
+    const char* at = strstr(symbol, "@@");
+    if (at && (size_t)(at - symbol) < 128) {
+      const size_t len = (size_t)(at - symbol - 1);
+      char base[128];
+      memcpy(base, symbol + 1, len);
+      base[len] = 0;
+      for (int i = 0; i < m.fn_count; ++i)
+        if (strcmp(m.fns[i].name, base) == 0) return 1;
+    }
+  }
+  return 0;
+}
+
+int trt_module_query_ordinal(const char* module, u16 ordinal) {
+  if (!module || !ordinal) return 0;
+  const char* target = trt_apiset_target(module);
+  if (!target) target = module;
+  const int mi = find_module(target);
+  if (mi < 0) return 0;
+  const builtin_mod& m = g_modules[mi];
+  if (m.route == TRT_ROUTE_STUB || m.route == TRT_ROUTE_SYSTEM) return 1;
+  if (m.route != TRT_ROUTE_BUILTIN) return 0;
+  // ordinal-only BUILTIN binds iff the table registered "#<ordinal>"
+  char ord_name[16];
+  snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
+  for (int i = 0; i < m.fn_count; ++i)
+    if (strcmp(m.fns[i].name, ord_name) == 0) return 1;
+  return 0;
+}
+
 void trt_set_system_loader(trt_system_load fn) { g_system_load = fn; }
 
 void trt_resolver_default(trt_resolver* out) {
@@ -287,6 +337,17 @@ struct mod_default { const char* name; trt_route route; };
 const mod_default k_defaults[] = {
     // ---- graphics / presentation (console ships these) ----
     {"d3d11.dll", TRT_ROUTE_SYSTEM},
+    // Xbox UWP ships D3D12 (UWP app model; DirectStorage sits on it).
+    // Provenance: Xbox UWP D3D12 is exposed through the API set schema and
+    // LoadLibrary("d3d12.dll") resolves in the AppContainer.
+    {"d3d12.dll", TRT_ROUTE_SYSTEM},
+    {"d3d12core.dll", TRT_ROUTE_SYSTEM},
+    // DirectStorage: games normally SHIP dstorage.dll/dstoragecore.dll in
+    // their own directory (the Go Next corpus does); the console also
+    // carries them, so route SYSTEM as fallback when the game does not
+    // bring its own copy.
+    {"dstorage.dll", TRT_ROUTE_SYSTEM},
+    {"dstoragecore.dll", TRT_ROUTE_SYSTEM},
     {"dxgi.dll", TRT_ROUTE_SYSTEM},
     {"d3dcompiler_47.dll", TRT_ROUTE_SYSTEM},
     {"dcomp.dll", TRT_ROUTE_SYSTEM},
@@ -299,6 +360,9 @@ const mod_default k_defaults[] = {
     {"gdi32.dll", TRT_ROUTE_BUILTIN},
     {"comctl32.dll", TRT_ROUTE_BUILTIN},  // M?: common-controls acceptance
     {"dwmapi.dll", TRT_ROUTE_SYSTEM},
+    // UIAutomationCore: UnityPlayer imports the Uia* accessibility surface;
+    // console has no UIA — STUB binds fail-visible, calls name themselves
+    {"uiautomationcore.dll", TRT_ROUTE_STUB},
     {"uxtheme.dll", TRT_ROUTE_SYSTEM},
     {"msimg32.dll", TRT_ROUTE_SYSTEM},
 

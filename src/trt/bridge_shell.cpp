@@ -28,6 +28,7 @@
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <errno.h>
 #endif
 
 namespace shellhelpers {
@@ -272,6 +273,85 @@ void* TRT_GUEST_ABI shell_ShellExecuteW(void* hwnd, const u16* verb,
 // ---- ILFree/ILCreateFromPath come in pairs; no shell item parsing here ----
 void TRT_GUEST_ABI shell_ILFree(void* pidl) { free(pidl); }
 
+// ---- SHCreateDirectoryExW (UnityCrashHandler): create a directory path ----
+// Real semantics: creates nested dirs, returns ERROR_ALREADY_EXISTS (183)
+// when the leaf already exists, ERROR_SUCCESS (0) on creation.
+int TRT_GUEST_ABI shell_SHCreateDirectoryExW(void* hwnd, const u16* path,
+                                             void* attr) {
+  (void)hwnd; (void)attr;
+  char host[1024];
+  if (!path || trt_vfs_resolve_utf16(path, host, sizeof(host)) != 0) {
+    char line[96];
+    snprintf(line, sizeof(line), "shell: SHCreateDirectoryExW -> path unresolvable");
+    log_line(line);
+    return (int)0x8007000B;  // E_INVALIDARG-shaped: named failure
+  }
+  char line[224];
+  const int rc = shellhelpers::mk_dir(host);
+  if (rc == 0) {
+    snprintf(line, sizeof(line), "shell: SHCreateDirectoryExW %s -> created", host);
+    log_line(line);
+    return 0;
+  }
+  if (errno == EEXIST) {
+    snprintf(line, sizeof(line),
+             "shell: SHCreateDirectoryExW %s -> ERROR_ALREADY_EXISTS", host);
+    log_line(line);
+    return 183;
+  }
+  snprintf(line, sizeof(line),
+           "shell: SHCreateDirectoryExW %s -> mkdir failed (errno=%d)", host, errno);
+  log_line(line);
+  return (int)0x80070005;  // E_ACCESSDENIED-shaped: named failure
+}
+
+// ---- CommandLineToArgvW (UnityPlayer + crash handler): standard argv split
+// Real semantics: returns pointer to [argv0..argvN, NULL] in one buffer;
+// *lpNumArgs gets the count. Program name is argv0.
+u16** TRT_GUEST_ABI shell_CommandLineToArgvW(const u16* cmdline, i32* count) {
+  if (!count) return nullptr;
+  *count = 0;
+  if (!cmdline) return nullptr;  // real ole32 faults; we fail named
+  // tokenize honoring quotes
+  static u16* argv_buf[64];
+  static u16 storage[64][512];
+  static u16* tail[2] = {nullptr, nullptr};
+  u32 nargs = 0;
+  u32 i = 0;
+  while (cmdline[i] && nargs < 64) {
+    while (cmdline[i] == ' ' || cmdline[i] == '\t') ++i;
+    if (!cmdline[i]) break;
+    u32 j = 0;
+    bool in_quotes = false;
+    while (cmdline[i] && (in_quotes || (cmdline[i] != ' ' && cmdline[i] != '\t'))) {
+      if (cmdline[i] == '"') { in_quotes = !in_quotes; ++i; continue; }
+      if (j < 512 - 1) storage[nargs][j++] = cmdline[i];
+      ++i;
+    }
+    storage[nargs][j] = 0;
+    argv_buf[nargs] = storage[nargs];
+    ++nargs;
+  }
+  tail[0] = nullptr;
+  argv_buf[nargs] = nullptr;
+  *count = (i32)nargs;
+  char line[96];
+  snprintf(line, sizeof(line), "shell: CommandLineToArgvW -> %u args", nargs);
+  log_line(line);
+  return argv_buf;
+}
+
+// ---- SHFileOperationW (UnityPlayer): file copy/move/delete/rename.
+// v0: no shell file ops — fail VISIBLY with the op code named so the work
+// item is in the log, never silently pretend success.
+int TRT_GUEST_ABI shell_SHFileOperationW(void* op) {
+  char line[128];
+  snprintf(line, sizeof(line),
+           "shell: SHFileOperationW -> 0xDE7A (named: no shell file ops yet)");
+  log_line(line);
+  return 0xDE7A;
+}
+
 }  // namespace
 
 extern "C" {
@@ -284,6 +364,9 @@ int trt_bridge_register_shell(void) {
       {"ShellExecuteExW", (void*)&shell_ShellExecuteExW},
       {"ShellExecuteW", (void*)&shell_ShellExecuteW},
       {"ILFree", (void*)&shell_ILFree},
+      {"SHCreateDirectoryExW", (void*)&shell_SHCreateDirectoryExW},
+      {"CommandLineToArgvW", (void*)&shell_CommandLineToArgvW},
+      {"SHFileOperationW", (void*)&shell_SHFileOperationW},
   };
   trt_module_register("shell32.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

@@ -337,6 +337,35 @@ void trt_gpu_set_hooks(const trt_gpu_hooks* hooks) {
 const trt_gpu_hooks* trt_gpu_hooks_get(void) { return &g_hooks; }
 
 int trt_bridge_register_d3d(void) {
+  // ---- dwmapi: the DWM compositor surface UnityPlayer asks for.
+  // On Xbox UWP DWM is the system compositor; DwmGetWindowAttribute is
+  // desktop-only there too, but UnityPlayer boots with the query. v0:
+  // a named no-op answer (attribute unknown -> E_INVALIDARG-shaped), the
+  // API's own failure value, never silent.
+  static const trt_named_fn k_dwm_fns[] = {
+      {"DwmGetWindowAttribute",
+       (void*)+[](void* hwnd, u32 attr, void* out, u32 cap) -> i32 {
+         (void)hwnd; (void)attr; (void)out; (void)cap;
+         char line[128];
+         snprintf(line, sizeof(line),
+                  "dwm: DwmGetWindowAttribute(attr=%u) -> E_INVALIDARG "
+                  "(no DWM attribute surface: fail-visible)", attr);
+         trt_core_log(line);
+         return (int)0x80070057;
+       }},
+      {"DwmSetWindowAttribute",
+       (void*)+[](void* hwnd, u32 attr, const void* val, u32 cap) -> i32 {
+         (void)hwnd; (void)attr; (void)val; (void)cap;
+         char line[128];
+         snprintf(line, sizeof(line),
+                  "dwm: DwmSetWindowAttribute(attr=%u) -> E_INVALIDARG "
+                  "(no DWM attribute surface: fail-visible)", attr);
+         trt_core_log(line);
+         return (int)0x80070057;
+       }},
+  };
+  trt_module_register("dwmapi.dll", TRT_ROUTE_BUILTIN, k_dwm_fns,
+                      (int)(sizeof(k_dwm_fns) / sizeof(k_dwm_fns[0])));
   trt_module_register("d3d11.dll", TRT_ROUTE_BUILTIN, k_d3d11_fns,
                        (int)(sizeof(k_d3d11_fns) / sizeof(k_d3d11_fns[0])));
   trt_module_register("dxgi.dll", TRT_ROUTE_BUILTIN, k_dxgi_fns,

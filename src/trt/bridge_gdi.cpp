@@ -265,6 +265,70 @@ int TRT_GUEST_ABI trt_EndPath(void* hdc) {
   return 1;
 }
 
+// ---- GetObjectA (UnityPlayer): OBJ_BITMAP/FONT/PEN query.
+// v0: a valid DC's objects are all recorded stubs — answer 0-sized (the
+// real GetObjectA returns 0 for a NULL/invalid object; a 0 here is the
+// API's own failure value, so the gap is visible, never fake-filled).
+int TRT_GUEST_ABI trt_GetObjectA(void* handle, int cap, void* out) {
+  (void)handle; (void)cap; (void)out;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: GetObjectA -> 0 (object query not implemented: fail-visible)");
+  log_line(line);
+  return 0;
+}
+
+// ---- pixel-format surface (UnityPlayer wgl-style boot asks) ----
+// Real semantics: ChoosePixelFormat matches the DC against the pixel
+// formats; the console backend owns presentation, so ONE deterministic
+// format descriptor (BPP 32, double-buffered, depth 24) is the honest
+// single-format answer.
+struct px_fmt {
+  u16 size; u16 version; u32 flags;
+  u32 pixel_type; u32 layer;
+  u8 red, green, blue, alpha;
+  u8 depth_bits, stencil_bits, aux_buffers, layer_type;
+  u8 reserved, masks, aux; void*plane;
+};
+int TRT_GUEST_ABI trt_ChoosePixelFormat(void* hdc, const px_fmt* want) {
+  (void)hdc; (void)want;
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: ChoosePixelFormat -> 1 (fixed format)");
+  log_line(line);
+  return 1;  // format index 1: the only one we describe
+}
+int TRT_GUEST_ABI trt_SetPixelFormat(void* hdc, int fmt, const void* descr) {
+  (void)hdc; (void)descr;
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: SetPixelFormat fmt=%d -> 1", fmt);
+  log_line(line);
+  return 1;
+}
+int TRT_GUEST_ABI trt_SwapBuffers(void* hdc) {
+  (void)hdc;
+  log_line("gdi32: SwapBuffers -> backend present pass (no GL surface yet)");
+  return 1;
+}
+int TRT_GUEST_ABI trt_GetDeviceCaps(void* hdc, int index) {
+  (void)hdc;
+  // the indices games actually ask: HORZRES/VERTRES 8/10, BITSPIXEL 12,
+  // PLANES 14, VREFRESH 116, SIZEPALETTE 104
+  int v = 0;
+  switch (index) {
+    case 8:  v = 1280; break;   // HORZRES
+    case 10: v = 720; break;    // VERTRES
+    case 12: v = 32; break;     // BITSPIXEL
+    case 14: v = 1; break;      // PLANES
+    case 116: v = 60; break;    // VREFRESH
+    case 104: v = 256; break;   // SIZEPALETTE
+    default: v = 0; break;
+  }
+  char line[96];
+  snprintf(line, sizeof(line), "gdi32: GetDeviceCaps(%d) -> %d (fixed)", index, v);
+  log_line(line);
+  return v;
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"CreateFontIndirectW", (void*)&trt_CreateFontIndirectW},
@@ -278,6 +342,11 @@ int trt_bridge_register_gdi(void) {
       {"SetBkColor", (void*)&trt_SetBkColor},
       {"BeginPath", (void*)&trt_BeginPath},
       {"EndPath", (void*)&trt_EndPath},
+      {"GetObjectA", (void*)&trt_GetObjectA},
+      {"ChoosePixelFormat", (void*)&trt_ChoosePixelFormat},
+      {"SetPixelFormat", (void*)&trt_SetPixelFormat},
+      {"SwapBuffers", (void*)&trt_SwapBuffers},
+      {"GetDeviceCaps", (void*)&trt_GetDeviceCaps},
   };
   trt_module_register("gdi32.dll", TRT_ROUTE_BUILTIN, k_gdi32_fns,
                       (int)(sizeof(k_gdi32_fns) / sizeof(k_gdi32_fns[0])));

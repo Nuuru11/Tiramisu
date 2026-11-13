@@ -100,6 +100,12 @@ typedef struct trt_named_fn {
 void trt_module_register(const char* name, trt_route route,
                           const trt_named_fn* fns, int fn_count);
 trt_route trt_module_route(const char* name);
+// Offline bind-simulation (corpus dry-run): would this module!symbol bind?
+// BUILTIN -> iff the named fn is registered; STUB/SYSTEM -> always yes
+// (STUB binds fail-visible, SYSTEM binds via the console host). Unknown
+// module or unknown BUILTIN symbol -> 0.
+int trt_module_query(const char* module, const char* symbol);
+int trt_module_query_ordinal(const char* module, u16 ordinal);
 void trt_resolver_default(trt_resolver* out);
 typedef void* (*trt_system_load)(const char* module, const char* symbol);
 void trt_set_system_loader(trt_system_load fn);

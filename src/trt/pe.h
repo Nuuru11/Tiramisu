@@ -67,7 +67,7 @@ typedef struct trt_file_header {
   u32 time_date_stamp;
   u32 pointer_to_symbol_table;
   u32 number_of_symbols;
-  u16 size_of_optional_header;
+  u16 size_of_optional_header;   // +16 (IMAGE_FILE_HEADER is 20 bytes)
   u16 characteristics;
 } trt_file_header;
 

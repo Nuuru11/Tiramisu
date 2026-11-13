@@ -46,6 +46,14 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
 // argument registers differ, so we marshal them.)
 u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d);
 
+// Load-only mode toggle: 0 = map/bind/seal without running TLS callbacks or
+// DllMain (corpus dry-run), 1 (default) = full boot semantics.
+void trt_set_image_code_run(int enable);
+
+// Drop every registered guest image (between corpus PEs: a stale image from
+// a previous game directory must never satisfy the next game's imports).
+void trt_images_reset(void);
+
 #ifdef __cplusplus
 }
 #endif

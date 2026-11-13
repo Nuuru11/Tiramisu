@@ -109,6 +109,36 @@ u32 TRT_GUEST_ABI trt_PlaySoundW(const u16* name, void*, u32 flags) {
   return 1;  // pretend handled so the engine does not retry forever
 }
 
+// ---- waveIn/waveOut full surface (UnityPlayer imports it; the console
+// has NO legacy wave devices — every call answers "no devices" honestly:
+// MMSYSERR_BADDEVICEID (4) / NDRIVER (6), the API's own named failure) ----
+u32 TRT_GUEST_ABI trt_waveInGetNumDevs(void) { return 0; }
+u32 TRT_GUEST_ABI trt_waveInGetDevCapsW(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInGetDevCapsA(u64 h, void* caps, u32 c) {
+  return trt_waveInGetDevCapsW(h, caps, c);  // ANSI twin, same "no devices"
+}
+u32 TRT_GUEST_ABI trt_waveInOpen(u64* handle, u32, u64, u64, u64, u32) {
+  if (handle) *handle = 0;
+  return 6;  // MMSYSERR_NODRIVER
+}
+u32 TRT_GUEST_ABI trt_waveInClose(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInPrepareHeader(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInUnprepareHeader(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInAddBuffer(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInReset(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveInStart(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutGetPosition(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutReset(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutWrite(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutClose(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutOpen(u64* handle, u32, u64, u64, u64, u32) {
+  if (handle) *handle = 0;
+  return 6;  // MMSYSERR_NODRIVER
+}
+u32 TRT_GUEST_ABI trt_waveOutUnprepareHeader(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutPrepareHeader(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64, void*, u32) { return 4; }
+
 int trt_bridge_register_winmm(void) {
   static const trt_named_fn k_fns[] = {
       {"timeGetTime", (void*)&trt_timeGetTime},
@@ -117,6 +147,24 @@ int trt_bridge_register_winmm(void) {
       {"timeGetDevCaps", (void*)&trt_timeGetDevCaps},
       {"waveOutGetNumDevs", (void*)&trt_waveOutGetNumDevs},
       {"waveOutGetDevCapsW", (void*)&trt_waveOutGetDevCapsW},
+      {"waveInGetNumDevs", (void*)&trt_waveInGetNumDevs},
+      {"waveInGetDevCapsW", (void*)&trt_waveInGetDevCapsW},
+      {"waveInGetDevCapsA", (void*)&trt_waveInGetDevCapsA},
+      {"waveInOpen", (void*)&trt_waveInOpen},
+      {"waveInClose", (void*)&trt_waveInClose},
+      {"waveInPrepareHeader", (void*)&trt_waveInPrepareHeader},
+      {"waveInUnprepareHeader", (void*)&trt_waveInUnprepareHeader},
+      {"waveInAddBuffer", (void*)&trt_waveInAddBuffer},
+      {"waveInReset", (void*)&trt_waveInReset},
+      {"waveInStart", (void*)&trt_waveInStart},
+      {"waveOutGetPosition", (void*)&trt_waveOutGetPosition},
+      {"waveOutReset", (void*)&trt_waveOutReset},
+      {"waveOutWrite", (void*)&trt_waveOutWrite},
+      {"waveOutClose", (void*)&trt_waveOutClose},
+      {"waveOutOpen", (void*)&trt_waveOutOpen},
+      {"waveOutPrepareHeader", (void*)&trt_waveOutPrepareHeader},
+      {"waveOutUnprepareHeader", (void*)&trt_waveOutUnprepareHeader},
+      {"waveOutGetDevCapsA", (void*)&trt_waveOutGetDevCapsA},
       {"midiOutGetNumDevs", (void*)&trt_midiOutGetNumDevs},
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},

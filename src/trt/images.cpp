@@ -27,6 +27,10 @@ const trt_backend* g_be = nullptr;
 trt_resolver g_rs;
 char g_search_dir[512] = "";
 int g_load_depth = 0;
+// Load-only mode (corpus dry-run): map + bind + seal guest DLLs but do NOT
+// run their TLS callbacks or DllMain — the corpus test proves the load
+// path, it does not execute game code. Default 1 = full boot semantics.
+int g_run_image_code = 1;
 
 char lower_of(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }
 
@@ -210,12 +214,14 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  // TLS callbacks, then the entry point (DllMain for a DLL)
-  for (int i = 0; i < img->tls_callback_count; ++i) {
-    void* cb = img->base + img->tls_callback_rvas[i];
-    trt_call_guest(cb, (u64)(uintptr_t)img->base, 1, 0, 0);
-  }
-  if (run_entry && img->entry_rva) {
+  // TLS callbacks, then the entry point (DllMain for a DLL) — skipped in
+  // load-only mode (corpus dry-run proves binding without executing code)
+  if (g_run_image_code)
+    for (int i = 0; i < img->tls_callback_count; ++i) {
+      void* cb = img->base + img->tls_callback_rvas[i];
+      trt_call_guest(cb, (u64)(uintptr_t)img->base, 1, 0, 0);
+    }
+  if (run_entry && g_run_image_code && img->entry_rva) {
     void* handle = trt_images_handle(img);
     char line[320];
     snprintf(line, sizeof(line),
@@ -230,6 +236,12 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   }
   return img;
 }
+
+// Load-only mode toggle: 0 = map/bind/seal without running TLS callbacks or
+// DllMain (corpus dry-run), 1 (default) = full boot semantics.
+void trt_set_image_code_run(int enable) { g_run_image_code = enable ? 1 : 0; }
+
+void trt_images_reset(void) { g_image_count = 0; }
 
 // ---------------------------------------------------------------------------
 // calling guest code from host code
