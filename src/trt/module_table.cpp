@@ -289,8 +289,8 @@ const mod_default k_defaults[] = {
     {"msimg32.dll", TRT_ROUTE_SYSTEM},
 
     // ---- COM / OLE / WinRT ----
-    {"ole32.dll", TRT_ROUTE_SYSTEM},
-    {"oleaut32.dll", TRT_ROUTE_SYSTEM},
+    {"ole32.dll", TRT_ROUTE_BUILTIN},  // M7: COM boot (bridge_ole)
+    {"oleaut32.dll", TRT_ROUTE_BUILTIN},  // M7: BSTR/variant (bridge_ole)
     {"combase.dll", TRT_ROUTE_SYSTEM},
 
     // ---- core runtime / CRT ----

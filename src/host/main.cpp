@@ -360,7 +360,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_module_register("winmm.dll", TRT_ROUTE_STUB, nullptr, 0);
   // d3d9.dll is registered by trt_bridge_boot (BUILTIN, the D3D9->D3D11
   // bridge) — do not downgrade it to STUB here.
-  trt_module_register("ole32.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
+  // ole32/oleaut32 are BUILTIN (bridge_ole via trt_bridge_boot)
   trt_module_register("d3d11.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_module_register("dxgi.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_module_register("ws2_32.dll", TRT_ROUTE_SYSTEM, nullptr, 0);

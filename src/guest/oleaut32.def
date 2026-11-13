@@ -1,0 +1,12 @@
+LIBRARY oleaut32.dll
+EXPORTS
+    SysAllocString
+    SysStringLen
+    SysFreeString
+    VariantInit
+    VariantClear
+    SafeArrayCreateVector
+    SafeArrayDestroy
+    SafeArrayGetUBound
+    SafeArrayGetElement
+    SafeArrayPutElement
