@@ -10,6 +10,7 @@
 #endif
 #include "input.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 
@@ -113,6 +114,13 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
     guest_window& rec = g_wins[g_win_count++];
     memset(&rec, 0, sizeof(rec));
     rec.handle = g_next_hwnd += 0x100;
+    // inherit the class's wndproc (guests register the class right before)
+    for (int i = 0; i < g_win_count; ++i)
+      if (g_wins[i].handle == 0 && g_wins[i].proc) {
+        rec.proc = g_wins[i].proc;
+        rec.class_atom = g_wins[i].class_atom;
+        break;
+      }
     hwnd = rec.handle;
   }
   guest_window* rec = find_win(hwnd);

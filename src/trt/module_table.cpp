@@ -40,10 +40,53 @@ int g_module_count = 0;
 // GetProcAddress of the console's real DLLs). NULL => SYSTEM routes fail.
 trt_system_load g_system_load = nullptr;
 
+// alias routing: desktop DLL name -> the name that exists on the console.
+// This is the #1 hidden boot-killer: a game importing vcruntime140.dll fails
+// at LOAD time unless we route it to the console's vcruntime140_app.dll.
+struct dll_alias { const char* guest_name; const char* system_name; };
+const dll_alias k_dll_aliases[] = {
+    {"vcruntime140.dll", "vcruntime140_app.dll"},
+    {"msvcp140.dll", "msvcp140_app.dll"},
+    {"msvcp140_1.dll", "msvcp140_1_app.dll"},
+    {"msvcp140_2.dll", "msvcp140_2_app.dll"},
+    {"msvcp140_atomic_wait.dll", "msvcp140_atomic_wait_app.dll"},
+    {"msvcp140_codecvt_ids.dll", "msvcp140_codecvt_ids_app.dll"},
+    {"concrt140.dll", "concrt140_app.dll"},
+    // XInput on console = XINPUTUAP.dll (the SDK's xinput.lib imports it)
+    {"xinput1_4.dll", "xinputuap.dll"},
+    {"xinput1_3.dll", "xinputuap.dll"},
+    {"xinput9_1_0.dll", "xinputuap.dll"},
+    {"xinput1_2.dll", "xinputuap.dll"},
+    {"xinput1_1.dll", "xinputuap.dll"},
+    {"xapauthenticode.dll", "xapauthenticode.dll"},
+    // shader compiler: real UWP component, same name
+    {"d3dcompiler_47.dll", "d3dcompiler_47.dll"},
+    {"d3dcompiler_46.dll", "d3dcompiler_47.dll"},
+    {"d3dcompiler_43.dll", "d3dcompiler_47.dll"},
+    // d3d9 has NO console component: keep it failing with a NAME (M5)
+    {"d3d9.dll", nullptr},
+    // steam api: named failure until M6 (no DRM bypass, ever)
+    {"steam_api64.dll", nullptr},
+    {"steam_api.dll", nullptr},
+};
+
+const char* dll_alias_lookup(const char* name);  // defined below (case-insens)
+
 int find_module(const char* name) {
   for (int i = 0; i < g_module_count; ++i)
     if (name_eq(name, g_modules[i].name)) return i;
   return -1;
+}
+
+// alias routing: desktop DLL name -> console system DLL name (case-insensitive)
+const char* dll_alias_lookup(const char* name) {
+  for (const dll_alias& a : k_dll_aliases) {
+    size_t i = 0;
+    for (; a.guest_name[i] && name[i]; ++i)
+      if (lower_ascii(a.guest_name[i]) != lower_ascii(name[i])) break;
+    if (a.guest_name[i] == 0 && name[i] == 0) return a.system_name;
+  }
+  return nullptr;
 }
 
 // resolve() adapter the loader consumes
@@ -51,20 +94,40 @@ void* resolve_through_table(void* user, const char* module,
                             const char* symbol, u16 ordinal) {
   (void)user;
   const int mi = find_module(module);
-  if (mi < 0) return nullptr;               // unknown module: hard fail
+  if (mi < 0) {
+    // unknown module: not a hard fail — try the console's real DLL by the
+    // same name (dwrite, d2d1, xmcore, secs... exist as system components),
+    // then known aliases. Failure stays NAMED in the log (not silent).
+    if (g_system_load) {
+      if (void* fn = g_system_load(module, symbol)) return fn;
+      if (const char* alias = dll_alias_lookup(module))
+        if (void* fn2 = g_system_load(alias, symbol)) return fn2;
+    }
+    return nullptr;  // loader names module!symbol in its error
+  }
   const builtin_mod& m = g_modules[mi];
   switch (m.route) {
     case TRT_ROUTE_STUB:
-      return (void*)&trt_stub_thunk;       // any symbol -> visible stub
+      return (void*)&trt_stub_thunk;        // any symbol -> visible stub
     case TRT_ROUTE_BUILTIN:
       if (symbol) {
         for (int i = 0; i < m.fn_count; ++i)
           if (strcmp(m.fns[i].name, symbol) == 0) return m.fns[i].fn;
+        // builtin module, unknown symbol: fall through to system by alias
+        if (g_system_load) {
+          if (void* fn = g_system_load(module, symbol)) return fn;
+          if (const char* alias = dll_alias_lookup(module))
+            if (void* fn2 = g_system_load(alias, symbol)) return fn2;
+        }
       }
-      return nullptr;                       // missing builtin: hard fail
+      return nullptr;                       // named failure in loader log
     case TRT_ROUTE_SYSTEM:
-      if (g_system_load) return g_system_load(module, symbol);
-      return nullptr;                       // no host binder: hard fail
+      if (g_system_load) {
+        if (void* fn = g_system_load(module, symbol)) return fn;
+        if (const char* alias = dll_alias_lookup(module))
+          return g_system_load(alias, symbol);
+      }
+      return nullptr;
     default:
       return nullptr;
   }

@@ -170,7 +170,7 @@ u32 expected_checksum(u32 build, u64 a, u64 b) {
 int run_case(const char* label, const u8* file, size_t size, bool ignore_preferred) {
   printf("case: %s\n", label);
   g_ignore_preferred = ignore_preferred;
-  trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log};
+  trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log, nullptr};
   trt_resolver rs = {nullptr, &test_resolve};
   trt_image* img = nullptr;
   int rc = trt_map_pe(&be, &rs, file, size, &img);
@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
 
   // negative: corrupt MZ
   {
-    trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log};
+    trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log, nullptr};
     trt_resolver rs = {nullptr, &test_resolve};
     trt_image* img = nullptr;
     file2[0] = 'X';

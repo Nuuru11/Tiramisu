@@ -308,7 +308,8 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   // walk section table in the mapped copy of the headers (NT headers sit at
   // e_lfanew, not at offset 0 — the DOS header occupies the page start)
   const trt_dos_header* dos = (const trt_dos_header*)img->base;
-  const trt_nt_headers64* nt = (const trt_nt_headers64*)(img->base + dos->e_lfanew);
+  const trt_nt_headers64* nt =
+      (const trt_nt_headers64*)(img->base + dos->e_lfanew);
   const u8* sec_base = (const u8*)&nt->optional_header +
                        rd16((const u8*)&nt->file_header.size_of_optional_header);
   for (u32 i = 0; i < img->section_count; ++i) {
@@ -326,6 +327,25 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
     }
   }
   logf_be(be, "trt: SEALED (W^X: code pages now RX, no RWX ever)");
+
+  // ---- unwind registration: the OS unwinder cannot see VirtualAlloc'd code
+  // until its .pdata is registered. Without this, the FIRST guest C++
+  // exception kills the whole process. This is boot-critical, not optional.
+  const trt_data_directory* ex =
+      &nt->optional_header.directories[TRT_PE_DIR_EXCEPTION];
+  if (ex->virtual_address && ex->size && be->register_unwind) {
+    const u32 count = ex->size / 8;  // RUNTIME_FUNCTION = 8 bytes
+    const int rc = be->register_unwind(img->base, img->base + ex->virtual_address,
+                                       count);
+    char line[128];
+    snprintf(line, sizeof(line),
+             "trt: unwind .pdata registered funcs=%u rc=%d (RtlAddFunctionTable)",
+             count, rc);
+    logf_be(be, line);
+  } else if (ex->virtual_address && ex->size) {
+    logf_be(be, "trt: NOTE .pdata present but backend cannot register unwind "
+               "(exceptions in guest code will be fatal)");
+  }
   return TRT_OK;
 }
 

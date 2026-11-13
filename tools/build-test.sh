@@ -52,3 +52,18 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
   -o "$out/test_input"
 "$out/test_input"
+
+# --- 5. THE launch-path proof: game-shaped PE through the full pipeline ---
+"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/kernel32.lib" -d src/guest/kernel32.def
+"$LLVM_DLLTOOL" -m i386:x86-64 -l "$out/user32.lib" -d src/guest/user32.def
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_game.c -o "$out/guest_game.obj"
+"$LLD_LINK" "$out/guest_game.obj" "$out/kernel32.lib" "$out/user32.lib" \
+  /NODEFAULTLIB /ENTRY:game_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_game.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_game_boot.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
+  src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
+  -o "$out/test_game_boot"
+"$out/test_game_boot" "$out/guest_game.exe"

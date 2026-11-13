@@ -1,0 +1,10 @@
+LIBRARY kernel32
+EXPORTS
+    GetProcessHeap
+    HeapAlloc
+    QueryPerformanceCounter
+    CreateFileW
+    WriteFile
+    CloseHandle
+    GetEnvironmentStringsW
+    GetModuleFileNameW

@@ -78,6 +78,7 @@ typedef struct trt_data_directory {
 
 #define TRT_PE_DIR_EXPORT 0
 #define TRT_PE_DIR_IMPORT 1
+#define TRT_PE_DIR_EXCEPTION 3
 #define TRT_PE_DIR_RELOC  5
 #define TRT_PE_DIR_TLS    9
 #define TRT_PE_DIR_DELAY_IMPORT 13

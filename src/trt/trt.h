@@ -26,6 +26,10 @@ typedef struct trt_backend {
   int   (*protect)(void* base, size_t bytes, unsigned prot);
   void  (*release)(void* base, size_t bytes);
   void  (*log)(const char* line);           // line without trailing \n
+  // register the guest's .pdata unwind ranges with the OS unwinder —
+  // REQUIRED for C++ exceptions in guest code (x64: RtlAddFunctionTable).
+  // Return 0 on success. NULL = unsupported (test backend).
+  int   (*register_unwind)(void* image_base, const void* pdata, u32 count);
 } trt_backend;
 
 // ---- import resolver: module+symbol -> callable address ----

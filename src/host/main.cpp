@@ -121,6 +121,15 @@ int uwp_protect(void* base, size_t bytes, unsigned prot) {
   return VirtualProtectFromApp(base, bytes, fl, &old) ? 0 : 1;
 }
 void uwp_release(void* base, size_t) { VirtualFree(base, 0, MEM_RELEASE); }
+
+// guest C++ exceptions must unwind: register the .pdata ranges with the OS
+int uwp_register_unwind(void* image_base, const void* pdata, u32 count) {
+  return RtlAddFunctionTable((PIMAGE_RUNTIME_FUNCTION_ENTRY)pdata, count,
+                             (DWORD64)(uintptr_t)image_base)
+             ? 0
+             : 1;
+}
+
 void uwp_log(const char* line) { longan::log_line(line); }
 
 // host pump the guest's GetMessageW calls: dispatcher + pad, nothing else
@@ -233,7 +242,8 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   guest_run_result r{};
   char line[256];
 
-  trt_backend be{&uwp_alloc, &uwp_protect, &uwp_release, &uwp_log};
+  trt_backend be{&uwp_alloc,     &uwp_protect,        &uwp_release,
+                 &uwp_log,       &uwp_register_unwind};
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
