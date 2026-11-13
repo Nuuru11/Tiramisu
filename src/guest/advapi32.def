@@ -3,3 +3,10 @@ EXPORTS
     RegOpenKeyExW
     RegQueryValueExW
     RegCloseKey
+    RegCreateKeyExW
+    RegSetValueExW
+    RegEnumKeyExW
+    OpenProcessToken
+    GetTokenInformation
+    ConvertStringSecurityDescriptorToSecurityDescriptorW
+    ConvertSidToStringSidW

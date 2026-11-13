@@ -44,6 +44,7 @@ __attribute__((dllimport)) i32 GSTD RegEnumKeyExW(void* key, u32 index,
 #define REG_SZ 1u
 #define REG_DWORD 4u
 
+
 u32 GSTD reg_boot(u64 a, u64 b, u64 c) {
   (void)a; (void)b; (void)c;
   u32 bits = 0;
@@ -116,6 +117,84 @@ u32 GSTD reg_boot(u64 a, u64 b, u64 c) {
   RegCloseKey(key);
   if (lmkey) RegCloseKey(lmkey);
   if (softkey) RegCloseKey(softkey);
+
+  // ============ 8. the token/security half (OrTMM's imports) ============
+  // 8a. OpenProcessToken: a REAL pseudo token handle
+  __attribute__((dllimport)) int GSTD OpenProcessToken(void* proc, u32 access,
+                                                        void** tok);
+  __attribute__((dllimport)) int GSTD GetTokenInformation(void* tok, u32 cls,
+                                                           void* info, u32 len,
+                                                           u32* len_out);
+  __attribute__((dllimport)) int GSTD
+      ConvertStringSecurityDescriptorToSecurityDescriptorW(const u16* sddl,
+                                                            u32 req,
+                                                            void** sd,
+                                                            u32* len);
+  __attribute__((dllimport)) int GSTD ConvertSidToStringSidW(const void* sid,
+                                                              u16** str);
+  void* tok = 0;
+  if (OpenProcessToken((void*)0xFFFFFFFFFFFFFFFFull /*pseudo current proc*/,
+                       0x0008 /*TOKEN_QUERY*/, &tok) == 1 && tok)
+    bits |= 0x80u;
+
+  // 8b. GetTokenInformation(TokenUser) fills a SID_AND_ATTRIBUTES record
+  if (tok) {
+    u8 tbuf[64];
+    u32 tlen = 0;
+    if (GetTokenInformation(tok, 1 /*TokenUser*/, tbuf, (u32)sizeof(tbuf),
+                            &tlen) == 1 && tlen >= 8 + 24) {
+      // the record points at a SID with revision 1 and NT authority (5)
+      const u8* sid = *(const u8**)tbuf;
+      const int user_ok = sid && sid[0] == 1 && sid[2 + 5] == 5;
+      bits |= user_ok ? 0x100u : 0u;
+      // 8c. ConvertSidToStringSidW on THAT sid gives "S-1-5-88-1-1001"
+      if (user_ok) {
+        u16* str = 0;
+        if (ConvertSidToStringSidW(sid, &str) == 1 && str) {
+          const char* want = "S-1-5-88-1-1001";
+          int ok = 1;
+          for (int i = 0; want[i]; ++i)
+            if (str[i] != (u16)(u8)want[i]) ok = 0;
+          bits |= (ok && str[15] == 0) ? 0x200u : 0u;
+        }
+      }
+    }
+
+    // 8d. TokenIntegrityLevel also answers (medium integrity S-1-16-8192)
+    u8 ibuf[48];
+    u32 ilen = 0;
+    if (GetTokenInformation(tok, 25 /*TokenIntegrityLevel*/, ibuf,
+                            (u32)sizeof(ibuf), &ilen) == 1) {
+      const u8* sid = *(const u8* const*)ibuf;
+      bits |= (sid && sid[0] == 1 && sid[7] == 16) ? 0x400u : 0u;
+    }
+
+    // 8e. an unsupported class fails NAMED (ERROR_INVALID_PARAMETER = 87)
+    u32 xl = 0;
+    if (GetTokenInformation(tok, 3 /*TokenGroups: unsupported*/, ibuf,
+                            (u32)sizeof(ibuf), &xl) == 0)
+      bits |= 0x800u;
+  }
+
+  // 8f. SDDL conversion fails visibly: ERROR_CALL_NOT_IMPLEMENTED (no
+  //     security model on console)
+  {
+    const u16 sddl[] = {'D', ':', 'P', 0};
+    void* sd = 0;
+    u32 sl = 0;
+    if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl, 1 /*SDDL_REVISION_1*/, &sd, &sl) == 0 && sd == 0 && sl == 0)
+      bits |= 0x1000u;
+  }
+
+  // 8g. a garbage token handle fails (ERROR_INVALID_HANDLE)
+  {
+    u8 tbuf[8];
+    u32 tlen = 0;
+    if (GetTokenInformation((void*)0x12340000u, 1, tbuf, sizeof(tbuf),
+                            &tlen) == 0)
+      bits |= 0x2000u;
+  }
 
   return bits | ((diag_type & 0xFFu) << 8) | ((diag_size & 0xFFu) << 16) |
          ((buf[0] & 0xFFu) << 24);

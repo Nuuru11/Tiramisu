@@ -101,6 +101,15 @@ void* resolve_through_table(void* user, const char* module,
                             const char* symbol, u16 ordinal) {
   (void)user;
 
+  // Ordinal-only import (hint/name parse produced no symbol, e.g. OrTMM's
+  // COMCTL32 bare hint/ord 380): synthesize the "#<ordinal>" name the
+  // builtin tables register so a BUILTIN route can bind it.
+  char ord_name[16];
+  if (!symbol && ordinal) {
+    snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
+    symbol = ord_name;
+  }
+
   // ---- API-set contracts --------------------------------------------
   // "api-ms-win-core-synch-l1-2-0.dll" is not a file on the console; it
   // is a contract name. Redirect it to the DLL that implements it, then
@@ -283,7 +292,12 @@ const mod_default k_defaults[] = {
     {"dcomp.dll", TRT_ROUTE_SYSTEM},
     {"d2d1.dll", TRT_ROUTE_SYSTEM},
     {"dwrite.dll", TRT_ROUTE_SYSTEM},
-    {"gdi32.dll", TRT_ROUTE_SYSTEM},
+    // gdi32: no SYSTEM route — console LoadLibrary("gdi32.dll") fails in an
+    // AppContainer (desktop-shell DLL), so a fake SYSTEM bind would HIDE
+    // the gap. bridge_gdi registers it BUILTIN; this default is BUILTIN too
+    // so the route is honest even before boot.
+    {"gdi32.dll", TRT_ROUTE_BUILTIN},
+    {"comctl32.dll", TRT_ROUTE_BUILTIN},  // M?: common-controls acceptance
     {"dwmapi.dll", TRT_ROUTE_SYSTEM},
     {"uxtheme.dll", TRT_ROUTE_SYSTEM},
     {"msimg32.dll", TRT_ROUTE_SYSTEM},

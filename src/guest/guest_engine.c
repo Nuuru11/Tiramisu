@@ -165,5 +165,50 @@ u32 GSTD engine_boot(u64 a, u64 b, u64 c) {
   bits |= (r[2] > 0 && r[3] > 0) ? 0x800u : 0u;
   bits |= (GetTickCount64() >= t0) ? 0x1000u : 0u;
 
+  // ===== 8. the console/child-process honesty surface (OrTMM's imports) =====
+  // 8a. CreateProcessW must fail VISIBLY named (console blocks children)
+  __attribute__((dllimport)) int GSTD CreateProcessW(const u16* app,
+                                                      u16* cmdline, void* pa,
+                                                      void* ta, i32 inh,
+                                                      u32 flags, void* env,
+                                                      const u16* dir,
+                                                      const void* si,
+                                                      void* pi);
+  __attribute__((dllimport)) void* GSTD GetStdHandle(u32 which);
+  __attribute__((dllimport)) u32 GSTD GetLastError(void);
+  __attribute__((dllimport)) void GSTD SetLastError(u32 err);
+  __attribute__((dllimport)) i32 GSTD GetConsoleMode(void* con, u32* mode);
+  __attribute__((dllimport)) i32 GSTD SetConsoleCtrlHandler(void* h, i32 add);
+  __attribute__((dllimport)) i32 GSTD ReadConsoleW(void* con, void* buf,
+                                                    u32 n, u32* got, void* c);
+  __attribute__((dllimport)) i32 GSTD WriteConsoleW(void* con, const void* buf,
+                                                     u32 n, u32* put, void* r);
+  const u16 child[] = {'n', 'o', 't', 'e', 'p', 'a', 'd', '.', 'e', 'x', 'e', 0};
+  u8 pi[104];  // PROCESS_INFORMATION (x64) sized room
+  for (u32 i = 0; i < sizeof(pi); ++i) pi[i] = 0;
+  const i32 cp = CreateProcessW(0, (u16*)child, 0, 0, 0, 0, 0, 0, 0, pi);
+  bits |= (cp == 0) ? 0x2000u : 0u;  // FALSE: no children, named
+  bits |= (GetLastError() == 5 /*ACCESS_DENIED*/) ? 0x4000u : 0u;
+  bits |= (pi[0] == 0 && pi[8] == 0) ? 0x8000u : 0u;  // no fake handles
+
+  // 8b. the console surface: GetStdHandle -> NULL + named last error
+  __attribute__((dllimport)) void* GSTD SetStdHandle(u32 which, void* h);
+  __attribute__((dllimport)) i32 GSTD WriteConsoleW(void* con, const void* buf,
+                                                     u32 n, u32* put, void* r);
+  (void)WriteConsoleW;
+  SetLastError(0);
+  const void* stdh = GetStdHandle(0xFFFFFFF5u /*STD_OUTPUT_HANDLE*/);
+  bits |= (stdh == 0 && GetLastError() == 6 /*INVALID_HANDLE*/) ? 0x10000u : 0u;
+  bits |= (SetStdHandle(0xFFFFFFF5u, 0) == 0) ? 0x20000u : 0u;
+
+  // 8c. console mode/read/write all say "no console" honestly
+  u32 cm = 0;
+  bits |= (GetConsoleMode(0, &cm) == 0) ? 0x40000u : 0u;
+  bits |= (SetConsoleCtrlHandler(0, 1) == 0) ? 0x80000u : 0u;
+  u32 io_n = 0;
+  bits |= (ReadConsoleW(0, (void*)pi, 4, &io_n, 0) == 0) ? 0x100000u : 0u;
+  bits |= (WriteConsoleW(0, (const void*)pi, 4, &io_n, 0) == 0) ? 0x200000u
+                                                                 : 0u;
+
   return bits;
 }

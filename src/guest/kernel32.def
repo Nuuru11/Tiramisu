@@ -12,3 +12,12 @@ EXPORTS
     GetProcAddress
     GetModuleHandleW
     FreeLibrary
+    CreateProcessW
+    GetStdHandle
+    SetStdHandle
+    GetConsoleMode
+    ReadConsoleW
+    WriteConsoleW
+    SetConsoleCtrlHandler
+    SetLastError
+    GetLastError

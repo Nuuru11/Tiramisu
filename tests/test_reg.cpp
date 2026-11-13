@@ -137,9 +137,20 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (bits want 0x7f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (bits want 0x3fff)\n", (unsigned long long)ret);
   // the high bytes carry diagnostics (the value type/size/first byte)
-  CHECK((ret & 0xFFull) == 0x7Full, "guest did the whole registry dance");
+  CHECK((ret & 0x7Full) == 0x7Full, "guest did the whole registry dance");
+  CHECK((ret & 0x80ull) != 0, "OpenProcessToken -> real pseudo token handle");
+  CHECK((ret & 0x100ull) != 0, "GetTokenInformation(TokenUser) -> SID record");
+  CHECK((ret & 0x200ull) != 0,
+        "ConvertSidToStringSidW -> \"S-1-5-88-1-1001\"");
+  CHECK((ret & 0x400ull) != 0,
+        "GetTokenInformation(TokenIntegrityLevel) -> medium-integrity SID");
+  CHECK((ret & 0x800ull) != 0,
+        "GetTokenInformation(unsupported class) fails named");
+  CHECK((ret & 0x1000ull) != 0,
+        "SDDL conversion -> ERROR_CALL_NOT_IMPLEMENTED (no security model)");
+  CHECK((ret & 0x2000ull) != 0, "garbage token handle fails (INVALID_HANDLE)");
 
   // the hive must exist on disk and carry the value
   char hive_path[512];

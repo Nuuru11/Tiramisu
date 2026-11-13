@@ -4,6 +4,7 @@
 // user32 spec; windows are records, the surface is the host swapchain.
 // MSG layout (x64): hwnd(8) message(4+) pad(4) wParam(8) lParam(8) time(4) point(8) = 48
 #include "trt.h"
+#include "thunk.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -13,6 +14,11 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+
+namespace user32log {
+static void line(const char* s) { trt_core_log(s); }
+}
+#define log_line(s_) user32log::line(s_)
 
 namespace {
 
@@ -368,6 +374,67 @@ int TRT_STDCALL trt_KillTimer(void* hwnd, u32 id) {
   return 1;
 }
 
+// ---- DC records (shared with bridge_gdi; see bridge_user32.h) ----
+namespace {
+struct user32_dc {
+  void* selected;  // currently selected HGDIOBJ (bridge_gdi records here)
+  bool used;
+};
+constexpr u32 USER32_DC_TAG = 0x55430000u;  // 'uC' = user32 DC
+constexpr int USER32_MAX_DCS = 16;
+user32_dc g_dcs[USER32_MAX_DCS];
+} // namespace
+
+void* trt_user32_dc_alloc(void) {
+  for (int i = 0; i < USER32_MAX_DCS; ++i) {
+    if (!g_dcs[i].used) {
+      g_dcs[i].used = true;
+      g_dcs[i].selected = nullptr;
+      return (void*)(uintptr_t)(USER32_DC_TAG | (u32)(i + 1));
+    }
+  }
+  return nullptr;
+}
+
+int trt_user32_dc_release(void* hdc) {
+  const u32 h = (u32)(uintptr_t)hdc;
+  if ((h & 0xFFFF0000u) != USER32_DC_TAG) return 0;
+  const u32 idx = h & 0xFFFFu;
+  if (idx == 0 || idx > USER32_MAX_DCS || !g_dcs[idx - 1].used) return 0;
+  g_dcs[idx - 1].used = false;
+  return 1;
+}
+
+int trt_user32_dc_is_valid(void* hdc) {
+  const u32 h = (u32)(uintptr_t)hdc;
+  if ((h & 0xFFFF0000u) != USER32_DC_TAG) return 0;
+  const u32 idx = h & 0xFFFFu;
+  return idx > 0 && idx <= USER32_MAX_DCS && g_dcs[idx - 1].used;
+}
+
+void* trt_user32_dc_selected(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return nullptr;
+  return g_dcs[((u32)(uintptr_t)hdc & 0xFFFFu) - 1].selected;
+}
+
+void trt_user32_dc_set_selected(void* hdc, void* hobj) {
+  if (!trt_user32_dc_is_valid(hdc)) return;
+  g_dcs[((u32)(uintptr_t)hdc & 0xFFFFu) - 1].selected = hobj;
+}
+
+// ---- user32 GetDC/ReleaseDC on the record space ----
+void* TRT_STDCALL trt_GetDC(void* hwnd) {
+  (void)hwnd;
+  void* hdc = trt_user32_dc_alloc();
+  if (!hdc) log_line("user32: GetDC DC table full -> NULL");
+  return hdc;  // a real DC record (window-less DCs are fine for records)
+}
+
+int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc) {
+  (void)hwnd;
+  return trt_user32_dc_release(hdc);
+}
+
 static const trt_named_fn k_user32_fns[] = {
   {"PostQuitMessage", (void*)&trt_PostQuitMessage},
   {"SetFocus", (void*)&trt_SetFocus},
@@ -409,6 +476,8 @@ static const trt_named_fn k_user32_fns[] = {
   {"GetForegroundWindow", (void*)&trt_GetForegroundWindow},
   {"GetKeyboardLayout", (void*)&trt_GetKeyboardLayout},
   {"SendMessageW", (void*)&trt_SendMessageW},
+  {"GetDC", (void*)&trt_GetDC},
+  {"ReleaseDC", (void*)&trt_ReleaseDC},
 };
 
 int trt_bridge_register_user32(void) {

@@ -26,6 +26,8 @@
 #include "bridge_dinput.h"
 #include "bridge_audio.h"
 #include "bridge_steam.h"
+#include "bridge_comctl.h"
+#include "bridge_gdi.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,6 +214,10 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_d3dx();
   // Steamworks: AUTH ONLY (no DRM bypass, ever)
   trt_bridge_register_steam();
+  // comctl32: common-controls acceptance (OrTMM imports ordinal #380)
+  trt_bridge_register_comctl();
+  // gdi32: the GDI object/state surface (fonts, DC-coupled state)
+  trt_bridge_register_gdi();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 
@@ -514,6 +520,88 @@ void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
   return img ? trt_images_handle(img) : nullptr;
 }
 
+// ==================== console + child-process honesty =======================
+// OrTMM (and every MSVC-runtime game) imports the console surface. The
+// console has NO console for a UWP AppContainer process: everything here
+// must say so HONESTLY (NULL/FALSE + a named last error), never a fake
+// success the CRT would then trust.
+//
+// CreateProcessW: the console blocks child processes for game PEs
+// (documented in docs/02-bridge-surface.md) — fail named with
+// ERROR_ACCESS_DENIED.
+
+namespace {
+
+void console_log(const char* s) { trt_core_log(s); }
+
+void console_no_console(const char* api, u32 err) {
+  char line[128];
+  snprintf(line, sizeof(line),
+           "kernel32: %s -> no console (AppContainer); lasterr=%u", api, err);
+  console_log(line);
+  g_tls_last_error[g_tls_index_current_thread % 128] = err;
+}
+
+} // namespace
+
+void* TRT_GUEST_ABI trt_GetStdHandle(u32 handle_id) {
+  (void)handle_id;  // STD_INPUT/OUTPUT/ERROR all equally absent
+  console_no_console("GetStdHandle", 6 /*ERROR_INVALID_HANDLE*/);
+  return nullptr;
+}
+
+int TRT_GUEST_ABI trt_SetStdHandle(u32 handle_id, void* handle) {
+  (void)handle_id; (void)handle;
+  console_no_console("SetStdHandle", 6);
+  return 0;  // FALSE
+}
+
+int TRT_GUEST_ABI trt_GetConsoleMode(void* console, u32* mode_out) {
+  (void)console; (void)mode_out;
+  console_no_console("GetConsoleMode", 6);
+  return 0;  // FALSE
+}
+
+int TRT_GUEST_ABI trt_ReadConsoleW(void* console, void* buffer, u32 to_read,
+                                  u32* read_out, void* ctrl) {
+  (void)console; (void)buffer; (void)to_read; (void)read_out; (void)ctrl;
+  console_no_console("ReadConsoleW", 6);
+  return 0;  // FALSE
+}
+
+int TRT_GUEST_ABI trt_WriteConsoleW(void* console, const void* buffer, u32 to_write,
+                                   u32* written_out, void* reserved) {
+  (void)console; (void)buffer; (void)to_write; (void)written_out; (void)reserved;
+  console_no_console("WriteConsoleW", 6);
+  return 0;  // FALSE
+}
+
+int TRT_GUEST_ABI trt_SetConsoleCtrlHandler(void* handler, int add) {
+  (void)handler; (void)add;
+  console_no_console("SetConsoleCtrlHandler", 120 /*ERROR_CALL_NOT_IMPLEMENTED*/);
+  return 0;  // FALSE: there is no console to attach a handler to
+}
+
+int TRT_GUEST_ABI trt_CreateProcessW(const u16* app, u16* cmdline, void* proc_attr,
+                                    void* thread_attr, int inherit,
+                                    u32 flags, void* env, const u16* dir,
+                                    const void* startup, void* info_out) {
+  char utf8[256];
+  if (cmdline)
+    trt_utf16_to_utf8(cmdline, utf8, sizeof(utf8));
+  else if (app)
+    trt_utf16_to_utf8(app, utf8, sizeof(utf8));
+  else
+    snprintf(utf8, sizeof(utf8), "(null)");
+  char line[256];
+  snprintf(line, sizeof(line),
+           "kernel32: CreateProcessW('%s') -> ERROR_ACCESS_DENIED "
+           "(console blocks child processes; documented)", utf8);
+  console_log(line);
+  g_tls_last_error[g_tls_index_current_thread % 128] = 5; // ACCESS_DENIED
+  return 0;  // FALSE
+}
+
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
   {"HeapCreate", (void*)&trt_HeapCreate},
@@ -548,6 +636,14 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"FreeLibrary", (void*)&trt_FreeLibrary},
   {"GetProcAddress", (void*)&trt_GetProcAddress},
   {"GetModuleHandleW", (void*)&trt_GetModuleHandleW},
+  // the console/child-process honesty surface (OrTMM's CRT imports)
+  {"GetStdHandle", (void*)&trt_GetStdHandle},
+  {"SetStdHandle", (void*)&trt_SetStdHandle},
+  {"GetConsoleMode", (void*)&trt_GetConsoleMode},
+  {"ReadConsoleW", (void*)&trt_ReadConsoleW},
+  {"WriteConsoleW", (void*)&trt_WriteConsoleW},
+  {"SetConsoleCtrlHandler", (void*)&trt_SetConsoleCtrlHandler},
+  {"CreateProcessW", (void*)&trt_CreateProcessW},
 };
 
 int trt_bridge_register_kernel32(void) {

@@ -82,6 +82,16 @@ int trt_GetClientRect(void*, void*);
 void* trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
 i32 trt_WriteFile(void*, const void*, u32, u32*, void*);
 i32 trt_CloseHandle(void*);
+void* trt_GetStdHandle(u32);
+int trt_SetStdHandle(u32, void*);
+int trt_GetConsoleMode(void*, u32*);
+int trt_SetConsoleCtrlHandler(void*, int);
+int trt_ReadConsoleW(void*, void*, u32, u32*, void*);
+int trt_WriteConsoleW(void*, const void*, u32, u32*, void*);
+int trt_CreateProcessW(const u16*, u16*, void*, void*, int, u32, void*,
+                       const u16*, const void*, void*);
+void trt_SetLastError(u32);
+u32 trt_GetLastError(void);
 }
 
 TRAMP_STUB(w_CreateFileMappingW, trt_CreateFileMappingW)
@@ -227,6 +237,15 @@ int main(int argc, char** argv) {
         {"CreateFileW", (void*)&w_CreateFileW},
         {"WriteFile", (void*)&w_WriteFile},
         {"CloseHandle", (void*)&w_CloseHandle},
+        {"GetStdHandle", (void*)&trt_GetStdHandle},
+        {"SetStdHandle", (void*)&trt_SetStdHandle},
+        {"GetConsoleMode", (void*)&trt_GetConsoleMode},
+        {"SetConsoleCtrlHandler", (void*)&trt_SetConsoleCtrlHandler},
+        {"ReadConsoleW", (void*)&trt_ReadConsoleW},
+        {"WriteConsoleW", (void*)&trt_WriteConsoleW},
+        {"CreateProcessW", (void*)&trt_CreateProcessW},
+        {"SetLastError", (void*)&trt_SetLastError},
+        {"GetLastError", (void*)&trt_GetLastError},
     };
     static const trt_named_fn k_u32[] = {
         {"PostQuitMessage", (void*)&w_PostQuitMessage},
@@ -259,7 +278,7 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x1fff)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0x3f1fff)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x1u, "GetVersionExW answered");
   CHECK(ret & 0x2u, "GetSystemInfo answered");
@@ -274,6 +293,16 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x400u, "PostQuitMessage accepted");
   CHECK(ret & 0x800u, "GetClientRect answered");
   CHECK(ret & 0x1000u, "GetTickCount64 moves");
+  // console/child-process honesty (OrTMM's kernel32 imports)
+  CHECK(ret & 0x2000u, "CreateProcessW -> FALSE (console blocks children)");
+  CHECK(ret & 0x4000u, "CreateProcessW names ERROR_ACCESS_DENIED");
+  CHECK(ret & 0x8000u, "CreateProcessW fills no fake PROCESS_INFORMATION");
+  CHECK(ret & 0x10000u, "GetStdHandle -> NULL + ERROR_INVALID_HANDLE");
+  CHECK(ret & 0x20000u, "SetStdHandle -> FALSE");
+  CHECK(ret & 0x40000u, "GetConsoleMode -> FALSE (no console)");
+  CHECK(ret & 0x80000u, "SetConsoleCtrlHandler -> FALSE");
+  CHECK(ret & 0x100000u, "ReadConsoleW -> FALSE (no console)");
+  CHECK(ret & 0x200000u, "WriteConsoleW -> FALSE (no console)");
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;

@@ -547,6 +547,243 @@ int TRT_GUEST_ABI trt_RegGetValueW(u64 hkey, const u16* subkey, const u16* value
   return REG_SUCCESS;
 }
 
+// ============================ token / security ==============================
+// OrTMM (and many PC games) import advapi32's token surface at boot to ask
+// "who am I". The honest answers on the console:
+//   OpenProcessToken: a REAL pseudo token handle (a record here — never a
+//     fake NULL or a fake failure: UWP processes DO have a process token).
+//   GetTokenInformation: TokenUser / TokenIntegrityLevel / TokenStatistics
+//     get minimal real records; anything else fails ERROR_INVALID_PARAMETER
+//     (named).
+//   ConvertStringSecurityDescriptorToSecurityDescriptorW: the console has
+//     no SDDL security: fail ERROR_CALL_NOT_IMPLEMENTED, named.
+//   ConvertSidToStringSidW: convert a real SID record if the bytes parse;
+//     fail ERROR_INVALID_PARAMETER otherwise.
+namespace {
+
+// token records: OpenProcessToken hands these out
+constexpr u32 TOKEN_HANDLE_TAG = 0x544B0000u;  // 'TK'
+bool g_token_used[8];
+
+bool token_is_valid(u32 h) {
+  if ((h & 0xFFFF0000u) != TOKEN_HANDLE_TAG) return false;
+  const u32 idx = h & 0xFFFFu;
+  return idx > 0 && idx <= 8 && g_token_used[idx - 1];
+}
+
+// token access rights
+constexpr u32 TOKEN_QUERY = 0x0008;
+
+// TOKEN_INFORMATION classes
+constexpr u32 TOKEN_USER = 1;
+constexpr u32 TOKEN_STATISTICS = 10;
+constexpr u32 TOKEN_INTEGRITY_LEVEL = 25;
+
+// the pseudo user SID: S-1-5-88-1-1001 (a domain-less local player).
+// SID layout: Revision u8, SubAuthorityCount u8, IdentifierAuthority
+// (6 bytes BE, 0x000000000005 = NT authority), SubAuthority[] u32 LE.
+constexpr u8 k_sid_bytes[24] = {
+    1,                 // revision
+    3,                 // sub-authority count (88, 1, 1001)
+    0, 0, 0, 0, 0, 5,  // ID authority: NT
+    88, 0, 0, 0,       // 88
+    1, 0, 0, 0,        // 1
+    233, 3, 0, 0,      // 1001 (the RID)
+};
+
+// the integrity SID: S-1-16-8192 (medium integrity)
+constexpr u8 k_il_sid[12] = {1, 1, 0, 0, 0, 0, 0, 16, 0, 32, 0, 0};
+
+constexpr u32 k_token_user_size = 36;    // SID_AND_ATTRIBUTES(12) + SID(24)
+constexpr u32 k_token_il_size = 40;      // SID_AND_ATTRIBUTES(12) + SID(12) + mask room
+constexpr u32 k_token_stats_size = 72;   // LUIDs + type/level fields
+
+// thread-local last error lives in bridge_kernel32.cpp; use the exported
+// setter so guest GetLastError() sees our named failures
+void token_set_last_error(u32 err);
+
+} // namespace
+
+extern "C" u32 TRT_STDCALL trt_SetLastError(u32 err);  // bridge_kernel32
+
+namespace {
+void token_set_last_error(u32 err) { trt_SetLastError(err); }
+} // namespace
+
+} // extern "C"  (registry half)
+
+extern "C" {  // token/security half
+
+// ============================ token / security ==============================
+
+void* TRT_GUEST_ABI trt_OpenProcessToken(void* process, u32 desired,
+                                          void* token_out) {
+  (void)process;  // GetCurrentProcess pseudo handle is fine
+  if (!token_out) {
+    token_set_last_error(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  if ((desired & TOKEN_QUERY) == 0) {
+    // we only support QUERY; anything else is honest about it
+    char line[160];
+    snprintf(line, sizeof(line),
+             "advapi32: OpenProcessToken desired=0x%x (no QUERY bit) -> "
+             "ERROR_ACCESS_DENIED", desired);
+    trt_core_log(line);
+    token_set_last_error(5);  // ERROR_ACCESS_DENIED
+    return 0;
+  }
+  int slot = -1;
+  for (int i = 0; i < 8; ++i)
+    if (!g_token_used[i]) { slot = i; break; }
+  if (slot < 0) {
+    token_set_last_error(5);
+    return 0;
+  }
+  g_token_used[slot] = true;
+  *(void**)token_out = (void*)(uintptr_t)(TOKEN_HANDLE_TAG | (u32)(slot + 1));
+  char line[128];
+  snprintf(line, sizeof(line),
+           "advapi32: OpenProcessToken -> token record (pseudo handle)");
+  trt_core_log(line);
+  return (void*)(uintptr_t)1;  // TRUE
+}
+
+int TRT_GUEST_ABI trt_GetTokenInformation(void* token, u32 cls,
+                                           void* info, u32 len,
+                                           u32* len_out) {
+  if (!token_is_valid((u32)(uintptr_t)token)) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "advapi32: GetTokenInformation bad token handle 0x%x -> "
+             "ERROR_INVALID_HANDLE", (u32)(uintptr_t)token);
+    trt_core_log(line);
+    token_set_last_error(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  // the classes games actually ask, with minimal REAL records
+  u32 fill = 0;
+  switch (cls) {
+    case TOKEN_USER: fill = k_token_user_size; break;
+    case TOKEN_INTEGRITY_LEVEL: fill = k_token_il_size; break;
+    case TOKEN_STATISTICS: fill = k_token_stats_size; break;
+    default: {
+      char line[160];
+      snprintf(line, sizeof(line),
+               "advapi32: GetTokenInformation class=%u unsupported -> "
+               "ERROR_INVALID_PARAMETER (named, fail-visible)", cls);
+      trt_core_log(line);
+      token_set_last_error(87);
+      return 0;
+    }
+  }
+  if (!info || !len_out) {
+    token_set_last_error(87);
+    return 0;
+  }
+  if (len < fill) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "advapi32: GetTokenInformation class=%u buffer=%u need=%u -> "
+             "ERROR_INSUFFICIENT_BUFFER", cls, len, fill);
+    trt_core_log(line);
+    *len_out = fill;
+    token_set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  *len_out = fill;
+  u8* out = (u8*)info;
+  memset(out, 0, fill);
+  if (cls == TOKEN_USER) {
+    // SID_AND_ATTRIBUTES { pSid, u32 attrs }: pSid points INTO the
+    // caller's buffer (winnt semantics), the SID bytes follow the pointer.
+    // The struct is { void*, u32 } with 4 bytes tail padding — never write
+    // the u32 at +4, that would zero the pointer's upper half.
+    u8* sid = out + 16;
+    memcpy(sid, k_sid_bytes, sizeof(k_sid_bytes));
+    *(void**)(out + 0) = sid;
+    *(u32*)(out + 8) = 0;  // attributes
+  } else if (cls == TOKEN_INTEGRITY_LEVEL) {
+    u8* sid = out + 16;
+    memcpy(sid, k_il_sid, sizeof(k_il_sid));
+    *(void**)(out + 0) = sid;
+    *(u32*)(out + 8) = 0;
+    *(u32*)(out + 28) = 0;  // policy mask: none (AFTER the 12-byte SID)
+  } else {  // TOKEN_STATISTICS minimal
+    *(u64*)(out + 0) = 0x2A;   // TokenId LUID (stable pseudo)
+    *(u64*)(out + 8) = 0x2A;   // AuthenticationId
+    *(u64*)(out + 16) = 0;     // ExpirationTime: never
+    *(u32*)(out + 24) = 1;     // TokenType: TokenPrimary
+    *(u32*)(out + 28) = 0;     // ImpersonationLevel: Anonymous
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "advapi32: GetTokenInformation class=%u -> %u bytes of record",
+           cls, fill);
+  trt_core_log(line);
+  return 1;  // TRUE
+}
+
+int TRT_GUEST_ABI trt_ConvertStringSecurityDescriptorToSecurityDescriptorW(
+    const u16* sddl, u32 req, void* sd_out, void* len_out) {
+  (void)req;
+  char utf8[128];
+  if (sddl)
+    trt_utf16_to_utf8(sddl, utf8, sizeof(utf8));
+  else
+    snprintf(utf8, sizeof(utf8), "(null)");
+  char line[224];
+  snprintf(line, sizeof(line),
+           "advapi32: ConvertStringSecurityDescriptorToSecurityDescriptorW"
+           "('%s') -> ERROR_CALL_NOT_IMPLEMENTED (no security model on "
+           "console; named, fail-visible)", utf8);
+  trt_core_log(line);
+  token_set_last_error(120);  // ERROR_CALL_NOT_IMPLEMENTED
+  if (sd_out) *(void**)sd_out = nullptr;
+  if (len_out) *(u32*)len_out = 0;
+  return 0;  // FALSE
+}
+
+int TRT_GUEST_ABI trt_ConvertSidToStringSidW(const void* sid, u16** str_out) {
+  if (!sid || !str_out) {
+    token_set_last_error(87);
+    return 0;
+  }
+  const u8* s = (const u8*)sid;
+  if (s[0] != 1 /*revision*/ || s[1] == 0 || s[1] > 15) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "advapi32: ConvertSidToStringSidW bad SID (rev=%u n=%u) -> "
+             "ERROR_INVALID_PARAMETER", s[0], s[1]);
+    trt_core_log(line);
+    token_set_last_error(87);
+    return 0;
+  }
+  // "S-1-<ia>-<sub>..." — authority is 6 bytes BE
+  u64 ia = 0;
+  for (int i = 0; i < 6; ++i) ia = (ia << 8) | s[2 + i];
+  char utf8[160];
+  int o = snprintf(utf8, sizeof(utf8), "S-1-%llu", (unsigned long long)ia);
+  const u32 n = s[1];
+  for (u32 i = 0; i < n && o < (int)sizeof(utf8) - 12; ++i) {
+    const u32 sub = (u32)s[8 + i * 4] | ((u32)s[9 + i * 4] << 8) |
+                    ((u32)s[10 + i * 4] << 16) | ((u32)s[11 + i * 4] << 24);
+    o += snprintf(utf8 + o, sizeof(utf8) - o, "-%u", sub);
+  }
+  // hand the caller a UTF-16 copy in a static ring (game-pace: a handful)
+  static u16 ring[4][160];
+  static int ring_i = 0;
+  u16* out = ring[ring_i++ % 4];
+  for (int i = 0; utf8[i] && i < 159; ++i) out[i] = (u16)(u8)utf8[i];
+  out[159] = 0;
+  *str_out = out;
+  char line[224];
+  snprintf(line, sizeof(line),
+           "advapi32: ConvertSidToStringSidW -> \"%s\"", utf8);
+  trt_core_log(line);
+  return 1;  // TRUE
+}
+
 int trt_bridge_register_registry(void) {
   static const trt_named_fn k_advapi32_fns[] = {
       {"RegOpenKeyExW", (void*)&trt_RegOpenKeyExW},
@@ -558,6 +795,12 @@ int trt_bridge_register_registry(void) {
       {"RegEnumKeyExW", (void*)&trt_RegEnumKeyExW},
       {"RegEnumValueW", (void*)&trt_RegEnumValueW},
       {"RegGetValueW", (void*)&trt_RegGetValueW},
+      // the token/security half (the honest no-security-model surface)
+      {"OpenProcessToken", (void*)&trt_OpenProcessToken},
+      {"GetTokenInformation", (void*)&trt_GetTokenInformation},
+      {"ConvertStringSecurityDescriptorToSecurityDescriptorW",
+       (void*)&trt_ConvertStringSecurityDescriptorToSecurityDescriptorW},
+      {"ConvertSidToStringSidW", (void*)&trt_ConvertSidToStringSidW},
   };
   trt_module_register("advapi32.dll", TRT_ROUTE_BUILTIN, k_advapi32_fns,
                        (int)(sizeof(k_advapi32_fns) / sizeof(k_advapi32_fns[0])));
