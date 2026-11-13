@@ -1,0 +1,10 @@
+LIBRARY dsound.dll
+EXPORTS
+    DirectSoundCreate
+    DirectSoundCreate8
+    DirectSoundEnumerateW
+    DirectSoundEnumerateA
+    DirectSoundCaptureCreate
+    DirectSoundCaptureCreate8
+    DirectSoundCaptureEnumerateW
+    DirectSoundCaptureEnumerateA

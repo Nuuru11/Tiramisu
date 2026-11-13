@@ -348,7 +348,7 @@ const mod_default k_defaults[] = {
     {"d3d9.dll", TRT_ROUTE_STUB},
     {"d3d9core.dll", TRT_ROUTE_STUB},
     {"ddraw.dll", TRT_ROUTE_STUB},
-    {"dsound.dll", TRT_ROUTE_STUB},
+    {"dsound.dll", TRT_ROUTE_BUILTIN},   // M6: DirectSound -> console sink
     {"opengl32.dll", TRT_ROUTE_STUB},    // console has no GL
     {"glu32.dll", TRT_ROUTE_STUB},
     {"dinput8.dll", TRT_ROUTE_STUB},     // console input = XInput
