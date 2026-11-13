@@ -348,6 +348,7 @@ const mod_default k_defaults[] = {
     {"d3d9.dll", TRT_ROUTE_STUB},
     {"d3d9core.dll", TRT_ROUTE_STUB},
     {"d3d8.dll", TRT_ROUTE_BUILTIN},     // M7: D3D8 -> same backend hooks
+    {"openal32.dll", TRT_ROUTE_BUILTIN}, // M7: OpenAL 1.1 -> console sink
     {"dsound.dll", TRT_ROUTE_BUILTIN},   // M6: DirectSound -> console sink
     {"ddraw.dll", TRT_ROUTE_BUILTIN},    // M6: DirectDraw -> backend present
     {"opengl32.dll", TRT_ROUTE_STUB},    // console has no GL

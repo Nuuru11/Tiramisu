@@ -40,6 +40,14 @@ extern "C" void trt_audio_set_hooks(int (*submit)(const void*, u32, u32, u32,
   g_hooks.user = user;
 }
 
+// getter for sibling bridges (openal drives the same sink)
+extern "C" void trt_audio_get_hooks(void (**submit)(const void*, u32, u32, u32,
+                                                    u32, void*),
+                                    void** user) {
+  if (submit) *submit = (void (*)(const void*, u32, u32, u32, u32, void*))g_hooks.submit;
+  if (user) *user = g_hooks.user;
+}
+
 namespace {
 
 // ---- objects ----

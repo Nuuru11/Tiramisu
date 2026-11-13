@@ -1,0 +1,16 @@
+LIBRARY openal32.dll
+EXPORTS
+    alcOpenDevice
+    alcCreateContext
+    alcMakeContextCurrent
+    alGetError
+    alGenBuffers
+    alBufferData
+    alGenSources
+    alSourceQueueBuffers
+    alSourcePlay
+    alGetSourcei
+    alSourceUnqueueBuffers
+    alSourceStop
+    alcCloseDevice
+    trt_openal_pump
