@@ -41,7 +41,7 @@ file "$out/guest_hello.exe"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_pe_loader.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
 
@@ -52,7 +52,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_input.cpp \
   src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
   src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -69,7 +69,7 @@ rm -f "$out/user32.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_game_boot.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
@@ -100,7 +100,7 @@ rm -f "$out/delayimp.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_real_load.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
+  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
@@ -129,7 +129,7 @@ rm -f "$out/guestdll.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_libload.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_libload"
@@ -168,10 +168,39 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_d3d.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/vfs.cpp \
+  src/trt/bridge_kernel32.cpp \
   src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_d3d"
 "$out/test_d3d" "$out/guest_d3d.exe"
 else
   echo "SKIP graphics bridge suite: no Windows SDK at $SDK"
 fi
+
+# --- 9. the registry: UWP has none, games expect one ---
+cat > "$out/advapi32.def" <<'DEOF'
+LIBRARY advapi32
+EXPORTS
+    RegOpenKeyExW
+    RegCreateKeyExW
+    RegQueryValueExW
+    RegSetValueExW
+    RegCloseKey
+    RegEnumKeyExW
+DEOF
+rm -f "$out/advapi32.lib"
+"$LLD_LINK" /lib /def:"$out/advapi32.def" /out:"$out/advapi32.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_reg.c -o "$out/guest_reg.obj"
+"$LLD_LINK" "$out/guest_reg.obj" "$out/advapi32.lib" \
+  /NODEFAULTLIB /ENTRY:reg_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_reg.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_reg.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/vfs.cpp \
+  src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
+  -o "$out/test_reg"
+DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
+"$out/test_reg" "$out/guest_reg.exe" "$DRIEC"

@@ -59,11 +59,12 @@ u32 GSTD real_load_boot(u64 a, u64 b, u64 c) {
   void* s = WindowsCreateString(src, 2);
   bits |= (s == (void*)src) ? 0x2u : 0u;
 
-  // 3. STUB: binds, and at the call site returns 0 with a named log
+  // 3. advapi32: the registry bridge answers with a NAMED error for a bad
+  //    handle - a failure, not a silent success
   void* hkey = (void*)0;
   const i32 r3 = RegOpenKeyExW((void*)0, (const u16[]){'S', 'o', 'f', 't', 0},
                                0, (void*)0, &hkey);
-  bits |= (r3 == 0 && hkey == (void*)0) ? 0x4u : 0u;
+  bits |= (r3 == 6 /*ERROR_INVALID_HANDLE*/) ? 0x4u : 0u;
 
   // 4. delay import: must not kill the load; calling it must be visible
   u32 code_len = 0;

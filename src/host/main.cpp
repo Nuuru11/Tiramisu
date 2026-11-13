@@ -13,6 +13,7 @@
 #include "../trt/input.h"
 #include "../trt/images.h"
 #include "../trt/bridge_d3d.h"
+#include "../trt/bridge_reg.h"
 
 #include <winrt/base.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -264,6 +265,10 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
   trt_bridge_set_exe_path(("Z:\\" + exe).c_str());
+  // the registry hive lives on the guest's C: drive (next to its saves).
+  // Windows wchar_t is UTF-16, which is what the bridge expects.
+  static_assert(sizeof(wchar_t) == 2, "wchar_t must be UTF-16");
+  trt_registry_set_hive_path((const u16*)L"C:\\registry.hiv");
 
   trt_resolver rs;
   trt_resolver_default(&rs);

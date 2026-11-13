@@ -7,6 +7,7 @@
 #include "images.h"
 #include "pe_exports.h"
 #include "bridge_d3d.h"
+#include "bridge_reg.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -147,6 +148,8 @@ void trt_bridge_boot(const trt_backend* be) {
   // the graphics bridge takes over d3d11/dxgi (its own functions first,
   // everything else falls through to the console's real DLLs)
   trt_bridge_register_d3d();
+  // the registry: UWP has none, games expect one
+  trt_bridge_register_registry();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 

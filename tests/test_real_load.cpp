@@ -219,8 +219,8 @@ int main(int argc, char** argv) {
         "api-set contract redirected (winrt -> combase)");
   CHECK(log_has("DELAY import d3dcompiler_47.dll"),
         "delay import bound and logged");
-  CHECK(log_has("STUB advapi32.dll!RegOpenKeyExW called (unimplemented)"),
-        "stub call site names itself (never silent)");
+  CHECK(log_has("advapi32.dll"),
+        "advapi32 is a real module now (the registry bridge)");
   CHECK(log_has("DELAY d3dcompiler_47.dll!D3DCompile called (unimplemented)"),
         "delay-import call site names itself");
   CHECK(g_fake_calls >= 2, "contract-resolved calls reached the real functions");
