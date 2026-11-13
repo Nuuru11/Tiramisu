@@ -444,15 +444,18 @@ int TRT_GUEST_ABI dx10_CreateSRVFromMemory(void* device, const void* data,
                                   out_srv, hr_out);
 }
 
-// D3DX11CompileFromFile: read the file, hand the source to the SYSTEM
-// d3dcompiler_47's D3DCompile through the module table. The SYSTEM route
-// means the console's real d3dcompiler_47.dll exports it — we resolve the
-// real function at first use.
+// D3DX11CompileFromFile: read the file, hand the source to a real
+// D3DCompile. The host sets the compiler through trt_d3dx_set_compiler
+// (it links d3dcompiler.lib and compiles its own shaders already); a
+// guest-imported D3DCompile goes straight to the console's SYSTEM
+// d3dcompiler_47 and never reaches here.
 using d3dcompile_t = int (TRT_GUEST_ABI *)(const void*, size_t, const void*,
                                            const void*, const void*, const char*,
                                            const char*, u32, u32, void**,
                                            void**);
 d3dcompile_t g_real_d3dcompile = nullptr;
+
+void trt_d3dx_set_compiler(void* fn) { g_real_d3dcompile = (d3dcompile_t)fn; }
 
 int TRT_GUEST_ABI dx11_CompileFromFileW(const u16* path, const void* defines,
                                         const void* includes,

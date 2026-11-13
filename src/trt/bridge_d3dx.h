@@ -32,6 +32,11 @@ extern "C" {
 
 int trt_bridge_register_d3dx(void);
 
+// the host hands its real D3DCompile here after boot (the console's
+// d3dcompiler_47); guests calling D3DCompile directly go through the
+// SYSTEM route and never need this
+void trt_d3dx_set_compiler(void* fn);
+
 #ifdef __cplusplus
 }
 #endif

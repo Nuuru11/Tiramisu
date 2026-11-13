@@ -5,6 +5,7 @@
 #include "swapchain.h"
 
 #include "../trt/bridge_d3d.h"
+#include "../trt/bridge_d3dx.h"
 
 #include <d3dcompiler.h>
 
@@ -98,6 +99,9 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   hooks.width = g_w;
   hooks.height = g_h;
   trt_gpu_set_hooks(&hooks);
+  // the guest's D3DCompile route: hand the SYSTEM d3dcompiler_47 to the
+  // d3dx bridge (CompileFromFile needs it)
+  trt_d3dx_set_compiler((void*)&D3DCompile);
   return r;
 }
 
