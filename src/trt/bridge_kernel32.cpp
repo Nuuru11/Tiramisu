@@ -11,6 +11,8 @@
 #include "bridge_mem.h"
 #include "bridge_thread.h"
 #include "bridge_sys.h"
+#include "bridge_dinput.h"
+#include "bridge_audio.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -166,6 +168,10 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_memory();
   trt_bridge_register_threads();
   trt_bridge_register_system();
+  // DirectInput 8: how most PC games read the mouse and keyboard
+  trt_bridge_register_dinput();
+  // XAudio2: how games play sound
+  trt_bridge_register_audio();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 

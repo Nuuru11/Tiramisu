@@ -23,6 +23,8 @@ without an artifact.
 | Guest-call ABI hazards are closed | the loader's Win64 call helper reads its arguments through memory constraints and before touching %rsp (a register-constrained version silently corrupted the guest's arguments; the test caught it) |
 | The guest's D3D11 frame reaches the host's GPU | `tests/test_d3d.cpp`: the guest's `D3D11CreateDevice` gets the host's device+context, the factory enumerates adapters through the console's real DXGI factory, `CreateSwapChainForHwnd` hands over the HOST's swapchain, and the guest's clear/draw/present land on the host's objects |
 | The engine-API batch works | `tests/test_engine.cpp`: the guest maps a file it wrote (the mapping carries the file's real bytes), starts a real worker thread and joins it through `WaitForSingleObject`, converts strings both ways, reads the OS version and system info, and drives the quit/focus lifecycle |
+| DirectInput 8 works | `tests/test_dinput.cpp`: factory, mouse + keyboard devices, acquire, poll; the polled state carries deltas and buttons the harness fed through the real input ring |
+| XAudio2 works | `tests/test_audio.cpp`: engine, mastering + source voices, PCM submit; the host sink received the guest's 48kHz stereo 16-bit buffer and `GetState`/`Flush` track the queue |
 | The guest has a working registry | `tests/test_reg.cpp`: HKCU/HKLM keys open and create, a string value round-trips, a missing value fails with ERROR_FILE_NOT_FOUND (not a silent zero), subkeys enumerate, and the hive is persisted to the guest's C: drive in a form that survives UTF-16 |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
