@@ -28,11 +28,13 @@ bool name_eq(const char* a, const char* b) {
   return a[i] == b[i];  // both ended (b may be the shorter registered name)
 }
 
-struct builtin_fn { const char* name; void* fn; };
 struct builtin_mod {
   char name[32];
   trt_route route;
-  const builtin_fn* fns;
+  // the function table is OWNED by the module: several bridges add to the
+  // same module (kernel32 gets memory, thread, system and core functions),
+  // so registering must MERGE, not replace
+  trt_named_fn fns[128];
   int fn_count;
 };
 // The table must hold every module a game might import: the defaults
@@ -141,7 +143,7 @@ void* resolve_through_table(void* user, const char* module,
     case TRT_ROUTE_BUILTIN:
       if (symbol) {
         for (int i = 0; i < m.fn_count; ++i)
-          if (strcmp(m.fns[i].name, symbol) == 0) return m.fns[i].fn;
+          if (strcmp(m.fns[i].name, symbol) == 0) return (void*)m.fns[i].fn;
         // Some SDK headers declare their exports inside C++ without
         // extern "C", so the import comes in MSVC-mangled:
         //   __imp_?CreateDXGIFactory2@@YAJAEBU_GUID@@PEAPEAX@Z
@@ -154,7 +156,7 @@ void* resolve_through_table(void* user, const char* module,
             memcpy(base, symbol + 1, len);
             base[len] = 0;
             for (int i = 0; i < m.fn_count; ++i)
-              if (strcmp(m.fns[i].name, base) == 0) return m.fns[i].fn;
+              if (strcmp(m.fns[i].name, base) == 0) return (void*)m.fns[i].fn;
           }
         }
         // builtin module, unknown symbol: fall through to system by alias
@@ -195,6 +197,25 @@ void trt_module_register(const char* name, trt_route route,
   builtin_mod* m = nullptr;
   if (existing >= 0) {
     m = &g_modules[existing];
+    // merging into an existing BUILTIN module: keep what is there and add
+    // the new functions; a function that already exists is REPLACED by the
+    // newer registration (a test harness or a later bridge can override)
+    if (m->route == TRT_ROUTE_BUILTIN && route == TRT_ROUTE_BUILTIN && fns) {
+      for (int i = 0; i < fn_count; ++i) {
+        bool replaced = false;
+        for (int j = 0; j < m->fn_count; ++j) {
+          if (strcmp(m->fns[j].name, fns[i].name) == 0) {
+            m->fns[j] = fns[i];
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced &&
+            m->fn_count < (int)(sizeof(m->fns) / sizeof(m->fns[0])))
+          m->fns[m->fn_count++] = fns[i];
+      }
+      return;
+    }
   } else {
     if (g_module_count >= (int)(sizeof(g_modules) / sizeof(g_modules[0]))) {
       char line[160];
@@ -208,7 +229,8 @@ void trt_module_register(const char* name, trt_route route,
   memset(m, 0, sizeof(*m));
   strncpy(m->name, name, sizeof(m->name) - 1);
   m->route = route;
-  m->fns = (const builtin_fn*)fns;
+  for (int i = 0; i < fn_count && i < (int)(sizeof(m->fns) / sizeof(m->fns[0])); ++i)
+    m->fns[i] = fns[i];
   m->fn_count = fn_count;
 }
 

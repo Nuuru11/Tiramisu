@@ -147,7 +147,7 @@ i64 TRT_STDCALL trt_DefWindowProcW(void* hwnd, u32 msg, u64 wp, i64 lp) {
   return msg == 0x0010 ? 1 : 0;  // WM_CLOSE -> TRUE
 }
 
-void* TRT_STDCALL trt_GetActiveWindow(void) {
+void* TRT_STDCALL trt_GetActiveWindow(void) {  // == the focused window
   for (int i = 0; i < g_win_count; ++i)
     if (g_wins[i].handle) return (void*)(uintptr_t)g_wins[i].handle;
   return nullptr;
@@ -185,6 +185,22 @@ int TRT_STDCALL trt_GetMessageW(guest_msg* out, void* hwnd, u32 min, u32 max) {
 }
 
 void trt_set_pump(void (*fn)(void)) { g_pump = fn; }
+
+// ---- quit + focus lifecycle ----
+// A game that cannot quit, or that never learns it lost focus, is broken:
+// it burns CPU in the background and the TV never goes back to the shelf.
+static u32 g_quit_code = 0;
+static bool g_quit_posted = false;
+static void* g_focus_window = nullptr;
+
+void trt_bridge_post_quit(int code) {
+  g_quit_code = (u32)code;
+  g_quit_posted = true;
+}
+
+bool trt_bridge_quit_posted(void) { return g_quit_posted; }
+
+void trt_bridge_set_focus(void* hwnd) { g_focus_window = hwnd; }
 
 int TRT_STDCALL trt_PeekMessageW(guest_msg* out, void* hwnd, u32 min, u32 max,
                                  u32 remove) {
@@ -299,7 +315,69 @@ i64 TRT_STDCALL trt_SendMessageW(void* hwnd, u32 msg, u64 wp, i64 lp) {
   return trt_DispatchMessageW(&m);
 }
 
+// PostQuitMessage(code): the guest asks the loop to end
+void TRT_STDCALL trt_PostQuitMessage(i32 code) {
+  trt_bridge_post_quit(code);
+}
+
+// SetFocus(hwnd) / GetFocus(): the guest's input focus
+void* TRT_STDCALL trt_SetFocus(void* hwnd) {
+  void* prev = g_focus_window;
+  g_focus_window = hwnd;
+  if (hwnd) {
+    trt_msg_post(0x0007 /*WM_SETFOCUS*/, 0, (i64)(uintptr_t)hwnd);
+  } else {
+    trt_msg_post(0x0008 /*WM_KILLFOCUS*/, 0, 0);
+  }
+  return prev;
+}
+
+void* TRT_STDCALL trt_GetFocus(void) { return g_focus_window; }
+
+// SetWindowPos(hwnd, after, x, y, cx, cy, flags)
+int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
+                                  i32 cx, i32 cy, u32 flags) {
+  (void)hwnd; (void)after; (void)x; (void)y; (void)cx; (void)cy; (void)flags;
+  return 1;
+}
+
+// IsWindow / IsWindowVisible: the guest asks whether its window is alive
+int TRT_STDCALL trt_IsWindow(void* hwnd) { return hwnd ? 1 : 0; }
+
+int TRT_STDCALL trt_IsWindowVisible(void* hwnd) { return hwnd ? 1 : 0; }
+
+// GetClientRect / GetWindowRect: the guest asks how big it is
+int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect) {
+  (void)hwnd;
+  if (!rect) return 0;
+  u32* r = (u32*)rect;
+  r[0] = 0;       // left
+  r[1] = 0;       // top
+  r[2] = 1920;    // right
+  r[3] = 1080;    // bottom
+  return 1;
+}
+
+int TRT_STDCALL trt_SetTimer(void* hwnd, u32 id, u32 ms, void* callback) {
+  (void)hwnd; (void)id; (void)ms; (void)callback;
+  return 1;  // timers are a no-op: the host drives the frame
+}
+
+int TRT_STDCALL trt_KillTimer(void* hwnd, u32 id) {
+  (void)hwnd; (void)id;
+  return 1;
+}
+
 static const trt_named_fn k_user32_fns[] = {
+  {"PostQuitMessage", (void*)&trt_PostQuitMessage},
+  {"SetFocus", (void*)&trt_SetFocus},
+  {"GetFocus", (void*)&trt_GetFocus},
+  {"SetWindowPos", (void*)&trt_SetWindowPos},
+  {"IsWindow", (void*)&trt_IsWindow},
+  {"IsWindowVisible", (void*)&trt_IsWindowVisible},
+  {"GetClientRect", (void*)&trt_GetClientRect},
+  {"SetTimer", (void*)&trt_SetTimer},
+  {"KillTimer", (void*)&trt_KillTimer},
   {"RegisterClassExW", (void*)&trt_RegisterClassExW},
   {"CreateWindowExW", (void*)&trt_CreateWindowExW},
   {"DestroyWindow", (void*)&trt_DestroyWindow},

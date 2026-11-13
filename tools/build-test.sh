@@ -42,6 +42,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_pe_loader.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
 
@@ -53,6 +54,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
   src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -70,6 +72,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_game_boot.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
@@ -101,6 +104,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_real_load.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
@@ -130,6 +134,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_libload.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_libload"
@@ -168,7 +173,9 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_d3d.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/vfs.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
+  src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp \
   src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_d3d"
@@ -199,8 +206,60 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_reg.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/vfs.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
+  src/trt/vfs.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_reg"
 DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
 "$out/test_reg" "$out/guest_reg.exe" "$DRIEC"
+
+# --- 10. the engine-API batch: mapping, threads, system info, lifecycle ---
+cat > "$out/engine.def" <<'DEOF'
+LIBRARY kernel32
+EXPORTS
+    CreateFileMappingW
+    MapViewOfFile
+    UnmapViewOfFile
+    CreateThread
+    WaitForSingleObject
+    CreateEventW
+    SetEvent
+    ResetEvent
+    InitializeCriticalSection
+    EnterCriticalSection
+    LeaveCriticalSection
+    GetVersionExW
+    GetSystemInfo
+    MultiByteToWideChar
+    WideCharToMultiByte
+    GetTempPathW
+    GetTickCount64
+DEOF
+cat > "$out/engine_u.def" <<'DEOF'
+LIBRARY user32
+EXPORTS
+    PostQuitMessage
+    SetFocus
+    GetFocus
+    GetClientRect
+DEOF
+rm -f "$out/engine.lib" "$out/engine_u.lib"
+"$LLD_LINK" /lib /def:"$out/engine.def" /out:"$out/engine.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:"$out/engine_u.def" /out:"$out/engine_u.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_engine.c -o "$out/guest_engine.obj"
+"$LLD_LINK" "$out/guest_engine.obj" "$out/engine.lib" "$out/engine_u.lib" \
+  "$out/kernel32.lib" "$out/user32.lib" \
+  /NODEFAULTLIB /ENTRY:engine_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_engine.exe"
+clang++ -std=c++17 -O2 -Wall -no-pie \
+  tests/test_engine.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
+  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/vfs.cpp \
+  src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
+  -o "$out/test_engine"
+DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
+"$out/test_engine" "$out/guest_engine.exe" "$DRIEC"

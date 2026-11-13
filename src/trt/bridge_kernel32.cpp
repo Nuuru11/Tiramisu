@@ -8,6 +8,9 @@
 #include "pe_exports.h"
 #include "bridge_d3d.h"
 #include "bridge_reg.h"
+#include "bridge_mem.h"
+#include "bridge_thread.h"
+#include "bridge_sys.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -104,6 +107,15 @@ void TRT_STDCALL trt_SetLastError(u32 err) {
 }
 
 u32 TRT_STDCALL trt_GetCurrentThreadId(void) { return g_tls_index_current_thread; }
+
+// the monotonic clock games use for timing (GetTickCount64 since Win7)
+u64 TRT_STDCALL trt_GetTickCount64(void) {
+  const i64 t = now_qpc_ticks();
+  // our QPC source is nanoseconds; Windows' GetTickCount64 is milliseconds
+  return (u64)(t / 1000000ll);
+}
+
+u32 TRT_STDCALL trt_GetTickCount(void) { return (u32)trt_GetTickCount64(); }
 void* TRT_STDCALL trt_GetCurrentProcess(void) { return (void*)(uintptr_t)-1; }
 
 int TRT_STDCALL trt_QueryPerformanceCounter(i64* out) {
@@ -150,6 +162,10 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_d3d();
   // the registry: UWP has none, games expect one
   trt_bridge_register_registry();
+  // the engine-API batch: mapped files, threads, system information
+  trt_bridge_register_memory();
+  trt_bridge_register_threads();
+  trt_bridge_register_system();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 
@@ -196,8 +212,21 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     return (void*)(uintptr_t)-1;
   }
   const bool write = (access & 0x40000000u) != 0 || (access & 0x2u) != 0;
-  FILE* os = fopen(host, write ? "r+b" : "rb");
-  if (!os && write) os = fopen(host, "w+b");
+  // disposition: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING,
+  // 4 OPEN_ALWAYS, 5 TRUNCATE_EXISTING
+  const u32 disp = disposition ? disposition : 3;
+  FILE* os = nullptr;
+  if (disp == 1 || disp == 2) {
+    os = fopen(host, "w+b");
+  } else if (disp == 4) {
+    os = fopen(host, "r+b");
+    if (!os) os = fopen(host, "w+b");
+  } else if (disp == 5) {
+    os = fopen(host, "w+b");
+  } else {
+    os = fopen(host, write ? "r+b" : "rb");
+  }
+  if (!os && write) os = fopen(host, "r+b");
   if (!os) {
     g_tls_last_error[g_tls_index_current_thread % 128] = 2; // FILE_NOT_FOUND
     return (void*)(uintptr_t)-1;
@@ -225,7 +254,29 @@ int TRT_STDCALL trt_WriteFile(void* h, const void* buf, u32 bytes, u32* written,
   return 1;
 }
 
+// the bytes behind one of the guest's file handles (used by the
+// memory-mapping bridge: a mapping must carry the file's content)
+void* trt_file_bytes(void* handle, size_t* size) {
+  FILE* os = file_os(handle);
+  if (!os) return nullptr;
+  fflush(os);
+  const long cur = ftell(os);
+  fseek(os, 0, SEEK_END);
+  const long n = ftell(os);
+  fseek(os, 0, SEEK_SET);
+  u8* buf = (u8*)malloc((size_t)(n > 0 ? n : 1));
+  if (!buf) return nullptr;
+  const size_t got = fread(buf, 1, (size_t)(n > 0 ? n : 0), os);
+  fseek(os, cur, SEEK_SET);
+  *size = got;
+  return buf;
+}
+
+int trt_sync_close(u64 handle);
+
 int TRT_STDCALL trt_CloseHandle(void* h) {
+  // a synchronisation object (event/mutex/thread) or a file?
+  if (trt_sync_close((u64)(uintptr_t)h)) return 1;
   FILE* os = file_os(h);
   if (!os) return 1;  // non-file handles: pretend closed
   fclose(os);
@@ -432,6 +483,8 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"QueryPerformanceFrequency", (void*)&trt_QueryPerformanceFrequency},
   {"IsProcessorFeaturePresent", (void*)&trt_IsProcessorFeaturePresent},
   {"Sleep", (void*)&trt_Sleep},
+  {"GetTickCount", (void*)&trt_GetTickCount},
+  {"GetTickCount64", (void*)&trt_GetTickCount64},
   {"CreateFileW", (void*)&trt_CreateFileW},
   {"ReadFile", (void*)&trt_ReadFile},
   {"WriteFile", (void*)&trt_WriteFile},

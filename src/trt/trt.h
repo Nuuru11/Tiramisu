@@ -118,6 +118,8 @@ int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 void trt_bridge_set_exe_path(const char* zpath);
 // UTF-16 -> UTF-8 helper (paths, strings)
 int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
+// the bytes behind a guest file handle (the memory-mapping bridge)
+void* trt_file_bytes(void* handle, size_t* size);
 int trt_bridge_register_user32(void);
 // host pump: called from the builtin GetMessageW while the guest blocks, so
 // CoreWindow events + XInput keep flowing after the guest owns the thread
