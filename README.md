@@ -37,6 +37,7 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 | Threads & sync | **BUILT** — real worker threads (`CreateThread`), events, mutexes, semaphores, critical sections, `WaitForSingleObject`/`WaitForMultipleObjects`, TLS |
 | System information | **BUILT** — OS version, `GetSystemInfo`, tick counters, temp path, computer name, `MultiByteToWideChar`/`WideCharToMultiByte`, file/dir APIs |
 | DirectInput 8 | **BUILT** — `DirectInput8Create`, factory + mouse/keyboard devices with the SDK's exact vtables, `Acquire`/`Poll`/`GetDeviceState` (DIMOUSESTATE deltas + 256-byte key map) fed from the real input ring |
+| Steamworks (auth-only) | **BUILT** — the boot lifecycle (`RestartAppIfNecessary` -> `Init` -> `GetSteamID` -> presence -> callbacks). **No DRM bypass, ever**: `BIsSubscribedApp` answers 0 with a log line, so a DRM'd build refuses to start visibly; use GOG/itch builds |
 | XAudio2 audio | **BUILT** — engine, mastering/source voices with the SDK's exact vtables, `SubmitSourceBuffer` hands the guest's PCM to the host sink, `GetState`/`Flush`/`Stop` |
 | Quit + focus lifecycle | **BUILT** — `PostQuitMessage`, `SetFocus`/`GetFocus`, `GetClientRect`, `SetTimer`/`KillTimer` (a game that cannot quit or pause is broken) |
 | D3D11/DXGI for the guest | **BUILT** — the guest's `D3D11CreateDevice` gets the host's device+context, its factory enumerates adapters through the console's real DXGI, and `CreateSwapChainForHwnd` hands it the HOST's CoreWindow swapchain (the console has no window for the guest's fake HWND) |

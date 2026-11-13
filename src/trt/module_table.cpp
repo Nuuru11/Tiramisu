@@ -200,6 +200,10 @@ void trt_module_register(const char* name, trt_route route,
     // merging into an existing BUILTIN module: keep what is there and add
     // the new functions; a function that already exists is REPLACED by the
     // newer registration (a test harness or a later bridge can override)
+    // a BUILTIN registration UPGRADES a STUB module (steam_api64 was a stub
+    // until the auth bridge replaced it); a STUB registration never
+    // downgrades an existing BUILTIN
+    if (route == TRT_ROUTE_STUB && m->route == TRT_ROUTE_BUILTIN) return;
     if (m->route == TRT_ROUTE_BUILTIN && route == TRT_ROUTE_BUILTIN && fns) {
       for (int i = 0; i < fn_count; ++i) {
         bool replaced = false;
@@ -355,7 +359,9 @@ const mod_default k_defaults[] = {
     {"d3dx10_43.dll", TRT_ROUTE_STUB},
     {"d3dx11_43.dll", TRT_ROUTE_STUB},
     {"d3dx11_47.dll", TRT_ROUTE_STUB},
-    {"steam_api64.dll", TRT_ROUTE_STUB}, // M6: never a DRM bypass
+    // steam: registered BUILTIN by bridge_steam (auth-only, no DRM bypass);
+    // this STUB entry is the fallback if the bridge never registered
+    {"steam_api64.dll", TRT_ROUTE_STUB},
     {"steam_api.dll", TRT_ROUTE_STUB},
 };
 

@@ -25,6 +25,7 @@ without an artifact.
 | The engine-API batch works | `tests/test_engine.cpp`: the guest maps a file it wrote (the mapping carries the file's real bytes), starts a real worker thread and joins it through `WaitForSingleObject`, converts strings both ways, reads the OS version and system info, and drives the quit/focus lifecycle |
 | DirectInput 8 works | `tests/test_dinput.cpp`: factory, mouse + keyboard devices, acquire, poll; the polled state carries deltas and buttons the harness fed through the real input ring |
 | XAudio2 works | `tests/test_audio.cpp`: engine, mastering + source voices, PCM submit; the host sink received the guest's 48kHz stereo 16-bit buffer and `GetState`/`Flush` track the queue |
+| Steamworks auth works | `tests/test_steam.cpp`: the boot lifecycle succeeds for a non-DRM'd build; ownership checks answer 0 *visibly* (no license server, no DRM bypass) |
 | The guest has a working registry | `tests/test_reg.cpp`: HKCU/HKLM keys open and create, a string value round-trips, a missing value fails with ERROR_FILE_NOT_FOUND (not a silent zero), subkeys enumerate, and the hive is persisted to the guest's C: drive in a form that survives UTF-16 |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
