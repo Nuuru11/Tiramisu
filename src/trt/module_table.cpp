@@ -355,8 +355,9 @@ const mod_default k_defaults[] = {
     {"dinput.dll", TRT_ROUTE_STUB},
     {"gameinput.dll", TRT_ROUTE_STUB},   // GDK input
     {"advapi32.dll", TRT_ROUTE_STUB},    // M4: registry (HKLM/HKCU hive)
-    {"msacm32.dll", TRT_ROUTE_STUB},
-    {"winspool.drv", TRT_ROUTE_STUB},
+    {"msacm32.dll", TRT_ROUTE_BUILTIN},  // M6: codec probes (PCM only)
+    {"msvfw32.dll", TRT_ROUTE_BUILTIN},  // M6: no AVI codecs (skip logos)
+    {"winspool.drv", TRT_ROUTE_BUILTIN}, // M6: no printers
     {"d3dx9_43.dll", TRT_ROUTE_BUILTIN}, // M6: D3DX math/textures/sprites
     {"d3dx9_40.dll", TRT_ROUTE_BUILTIN},
     {"d3dx9_36.dll", TRT_ROUTE_BUILTIN},

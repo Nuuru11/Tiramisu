@@ -32,6 +32,9 @@ without an artifact.
 | The launcher scans compatibility before launch | `main.cpp` `scan_compat`: reads each game's PE machine type + full import table (RVA→file-offset through the section table), flags [steam-auth]/[d3d9 OK]/[d3d11 OK] on the shelf |
 | The console has real audio output | `src/host/audio.cpp`: XAudio2 2.8 mastering + per-format source voices, 8-slot PCM ring wired to `trt_audio_set_hooks`; offline side proven by `tests/test_audio.cpp` sink receipt |
 | The D3D9 bridge works end-to-end | `tests/test_d3d9.cpp`: the guest creates a D3D9 device through `Direct3DCreate9`/`CreateDevice` (SDK-exact 17/119-slot vtables), locks a texture and vertex buffer and writes through the locked pointers, sets render state/transforms/FVF, and the host hooks observe Clear, Present, both draws (TRIANGLELIST, FVF 0x42, viewport 1280x720) — the guest returned the full 0x3ff bitmask |
+| DirectSound reaches the console sink | `tests/test_dsound.cpp`: the guest creates a DS8 device, sets the cooperative level, creates a secondary buffer, locks and writes PCM, plays, stops — the host sink observed the guest's 44.1kHz stereo 16-bit bytes (guest 0x3ff) |
+| DirectDraw reaches the backend present | `tests/test_ddraw.cpp`: the guest creates an IDirectDraw7, sets display mode, creates the primary surface, locks and writes a gradient, creates an offscreen surface, BltFast copies it onto the primary, Flips — the host present hook fired twice (Unlock + Flip) (guest 0xfff) |
+| D3DX9 math is exact and textures upload | `tests/test_d3dx9.cpp`: MatrixIdentity/Multiply/PerspectiveFovLH/Inverse/Transpose verified against hand-computed values, Vec3 normalize/cross/dot exact, a 32-bit BMP in memory became a texture through the d3d9 hooks (2 create_tex + 1 lock observed), shader source round-tripped through a real ID3DXBuffer, sprite Begin/End (guest 0x3ff) |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 

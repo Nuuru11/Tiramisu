@@ -43,10 +43,13 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 | D3D11/DXGI for the guest | **BUILT** — the guest's `D3D11CreateDevice` gets the host's device+context, its factory enumerates adapters through the console's real DXGI, and `CreateSwapChainForHwnd` hands it the HOST's CoreWindow swapchain (the console has no window for the guest's fake HWND) |
 | Guest DLLs loading the game's own DLLs | **BUILT** — loaded on demand from the game's own directory, imports bound recursively, DllMain run, exports resolvable by name and ordinal |
 | D3D9 -> D3D11 bridge (M5) | **BUILT** — `Direct3DCreate9`/`CreateDevice` with the SDK's exact 17/119-slot vtables; texture/VB/IB lifecycle, LockRect/Lock, render state, transforms, FVF, Clear/BeginScene/EndScene, all four draw paths, Present; D3DRS_* pass through to the host backend (D3D9On12 semantics, MIT); host binds plain-C hooks |
+| DirectSound (M6) | **BUILT** — `dsound.dll` BUILTIN: SDK-exact vtables (DS8=12, Buffer8=22 slots); Lock/write/Unlock marshals the guest's PCM into the same console XAudio2 sink XAudio2 uses |
+| DirectDraw (M6) | **BUILT** — `ddraw.dll` BUILTIN: SDK-exact vtables (DD7=30, Surface7=49 slots); primary-surface Unlock/Flip maps to the host backend present (cnc-ddraw's mapping onto D3D11); offscreen surfaces + Blt/BltFast |
+| D3DX9 (M6) | **BUILT** — `d3dx9_30..43.dll` BUILTIN: exact D3DXMatrix/Vec/Quaternion math, texture creation from BMP/TGA in memory (PNG/DDS fail visibly as M7), `D3DXAssembleShader` with a real ID3DXBuffer, ID3DXSprite (14-slot SDK order) |
 | winmm (the frame clock) | **BUILT** — `timeGetTime`/`timeBeginPeriod`/`timeGetDevCaps`; legacy waveOut/midi/joy probes answer "no devices"; MCI fails visibly (263) |
 | Console audio output | **BUILT** — `src/host/audio.cpp`: real XAudio2 2.8 mastering + per-format source voices on console, 8-slot PCM ring, wired to the guest bridge via `trt_audio_set_hooks` |
 | Launcher setup UI | **BUILT** — first-run live checklist (storage → D3D11 → gamepads → audio → transfer server → shelf scan → self-test); A opens the shelf |
-| Pre-boot compat scanner | **BUILT** — the shelf reads each game's PE (machine + import table) and flags `[steam-auth]` / `[d3d9 OK]` / `[d3d11 OK]` BEFORE you launch |
+| Pre-boot compat scanner | **BUILT** — the shelf reads each game's PE (machine + import table) and flags `[steam-auth]` / `[d3d9 OK]` / `[d3dx9 OK]` / `[dsound OK]` / `[ddraw OK]` / `[d3d11 OK]` BEFORE you launch |
 | Audio (M3) | **DONE** — bridge (guest PCM) + console sink (real XAudio2 output) both built |
 | Console run | **PENDING** — `tools/deploy.sh install` then look at the TV |
 | 32-bit | dead by console evidence (compat-mode `ljmp 0x23` = 0xc0000005 on Series S); needs an x86 engine later |

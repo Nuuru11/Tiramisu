@@ -1,0 +1,7 @@
+LIBRARY msacm32.dll
+EXPORTS
+    acmGetVersion
+    acmStreamOpen
+    acmStreamConvert
+    acmStreamClose
+    acmFormatTagEnumW

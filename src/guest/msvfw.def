@@ -1,0 +1,5 @@
+LIBRARY msvfw32.dll
+EXPORTS
+    ICInfo
+    ICOpen
+    DrawDibOpen
