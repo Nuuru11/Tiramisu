@@ -1,0 +1,5 @@
+LIBRARY advapi32
+EXPORTS
+    RegOpenKeyExW
+    RegQueryValueExW
+    RegCloseKey

@@ -147,6 +147,20 @@ typedef struct trt_import_descriptor {
   u32 first_thunk;          // RVA of IAT
 } trt_import_descriptor;
 
+// ---- delay imports (delay-load directory) ----
+// Modern linkers set attributes bit 0 ("RVA based"): every field below is an
+// RVA. Legacy images use VAs instead - the loader handles both.
+typedef struct trt_delayload_descriptor {
+  u32 attributes;
+  u32 name_rva;         // RVA (or VA) of the DLL name
+  u32 module_handle_rva;// RVA (or VA) of the HMODULE slot
+  u32 iat_rva;          // RVA (or VA) of the delay-load IAT
+  u32 int_rva;          // RVA (or VA) of the delay-load INT
+  u32 bound_iat_rva;
+  u32 unload_iat_rva;
+  u32 time_stamp;
+} trt_delayload_descriptor;
+
 // thunk value: bit63 set => import by ordinal (low 16 bits), else RVA of
 // IMAGE_IMPORT_BY_NAME { u16 hint; char name[]; }
 

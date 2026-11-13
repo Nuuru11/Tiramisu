@@ -90,6 +90,10 @@ typedef void* (*trt_system_load)(const char* module, const char* symbol);
 void trt_set_system_loader(trt_system_load fn);
 extern void trt_stub_thunk(void);
 
+// Register the module coverage a real PC game imports (SYSTEM/STUB routes).
+// Never overwrites a module the bridges already registered.
+void trt_modules_register_defaults(void);
+
 // bridge + vfs boot (declared for hosts/tests; defined in bridge_kernel32.cpp)
 void trt_bridge_boot(const trt_backend* be);
 int trt_bridge_register_kernel32(void);

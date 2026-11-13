@@ -3,6 +3,7 @@
 // backend (memory) and CRT. Wine semantics, Tiramisu implementation.
 // v0 scope: heap/memory/sync-primitive/file-io/clock/error/TLS basics.
 #include "trt.h"
+#include "thunk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,6 +137,10 @@ void TRT_STDCALL trt_Sleep(u32 ms) {
 // ---- boot ----
 void trt_bridge_boot(const trt_backend* be) {
   if (be) { g_be = *be; g_be_ready = true; }
+  // the core needs the backend too: fail-visible thunks allocate through it
+  trt_core_set_backend(be);
+  // module coverage for real PC games (idempotent; bridges override)
+  trt_modules_register_defaults();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 

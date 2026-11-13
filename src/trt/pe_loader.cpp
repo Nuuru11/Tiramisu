@@ -5,6 +5,7 @@
 // Bounds-checked throughout: a malformed PE must fail with a named error,
 // never crash the host process (the host IS the console app).
 #include "trt.h"
+#include "thunk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -286,9 +287,80 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     logf_be(be, line);
   }
 
-  // ---- 8. delay imports: fail-visible until v0.2 ----
-  if (dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address)
-    logf_be(be, "trt: NOTE delay-import directory present (not processed in v0)");
+  // ---- 8. delay imports (delay-load directory) ----
+  // Games delay-load optional DLLs (d3dcompiler_47, xaudio2_9, ...) and
+  // expect LoadLibrary to fail gracefully when they are absent. We bind
+  // them EAGERLY: resolvable symbols get the real address, unresolvable
+  // ones get a fail-visible thunk so the game still boots and the log
+  // names the gap instead of the load dying.
+  if (dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address) {
+    const u64 dd_va = dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address;
+    const u64 dd_sz = dirs[TRT_PE_DIR_DELAY_IMPORT].size;
+    u32 n_delay_mods = 0, n_delay_bound = 0, n_delay_stub = 0;
+    for (u64 d = 0; d + sizeof(trt_delayload_descriptor) <= (dd_sz ? dd_sz : 4096);
+         d += sizeof(trt_delayload_descriptor)) {
+      if (dd_va + d + sizeof(trt_delayload_descriptor) > size_of_image) break;
+      const trt_delayload_descriptor* dd =
+          (const trt_delayload_descriptor*)(img.base + dd_va + d);
+      if (!dd->name_rva && !dd->iat_rva) break;  // terminator
+      const int rva_based = (dd->attributes & 1u) != 0;
+      // legacy descriptors store VAs: convert to RVAs
+      const u64 name_rva = rva_based ? dd->name_rva
+                                     : (u64)dd->name_rva - preferred;
+      const u64 iat_rva = rva_based ? dd->iat_rva : (u64)dd->iat_rva - preferred;
+      const u64 int_rva = rva_based ? dd->int_rva : (u64)dd->int_rva - preferred;
+      const u64 mod_rva = rva_based ? dd->module_handle_rva
+                                    : (u64)dd->module_handle_rva - preferred;
+      if (name_rva >= size_of_image || iat_rva >= size_of_image ||
+          int_rva >= size_of_image)
+        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay descriptor out of image");
+      const char* mod_name = (const char*)(img.base + name_rva);
+      if (strnlen(mod_name, 256) == 256)
+        return fail(&img, be, TRT_ERR_DELAY_IMPORT, "delay dll name unterminated");
+      for (u64 t = 0;; t += 8) {
+        if (int_rva + t + 8 > size_of_image || iat_rva + t + 8 > size_of_image)
+          break;
+        const u64 thunk = rd64(img.base + int_rva + t);
+        if (thunk == 0) break;
+        const char* sym_name = nullptr;
+        u16 ordinal = 0;
+        if (thunk >> 63) {
+          ordinal = (u16)(thunk & 0xFFFF);
+        } else {
+          if (thunk + 2 >= size_of_image) break;
+          sym_name = (const char*)(img.base + thunk + 2);
+          if (strnlen(sym_name, 256) == 256) break;
+        }
+        void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
+        if (fn) {
+          memcpy(img.base + iat_rva + t, &fn, 8);
+          ++n_delay_bound;
+        } else {
+          char sym[128];
+          if (sym_name) snprintf(sym, sizeof(sym), "%s", sym_name);
+          else snprintf(sym, sizeof(sym), "#%u", (unsigned)ordinal);
+          void* stub = trt_thunk_make(be, "DELAY", mod_name, sym);
+          if (!stub) stub = (void*)&trt_stub_thunk;
+          memcpy(img.base + iat_rva + t, &stub, 8);
+          ++n_delay_stub;
+        }
+      }
+      // the guest may ask for the module handle: give it a non-null sentinel
+      if (mod_rva && mod_rva + 8 <= size_of_image) {
+        u64 sentinel = 0x1000;
+        memcpy(img.base + mod_rva, &sentinel, 8);
+      }
+      char line[160];
+      snprintf(line, sizeof(line), "trt: DELAY import %s bound=%u stub=%u",
+               mod_name, n_delay_bound, n_delay_stub);
+      logf_be(be, line);
+      ++n_delay_mods;
+    }
+    char line[128];
+    snprintf(line, sizeof(line), "trt: delay imports modules=%u bound=%u stub=%u",
+             n_delay_mods, n_delay_bound, n_delay_stub);
+    logf_be(be, line);
+  }
 
   *out = (trt_image*)malloc(sizeof(trt_image));
   if (!*out) return fail(&img, be, TRT_ERR_ALLOC, "image struct alloc");
