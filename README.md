@@ -46,6 +46,7 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 | DirectSound (M6) | **BUILT** — `dsound.dll` BUILTIN: SDK-exact vtables (DS8=12, Buffer8=22 slots); Lock/write/Unlock marshals the guest's PCM into the same console XAudio2 sink XAudio2 uses |
 | DirectDraw (M6) | **BUILT** — `ddraw.dll` BUILTIN: SDK-exact vtables (DD7=30, Surface7=49 slots); primary-surface Unlock/Flip maps to the host backend present (cnc-ddraw's mapping onto D3D11); offscreen surfaces + Blt/BltFast |
 | D3DX9 (M6) | **BUILT** — `d3dx9_30..43.dll` BUILTIN: exact D3DXMatrix/Vec/Quaternion math, texture creation from BMP/TGA in memory (PNG/DDS fail visibly as M7), `D3DXAssembleShader` with a real ID3DXBuffer, ID3DXSprite (14-slot SDK order) |
+| Small-gap probes (M6) | **BUILT** — `msacm32` (PCM identity streams; unknown codecs fail visibly so engines use PCM assets), `msvfw32` (no AVI codecs — engines skip logo videos), `winspool.drv` (no printers) |
 | winmm (the frame clock) | **BUILT** — `timeGetTime`/`timeBeginPeriod`/`timeGetDevCaps`; legacy waveOut/midi/joy probes answer "no devices"; MCI fails visibly (263) |
 | Console audio output | **BUILT** — `src/host/audio.cpp`: real XAudio2 2.8 mastering + per-format source voices on console, 8-slot PCM ring, wired to the guest bridge via `trt_audio_set_hooks` |
 | Launcher setup UI | **BUILT** — first-run live checklist (storage → D3D11 → gamepads → audio → transfer server → shelf scan → self-test); A opens the shelf |
