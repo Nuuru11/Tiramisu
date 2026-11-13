@@ -44,6 +44,18 @@ desktop component. Options: own small D3D9->D3D11 shim (fixed-function/SM3
 subset first) — gates every older 32-bit title anyway.
 - **Acceptance:** a D3D9 triangle test exe presents 300 frames, hr=0.
 
+## M4.5 — the D3D11/DXGI bridge (DONE, v0.7)
+Not in the original ladder, but it is the gate for every 64-bit D3D11 title
+(rung 1) and it had to come before M3/M5:
+- The guest's `D3D11CreateDevice` returns the HOST's device and context, so
+  the guest's resources live in the device that owns the swapchain.
+- The guest's DXGI factory is a shim: adapter enumeration forwards to the
+  console's real factory, `CreateSwapChainForHwnd` returns the HOST's
+  CoreWindow swapchain (the console has no window for the guest's fake
+  HWND), everything else is named-failure.
+- Evidence: `tests/test_d3d.cpp` (offline, fake host GPU, real SDK vtable
+  slots) — the guest's whole frame lands on the host's objects.
+
 ## M6 — Steam path
 Legitimate only: resident client (Steam QR login + downloader like
 xboxnative's launcher) or clean-room steam_api replacement that passes the

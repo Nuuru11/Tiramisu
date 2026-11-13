@@ -11,6 +11,8 @@
 #include "webxfer.h"
 #include "../trt/trt.h"
 #include "../trt/input.h"
+#include "../trt/images.h"
+#include "../trt/bridge_d3d.h"
 
 #include <winrt/base.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -265,6 +267,10 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
 
   trt_resolver rs;
   trt_resolver_default(&rs);
+  // the runtime knows where the game's own DLLs live, and resolves imports
+  // through the guest-image registry (a game's own DLLs beat the system's)
+  trt_runtime_init(&be, game_dir.c_str());
+  trt_resolver* runtime_rs = trt_runtime_resolver();
 
   const std::string exe_path = game_dir + "\\" + exe;
   std::ifstream f(exe_path, std::ios::binary);
@@ -280,7 +286,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   longan::log_line(line);
 
   trt_image* img = nullptr;
-  r.map_rc = trt_map_pe(&be, &rs, buf.data(), buf.size(), &img);
+  r.map_rc = trt_map_pe(&be, runtime_rs, buf.data(), buf.size(), &img);
   if (r.map_rc != TRT_OK) {
     strncpy(r.detail, trt_errstr(r.map_rc), sizeof(r.detail) - 1);
     return r;

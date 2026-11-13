@@ -21,6 +21,7 @@ without an artifact.
 | A missing optional DLL does not kill the load | delay import d3dcompiler_47 bound to a fail-visible stub; load continues; the call site names itself |
 | A game can load the DLLs it ships | `tests/test_libload.cpp`: guestdll.dll loaded on demand from the game's directory, its own imports bound, DllMain ran with the right arguments, its export called across the image boundary, LoadLibraryW + GetProcAddress work |
 | Guest-call ABI hazards are closed | the loader's Win64 call helper reads its arguments through memory constraints and before touching %rsp (a register-constrained version silently corrupted the guest's arguments; the test caught it) |
+| The guest's D3D11 frame reaches the host's GPU | `tests/test_d3d.cpp`: the guest's `D3D11CreateDevice` gets the host's device+context, the factory enumerates adapters through the console's real DXGI factory, `CreateSwapChainForHwnd` hands over the HOST's swapchain, and the guest's clear/draw/present land on the host's objects |
 
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 

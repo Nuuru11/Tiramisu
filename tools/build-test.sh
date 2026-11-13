@@ -41,7 +41,7 @@ file "$out/guest_hello.exe"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_pe_loader.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
   src/trt/bridge_kernel32.cpp \
   -o "$out/test_pe_loader"
 
@@ -52,7 +52,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_input.cpp \
   src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_kernel32.cpp \
   src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -69,7 +69,7 @@ rm -f "$out/user32.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_game_boot.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
@@ -100,7 +100,7 @@ rm -f "$out/delayimp.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_real_load.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp src/trt/input.cpp \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
@@ -129,8 +129,49 @@ rm -f "$out/guestdll.lib"
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_libload.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp \
   src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_user32.cpp \
   src/trt/input.cpp \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
+
+# --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
+# The guest is compiled against the REAL SDK headers (so the vtable slots are
+# the SDK's), the host's GPU is faked in the test.
+SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
+XCRT="$HOME/.cache/uwp-crossbuild/xwin/crt/include"
+if [[ -d "$SDK/um" && -d "$XCRT" ]]; then
+cat > "$out/d3d11.def" <<'DEOF'
+LIBRARY d3d11
+EXPORTS
+    D3D11CreateDevice
+DEOF
+cat > "$out/dxgi.def" <<'DEOF'
+LIBRARY dxgi
+EXPORTS
+    CreateDXGIFactory1
+    CreateDXGIFactory2
+    ?CreateDXGIFactory2@@YAJAEBU_GUID@@PEAPEAX@Z
+DEOF
+rm -f "$out/d3d11.lib" "$out/dxgi.lib"
+"$LLD_LINK" /lib /def:"$out/d3d11.def" /out:"$out/d3d11.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:"$out/dxgi.def" /out:"$out/dxgi.lib" /machine:x64 /noentry
+"$CLANG" -x c++ --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -fno-exceptions -fno-rtti \
+  -I"$SDK/um" -I"$SDK/shared" -I"$SDK/ucrt" -I"$XCRT" \
+  -DWIN32_LEAN_AND_MEAN -D_CRT_SECURE_NO_WARNINGS \
+  -c src/guest/guest_d3d.c -o "$out/guest_d3d.obj"
+"$LLD_LINK" "$out/guest_d3d.obj" "$out/d3d11.lib" "$out/dxgi.lib" \
+  /NODEFAULTLIB /ENTRY:d3d_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_d3d.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d.cpp \
+  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
+  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
+  src/trt/bridge_d3d.cpp src/trt/vfs.cpp src/trt/bridge_kernel32.cpp \
+  src/trt/bridge_user32.cpp src/trt/input.cpp \
+  -o "$out/test_d3d"
+"$out/test_d3d" "$out/guest_d3d.exe"
+else
+  echo "SKIP graphics bridge suite: no Windows SDK at $SDK"
+fi

@@ -33,7 +33,9 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 | API-set contracts (`api-ms-win-*`) | **BUILT** — redirected to the DLL that implements them (synch->kernel32, winrt/com->combase, crt->ucrtbase, d3d11/dxgi/gdi/user/ole...) |
 | Delay imports | **BUILT** — bound eagerly; a missing optional DLL no longer kills the load, the call site names itself instead |
 | Registry (advapi32) | **STUB** — games that read HKLM/HKCU settings get a named stub, not a silent zero |
-| D3D11 swapchain for the guest | **PENDING** — the guest's own d3d11/dxgi calls are not yet bridged onto the host's CoreWindow swapchain (the next keystone) |
+| D3D11/DXGI for the guest | **BUILT** — the guest's `D3D11CreateDevice` gets the host's device+context, its factory enumerates adapters through the console's real DXGI, and `CreateSwapChainForHwnd` hands it the HOST's CoreWindow swapchain (the console has no window for the guest's fake HWND) |
+| Guest DLLs loading the game's own DLLs | **BUILT** — loaded on demand from the game's own directory, imports bound recursively, DllMain run, exports resolvable by name and ordinal |
+| Audio (M3) | **PENDING** — no WASAPI/XAudio2 path for the guest yet |
 | Console run | **PENDING** — `tools/deploy.sh install` then look at the TV |
 | 32-bit | dead by console evidence (compat-mode `ljmp 0x23` = 0xc0000005 on Series S); needs an x86 engine later |
 

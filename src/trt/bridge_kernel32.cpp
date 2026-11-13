@@ -6,6 +6,7 @@
 #include "thunk.h"
 #include "images.h"
 #include "pe_exports.h"
+#include "bridge_d3d.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,6 +144,9 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_core_set_backend(be);
   // module coverage for real PC games (idempotent; bridges override)
   trt_modules_register_defaults();
+  // the graphics bridge takes over d3d11/dxgi (its own functions first,
+  // everything else falls through to the console's real DLLs)
+  trt_bridge_register_d3d();
   for (u32 t = 0; t < 128; ++t) g_tls_last_error[t] = 0;
 }
 

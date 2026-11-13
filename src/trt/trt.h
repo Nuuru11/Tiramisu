@@ -11,6 +11,21 @@
 extern "C" {
 #endif
 
+// ---- guest ABI ----
+// Functions the GUEST calls directly (imported by the guest, or reached
+// through a COM vtable) must use the Win64 calling convention. On the
+// console host that is the default; on a Linux test host the compiler
+// would use SysV and every argument would arrive in the wrong register.
+// ms_abi makes the code guest-correct on any host, which also removes the
+// hand-written trampolines the test harness used to need.
+#if defined(_WIN32)
+#  define TRT_GUEST_ABI
+#elif defined(__x86_64__) && defined(__clang__)
+#  define TRT_GUEST_ABI __attribute__((ms_abi))
+#else
+#  define TRT_GUEST_ABI
+#endif
+
 // ---- protection bits (backend-translated) ----
 #define TRT_PROT_R 1u
 #define TRT_PROT_W 2u

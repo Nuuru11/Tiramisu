@@ -142,6 +142,21 @@ void* resolve_through_table(void* user, const char* module,
       if (symbol) {
         for (int i = 0; i < m.fn_count; ++i)
           if (strcmp(m.fns[i].name, symbol) == 0) return m.fns[i].fn;
+        // Some SDK headers declare their exports inside C++ without
+        // extern "C", so the import comes in MSVC-mangled:
+        //   __imp_?CreateDXGIFactory2@@YAJAEBU_GUID@@PEAPEAX@Z
+        // Fall back to the base name between '?' and the first '@@'.
+        if (symbol[0] == '?') {
+          const char* at = strstr(symbol, "@@");
+          if (at && (size_t)(at - symbol) < 128) {
+            char base[128];
+            const size_t len = (size_t)(at - symbol - 1);
+            memcpy(base, symbol + 1, len);
+            base[len] = 0;
+            for (int i = 0; i < m.fn_count; ++i)
+              if (strcmp(m.fns[i].name, base) == 0) return m.fns[i].fn;
+          }
+        }
         // builtin module, unknown symbol: fall through to system by alias
         if (g_system_load) {
           if (void* fn = g_system_load(target, symbol)) return fn;

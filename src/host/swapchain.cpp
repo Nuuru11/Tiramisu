@@ -4,6 +4,8 @@
 // Renders an animated gradient quad: a TV screenshot proves present works.
 #include "swapchain.h"
 
+#include "../trt/bridge_d3d.h"
+
 #include <d3dcompiler.h>
 
 #pragma comment(lib, "d3d11.lib")
@@ -17,6 +19,7 @@ winrt::com_ptr<ID3D11Device1> g_device;
 winrt::com_ptr<ID3D11DeviceContext1> g_ctx;
 winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
+winrt::com_ptr<IDXGIFactory2> g_factory;
 unsigned g_w = 1280, g_h = 720;
 
 const char* k_vs = R"(struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
@@ -82,6 +85,19 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   winrt::com_ptr<ID3D11Texture2D> back;
   g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
   g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+
+  // publish the GPU to the runtime: a guest game's D3D11 calls must land on
+  // THIS device and THIS swapchain (it has no HWND of its own)
+  g_factory = factory;
+  trt_gpu_hooks hooks{};
+  hooks.device = g_device.get();
+  hooks.context = g_ctx.get();
+  hooks.swapchain = g_swap.get();
+  hooks.factory = factory.get();
+  hooks.feature_level = r.feature_level;
+  hooks.width = g_w;
+  hooks.height = g_h;
+  trt_gpu_set_hooks(&hooks);
   return r;
 }
 
