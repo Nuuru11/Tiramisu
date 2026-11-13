@@ -572,11 +572,11 @@ bool token_is_valid(u32 h) {
 }
 
 // token access rights
-constexpr u32 TOKEN_QUERY = 0x0008;
+constexpr u32 TRT_TOKEN_QUERY_RIGHT = 0x0008;
 
 // TOKEN_INFORMATION classes
-constexpr u32 TOKEN_USER = 1;
-constexpr u32 TOKEN_STATISTICS = 10;
+constexpr u32 TRT_TOKENINFO_USER = 1;
+constexpr u32 TRT_TOKENINFO_STATISTICS = 10;
 constexpr u32 TOKEN_INTEGRITY_LEVEL = 25;
 
 // the pseudo user SID: S-1-5-88-1-1001 (a domain-less local player).
@@ -623,7 +623,7 @@ void* TRT_GUEST_ABI trt_OpenProcessToken(void* process, u32 desired,
     token_set_last_error(87);  // ERROR_INVALID_PARAMETER
     return 0;
   }
-  if ((desired & TOKEN_QUERY) == 0) {
+  if ((desired & TRT_TOKEN_QUERY_RIGHT) == 0) {
     // we only support QUERY; anything else is honest about it
     char line[160];
     snprintf(line, sizeof(line),
@@ -664,9 +664,9 @@ int TRT_GUEST_ABI trt_GetTokenInformation(void* token, u32 cls,
   // the classes games actually ask, with minimal REAL records
   u32 fill = 0;
   switch (cls) {
-    case TOKEN_USER: fill = k_token_user_size; break;
+    case TRT_TOKENINFO_USER: fill = k_token_user_size; break;
     case TOKEN_INTEGRITY_LEVEL: fill = k_token_il_size; break;
-    case TOKEN_STATISTICS: fill = k_token_stats_size; break;
+    case TRT_TOKENINFO_STATISTICS: fill = k_token_stats_size; break;
     default: {
       char line[160];
       snprintf(line, sizeof(line),
@@ -694,7 +694,7 @@ int TRT_GUEST_ABI trt_GetTokenInformation(void* token, u32 cls,
   *len_out = fill;
   u8* out = (u8*)info;
   memset(out, 0, fill);
-  if (cls == TOKEN_USER) {
+  if (cls == TRT_TOKENINFO_USER) {
     // SID_AND_ATTRIBUTES { pSid, u32 attrs }: pSid points INTO the
     // caller's buffer (winnt semantics), the SID bytes follow the pointer.
     // The struct is { void*, u32 } with 4 bytes tail padding — never write
@@ -709,7 +709,7 @@ int TRT_GUEST_ABI trt_GetTokenInformation(void* token, u32 cls,
     *(void**)(out + 0) = sid;
     *(u32*)(out + 8) = 0;
     *(u32*)(out + 28) = 0;  // policy mask: none (AFTER the 12-byte SID)
-  } else {  // TOKEN_STATISTICS minimal
+  } else {  // TRT_TOKENINFO_STATISTICS minimal
     *(u64*)(out + 0) = 0x2A;   // TokenId LUID (stable pseudo)
     *(u64*)(out + 8) = 0x2A;   // AuthenticationId
     *(u64*)(out + 16) = 0;     // ExpirationTime: never

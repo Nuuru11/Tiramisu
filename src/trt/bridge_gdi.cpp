@@ -40,11 +40,11 @@ namespace {
 // ---- object types ----
 // (OBJ_* for the types the handle table records; pen/bitmap/region records
 //  arrive with SDL2-class DLLs — fonts and brushes are the proven set)
-constexpr u32 OBJ_FONT = 1;
-constexpr u32 OBJ_BRUSH = 2;
-[[maybe_unused]] constexpr u32 OBJ_PEN = 3;
-[[maybe_unused]] constexpr u32 OBJ_REGION = 4;
-[[maybe_unused]] constexpr u32 OBJ_BITMAP = 5;
+constexpr u32 TRT_GDI_OBJ_FONT = 1;
+constexpr u32 TRT_GDI_OBJ_BRUSH = 2;
+[[maybe_unused]] constexpr u32 TRT_GDI_OBJ_PEN = 3;
+[[maybe_unused]] constexpr u32 TRT_GDI_OBJ_REGION = 4;
+[[maybe_unused]] constexpr u32 TRT_GDI_OBJ_BITMAP = 5;
 
 // ---- LOGFONTW (x64): the fields games actually set ----
 // lfHeight i32, lfWidth i32, lfEscapement i32, lfOrientation i32,
@@ -111,7 +111,7 @@ void* TRT_GUEST_ABI trt_CreateFontIndirectW(const void* logfont) {
   const u8* lf = (const u8*)logfont;
   const i32 height = (i32)((u32)lf[0] | ((u32)lf[1] << 8) | ((u32)lf[2] << 16) |
                            ((u32)lf[3] << 24));
-  const int slot = obj_alloc(OBJ_FONT);
+  const int slot = obj_alloc(TRT_GDI_OBJ_FONT);
   if (slot < 0) {
     log_line("gdi32: object table full -> NULL");
     return nullptr;
@@ -128,7 +128,7 @@ void* TRT_GUEST_ABI trt_CreateFontIndirectW(const void* logfont) {
 }
 
 void* TRT_GUEST_ABI trt_CreateSolidBrush(u32 color) {
-  const int slot = obj_alloc(OBJ_BRUSH);
+  const int slot = obj_alloc(TRT_GDI_OBJ_BRUSH);
   if (slot < 0) return nullptr;
   g_objs[slot].color = color;
   return make_handle(slot);
@@ -136,7 +136,7 @@ void* TRT_GUEST_ABI trt_CreateSolidBrush(u32 color) {
 
 void* TRT_GUEST_ABI trt_CreateRectRgn(i32 a, i32 b, i32 c, i32 d) {
   (void)a; (void)b; (void)c; (void)d;
-  const int slot = obj_alloc(OBJ_REGION);
+  const int slot = obj_alloc(TRT_GDI_OBJ_REGION);
   if (slot < 0) return nullptr;
   return make_handle(slot);  // an empty-ish region record; no rendering
 }
