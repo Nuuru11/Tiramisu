@@ -19,6 +19,8 @@ void ui_shutdown();
 void ui_set_games(const std::vector<ui_game>& games, int selected);
 void ui_set_lines(const std::vector<std::wstring>& lines);
 void ui_set_qr(const std::string& qr_text);  // empty = hide QR
+void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
+                  bool finished);  // non-empty steps = setup screen on
 void ui_render();
 
 } // namespace longan

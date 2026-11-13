@@ -30,6 +30,9 @@ IDWriteTextFormat* g_text = nullptr;
 IDWriteTextFormat* g_small = nullptr;
 
 std::vector<std::wstring> g_lines;
+std::vector<std::wstring> g_setup_steps;
+int g_setup_done_count = 0;
+bool g_setup_finished = false;
 std::vector<ui_game> g_games;
 int g_selected = 0;
 std::string g_qr_text;
@@ -88,6 +91,13 @@ void ui_set_games(const std::vector<ui_game>& games, int selected) {
 
 void ui_set_lines(const std::vector<std::wstring>& lines) { g_lines = lines; }
 
+void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
+                  bool finished) {
+  g_setup_steps = steps;
+  g_setup_done_count = done_count;
+  g_setup_finished = finished;
+}
+
 void ui_set_qr(const std::string& qr_text) {
   g_qr_text = qr_text;
   g_qr_size = 0;
@@ -120,6 +130,35 @@ void ui_render() {
     g_ctx->BeginDraw();
 
     const float m = g_h * 0.06f;
+
+    // ---- first-run setup screen ----
+    if (!g_setup_steps.empty()) {
+      text_out(g_title, m, m * 0.55f, g_w - 2 * m, g_h * 0.1f,
+               L"Tiramisu Setup", g_teal);
+      float sy = m + g_h * 0.12f;
+      const float step_h = g_h * 0.062f;
+      for (size_t i = 0; i < g_setup_steps.size() && sy < g_h - m; ++i) {
+        // done = teal check, current = white, pending = dim
+        const bool done = (int)i < g_setup_done_count;
+        const bool cur = (int)i == g_setup_done_count && !g_setup_finished;
+        wchar_t mark[4] = L"+  ";
+        if (done) { mark[0] = (wchar_t)0x2713; mark[1] = L' '; mark[2] = L' '; }
+        const std::wstring row = std::wstring(mark) + g_setup_steps[i];
+        if (done) text_out(g_text, m, sy, g_w - 2 * m, step_h, row.c_str(), g_teal);
+        else if (cur) text_out(g_text, m, sy, g_w - 2 * m, step_h, row.c_str(), g_brush ? g_dim : g_dim);
+        else text_out(g_text, m, sy, g_w - 2 * m, step_h, row.c_str(), g_dim);
+        sy += step_h;
+      }
+      if (g_setup_finished)
+        text_out(g_text, m, g_h - m - g_h * 0.06f, g_w - 2 * m, g_h * 0.06f,
+                 L"Setup complete — press A to open the game shelf", g_teal);
+      g_ctx->EndDraw();
+      if (bmp) bmp->Release();
+      surf->Release();
+      g_ctx->SetTarget(old_target);
+      if (old_target) old_target->Release();
+      return;
+    }
 
     // title
     text_out(g_title, m, m * 0.55f, g_w - 2 * m, g_h * 0.1f, L"Tiramisu", g_teal);

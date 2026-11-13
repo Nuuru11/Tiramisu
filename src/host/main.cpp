@@ -64,6 +64,8 @@ std::atomic<bool> g_shutdown{false};
 std::string g_pending_launch;
 bool g_mouse_mode = false;
 bool g_booted = false;
+bool g_setup_done = false;      // first-run setup screen flag
+bool g_setup_active = false;    // currently showing the setup screen
 
 // ---------------- helpers ----------------
 std::string ws2u8(winrt::hstring const& h) {
@@ -613,14 +615,42 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "tiramisu boot: pkg=%s state=%s",
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
+
+    // ---- setup screen: steps update live as boot proceeds ----
+    g_setup_active = true;
+    auto setup_steps = [](std::initializer_list<std::wstring> done,
+                          const wchar_t* current, bool finished) {
+      std::vector<std::wstring> steps;
+      for (const auto& d : done) steps.push_back(d);
+      if (current) steps.push_back(current);
+      longan::ui_set_setup(steps, (int)done.size(), finished);
+    };
+    setup_steps({L"Storage ready"}, L"Checking Direct3D 11 device…", false);
+
+    // (the swapchain was created in SetWindow; report it as the D3D step)
+    snprintf(line, sizeof(line), "setup: d3d11 ready (swapchain created in SetWindow)");
+    longan::log_line(line);
+    setup_steps({L"Storage ready", L"Direct3D 11 ready"}, L"Probing gamepads…",
+                false);
     run_probes();
+    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed"},
+                L"Starting audio output…", false);
     longan::audio_init();
     longan::audio_status(line, sizeof(line));
     longan::log_line(line);
+    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+                 std::wstring(L"Audio: ") + u82ws(line)},
+                L"Starting the transfer server…", false);
     const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
+    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+                 L"Audio ready", L"Transfer server up"},
+                L"Scanning for games…", false);
     rescan_games();
+    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+                 L"Audio ready", L"Transfer server up", L"Game shelf scanned"},
+                L"Running the built-in self-test…", false);
 
     // builtin self-test: proves the whole pipeline on hardware
     const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
@@ -628,6 +658,11 @@ struct tiramisu_host
              gr.detail);
     longan::log_line(line);
     g_guest_status = std::string("selftest ") + trt_errstr(gr.map_rc);
+    setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
+                 L"Audio ready", L"Transfer server up", L"Game shelf scanned",
+                 L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
+                nullptr, true);
+    g_setup_done = true;  // A press on the finished screen opens the shelf
   }
 
   void Run() {
@@ -661,7 +696,12 @@ struct tiramisu_host
         } else if (!(b & XINPUT_GAMEPAD_DPAD_DOWN)) d_dn = false;
         if ((b & XINPUT_GAMEPAD_A) && !a_btn) {
           a_btn = true;
-          if (!g_games.empty()) g_pending_launch = g_games[g_selected].name;
+          if (g_setup_active && g_setup_done) {
+            g_setup_active = false;  // leave setup, open the shelf
+            longan::ui_set_setup({}, 0, false);
+          } else if (!g_setup_active && !g_games.empty()) {
+            g_pending_launch = g_games[g_selected].name;
+          }
         } else if (!(b & XINPUT_GAMEPAD_A)) a_btn = false;
         if ((b & XINPUT_GAMEPAD_Y) && !y_btn) {
           y_btn = true;
@@ -721,29 +761,32 @@ struct tiramisu_host
       }
 
       // ---- UI ----
-      if (m_frames - m_rescan_at >= 120) {
-        m_rescan_at = m_frames;
-        rescan_games();
+      if (!g_setup_active) {
+        if (m_frames - m_rescan_at >= 120) {
+          m_rescan_at = m_frames;
+          rescan_games();
+        }
+        std::vector<longan::ui_game> uig;
+        for (const auto& ge : g_games)
+          uig.push_back({u82ws(ge.name), u82ws(ge.exe)});
+        longan::ui_set_games(uig, g_selected);
+        std::vector<std::wstring> lines;
+        lines.push_back(u82ws(longan::webxfer_status_line()));
+        lines.push_back(u82ws("guest: " + g_guest_status));
+        lines.push_back(u82ws(g_steam_status +
+                              (g_mouse_mode ? "  |  MOUSE MODE" : "")));
+        char audio_line[128];
+        longan::audio_status(audio_line, sizeof(audio_line));
+        lines.push_back(u82ws(audio_line));
+        // the selected game's static compat scan: what will happen on launch
+        if (!g_games.empty() && g_selected < (int)g_games.size()) {
+          lines.push_back(u82ws(g_games[g_selected].compat));
+        }
+        lines.push_back(
+            L"D-pad: select   A: launch   Y: steam   RS: mouse mode");
+        longan::ui_set_lines(lines);
+        longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
       }
-      std::vector<longan::ui_game> uig;
-      for (const auto& ge : g_games)
-        uig.push_back({u82ws(ge.name), u82ws(ge.exe)});
-      longan::ui_set_games(uig, g_selected);
-      std::vector<std::wstring> lines;
-      lines.push_back(u82ws(longan::webxfer_status_line()));
-      lines.push_back(u82ws("guest: " + g_guest_status));
-      lines.push_back(u82ws(g_steam_status +
-                            (g_mouse_mode ? "  |  MOUSE MODE" : "")));
-      char audio_line[128];
-      longan::audio_status(audio_line, sizeof(audio_line));
-      lines.push_back(u82ws(audio_line));
-      // the selected game's static compat scan: what will happen on launch
-      if (!g_games.empty() && g_selected < (int)g_games.size()) {
-        lines.push_back(u82ws(g_games[g_selected].compat));
-      }
-      lines.push_back(L"D-pad: select   A: launch   Y: steam   RS: mouse mode");
-      longan::ui_set_lines(lines);
-      longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
       longan::ui_render();
 
       longan::swapchain_render_frame((m_frames % 180) / 180.0f);
