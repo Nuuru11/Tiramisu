@@ -46,10 +46,15 @@
 #include "../src/trt/thunk.h"
 #include "../src/trt/bridge_reg.h"
 
+// bridge_sys.cpp: Win8+ temp-path (shared answer with GetTempPathW).
+// Declared inside extern "C" so the guest-ABI symbol name matches.
+extern "C" int __attribute__((ms_abi)) trt_GetTempPathW(u32 size, u16* buf);
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -397,6 +402,9 @@ const console_named k_console_named_fns[] = {
     // the same honest deterministic-fill bridge (never a fake success).
     {"kernel32.dll", "SystemFunction036", (void*)&trt_bridge_SystemFunction036},
     {"kernel32.dll", "GetSystemInfo", nullptr},  // BUILTIN already answers; guard
+    // Win8+ temp-path the UCRT imports; blanket-0 made the UCRT temp-name
+    // loop spin to the backstop. Same guest-style answer as GetTempPathW.
+    {"kernel32.dll", "GetTempPath2W", (void*)&trt_GetTempPathW},
 };
 const int k_console_named_count =
     (int)(sizeof(k_console_named_fns) / sizeof(k_console_named_fns[0]));
@@ -757,6 +765,21 @@ int child_boot(const char* path) {
   // before the CRT ever reaches WinMain. (Same contract as src/host/main.cpp
   // lines 372-374.)
   trt_vfs_mount("z:", g_game_dir);
+  // STAGE 7: a real Windows process ALWAYS has a writable C: drive with an
+  // existing %TEMP%. GetTempPathW answers "C:\Temp\" (matching the TEMP env)
+  // and PyInstaller's UCRT _wtempnam probes that dir with
+  // GetFileAttributesExW BEFORE generating any candidate name — with no C:
+  // mount the probe fails forever and the candidate loop spun 2.5M opens
+  // (watchdog exit 43). Mount a scratch C: and create Temp on it.
+  {
+    char ctpl[] = "/tmp/opencode/tiramisu-drivec.XXXXXX";
+    if (mkdtemp(ctpl)) {
+      trt_vfs_mount("c:", ctpl);
+      char tdir[1100];
+      snprintf(tdir, sizeof(tdir), "%s/Temp", ctpl);
+      mkdir(tdir, 0755);
+    }
+  }
   char zpath[1100];
   snprintf(zpath, sizeof(zpath), "Z:\\%s", name);
   trt_bridge_set_exe_path(zpath);

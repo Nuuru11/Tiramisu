@@ -42,8 +42,11 @@
 #include <time.h>
 #if !defined(_WIN32)
 #  include <unistd.h>
-#  include <time.h>
+#  include <dirent.h>
 #endif
+#  include <time.h>
+#  include <sys/stat.h>
+#  include <errno.h>
 
 namespace {
 
@@ -406,6 +409,10 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   if (!os && write) os = fopen(host, "r+b");
   if (!os) {
     g_tls_last_error[g_tls_index_current_thread % 128] = 2; // FILE_NOT_FOUND
+    trt_core_log("kernel32: CreateFileW write open failed on host (see path)");
+    char plog[1100];
+    snprintf(plog, sizeof(plog), "  path was: %s", host);
+    trt_core_log(plog);
     return (void*)(uintptr_t)-1;
   }
   return file_alloc(os, write ? 'w' : 'r');
@@ -840,21 +847,214 @@ void fill_startup_info_a(void* si) {
   boot_log("kernel32: GetStartupInfoA -> zeroed STARTUPINFOA (no console)");
 }
 
-// FindFirstFileExW / FindNextFileW / FindClose over an EMPTY directory set:
-// the CRT only calls these for wildcard CRT file walks. INVALID_HANDLE_VALUE
-// + ERROR_FILE_NOT_FOUND is the honest answer for "no matches".
+// FindFirstFileExW / FindNextFileW / FindClose: REAL directory enumeration
+// over the VFS. This was an INVALID_HANDLE-stub — the measured blocker where
+// PyInstaller-packed games (OrTMM) and every engine scanning its own asset /
+// mod / save directories died. The guest passes a Win32 path with an optional
+// wildcard; we resolve through the VFS, enumerate the host directory, and
+// hand back WIN32_FIND_DATAW records the slot registry tracks.
+//
+// Both platforms are REAL:
+//   Linux (offline gate)  — POSIX readdir over the resolved host dir
+//   Windows (the console) — passthrough to the native FindFirstFileExW family
+//                           on the VFS-resolved host path
+struct find_ctx { void* os_dir; char pattern[64]; bool have_pattern; char host_path[1024]; };
+find_ctx g_find_ctx[32];
+bool g_find_used[32];
+
+void find_free(int slot) {
+  if (slot < 0 || slot >= 32) return;
+#if defined(_WIN32)
+  if (g_find_ctx[slot].os_dir) {
+    FindClose(g_find_ctx[slot].os_dir);
+    g_find_ctx[slot].os_dir = nullptr;
+  }
+#else
+  if (g_find_ctx[slot].os_dir) { closedir((DIR*)g_find_ctx[slot].os_dir); g_find_ctx[slot].os_dir = nullptr; }
+#endif
+  g_find_used[slot] = false;
+}
+
+#if !defined(_WIN32)
+// wildcard match: '*' and '?' the Win32 way
+bool find_match(const char* pat, const char* s) {
+  if (!*pat) return !*s;
+  if (*pat == '*') {
+    for (const char* q = s; ; ++q) {
+      if (find_match(pat + 1, q)) return true;
+      if (!*q) break;
+    }
+    return false;
+  }
+  if (!*s) return false;
+  if (*pat == '?' || *pat == *s) return find_match(pat + 1, s + 1);
+  return false;
+}
+
+// fill a WIN32_FIND_DATAW (x64, real Win32 layout, 592 bytes):
+// attrs +0, FILETIMEs +4/+12/+20, size hi +28 / lo +32, reserved +36/+40,
+// cFileName +44 (u16[260]), cAlternateFileName +564 (u16[14])
+void find_fill_data(void* data, const char* name, bool is_dir, off_t size) {
+  u8* p = (u8*)data;
+  memset(p, 0, 592);
+  *(u32*)(p + 0) = is_dir ? 0x10 /*FILE_ATTRIBUTE_DIRECTORY*/ : 0x80 /*NORMAL*/;
+  *(u32*)(p + 28) = (u32)(size >> 32);
+  *(u32*)(p + 32) = (u32)(size & 0xFFFFFFFFu);
+  u16* wname = (u16*)(p + 44);
+  u32 i = 0;
+  for (; name[i] && i < 259; ++i) wname[i] = (u16)(u8)name[i];
+  wname[i] = 0;
+}
+
+// "." and ".." are excluded the Win32 way (FindFirstFile never returns them)
+bool find_skip_dot(const char* n) {
+  return n[0] == '.' && (n[1] == 0 || (n[1] == '.' && n[2] == 0));
+}
+#endif  // !_WIN32
+
 void* find_first_file(const u16* name, void* found) {
   char utf8[512];
   if (name) trt_utf16_to_utf8(name, utf8, sizeof(utf8));
   else snprintf(utf8, sizeof(utf8), "(null)");
-  char line[640];
-  snprintf(line, sizeof(line),
-           "kernel32: FindFirstFileExW('%s') -> INVALID_HANDLE_VALUE "
-           "(empty VFS dir set; lasterr=2)", utf8);
+
+  // split "dir\pattern" (last separator); no separator -> pattern only in cwd
+  char dir[512] = ".", pat[64] = {};
+  char* last_sep = nullptr;
+  for (char* q = utf8; *q; ++q)
+    if (*q == '\\' || *q == '/') last_sep = q;
+  if (last_sep) {
+    const size_t dl = (size_t)(last_sep - utf8);
+    if (dl == 0) snprintf(dir, sizeof(dir), "/");
+    else { snprintf(dir, sizeof(dir), "%.*s", (int)dl, utf8); }
+    snprintf(pat, sizeof(pat), "%s", last_sep + 1);
+  } else {
+    snprintf(pat, sizeof(pat), "%s", utf8);
+  }
+
+  // pattern "" or missing find-data falls through to the honest no-match
+  if (!pat[0] || !found) {
+    char line[640];
+    snprintf(line, sizeof(line),
+             "kernel32: FindFirstFileExW('%s') -> INVALID_HANDLE_VALUE "
+             "(no pattern/find-data; lasterr=2)", utf8);
+    boot_log(line);
+    g_tls_last_error[g_tls_index_current_thread % 128] = 2;  // FILE_NOT_FOUND
+    return (void*)(uintptr_t)-1;
+  }
+
+  char host[1024];
+  // resolve the DIR through the VFS (a u16 resolve needs the original; for
+  // an ANSI dir we resolve the whole name minus pattern via the vfs by
+  // passing the dir alone)
+  u16 wdir[512];
+  u32 wi = 0;
+  for (; dir[wi] && wi < 511; ++wi) wdir[wi] = (u16)(u8)dir[wi];
+  wdir[wi] = 0;
+  if (trt_vfs_resolve_utf16(wdir, host, sizeof(host)) != 0)
+    snprintf(host, sizeof(host), "%s", dir);
+
+  int slot = -1;
+  for (int i = 0; i < 32; ++i)
+    if (!g_find_used[i]) { slot = i; break; }
+  if (slot < 0) {
+    boot_log("kernel32: FindFirstFileExW -> handle table full (32)");
+    g_tls_last_error[g_tls_index_current_thread % 128] = 4;
+    return (void*)(uintptr_t)-1;
+  }
+
+#if defined(_WIN32)
+  // console path: native enumeration on the resolved host path. The caller's
+  // WIN32_FIND_DATAW is filled by the OS itself — no struct games.
+  u16 whost[1024];
+  u32 wj = 0;
+  for (; host[wj] && wj < 1023; ++wj) whost[wj] = (u16)(u8)host[wj];
+  whost[wj] = 0;
+  u16 wpat[64];
+  for (wj = 0; pat[wj] && wj < 63; ++wj) wpat[wj] = (u16)(u8)pat[wj];
+  wpat[wj] = 0;
+  // "<dir>\<pattern>" for the native call
+  u16 wfull[1100];
+  u32 wn = 0;
+  for (wj = 0; whost[wj] && wn < 1000; ++wj) wfull[wn++] = whost[wj];
+  if (wn && wfull[wn - 1] != '\\' && wfull[wn - 1] != '/') wfull[wn++] = '\\';
+  for (wj = 0; wpat[wj] && wn < 1090; ++wj) wfull[wn++] = wpat[wj];
+  wfull[wn] = 0;
+  WIN32_FIND_DATAW native_fd;
+  HANDLE h = FindFirstFileExW((LPCWSTR)wfull, FindExInfoStandard, &native_fd,
+                              FindExSearchNameMatch, nullptr, 0);
+  if (h == INVALID_HANDLE_VALUE) {
+    const u32 le = GetLastError();
+    char line[640];
+    snprintf(line, sizeof(line), "kernel32: FindFirstFileExW('%s') -> "
+             "INVALID_HANDLE_VALUE (native, host='%s', lasterr=%u)",
+             utf8, host, le);
+    boot_log(line);
+    g_tls_last_error[g_tls_index_current_thread % 128] =
+        (le == ERROR_PATH_NOT_FOUND) ? 3 : 2;
+    return (void*)(uintptr_t)-1;
+  }
+  find_ctx& cw = g_find_ctx[slot];
+  cw.os_dir = (void*)h;
+  g_find_used[slot] = true;
+  snprintf(cw.host_path, sizeof(cw.host_path), "%s", host);
+  // caller's buffer gets the native record byte-for-byte
+  memcpy(found, &native_fd, sizeof(WIN32_FIND_DATAW));
+  char line[700];
+  char first_name[64] = {};
+  for (u32 k = 0; native_fd.cFileName[k] && k < 63; ++k)
+    first_name[k] = (char)native_fd.cFileName[k];
+  snprintf(line, sizeof(line), "kernel32: FindFirstFileExW('%s') -> handle "
+           "slot=%d first='%s' (native)", utf8, slot, first_name);
   boot_log(line);
-  (void)found;
-  g_tls_last_error[g_tls_index_current_thread % 128] = 2;  // FILE_NOT_FOUND
-  return (void*)(uintptr_t)-1;  // INVALID_HANDLE_VALUE
+  return (void*)(uintptr_t)(0x88800000u | (u32)slot);
+#else
+  DIR* d = opendir(host);
+  if (!d) {
+    char line[640];
+    snprintf(line, sizeof(line), "kernel32: FindFirstFileExW('%s') -> "
+             "INVALID_HANDLE_VALUE (opendir '%s' failed; lasterr=3)", utf8, host);
+    boot_log(line);
+    g_tls_last_error[g_tls_index_current_thread % 128] = 3;  // PATH_NOT_FOUND
+    return (void*)(uintptr_t)-1;
+  }
+
+  // a no-wildcard name must match exactly (Win32 opens the single entry)
+  find_ctx& c = g_find_ctx[slot];
+  c.os_dir = d;
+  g_find_used[slot] = true;  // FindNext/FindClose validate on this flag
+  snprintf(c.pattern, sizeof(c.pattern), "%s", pat);
+  c.have_pattern = !strchr(pat, '*') && !strchr(pat, '?');
+  snprintf(c.host_path, sizeof(c.host_path), "%s", host);
+
+  for (;;) {
+    errno = 0;
+    dirent* e = readdir(d);
+    if (!e) {
+      find_free(slot);
+      char line[640];
+      snprintf(line, sizeof(line), "kernel32: FindFirstFileExW('%s') -> "
+               "INVALID_HANDLE_VALUE (no match in %s; lasterr=2)", utf8, host);
+      boot_log(line);
+      g_tls_last_error[g_tls_index_current_thread % 128] = 2;
+      return (void*)(uintptr_t)-1;
+    }
+    if (find_skip_dot(e->d_name)) continue;
+    if (!find_match(c.pattern, e->d_name)) continue;
+    // fill the WIN32_FIND_DATAW the caller provided
+    struct stat st;
+    char fullp[1100];
+    snprintf(fullp, sizeof(fullp), "%s/%s", host, e->d_name);
+    off_t sz = 0;
+    bool isdir = (e->d_type == DT_DIR);
+    if (stat(fullp, &st) == 0) { sz = st.st_size; isdir = S_ISDIR(st.st_mode); }
+    find_fill_data(found, e->d_name, isdir, sz);
+    char line[700];
+    snprintf(line, sizeof(line), "kernel32: FindFirstFileExW('%s') -> handle "
+             "slot=%d first='%s'", utf8, slot, e->d_name);
+    boot_log(line);
+    return (void*)(uintptr_t)(0x88800000u | (u32)slot);
+  }
+#endif
 }
 
 } // namespace
@@ -1250,25 +1450,68 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) { (void)cv; }
 void TRT_STDCALL trt_WakeConditionVariable(void* cv) { (void)cv; }
 
 // ---- file surface extensions the CRT init uses ----
-void* TRT_STDCALL trt_FindFirstFileExW(const u16* name, void* info, u32 flags) {
-  (void)info; (void)flags;
-  return find_first_file(name, nullptr);
+// REAL Win64 signature: FindFirstFileExW(name, infoLevel, findData,
+// searchOp, extraInfo, flags) — 6 args. A 3-arg declaration shifted every
+// register left: the guest's infoLevel landed in `info` and the bridge
+// memset through it (fault address 0x5 = the level value). Full signature
+// keeps the register map honest.
+void* TRT_STDCALL trt_FindFirstFileExW(const u16* name, u32 level, void* info,
+                                       u32 search_op, void* extra, u32 flags) {
+  (void)level; (void)search_op; (void)extra; (void)flags;
+  return find_first_file(name, info);
 }
 
 int TRT_STDCALL trt_FindNextFileW(void* handle, void* info) {
-  (void)handle; (void)info;
-  g_tls_last_error[g_tls_index_current_thread % 128] = 2;  // FILE_NOT_FOUND
-  return 0;  // no more files
+  const u32 v = (u32)(uintptr_t)handle;
+  if ((v >> 20) != 0x888 || (v & 0xFFFFF) >= 32 || !g_find_used[v & 0xFFFFF]) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 6;  // INVALID_HANDLE
+    return 0;
+  }
+  const int slot = (int)(v & 0xFFFFF);
+  find_ctx& c = g_find_ctx[slot];
+#if defined(_WIN32)
+  WIN32_FIND_DATAW native_fd;
+  if (!FindNextFileW((HANDLE)c.os_dir, &native_fd)) {
+    g_tls_last_error[g_tls_index_current_thread % 128] = 18;  // NO_MORE_FILES
+    return 0;
+  }
+  memcpy(info, &native_fd, sizeof(WIN32_FIND_DATAW));
+  return 1;
+#else
+  DIR* d = (DIR*)c.os_dir;
+  for (;;) {
+    errno = 0;
+    dirent* e = readdir(d);
+    if (!e) {
+      g_tls_last_error[g_tls_index_current_thread % 128] =
+          18;  // ERROR_NO_MORE_FILES
+      return 0;
+    }
+    if (find_skip_dot(e->d_name)) continue;
+    if (!find_match(c.pattern, e->d_name)) continue;
+    struct stat st;
+    char fullp[1100];
+    snprintf(fullp, sizeof(fullp), "%s/%s", c.host_path, e->d_name);
+    off_t sz = 0;
+    bool isdir = (e->d_type == DT_DIR);
+    if (stat(fullp, &st) == 0) { sz = st.st_size; isdir = S_ISDIR(st.st_mode); }
+    find_fill_data(info, e->d_name, isdir, sz);
+    return 1;
+  }
+#endif
 }
 
 int TRT_STDCALL trt_FindClose(void* handle) {
-  (void)handle;
+  const u32 v = (u32)(uintptr_t)handle;
+  if ((v >> 20) != 0x888 || (v & 0xFFFFF) >= 32 ||
+      !g_find_used[v & 0xFFFFF])
+    return 0;  // FALSE — unknown or already-freed handle
+  find_free((int)(v & 0xFFFFF));
   return 1;
 }
 
 void* TRT_STDCALL trt_FindFirstFileW(const u16* name, void* info) {
-  (void)info;
-  return find_first_file(name, nullptr);
+  return find_first_file(name, info);
 }
 
 int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info) {
@@ -1279,7 +1522,10 @@ int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info)
     return 0;
   }
   (void)level;
-  // WIN32_FILE_ATTRIBUTE_DATA: attributes, times (8+8+8), size hi+lo
+  // WIN32_FILE_ATTRIBUTE_DATA (x64, real Win32 layout, 36 bytes):
+  // attrs +0, times +4/+12/+20, size hi +28 / lo +32. Writing the sizes at
+  // +36/+40 used to zero the guest's /GS stack cookie (OrTMM: fastfail 2 =
+  // FAST_FAIL_STACK_COOKIE_CHECK_FAILURE at its cookie epilogue).
   u32* d = (u32*)info;
   memset(d, 0, 36);
   d[0] = 0x80;  // FILE_ATTRIBUTE_NORMAL
@@ -1288,8 +1534,8 @@ int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info)
     fseek(f, 0, SEEK_END);
     const long sz = ftell(f);
     fclose(f);
-    d[9] = (u32)sz;          // nFileSizeLow
-    d[10] = 0;               // nFileSizeHigh
+    d[7] = (u32)((u64)sz >> 32);  // nFileSizeHigh (+28)
+    d[8] = (u32)(sz & 0xFFFFFFFFu);  // nFileSizeLow (+32)
   }
   return 1;
 }

@@ -23,6 +23,8 @@
 #  define rmdir_portable(p) rmdir(p)
 #endif
 
+#include <errno.h>
+
 namespace {
 
 size_t wcslen_(const u16* s) {
@@ -52,6 +54,7 @@ void utf16_to_utf8(const u16* in, char* out, size_t cap) {
 } // namespace
 
 extern "C" {
+int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 
 // ---- system information ----
 
@@ -216,13 +219,16 @@ int TRT_STDCALL trt_WideCharToMultiByte(u32 codepage, u32 flags,
 // ---- files and directories ----
 
 u32 TRT_STDCALL trt_GetTempPathW(u32 size, u16* buf) {
-  const char* t = getenv("TMPDIR");
-  if (!t || !*t) t = "/tmp";
-  char tmp[512];
-  snprintf(tmp, sizeof(tmp), "%s/", t);
-  const u32 need = (u32)strlen(tmp) + 1;
+  // GUEST-style path under a mounted drive. Returning the HOST path ("/tmp/")
+  // used to poison every derived path: PyInstaller built "/tmp\_MEIxxxx"
+  // which the resolver treated as a RELATIVE guest path (host-absolute paths
+  // are not guest paths), so the temp dir never materialised and the
+  // candidate-name probe looped for 2.5M opens (watchdog exit 43). The
+  // environment block already advertises TEMP=C:\Temp — match it.
+  const char* t = "C:\\Temp\\";
+  const u32 need = (u32)strlen(t) + 1;
   if (buf && size >= need) {
-    for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)tmp[i];
+    for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)t[i];
     return need;
   }
   return need;
@@ -252,7 +258,8 @@ u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {
 
 u32 TRT_STDCALL trt_GetFileAttributesW(const u16* path) {
   char p[512];
-  utf16_to_utf8(path, p, sizeof(p));
+  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
+    utf16_to_utf8(path, p, sizeof(p));
   FILE* f = fopen(p, "rb");
   if (!f) return 0xFFFFFFFFu;  // INVALID_FILE_ATTRIBUTES
   fclose(f);
@@ -266,28 +273,52 @@ int TRT_STDCALL trt_SetFileAttributesW(const u16* path, u32 attrs) {
 
 int TRT_STDCALL trt_DeleteFileW(const u16* path) {
   char p[512];
-  utf16_to_utf8(path, p, sizeof(p));
+  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
+    utf16_to_utf8(path, p, sizeof(p));
   return remove(p) == 0 ? 1 : 0;
 }
 
 int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa) {
   (void)sa;
   char p[512];
-  utf16_to_utf8(path, p, sizeof(p));
-  return mkdir_portable(p);
+  // resolve via the VFS so relative guest paths (".\_MEIxxxx") land on the
+  // guest cwd drive instead of mkdir'ing a literal ".\_MEIxxxx" entry in
+  // the host cwd (measured: PyInstaller's extraction dir went to the wrong
+  // place and CreateFileW could not find it).
+  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0) {
+    utf16_to_utf8(path, p, sizeof(p));  // fail-visible: try the raw name
+  }
+  // create missing parents (Win32 C:\Temp exists on a real install; on the
+  // console the drive_c mount starts empty, so "C:\Temp\_MEIxxxx" needs the
+  // intermediate level). Each level is a real mkdir, not a fake success.
+  for (char* q = p + 1; *q; ++q) {
+    if (*q == '/') {
+      *q = 0;
+      mkdir_portable(p);
+      *q = '/';
+    }
+  }
+  // Win32 semantics: nonzero = created. POSIX mkdir returns 0 on success —
+  // and EEXIST for a directory that ALREADY exists is also a Win32 success
+  // (ERROR_ALREADY_EXISTS, GetLastError names it; the call itself answers 1).
+  if (mkdir_portable(p) == 0) return 1;
+  return errno == EEXIST ? 1 : 0;
 }
 
 int TRT_STDCALL trt_RemoveDirectoryW(const u16* path) {
   char p[512];
-  utf16_to_utf8(path, p, sizeof(p));
+  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
+    utf16_to_utf8(path, p, sizeof(p));
   return rmdir_portable(p);
 }
 
 int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
   (void)fail;
   char s[512], d[512];
-  utf16_to_utf8(src, s, sizeof(s));
-  utf16_to_utf8(dst, d, sizeof(d));
+  if (trt_vfs_resolve_utf16(src, s, sizeof(s)) != 0)
+    utf16_to_utf8(src, s, sizeof(s));
+  if (trt_vfs_resolve_utf16(dst, d, sizeof(d)) != 0)
+    utf16_to_utf8(dst, d, sizeof(d));
   FILE* in = fopen(s, "rb");
   if (!in) return 0;
   FILE* out = fopen(d, "wb");
@@ -319,6 +350,9 @@ int trt_bridge_register_system(void) {
       {"MultiByteToWideChar", (void*)&trt_MultiByteToWideChar},
       {"WideCharToMultiByte", (void*)&trt_WideCharToMultiByte},
       {"GetTempPathW", (void*)&trt_GetTempPathW},
+      // Win8+ sibling the UCRT itself imports (kernel32!GetTempPath2W);
+      // blanket-0 bind made UCRT's temp-name loop spin -> boot backstop.
+      {"GetTempPath2W", (void*)&trt_GetTempPathW},
       {"GetTempFileNameW", (void*)&trt_GetTempFileNameW},
       {"GetWindowsDirectoryW", (void*)&trt_GetWindowsDirectoryW},
       {"GetFileAttributesW", (void*)&trt_GetFileAttributesW},
