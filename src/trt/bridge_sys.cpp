@@ -309,7 +309,11 @@ int TRT_STDCALL trt_RemoveDirectoryW(const u16* path) {
   char p[512];
   if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
     utf16_to_utf8(path, p, sizeof(p));
-  return rmdir_portable(p);
+  // Win32 semantics: nonzero = removed, 0 = failed (POSIX rmdir is the
+  // inverse: 0 on success). Returning the raw POSIX code made every
+  // successful cleanup read as failure — OrTMM popped a spurious
+  // "Failed to remove temporary directory" MessageBox on a clean exit.
+  return rmdir_portable(p) == 0 ? 1 : 0;
 }
 
 int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {

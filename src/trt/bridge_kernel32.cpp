@@ -1522,6 +1522,14 @@ int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info)
     return 0;
   }
   (void)level;
+  FILE* f = fopen(host, "rb");
+  if (!f) {
+    // Real Win32 semantics: FALSE for a missing path. Returning TRUE here
+    // wedged PyInstaller's unique-temp-dir search ("does _MEI<N> exist?"
+    // answered yes for every counter -> infinite silent probe loop).
+    g_tls_last_error[g_tls_index_current_thread % 128] = 2;  // FILE_NOT_FOUND
+    return 0;
+  }
   // WIN32_FILE_ATTRIBUTE_DATA (x64, real Win32 layout, 36 bytes):
   // attrs +0, times +4/+12/+20, size hi +28 / lo +32. Writing the sizes at
   // +36/+40 used to zero the guest's /GS stack cookie (OrTMM: fastfail 2 =
@@ -1529,14 +1537,11 @@ int TRT_STDCALL trt_GetFileAttributesExW(const u16* name, u32 level, void* info)
   u32* d = (u32*)info;
   memset(d, 0, 36);
   d[0] = 0x80;  // FILE_ATTRIBUTE_NORMAL
-  FILE* f = fopen(host, "rb");
-  if (f) {
-    fseek(f, 0, SEEK_END);
-    const long sz = ftell(f);
-    fclose(f);
-    d[7] = (u32)((u64)sz >> 32);  // nFileSizeHigh (+28)
-    d[8] = (u32)(sz & 0xFFFFFFFFu);  // nFileSizeLow (+32)
-  }
+  fseek(f, 0, SEEK_END);
+  const long sz = ftell(f);
+  fclose(f);
+  d[7] = (u32)((u64)sz >> 32);     // nFileSizeHigh (+28)
+  d[8] = (u32)(sz & 0xFFFFFFFFu);  // nFileSizeLow (+32)
   return 1;
 }
 

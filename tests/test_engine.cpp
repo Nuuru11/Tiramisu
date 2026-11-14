@@ -525,6 +525,15 @@ int main(int argc, char** argv) {
           gd.g2 == 0xC33DE333 && gd.g3 == 0xD44EE444,
           "guard qwords intact (no write past the 36-byte record)");
     CHECK(gd.d.szlo == 15 && gd.d.szhi == 0, "size at the real +32/+28 offsets");
+    // Missing path -> FALSE (real Win32). Returning TRUE wedged PyInstaller's
+    // unique-temp-dir search into an infinite silent probe loop (OrTMM v0.33).
+    u16 wmiss[300];
+    const char* relm = "attr_missing_zz.bin";
+    u32 mi = 0;
+    for (; relm[mi]; ++mi) wmiss[mi] = (u16)(u8)relm[mi];
+    wmiss[mi] = 0;
+    CHECK(trt_GetFileAttributesExW(wmiss, 0, &gd.d) == 0,
+          "GetFileAttributesExW(missing) -> FALSE, not a silent TRUE");
   }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
