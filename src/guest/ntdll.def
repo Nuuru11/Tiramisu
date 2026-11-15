@@ -1,0 +1,14 @@
+LIBRARY ntdll.dll
+EXPORTS
+    NtCreateFile
+    NtReadFile
+    NtWriteFile
+    NtClose
+    NtQueryInformationFile
+    NtCreateEvent
+    NtSetEvent
+    NtWaitForSingleObject
+    NtSignalAndWaitForSingleObject
+    RaiseFailFastException
+    RtlGetVersion
+    RtlNtStatusToDosError

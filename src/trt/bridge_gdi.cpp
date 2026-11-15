@@ -802,8 +802,74 @@ int TRT_GUEST_ABI trt_GetDeviceCaps(void* hdc, int index) {
 extern "C" void* TRT_STDCALL trt_GetDC(void* hwnd);
 extern "C" int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc);
 
+// ---- D3DKMT (engine adapter queries; gdi32 exports) ------------------------
+// Honest stub: an adapter DOES exist on Xbox (the APU), so open/close/
+// enumerate answer with a synthetic handle; per-type adapter info queries
+// fail visibly with STATUS_NOT_IMPLEMENTED so engines take their fallback.
+// Struct layouts are the documented WDK d3dkmthk.h ABI (x64).
+namespace d3dkmt {
+constexpr u32 k_status_not_impl = 0xC0000002u;  // STATUS_NOT_IMPLEMENTED
+constexpr u32 k_adapter_handle = 0x44584B31u;   // 'DXK1' synthetic
+}  // namespace d3dkmt
+
+int TRT_GUEST_ABI gdi_D3DKMTOpenAdapterFromLuid(void* args) {
+  // D3DKMT_OPENADAPTERFROMLUID { LUID AdapterLuid(8); ULONG hAdapter; }
+  if (args) {
+    u32* h = (u32*)((u8*)args + 8);
+    *h = d3dkmt::k_adapter_handle;
+    u32 lo, hi;
+    __builtin_memcpy(&lo, args, 4);
+    __builtin_memcpy(&hi, (u8*)args + 4, 4);
+    char b[96];
+    snprintf(b, sizeof(b),
+             "gdi: D3DKMTOpenAdapterFromLuid(%08x-%08x) -> hAdapter=0x%x "
+             "(synthetic Xbox APU adapter)",
+             lo, hi, *h);
+    log_line(b);
+  }
+  return 0;  // STATUS_SUCCESS
+}
+int TRT_GUEST_ABI gdi_D3DKMTCloseAdapter(void* args) {
+  // D3DKMT_CLOSEADAPTER { ULONG hAdapter; }
+  if (args) {
+    char b[64];
+    snprintf(b, sizeof(b), "gdi: D3DKMTCloseAdapter(hAdapter=0x%x)", *(u32*)args);
+    log_line(b);
+  }
+  return 0;  // STATUS_SUCCESS
+}
+int TRT_GUEST_ABI gdi_D3DKMTQueryAdapterInfo(void* args) {
+  // D3DKMT_QUERYADAPTERINFO { ULONG hAdapter(0); ULONG Type(4);
+  //                           VOID* PrivateDriverData(8); UINT Size(16); }
+  u32 type = args ? *(u32*)((u8*)args + 4) : 0;
+  char b[96];
+  snprintf(b, sizeof(b),
+           "gdi: D3DKMTQueryAdapterInfo(type=%u) -> STATUS_NOT_IMPLEMENTED",
+           type);
+  log_line(b);
+  return (int)d3dkmt::k_status_not_impl;
+}
+int TRT_GUEST_ABI gdi_D3DKMTEnumAdapters(void* args) {
+  // D3DKMT_ENUMADAPTERS { UINT NumAdapters(0); D3DKMT_ADAPTERINFO Adapters[16](8); }
+  // D3DKMT_ADAPTERINFO { ULONG hAdapter(0); LUID AdapterLuid(8); ULONG Flags(16); }
+  if (args) {
+    *(u32*)args = 1;
+    u8* a = (u8*)args + 8;
+    *(u32*)(a + 0) = d3dkmt::k_adapter_handle;
+    *(u32*)(a + 8) = 0x1337u;  // LUID low (matches the D3D12 bridge LUID)
+    *(i32*)(a + 12) = 0;       // LUID high
+    *(u32*)(a + 16) = 0;       // Flags
+  }
+  log_line("gdi: D3DKMTEnumAdapters -> 1 adapter (Xbox APU, synthetic)");
+  return 0;  // STATUS_SUCCESS
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
+      {"D3DKMTOpenAdapterFromLuid", (void*)&gdi_D3DKMTOpenAdapterFromLuid},
+      {"D3DKMTCloseAdapter", (void*)&gdi_D3DKMTCloseAdapter},
+      {"D3DKMTQueryAdapterInfo", (void*)&gdi_D3DKMTQueryAdapterInfo},
+      {"D3DKMTEnumAdapters", (void*)&gdi_D3DKMTEnumAdapters},
       {"CreateFontIndirectW", (void*)&trt_CreateFontIndirectW},
       {"CreateFontIndirectA", (void*)&trt_CreateFontIndirectA},
       {"CreateFontW", (void*)&trt_CreateFontW},

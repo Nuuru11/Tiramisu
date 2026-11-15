@@ -57,6 +57,76 @@ bool is_iunknown(const void* riid) {
   return guid_eq(riid, 0x00000000u, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46);
 }
 
+// ---- BUG-6: version-aware QueryInterface ----------------------------------
+// IID values verified verbatim against the xwin SDK d3d12.h DEFINE_GUID block
+// (the same constants the console's d3d12.dll ships). A vtbl serves exactly
+// the interface versions whose slot count it covers; anything else fails
+// VISIBLY with E_NOINTERFACE instead of handing back a short vtbl that a
+// game would call off the end of.
+struct qi_iid {
+  u32 d1;
+  u16 d2, d3;
+  u8 d4[8];
+  const char* name;
+};
+
+#define TIRAMISU_IID(sym, a, b, c, b0, b1, b2, b3, b4, b5, b6, b7) \
+  { a, b, c, { b0, b1, b2, b3, b4, b5, b6, b7 }, #sym }
+
+static const qi_iid k_iid_object = TIRAMISU_IID(ID3D12Object,
+    0xc4fec28fu, 0x7966, 0x4e95, 0x9f, 0x94, 0xf4, 0x31, 0xcb, 0x56, 0xc3, 0xb8);
+static const qi_iid k_iid_device_child = TIRAMISU_IID(ID3D12DeviceChild,
+    0x905db94bu, 0xa00c, 0x4140, 0x9d, 0xf5, 0x2b, 0x64, 0xca, 0x9e, 0xa3, 0x57);
+static const qi_iid k_iid_pageable = TIRAMISU_IID(ID3D12Pageable,
+    0x63ee58fbu, 0x1268, 0x4835, 0x86, 0xda, 0xf0, 0x08, 0xce, 0x62, 0xf0, 0xd6);
+
+// chain is a nullptr-terminated array of accepted IIDs (IUnknown implied).
+u32 TRT_GUEST_ABI base_addref(void* self);  // defined below with com_base
+static int d3d12_qi_chain(void* self, const void* riid, void** ppv,
+                          const qi_iid* const* chain, const char* what) {
+  if (!ppv) return k_e_invalidarg;
+  *ppv = nullptr;
+  if (!riid) return k_e_invalidarg;
+  if (is_iunknown(riid)) {
+    *ppv = self;
+    base_addref(self);
+    return k_s_ok;
+  }
+  for (u32 i = 0; chain[i]; ++i) {
+    const qi_iid& e = *chain[i];
+    if (guid_eq(riid, e.d1, e.d2, e.d3, e.d4[0], e.d4[1], e.d4[2], e.d4[3],
+                e.d4[4], e.d4[5], e.d4[6], e.d4[7])) {
+      *ppv = self;
+      base_addref(self);
+      return k_s_ok;
+    }
+  }
+  const raw_guid* r = (const raw_guid*)riid;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: %s QueryInterface({%08x-%04x-%04x-%02x%02x...}) -> "
+           "E_NOINTERFACE (interface version beyond bridge vtbl)",
+           what, r->d1, r->d2, r->d3, r->d4[0], r->d4[1]);
+  trt_core_log(line);
+  return k_e_nointerface;
+}
+
+// log-once gate for the versioned command-list stubs (24 methods beyond the
+// ID3D12GraphicsCommandList base slots) — visible on first use, silent after
+// so per-frame DXR/VRS calls cannot flood the log.
+static std::atomic<u32> g_gcl_stub_seen{0};
+static void gcl_stub_log(u32 bit, const char* name) {
+  u32 seen = g_gcl_stub_seen.load(std::memory_order_relaxed);
+  if (!(seen & (1u << bit)) &&
+      !(g_gcl_stub_seen.fetch_or(1u << bit, std::memory_order_relaxed) & (1u << bit))) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "d3d12: GraphicsCommandList::%s -> logged no-op "
+             "(versioned slot; real impl = sprint-2 item 27/34)", name);
+    trt_core_log(line);
+  }
+}
+
 bool is_valid_fl(u32 fl) {
   return fl == k_fl_9_1 || fl == 0x9200 || fl == 0x9300 ||
          fl == 0xa000 || fl == 0xa100 || fl == k_fl_11_0 ||
@@ -242,6 +312,7 @@ struct fence_waiter {
 struct d3d12_fence : com_base {
   std::mutex mu;
   std::atomic<u64> completed{0};
+  u32 flags = 0;  // D3D12_FENCE_FLAGS from CreateFence (Fence1::GetCreationFlags)
   std::vector<fence_waiter> waiters;
 };
 
@@ -294,8 +365,25 @@ int TRT_GUEST_ABI fence_signal(void* self, u64 value) {
   return k_s_ok;
 }
 
-const void* g_fence_vtbl[11] = {
-    (const void*)&base_qi_self,
+// ID3D12Fence1::GetCreationFlags — a real getter (flags recorded at create).
+u32 TRT_GUEST_ABI fence1_get_creation_flags(void* self) {
+  return ((d3d12_fence*)self)->flags;
+}
+
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + Pageable + Fence + Fence1
+int TRT_GUEST_ABI fence_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_fence = TIRAMISU_IID(ID3D12Fence,
+      0x0a753dcfu, 0xc4d8, 0x4b91, 0xad, 0xf6, 0xbe, 0x5a, 0x60, 0xd9, 0x5a, 0x76);
+  static const qi_iid k_fence1 = TIRAMISU_IID(ID3D12Fence1,
+      0x433685feu, 0xe22b, 0x4ca0, 0xa8, 0xdb, 0xb5, 0xb4, 0xf4, 0xdd, 0x0e, 0x4a);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_iid_pageable, &k_fence, &k_fence1,
+      nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12Fence");
+}
+
+const void* g_fence_vtbl[12] = {
+    (const void*)&fence_qi,
     (const void*)&base_addref,
     (const void*)&base_release,
     (const void*)&child_get_priv,
@@ -303,12 +391,13 @@ const void* g_fence_vtbl[11] = {
     (const void*)&child_set_priv_iface,
     (const void*)&child_set_name,
     (const void*)&child_get_device,
-    (const void*)&fence_completed,
-    (const void*)&fence_set_event,
-    (const void*)&fence_signal,
+    (const void*)&fence_completed,          // 8  GetCompletedValue
+    (const void*)&fence_set_event,          // 9  SetEventOnCompletion
+    (const void*)&fence_signal,             // 10 Signal
+    (const void*)&fence1_get_creation_flags,// 11 ID3D12Fence1::GetCreationFlags
 };
-static_assert(sizeof(g_fence_vtbl) / sizeof(g_fence_vtbl[0]) == 11,
-              "ID3D12Fence vtbl must stay 11 slots (Win64 ABI)");
+static_assert(sizeof(g_fence_vtbl) / sizeof(g_fence_vtbl[0]) == 12,
+              "ID3D12Fence/Fence1 vtbl must stay 12 slots (Win64 ABI)");
 
 // ---- ID3D12DescriptorHeap --------------------------------------------------
 struct d3d12_desc_heap : com_base {
@@ -334,8 +423,17 @@ u64* TRT_GUEST_ABI descheap_gpu_start(void* self, u64* ret) {
   return ret;
 }
 
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + Pageable + DescriptorHeap
+int TRT_GUEST_ABI descheap_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_descheap = TIRAMISU_IID(ID3D12DescriptorHeap,
+      0x8efb471du, 0x616c, 0x4f49, 0x90, 0xf7, 0x12, 0xb7, 0xb7, 0x63, 0xfa, 0x51);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_iid_pageable, &k_descheap, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12DescriptorHeap");
+}
+
 const void* g_descheap_vtbl[11] = {
-    (const void*)&base_qi_self,
+    (const void*)&descheap_qi,
     (const void*)&base_addref,
     (const void*)&base_release,
     (const void*)&child_get_priv,
@@ -415,8 +513,18 @@ int TRT_GUEST_ABI res_get_heap_props(void* self, d3d12_heap_props_t* props, u32*
   return k_s_ok;
 }
 
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + Pageable + Resource.
+// ID3D12Resource1/2 add slots beyond this 15-slot vtbl -> E_NOINTERFACE (logged).
+int TRT_GUEST_ABI resource_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_resource = TIRAMISU_IID(ID3D12Resource,
+      0x696442beu, 0xa72e, 0x4059, 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_iid_pageable, &k_resource, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12Resource");
+}
+
 const void* g_resource_vtbl[15] = {
-    (const void*)&base_qi_self,
+    (const void*)&resource_qi,
     (const void*)&base_addref,
     (const void*)&base_release,
     (const void*)&child_get_priv,
@@ -459,22 +567,52 @@ int TRT_GUEST_ABI pso_get_cached_blob(void* self, void** out_blob) {
   return k_s_ok;
 }
 
+// BUG-6 QI chain for the pure-DeviceChild shape (RootSignature and
+// CommandSignature share this vtbl — both have no methods beyond DeviceChild).
+int TRT_GUEST_ABI child8_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_rootsig = TIRAMISU_IID(ID3D12RootSignature,
+      0xc54a6b66u, 0x72df, 0x4ee8, 0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14);
+  static const qi_iid k_cmdsig = TIRAMISU_IID(ID3D12CommandSignature,
+      0xc36a797cu, 0xec80, 0x4f0a, 0x89, 0x85, 0xa7, 0xb2, 0x47, 0x50, 0x82, 0xd1);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_rootsig, &k_cmdsig, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12RootSignature/CommandSignature");
+}
+
 const void* g_child8_vtbl[8] = {
-    (const void*)&base_qi_self, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&child8_qi, (const void*)&base_addref, (const void*)&base_release,
     (const void*)&child_get_priv, (const void*)&child_set_priv,
     (const void*)&child_set_priv_iface, (const void*)&child_set_name,
     (const void*)&child_get_device,
 };
 
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + PipelineState
+int TRT_GUEST_ABI pso_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_pso = TIRAMISU_IID(ID3D12PipelineState,
+      0x765a30f3u, 0xf624, 0x4c6f, 0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_pso, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12PipelineState");
+}
+
 const void* g_pso_vtbl[9] = {
-    (const void*)&base_qi_self, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&pso_qi, (const void*)&base_addref, (const void*)&base_release,
     (const void*)&child_get_priv, (const void*)&child_set_priv,
     (const void*)&child_set_priv_iface, (const void*)&child_set_name,
     (const void*)&child_get_device, (const void*)&pso_get_cached_blob,
 };
 
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + QueryHeap
+int TRT_GUEST_ABI queryheap_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_queryheap = TIRAMISU_IID(ID3D12QueryHeap,
+      0x0d9658aeu, 0xed45, 0x469e, 0xa6, 0x1d, 0x97, 0x0e, 0xc5, 0x83, 0xca, 0xb4);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_queryheap, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12QueryHeap");
+}
+
 const void* g_heap_vtbl[9] = {
-    (const void*)&base_qi_self, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&queryheap_qi, (const void*)&base_addref, (const void*)&base_release,
     (const void*)&child_get_priv, (const void*)&child_set_priv,
     (const void*)&child_set_priv_iface, (const void*)&child_set_name,
     (const void*)&child_get_device, (const void*)&heap_get_desc,
@@ -490,8 +628,17 @@ int TRT_GUEST_ABI alloc_reset(void* self) {
   ++((d3d12_alloc*)self)->reset_count;
   return k_s_ok;
 }
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + CommandAllocator
+int TRT_GUEST_ABI alloc_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_alloc = TIRAMISU_IID(ID3D12CommandAllocator,
+      0x6102dee4u, 0xaf59, 0x4b09, 0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_alloc, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12CommandAllocator");
+}
+
 const void* g_alloc_vtbl[9] = {
-    (const void*)&base_qi_self, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&alloc_qi, (const void*)&base_addref, (const void*)&base_release,
     (const void*)&child_get_priv, (const void*)&child_set_priv,
     (const void*)&child_set_priv_iface, (const void*)&child_set_name,
     (const void*)&child_get_device, (const void*)&alloc_reset,
@@ -542,8 +689,67 @@ void TRT_GUEST_ABI cmd_clear_rtv(void* self, u64, const void*, u32, const void*)
 void TRT_GUEST_ABI cmd_clear_dsv(void* self, u64, u32, float, u8, u32, const void*) { ++((d3d12_cmd_list*)self)->clears; }
 void TRT_GUEST_ABI cmd_noop(void*) {}
 
-const void* g_cmdlist_vtbl[60] = {
-    (const void*)&base_qi_self,        // 0 QueryInterface
+// ---- ID3D12GraphicsCommandList1..9 versioned slots (60-83) ----------------
+// ABI-correct arities verified against the xwin SDK d3d12.h vtbl declarations.
+void TRT_GUEST_ABI gcl_atomic_copy_uint(void*, void*, u32, u64, const void*, u32, u32, u32) { gcl_stub_log(0, "AtomicCopyBufferUINT"); }
+void TRT_GUEST_ABI gcl_atomic_copy_uint64(void*, void*, u32, u64, const void*, u32, u32, u32) { gcl_stub_log(1, "AtomicCopyBufferUINT64"); }
+void TRT_GUEST_ABI gcl_om_set_depth_bounds(void*, float, float, float) { gcl_stub_log(2, "OMSetDepthBounds"); }
+void TRT_GUEST_ABI gcl_set_sample_positions(void*, u32, u32, const void*, const void*) { gcl_stub_log(3, "SetSamplePositions"); }
+void TRT_GUEST_ABI gcl_resolve_subresource_region(void*, void*, u32, u32, void*, u32, u32, u32, u32, u32) { gcl_stub_log(4, "ResolveSubresourceRegion"); }
+void TRT_GUEST_ABI gcl_set_view_instance_mask(void*, u32, u32) { gcl_stub_log(5, "SetViewInstanceMask"); }
+void TRT_GUEST_ABI gcl_write_buffer_immediate(void*, u32, const void*, u32, u32) { gcl_stub_log(6, "WriteBufferImmediate"); }
+void TRT_GUEST_ABI gcl_set_protected_resource_session(void*, void*) { gcl_stub_log(7, "SetProtectedResourceSession"); }
+void TRT_GUEST_ABI gcl_begin_render_pass(void*, u32, const void*, const void*, const void*, u32) { gcl_stub_log(8, "BeginRenderPass"); }
+void TRT_GUEST_ABI gcl_end_render_pass(void*) { gcl_stub_log(9, "EndRenderPass"); }
+void TRT_GUEST_ABI gcl_initialize_meta_command(void*, void*, const void*, const void*, u32) { gcl_stub_log(10, "InitializeMetaCommand"); }
+void TRT_GUEST_ABI gcl_execute_meta_command(void*, void*, const void*, const void*, u32) { gcl_stub_log(11, "ExecuteMetaCommand"); }
+void TRT_GUEST_ABI gcl_build_rtas(void*, const void*, u32, const void*) { gcl_stub_log(12, "BuildRaytracingAccelerationStructure"); }
+void TRT_GUEST_ABI gcl_emit_rtas_postbuild(void*, const void*, u32, void*) { gcl_stub_log(13, "EmitRaytracingAccelerationStructurePostbuildInfo"); }
+void TRT_GUEST_ABI gcl_copy_rtas(void*, void*, void*, void*) { gcl_stub_log(14, "CopyRaytracingAccelerationStructure"); }
+void TRT_GUEST_ABI gcl_set_pipeline_state1(void*, void*) { gcl_stub_log(15, "SetPipelineState1"); }
+void TRT_GUEST_ABI gcl_dispatch_rays(void*, const void*, const void*, const void*) { gcl_stub_log(16, "DispatchRays"); }
+void TRT_GUEST_ABI gcl_rs_set_shading_rate(void*, u32, u32) { gcl_stub_log(17, "RSSetShadingRate"); }
+void TRT_GUEST_ABI gcl_rs_set_shading_rate_image(void*, void*) { gcl_stub_log(18, "RSSetShadingRateImage"); }
+void TRT_GUEST_ABI gcl_dispatch_mesh(void*, u32, u32, const void*) { gcl_stub_log(19, "DispatchMesh"); }
+void TRT_GUEST_ABI gcl_barrier(void*, u32, const void*) { gcl_stub_log(20, "Barrier"); }
+void TRT_GUEST_ABI gcl_om_set_front_back_stencil_ref(void*, u32, u32, u32) { gcl_stub_log(21, "OMSetFrontAndBackStencilRef"); }
+void TRT_GUEST_ABI gcl_rs_set_depth_bias(void*, float, float, u32, u32) { gcl_stub_log(22, "RSSetDepthBias"); }
+void TRT_GUEST_ABI gcl_ia_set_index_buffer_strip_cut(void*, u32) { gcl_stub_log(23, "IASetIndexBufferStripCutValue"); }
+
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + CommandList +
+// GraphicsCommandList base + versions 1-9 (vtbl covers all 84 slots).
+int TRT_GUEST_ABI cmdlist_qi(void* self, const void* riid, void** ppv) {
+  static const qi_iid k_cmdlist = TIRAMISU_IID(ID3D12CommandList,
+      0x7116d91cu, 0xe7e4, 0x47ce, 0xb8, 0xc6, 0xec, 0x81, 0x68, 0xf4, 0x37, 0xe5);
+  static const qi_iid k_gcl = TIRAMISU_IID(ID3D12GraphicsCommandList,
+      0x5b160d0fu, 0xac1b, 0x4185, 0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55);
+  static const qi_iid k_gcl1 = TIRAMISU_IID(ID3D12GraphicsCommandList1,
+      0x553103fbu, 0x1fe7, 0x4557, 0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7);
+  static const qi_iid k_gcl2 = TIRAMISU_IID(ID3D12GraphicsCommandList2,
+      0x38c3e585u, 0xff17, 0x412c, 0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28);
+  static const qi_iid k_gcl3 = TIRAMISU_IID(ID3D12GraphicsCommandList3,
+      0x6fda83a7u, 0xb84c, 0x4e38, 0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d);
+  static const qi_iid k_gcl4 = TIRAMISU_IID(ID3D12GraphicsCommandList4,
+      0x8754318eu, 0xd3a9, 0x4541, 0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74);
+  static const qi_iid k_gcl5 = TIRAMISU_IID(ID3D12GraphicsCommandList5,
+      0x55050859u, 0x4024, 0x474c, 0x87, 0xf5, 0x64, 0x72, 0xea, 0xee, 0x44, 0xea);
+  static const qi_iid k_gcl6 = TIRAMISU_IID(ID3D12GraphicsCommandList6,
+      0xc3827890u, 0xe548, 0x4cfa, 0x96, 0xcf, 0x56, 0x89, 0xa9, 0x37, 0x0f, 0x80);
+  static const qi_iid k_gcl7 = TIRAMISU_IID(ID3D12GraphicsCommandList7,
+      0xdd171223u, 0x8b61, 0x4769, 0x90, 0xe3, 0x16, 0x0c, 0xcd, 0xe4, 0xe2, 0xc1);
+  static const qi_iid k_gcl8 = TIRAMISU_IID(ID3D12GraphicsCommandList8,
+      0xee936ef9u, 0x599d, 0x4d28, 0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51);
+  static const qi_iid k_gcl9 = TIRAMISU_IID(ID3D12GraphicsCommandList9,
+      0x34ed2808u, 0xffe6, 0x4c2b, 0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_cmdlist, &k_gcl,
+      &k_gcl1, &k_gcl2, &k_gcl3, &k_gcl4, &k_gcl5, &k_gcl6, &k_gcl7, &k_gcl8,
+      &k_gcl9, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12GraphicsCommandList");
+}
+
+const void* g_cmdlist_vtbl[84] = {
+    (const void*)&cmdlist_qi,          // 0 QueryInterface (BUG-6 version chain)
     (const void*)&base_addref,         // 1 AddRef
     (const void*)&base_release,        // 2 Release
     (const void*)&child_get_priv,      // 3 GetPrivateData
@@ -603,9 +809,38 @@ const void* g_cmdlist_vtbl[60] = {
     (const void*)&cmd_noop,            // 57 BeginEvent
     (const void*)&cmd_noop,            // 58 EndEvent
     (const void*)&cmd_draw_inst,       // 59 ExecuteIndirect
+    // ---- ID3D12GraphicsCommandList1..9 extensions (slots 60-83) ------------
+    // Logged no-ops: the slot EXISTS (ABI-correct arity) so versioned QI can
+    // succeed without the game calling off the end of the vtbl; the render
+    // behavior is a sprint-2 item 27/34 deliverable. First call per method
+    // logs loudly (gcl_stub_log), later calls are silent.
+    (const void*)&gcl_atomic_copy_uint,     // 60 GCL1 AtomicCopyBufferUINT
+    (const void*)&gcl_atomic_copy_uint64,   // 61 GCL1 AtomicCopyBufferUINT64
+    (const void*)&gcl_om_set_depth_bounds,  // 62 GCL1 OMSetDepthBounds
+    (const void*)&gcl_set_sample_positions, // 63 GCL1 SetSamplePositions
+    (const void*)&gcl_resolve_subresource_region, // 64 GCL1 ResolveSubresourceRegion
+    (const void*)&gcl_set_view_instance_mask,     // 65 GCL1 SetViewInstanceMask
+    (const void*)&gcl_write_buffer_immediate,     // 66 GCL2 WriteBufferImmediate
+    (const void*)&gcl_set_protected_resource_session, // 67 GCL3 SetProtectedResourceSession
+    (const void*)&gcl_begin_render_pass,    // 68 GCL4 BeginRenderPass
+    (const void*)&gcl_end_render_pass,      // 69 GCL4 EndRenderPass
+    (const void*)&gcl_initialize_meta_command,    // 70 GCL4 InitializeMetaCommand
+    (const void*)&gcl_execute_meta_command,       // 71 GCL4 ExecuteMetaCommand
+    (const void*)&gcl_build_rtas,           // 72 GCL4 BuildRaytracingAccelerationStructure
+    (const void*)&gcl_emit_rtas_postbuild,  // 73 GCL4 EmitRaytracingAccelerationStructurePostbuildInfo
+    (const void*)&gcl_copy_rtas,            // 74 GCL4 CopyRaytracingAccelerationStructure
+    (const void*)&gcl_set_pipeline_state1,  // 75 GCL4 SetPipelineState1
+    (const void*)&gcl_dispatch_rays,        // 76 GCL4 DispatchRays
+    (const void*)&gcl_rs_set_shading_rate,  // 77 GCL5 RSSetShadingRate
+    (const void*)&gcl_rs_set_shading_rate_image,  // 78 GCL5 RSSetShadingRateImage
+    (const void*)&gcl_dispatch_mesh,        // 79 GCL6 DispatchMesh
+    (const void*)&gcl_barrier,              // 80 GCL7 Barrier
+    (const void*)&gcl_om_set_front_back_stencil_ref, // 81 GCL8 OMSetFrontAndBackStencilRef
+    (const void*)&gcl_rs_set_depth_bias,    // 82 GCL9 RSSetDepthBias
+    (const void*)&gcl_ia_set_index_buffer_strip_cut, // 83 GCL9 IASetIndexBufferStripCutValue
 };
-static_assert(sizeof(g_cmdlist_vtbl) / sizeof(g_cmdlist_vtbl[0]) == 60,
-              "ID3D12GraphicsCommandList vtbl must stay 60 slots (Win64 ABI)");
+static_assert(sizeof(g_cmdlist_vtbl) / sizeof(g_cmdlist_vtbl[0]) == 84,
+              "ID3D12GraphicsCommandList1..9 vtbl must stay 84 slots (Win64 ABI)");
 
 // ---- ID3D12CommandQueue ----------------------------------------------------
 // Real ABI: ID3D12CommandQueue has exactly 13 vtable slots (0-12).
@@ -637,17 +872,13 @@ void queue_destroy(com_base* b) {
   delete (d3d12_queue*)b;
 }
 
+// BUG-6 QI chain: IUnknown + Object + DeviceChild + Pageable + CommandQueue
 int TRT_GUEST_ABI queue_qi(void* self, const void* riid, void** ppv) {
-  if (!ppv) return k_e_invalidarg;
-  if (!riid || is_iunknown(riid) ||
-      guid_eq(riid, 0x0ec870a6u, 0x5d7e, 0x4c22, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed) ||
-      guid_eq(riid, 0xc4fec28fu, 0x7966, 0x4e95, 0x9f, 0x94, 0xf4, 0x31, 0xcb, 0x56, 0xc3, 0xb8)) {
-    *ppv = self;
-    base_addref(self);
-    return k_s_ok;
-  }
-  *ppv = nullptr;
-  return k_e_nointerface;
+  static const qi_iid k_queue = TIRAMISU_IID(ID3D12CommandQueue,
+      0x0ec870a6u, 0x5d7e, 0x4c22, 0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed);
+  static const qi_iid* const chain[] = {
+      &k_iid_object, &k_iid_device_child, &k_iid_pageable, &k_queue, nullptr};
+  return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12CommandQueue");
 }
 
 void TRT_GUEST_ABI queue_update_tile(void*, void*, u32, const void*, const void*, void*, u32, const void*, const void*, const void*, u32) {}
@@ -785,7 +1016,7 @@ int TRT_GUEST_ABI dev_qi(void* self, const void* riid, void** ppv) {
       guid_eq(riid, 0x5c014b53u, 0x68a1, 0x4b9b, 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b) || // ID3D12Device7
       guid_eq(riid, 0x9218e6bbu, 0xf944, 0x4f7e, 0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3) || // ID3D12Device8
       guid_eq(riid, 0x4c80e962u, 0xf032, 0x4f60, 0xbc, 0x9e, 0xeb, 0xc2, 0xcf, 0xa1, 0xd8, 0x3c) || // ID3D12Device9
-      guid_eq(riid, 0xc7e2816fu, 0xb6fa, 0x4f91, 0xa5, 0x72, 0x9e, 0x5c, 0x78, 0x64, 0x75, 0x38)) { // ID3D12Object
+      guid_eq(riid, 0xc4fec28fu, 0x7966, 0x4e95, 0x9f, 0x94, 0xf4, 0x31, 0xcb, 0x56, 0xc3, 0xb8)) { // ID3D12Object (xwin SDK d3d12.h)
     *ppv = self;
     base_addref(self);
     return k_s_ok;
@@ -1008,7 +1239,7 @@ int TRT_GUEST_ABI dev_create_placed(void* self, void*, u64,
 
 int TRT_GUEST_ABI dev_unimpl(void*) { return k_e_notimpl; }
 
-int TRT_GUEST_ABI dev_create_fence(void* self, u64 init_val, u32,
+int TRT_GUEST_ABI dev_create_fence(void* self, u64 init_val, u32 flags,
                                    const void*, void** out_fence) {
   if (!out_fence) return k_e_invalidarg;
   auto* f = new d3d12_fence();
@@ -1016,6 +1247,7 @@ int TRT_GUEST_ABI dev_create_fence(void* self, u64 init_val, u32,
   f->device = (d3d12_device*)self;
   f->destroy_fn = &fence_destroy;
   f->completed.store(init_val);
+  f->flags = flags;
   *out_fence = f;
   return k_s_ok;
 }

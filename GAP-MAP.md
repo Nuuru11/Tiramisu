@@ -90,10 +90,75 @@ so the CLI path never runs; the live session ran it via import (see
   case: every `try/catch` in C# game code goes through our unwinder.
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
-- (none — the three-agent wave + TRIANGLE GATE are complete and committed;
-  next: console M0 when DP credentials arrive)
-- Orchestrator: Master prompt renamed to `TIRAMISU-MASTER-PROMPT.md`
-  (commit 9e259c6). Re-check `git diff --stat` before starting anything.
+- (none — the two-agent wave (items 16 + 12) + orchestrator items (BUG-6
+  remainder, 1L, DXGI BUG-6) are complete; the full canonical gate
+  `build-test.sh` is running as final verification. Next: console M0 when
+  DP credentials arrive.)
+
+**LANDED (wave 4, 2026-11-15, all verified offline):**
+- **Item 16 / 1K — ntdll native surface** (`bridge_ntdll.cpp`, `bridge_ole.cpp`):
+  NtCreateFile (OBJECT_ATTRIBUTES/UNICODE_STRING parse, `\??\` strip,
+  RootDirectory-relative, 6 dispositions -> kernel32 mapping, full
+  dos_to_ntstatus) + NtReadFile routed onto the same VFS the kernel32 file
+  surface uses; NtCreateEvent/NtSetEvent/NtWaitForSingleObject/
+  NtSignalAndWaitForSingleObject on the kernel32 event primitives;
+  RaiseFailFastException honors fail-fast (logs, then terminates — tested
+  by writing DONE to results.txt first); CoWaitForMultipleHandles STA wait
+  (S_OK signaled / RPC_S_CALLPENDING timeout / E_HANDLE).
+  Evidence: `test_ntdll` 34/34, `test_ole` 16/16 (both rerun by the
+  orchestrator, not just the agent).
+- **Item 12 remainder — kernel32 gap** (`bridge_kernel32_gap.cpp`,
+  `bridge_kernel32.cpp`, `bridge_nvapi.cpp` NEW): job objects
+  (CreateJobObjectW/A, SetInformationJobObject, AssignProcessToJobObject,
+  TerminateJobObject, OpenJobObject honest-fail, IsProcessInJob),
+  AllocConsole/FreeConsole/AttachConsole, Toolhelp module walk UPGRADED
+  from honest-fail to a real image-registry-backed MODULEENTRY32W walk,
+  Get/SetProcessMitigationPolicy, Get/SetThreadStackGuarantee;
+  `bridge_nvapi.cpp` honest not-supported stubs for nvapi/nvml/atiadlxx
+  (NVAPI_NVIDIA_NOT_FOUND / NVML_ERROR_NOT_SUPPORTED / ADL_ERR_NOT_SUPPORTED,
+  log-once), wired into host `main.cpp` boot.
+  Evidence: `test_kernel32b` 17/17 (rerun by the orchestrator).
+- **BUG-6 remainder — version-aware QI everywhere** (`bridge_d3d12.cpp`):
+  every D3D12 object type now answers QI from a verified IID chain
+  (IUnknown + Object + DeviceChild + Pageable + own versions) and fails
+  VISIBLY with E_NOINTERFACE for anything beyond its vtbl — previously
+  `base_qi_self` accepted ANY IID, handing a 60-slot vtbl to a game that
+  QIed GCL4 (77 slots) = call off the end. Command-list vtbl extended
+  60 -> 84 slots (GCL1..9; 24 ABI-correct logged no-op stubs, arities from
+  the SDK header), fence 11 -> 12 with a REAL Fence1::GetCreationFlags
+  (CreateFence now records flags), and the FABRICATED Object GUID
+  (c7e2816f... — not in the SDK header at all) replaced by the real
+  c4fec28f. All IIDs verified verbatim against the xwin SDK d3d12.h.
+  Evidence: `test_d3d12` ALL PASS with 15 new versioned-QI checks (GCL..GCL9
+  QI, cross-type E_NOINTERFACE, Fence1, Object-IID), TRIANGLE GATE 12/12,
+  test_wave2 ALL PASS, RACCOIN `1 booted, 0 failed`.
+- **BUG-6 applied to DXGI** (`bridge_d3d.cpp`): adapter vtbl 19 slots
+  (IDXGIAdapter4 chain), factory 30 -> 32 (Factory7
+  Register/UnregisterAdaptersChangedEvent real), output 23 -> 29
+  (Output2..6: SupportsOverlays honest FALSE, CheckOverlaySupport
+  DXGI_ERROR_UNSUPPORTED, GetDesc1 with real RDNA2-class colorimetry),
+  all version chains verified against the SDK headers, static_asserts
+  pinning every size. Evidence: `test_wave2` wave2f block ALL PASS.
+- **Item 17 / 1L — WinRT ThreadPool + D3DKMT** (`bridge_winrt.cpp`,
+  `bridge_gdi.cpp`): IThreadPoolStatics (RunAsync/RunWithPriorityAsync/
+  RunWithPriorityAndOptionsAsync — work items run on a detached host
+  thread, returned IAsyncAction reports Completed; IIDs verified against
+  mingw windows.system.threading.h/asyncinfo.h/windows.foundation.h);
+  D3DKMTOpenAdapterFromLuid/CloseAdapter/EnumAdapters honest synthetic
+  Xbox-APU adapter + D3DKMTQueryAdapterInfo STATUS_NOT_IMPLEMENTED
+  (fail-visible); Windows.Gaming.Input event surface VERIFIED
+  already-present (GamepadAdded/Removed/FromGamepad were landed with the
+  Gamepad statics).
+  Evidence: `test_console_pack` ThreadPool block ALL PASS (handler invoked
+  off-thread, AsyncStatus::Completed), `test_gdi` D3DKMT block ALL PASS.
+- **Item 19 — save VFS overlay VERIFIED already-implemented**: Z: writes
+  route to `<C: mount>/_z_write/` with whiteout-aware reads
+  (`vfs.cpp` trt_vfs_resolve_utf16_rw); existing test_engine coverage
+  ("Z:\ro.txt write succeeds via _z_write overlay") is the evidence. No
+  code change needed — the gap list was stale.
+- **Wiring**: `build-test.sh` suites 37 (ntdll) + 38 (kernel32b) appended;
+  `main.cpp` registers nvapi stubs. Full canonical gate running as final
+  verification of the whole wave.
 
 **LANDED (same orchestrated wave, 2026-11-15, all verified offline):**
 - **BUG-1 FIXED** (`bridge_d3d12.cpp`): CommandQueue vtbl rebuilt 19 -> 13

@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern "C" {
 u32 TRT_STDCALL trt_GetLastError(void);
@@ -55,6 +56,32 @@ int on_pcm_submit(const void* pcm, u32 bytes, u32 rate, u32 channels, u32 bps,
 void* resolve_builtin(const char* mod, const char* sym) {
   return trt_resolve_module(nullptr, mod, sym, 0);
 }
+
+// ---- ThreadPool.RunAsync test helpers (WorkItemHandler duck-type) ----------
+// IWorkItemHandler delegate: vtbl {QI, AddRef, Release, Invoke(asyncAction)}.
+static u32* g_tp_flag = nullptr;
+static const void* g_wh_vtbl[4];
+static i32 TRT_GUEST_ABI wh_qi(void*, const void*, void** out) {
+  if (out) *out = nullptr;
+  return (int)0x80004002u;  // E_NOINTERFACE
+}
+static u32 TRT_GUEST_ABI wh_addref(void*) { return 2; }
+static u32 TRT_GUEST_ABI wh_release(void*) { return 1; }
+static i32 TRT_GUEST_ABI wh_invoke(void*, void*) {
+  if (g_tp_flag) ++*g_tp_flag;
+  return 0;
+}
+struct wh_init {
+  wh_init() {
+    g_wh_vtbl[0] = (const void*)&wh_qi;
+    g_wh_vtbl[1] = (const void*)&wh_addref;
+    g_wh_vtbl[2] = (const void*)&wh_release;
+    g_wh_vtbl[3] = (const void*)&wh_invoke;
+  }
+} g_wh_init;
+struct wh_obj {
+  const void** vtbl;
+};
 
 }  // namespace
 
@@ -412,6 +439,33 @@ int main() {
     if (hs_dqc && pDelS) pDelS(hs_dqc);
     CHECK(dqc != nullptr && dq != nullptr && has_access == 1,
           "WinRT DispatcherQueueController creates DispatcherQueue with HasThreadAccess=1");
+
+    // Windows.System.Threading.ThreadPool (IThreadPoolStatics)
+    void* hs_tp = make_hs("Windows.System.Threading.ThreadPool");
+    void* tp_stat = nullptr;
+    void* tp_action = nullptr;
+    u32 tp_status = 0xDEADu;
+    u32 tp_ran = 0;
+    if (pRoFac && hs_tp && pRoFac(hs_tp, nullptr, &tp_stat) == 0 && tp_stat) {
+      void** tvt = *(void***)tp_stat;
+      g_tp_flag = &tp_ran;
+      wh_obj handler{g_wh_vtbl};
+      ((i32(TRT_GUEST_ABI*)(void*, void*, void**))tvt[6])(tp_stat, &handler,
+                                                          &tp_action);
+      if (tp_action) {
+        void** avt = *(void***)tp_action;
+        ((i32(TRT_GUEST_ABI*)(void*, u32*))avt[7])(tp_action, &tp_status);
+      }
+      // The work item runs on a detached host thread — bounded wait.
+      for (int i = 0; i < 2000 && !tp_ran; ++i) {
+        struct timespec ts{0, 1000000};  // 1ms
+        nanosleep(&ts, nullptr);
+      }
+    }
+    if (hs_tp && pDelS) pDelS(hs_tp);
+    CHECK(tp_stat != nullptr && tp_action != nullptr && tp_status == 1u &&
+              tp_ran == 1u,
+          "WinRT ThreadPool.RunAsync -> completed IAsyncAction + handler invoked off-thread");
 
     // Windows.Gaming.Input.Gamepad
     trt_input_pad_state_n(0, true, 32767, 0, 0, 0, 0x1000u /*A*/, 0, 255);

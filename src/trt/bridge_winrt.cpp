@@ -17,6 +17,7 @@
 #include <atomic>
 #include <stdio.h>
 #include <stdlib.h>
+#include <thread>
 #include <string.h>
 
 #if defined(_WIN32)
@@ -1969,6 +1970,142 @@ const void* const g_appdatas_vtbl[7] = {
 };
 
 // ---- Dispatchers ----
+// ---- Windows.System.Threading.ThreadPool (IThreadPoolStatics) --------------
+// IIDs verified against mingw-w64 windows.system.threading.h (IThreadPoolStatics
+// b6bf67dd-84bd-44f8-ac1c-93ebcb9dba91; WorkItemHandler delegate
+// 1d1a8b8b-fa66-414f-9cbd-b65fc99d17fa invokes at vtbl slot 3),
+// asyncinfo.h (IAsyncInfo 00000036-...) and windows.foundation.h
+// (IAsyncAction 5a648006-...). Work items run on a detached host thread; the
+// returned IAsyncAction reports Completed immediately (AsyncStatus::Completed=1).
+static constexpr wrt_guid k_iid_wtp_statics = {
+    0xb6bf67dd, 0x84bd, 0x44f8, {0xac, 0x1c, 0x93, 0xeb, 0xcb, 0x9d, 0xba, 0x91}};
+static constexpr wrt_guid k_iid_async_info = {
+    0x00000036, 0x0000, 0x0000, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+static constexpr wrt_guid k_iid_async_action = {
+    0x5a648006, 0x843a, 0x4da9, {0x86, 0x5b, 0x9d, 0x26, 0xe5, 0xdf, 0xad, 0x7b}};
+
+struct wrt_wtp_iface {
+  const void* const* vtbl;
+};
+
+extern const void* const g_wtp_action_vtbl[14];
+extern const void* const g_wtp_statics_vtbl[9];
+static struct {
+  const void* const* vtbl;
+} g_wtp_action = {g_wtp_action_vtbl};
+static wrt_wtp_iface g_wtp_statics = {g_wtp_statics_vtbl};
+
+i32 TRT_GUEST_ABI wtp_act_GetClassName(void*, void** cls) {
+  return wrt_make_hstr("Windows.Foundation.IAsyncAction", cls);
+}
+i32 TRT_GUEST_ABI wtp_act_qi(void*, const void* iid, void** out) {
+  if (!out) return E_POINTER_;
+  *out = nullptr;
+  if (is_base_iid(iid) || iid_eq(iid, k_iid_async_info) ||
+      iid_eq(iid, k_iid_async_action)) {
+    *out = &g_wtp_action;
+    return S_OK_;
+  }
+  return E_NOINTERFACE_;
+}
+i32 TRT_GUEST_ABI wtp_act_get_id(void*, i32* out) {
+  if (out) *out = 1;
+  return S_OK_;
+}
+i32 TRT_GUEST_ABI wtp_act_get_status(void*, u32* out) {
+  if (out) *out = 1;  // AsyncStatus::Completed
+  return S_OK_;
+}
+i32 TRT_GUEST_ABI wtp_act_get_error(void*, i32* out) {
+  if (out) *out = 0;
+  return S_OK_;
+}
+i32 TRT_GUEST_ABI wtp_act_cancel(void*) { return S_OK_; }  // already completed
+i32 TRT_GUEST_ABI wtp_act_close(void*) { return S_OK_; }
+i32 TRT_GUEST_ABI wtp_act_put_completed(void*, void*) { return S_OK_; }
+i32 TRT_GUEST_ABI wtp_act_get_completed(void*, void** out) {
+  if (out) *out = nullptr;
+  return S_OK_;
+}
+i32 TRT_GUEST_ABI wtp_act_get_results(void*, void** out) {
+  if (out) *out = nullptr;
+  return S_OK_;
+}
+
+const void* const g_wtp_action_vtbl[14] = {
+    (const void*)&wtp_act_qi,            (const void*)&wrt_singleton_AddRef,
+    (const void*)&wrt_singleton_Release, (const void*)&wrt_common_GetIids,
+    (const void*)&wtp_act_GetClassName,  (const void*)&wrt_common_GetTrustLevel,
+    (const void*)&wtp_act_get_id,        // 6  IAsyncInfo::get_Id
+    (const void*)&wtp_act_get_status,    // 7  IAsyncInfo::get_Status
+    (const void*)&wtp_act_get_error,     // 8  IAsyncInfo::get_ErrorCode
+    (const void*)&wtp_act_cancel,        // 9  IAsyncInfo::Cancel
+    (const void*)&wtp_act_close,         // 10 IAsyncInfo::Close
+    (const void*)&wtp_act_put_completed, // 11 IAsyncAction::put_Completed
+    (const void*)&wtp_act_get_completed, // 12 IAsyncAction::get_Completed
+    (const void*)&wtp_act_get_results,   // 13 IAsyncAction::GetResults
+};
+
+// Invoke the WorkItemHandler (slot 3: Invoke(IAsyncAction*)) off the guest
+// thread. Handler may be released by the caller after RunAsync returns, so
+// copy the vtbl+object pointers before detaching.
+static void wtp_run_handler_detached(void* handler) {
+  struct job {
+    void* h;
+    const void* const* vtbl;
+  };
+  auto* j = new job{handler, handler ? *(const void* const**)handler : nullptr};
+  std::thread([j] {
+    if (j->vtbl && j->h) {
+      using invoke_fn = i32 (TRT_GUEST_ABI*)(void*, void*);
+      ((invoke_fn)j->vtbl[3])(j->h, &g_wtp_action);
+    }
+    delete j;
+  }).detach();
+}
+
+i32 TRT_GUEST_ABI wtp_RunAsync(void*, void* handler, void** out_action) {
+  if (!out_action) return E_POINTER_;
+  *out_action = &g_wtp_action;
+  static std::atomic<bool> logged{false};
+  if (!logged.exchange(true))
+    trt_core_log(
+        "winrt: ThreadPool.RunAsync -> detached host thread + completed "
+        "IAsyncAction");
+  wtp_run_handler_detached(handler);
+  return S_OK_;
+}
+i32 TRT_GUEST_ABI wtp_RunWithPriorityAsync(void*, void* handler, u32, void** out_action) {
+  return wtp_RunAsync(nullptr, handler, out_action);
+}
+i32 TRT_GUEST_ABI wtp_RunWithPriorityAndOptionsAsync(void*, void* handler, u32, u32,
+                                                     void** out_action) {
+  return wtp_RunAsync(nullptr, handler, out_action);
+}
+
+i32 TRT_GUEST_ABI wtp_QI(void*, const void* iid, void** out) {
+  if (!out) return E_POINTER_;
+  *out = nullptr;
+  if (is_base_iid(iid) || iid_eq(iid, k_iid_act_factory) ||
+      iid_eq(iid, k_iid_wtp_statics)) {
+    *out = &g_wtp_statics;
+    return S_OK_;
+  }
+  return E_NOINTERFACE_;
+}
+i32 TRT_GUEST_ABI wtp_GetClassName(void*, void** cls) {
+  return wrt_make_hstr("Windows.System.Threading.ThreadPool", cls);
+}
+
+const void* const g_wtp_statics_vtbl[9] = {
+    (const void*)&wtp_QI,                (const void*)&wrt_singleton_AddRef,
+    (const void*)&wrt_singleton_Release, (const void*)&wrt_common_GetIids,
+    (const void*)&wtp_GetClassName,      (const void*)&wrt_common_GetTrustLevel,
+    (const void*)&wtp_RunAsync,          // 6 RunAsync
+    (const void*)&wtp_RunWithPriorityAsync, // 7 RunWithPriorityAsync
+    (const void*)&wtp_RunWithPriorityAndOptionsAsync, // 8 RunWithPriorityAndOptionsAsync
+};
+
 static i32 wrt_offline_activate(const char* cls, void** instance) {
   if (!cls || !instance) return REGDB_E_CLASSNOTREG_;
   if (strcmp(cls, "Windows.Globalization.Language") == 0) {
@@ -2007,6 +2144,9 @@ static i32 wrt_offline_factory(const char* cls, const void* iid, void** factory)
   } else if (strcmp(cls, "Windows.Globalization.ApplicationLanguages") == 0) {
     target = &g_applangs_statics;
     qi = &wrt_al_QI;
+  } else if (strcmp(cls, "Windows.System.Threading.ThreadPool") == 0) {
+    target = &g_wtp_statics;
+    qi = &wtp_QI;
   } else if (strcmp(cls, "Windows.Storage.ApplicationData") == 0) {
     target = &g_appdata_statics;
     qi = &wrt_ads_QI;

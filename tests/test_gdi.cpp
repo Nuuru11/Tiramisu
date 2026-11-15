@@ -155,6 +155,40 @@ int main(int argc, char** argv) {
   CHECK(trt_module_route("user32.dll") == TRT_ROUTE_BUILTIN,
         "user32.dll routes BUILTIN (shared DC space)");
 
+  // ---- D3DKMT adapter queries (honest stubs, host-direct) ------------------
+  {
+    using Dkmt_t = i32(TRT_GUEST_ABI*)(void*);
+    auto pOpen = (Dkmt_t)trt_resolve_module(nullptr, "gdi32.dll",
+                                            "D3DKMTOpenAdapterFromLuid", 0);
+    auto pClose = (Dkmt_t)trt_resolve_module(nullptr, "gdi32.dll",
+                                             "D3DKMTCloseAdapter", 0);
+    auto pQuery = (Dkmt_t)trt_resolve_module(nullptr, "gdi32.dll",
+                                             "D3DKMTQueryAdapterInfo", 0);
+    auto pEnum = (Dkmt_t)trt_resolve_module(nullptr, "gdi32.dll",
+                                            "D3DKMTEnumAdapters", 0);
+    CHECK(pOpen && pClose && pQuery && pEnum,
+          "gdi32 exports the D3DKMT adapter-query surface");
+
+    // D3DKMT_OPENADAPTERFROMLUID { LUID(8); ULONG hAdapter; }
+    struct { u32 lo, hi, h; } oa{0x1337u, 0, 0u};
+    CHECK(pOpen && pOpen(&oa) == 0 && oa.h == 0x44584B31u,
+          "D3DKMTOpenAdapterFromLuid -> STATUS_SUCCESS + synthetic hAdapter");
+
+    // D3DKMT_QUERYADAPTERINFO { ULONG hAdapter; ULONG Type; void* d; u32 n; }
+    struct { u32 h, type; void* d; u32 n; } qa{0x44584B31u, 35u, nullptr, 0u};
+    CHECK(pQuery && pQuery(&qa) == (i32)0xC0000002u,
+          "D3DKMTQueryAdapterInfo -> STATUS_NOT_IMPLEMENTED (fail-visible)");
+
+    // D3DKMT_ENUMADAPTERS { UINT NumAdapters; D3DKMT_ADAPTERINFO Adapters[16]; }
+    u8 ea[8 + 16 * 24] = {};
+    CHECK(pEnum && pEnum(ea) == 0 && *(u32*)ea == 1u &&
+              *(u32*)(ea + 8 + 8) == 0x1337u,
+          "D3DKMTEnumAdapters -> 1 Xbox APU adapter with the bridge LUID");
+
+    struct { u32 h; } ca{0x44584B31u};
+    CHECK(pClose && pClose(&ca) == 0, "D3DKMTCloseAdapter -> STATUS_SUCCESS");
+  }
+
   // ---- guest-PE flow (existing coverage; needs a guest exe argument) ----
   if (argc >= 2) {
     size_t size = 0;

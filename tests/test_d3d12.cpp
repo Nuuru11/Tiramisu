@@ -236,6 +236,98 @@ int main() {
   CHECK((u32)bhr == 0x80004002u && bogus == nullptr,
         "device QI(bogus GUID) -> E_NOINTERFACE, out null");
 
+  // ---- BUG-6 remainder: version-aware QI chains ------------------------------
+  // ID3D12Object {C4FEC28F-7966-4E95-9F94-F431CB56C3B8} — the real SDK IID
+  // (the bridge previously answered a fabricated c7e2816f... GUID).
+  raw_guid iid_obj12;
+  make_iid(&iid_obj12, 0xc4fec28fu, 0x7966, 0x4e95, 0x9f, 0x94, 0xf4, 0x31,
+           0xcb, 0x56, 0xc3, 0xb8);
+  void* obj12 = nullptr;
+  CHECK(((qi_fn)dvt[0])(dev, &iid_obj12, &obj12) == 0 && obj12 == dev,
+        "device QI(ID3D12Object) -> S_OK (SDK IID, not the fabricated one)");
+  if (obj12) ((rel_fn)dvt[2])(obj12);
+
+  // Fence1: QI succeeds on the 12-slot vtbl and GetCreationFlags (slot 11)
+  // returns the flags recorded at CreateFence.
+  raw_guid iid_fence1;
+  make_iid(&iid_fence1, 0x433685feu, 0xe22b, 0x4ca0, 0xa8, 0xdb, 0xb5, 0xb4,
+           0xf4, 0xdd, 0x0e, 0x4a);
+  if (fence) {
+    const void** fvt = vtbl_of(fence);
+    void* f1 = nullptr;
+    CHECK(((qi_fn)fvt[0])(fence, &iid_fence1, &f1) == 0 && f1 == fence,
+          "fence QI(ID3D12Fence1) -> S_OK (12-slot vtbl)");
+    if (f1) ((rel_fn)fvt[2])(f1);
+    using gcf_fn = u32 (TRT_GUEST_ABI*)(void*);
+    CHECK(((gcf_fn)fvt[11])(fence) == 0,
+          "fence GetCreationFlags (slot 11) -> D3D12_FENCE_FLAG_NONE");
+  }
+
+  // Command list: QI GraphicsCommandList base + versions 1..9 all succeed
+  // (84-slot vtbl covers every versioned layout); a cross-type QI fails
+  // visibly. IID d1/d2/d3/d4 values verbatim from the SDK DEFINE_GUID block.
+  {
+    using alloc_fn = int (TRT_GUEST_ABI*)(void*, u32, const void*, void**);
+    using cl_fn = int (TRT_GUEST_ABI*)(void*, u32, u32, void*, void*,
+                                       const void*, void**);
+    void* alloc = nullptr;
+    CHECK(((alloc_fn)dvt[9])(dev, 0, nullptr, &alloc) == 0 && alloc != nullptr,
+          "device->CreateCommandAllocator -> S_OK");
+    void* cl = nullptr;
+    CHECK(((cl_fn)dvt[12])(dev, 0, 0 /*DIRECT*/, alloc, nullptr, nullptr,
+                           &cl) == 0 &&
+              cl != nullptr,
+          "device->CreateCommandList -> S_OK");
+    if (cl) {
+      const void** cvt = vtbl_of(cl);
+      struct gcl_iid_row {
+        u32 d1;
+        u16 d2, d3;
+        u8 d4[8];
+      };
+      const gcl_iid_row rows[10] = {
+          {0x5b160d0fu, 0xac1b, 0x4185, {0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55}},
+          {0x553103fbu, 0x1fe7, 0x4557, {0xbb, 0x38, 0x94, 0x6d, 0x7d, 0x0e, 0x7c, 0xa7}},
+          {0x38c3e585u, 0xff17, 0x412c, {0x91, 0x50, 0x4f, 0xc6, 0xf9, 0xd7, 0x2a, 0x28}},
+          {0x6fda83a7u, 0xb84c, 0x4e38, {0x9a, 0xc8, 0xc7, 0xbd, 0x22, 0x01, 0x6b, 0x3d}},
+          {0x8754318eu, 0xd3a9, 0x4541, {0x98, 0xcf, 0x64, 0x5b, 0x50, 0xdc, 0x48, 0x74}},
+          {0x55050859u, 0x4024, 0x474c, {0x87, 0xf5, 0x64, 0x72, 0xea, 0xee, 0x44, 0xea}},
+          {0xc3827890u, 0xe548, 0x4cfa, {0x96, 0xcf, 0x56, 0x89, 0xa9, 0x37, 0x0f, 0x80}},
+          {0xdd171223u, 0x8b61, 0x4769, {0x90, 0xe3, 0x16, 0x0c, 0xcd, 0xe4, 0xe2, 0xc1}},
+          {0xee936ef9u, 0x599d, 0x4d28, {0x93, 0x8e, 0x23, 0xc4, 0xad, 0x05, 0xce, 0x51}},
+          {0x34ed2808u, 0xffe6, 0x4c2b, {0xb1, 0x1a, 0xca, 0xbd, 0x2b, 0x0c, 0x59, 0xe1}}};
+      const char* names[10] = {"GCL",  "GCL1", "GCL2", "GCL3", "GCL4",
+                               "GCL5", "GCL6", "GCL7", "GCL8", "GCL9"};
+      for (int i = 0; i < 10; ++i) {
+        raw_guid iid;
+        make_iid(&iid, rows[i].d1, rows[i].d2, rows[i].d3, rows[i].d4[0],
+                 rows[i].d4[1], rows[i].d4[2], rows[i].d4[3], rows[i].d4[4],
+                 rows[i].d4[5], rows[i].d4[6], rows[i].d4[7]);
+        void* out = nullptr;
+        const int hr = ((qi_fn)cvt[0])(cl, &iid, &out);
+        char msg[96];
+        snprintf(msg, sizeof(msg),
+                 "cmdlist QI(%s) -> S_OK (84-slot vtbl covers versioned ABI)",
+                 names[i]);
+        CHECK(hr == 0 && out == cl, msg);
+        if (out) ((rel_fn)cvt[2])(out);
+      }
+      // Cross-type probe: Resource IID on a command list -> E_NOINTERFACE.
+      raw_guid iid_res;
+      make_iid(&iid_res, 0x696442beu, 0xa72e, 0x4059, 0xbc, 0x79, 0x5b, 0x5c,
+               0x98, 0x04, 0x0f, 0xad);
+      void* rout = (void*)(uintptr_t)0x1;
+      const int rhr = ((qi_fn)cvt[0])(cl, &iid_res, &rout);
+      CHECK((u32)rhr == 0x80004002u && rout == nullptr,
+            "cmdlist QI(ID3D12Resource) -> E_NOINTERFACE, out null");
+      ((rel_fn)cvt[2])(cl);
+    }
+    if (alloc) {
+      const void** avt = vtbl_of(alloc);
+      ((rel_fn)avt[2])(alloc);
+    }
+  }
+
   // ---- TRIANGLE GATE recorded-lists proof ------------------------------------
   // Submit through slot 8 again on a FRESH queue and confirm the submission is
   // observable host-side: trt_d3d12_is_queue recognizes the object (state

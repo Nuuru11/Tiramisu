@@ -20,6 +20,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
 #include <chrono>
 
 namespace {
@@ -555,9 +556,28 @@ struct offline_adapter {
   u32 refcount;
 };
 
+// Version-aware QI (the d3d12 BUG-6 rule applied to DXGI): the 19-slot
+// vtbl below serves exactly the IDXGIAdapter chain whose slot count it
+// covers — IDXGIAdapter(9) .. IDXGIAdapter4(19, GetDesc3). IIDs verified
+// verbatim against the xwin SDK dxgi.h/dxgi1_2.h/dxgi1_4.h/dxgi1_6.h
+// DEFINE_GUID block. Anything else fails VISIBLY with E_NOINTERFACE
+// instead of handing back an object a game would call off the end of.
+bool is_adapter_iid(const void* riid) {
+  if (!riid) return false;
+  if (guid_eq(riid, 0x00000000u, 0x0000, 0x0000, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46)) return true; // IUnknown
+  if (guid_eq(riid, 0xAEC22FB8u, 0x76F3, 0x4639, 0x9B,0xE0,0x28,0xEB,0x43,0xA6,0x7A,0x2E)) return true; // IDXGIObject
+  if (guid_eq(riid, 0x2411E7E1u, 0x12AC, 0x4CCF, 0xBD,0x14,0x97,0x98,0xE8,0x53,0x4D,0xC0)) return true; // IDXGIAdapter
+  if (guid_eq(riid, 0x29038F61u, 0x3839, 0x4626, 0x91,0xFD,0x08,0x68,0x79,0x01,0x1A,0x05)) return true; // IDXGIAdapter1
+  if (guid_eq(riid, 0x0AA1AE0Au, 0xFA0E, 0x4B84, 0x86,0x44,0xE0,0x5F,0xF8,0xE5,0xAC,0xB5)) return true; // IDXGIAdapter2
+  if (guid_eq(riid, 0x645967A4u, 0x1392, 0x4310, 0xA7,0x98,0x80,0x53,0xCE,0x3E,0x93,0xFD)) return true; // IDXGIAdapter3
+  if (guid_eq(riid, 0x3C8D99D1u, 0x4FBF, 0x4181, 0xA8,0x2C,0xAF,0x66,0xBF,0x7B,0xD2,0x4E)) return true; // IDXGIAdapter4
+  return false;
+}
+
 int TRT_GUEST_ABI adp_qi(void* self, const void* riid, void** ppv) {
-  (void)riid;
   if (!ppv) return TRT_E_NOINTERFACE;
+  *ppv = nullptr;
+  if (!is_adapter_iid(riid)) return TRT_E_NOINTERFACE;
   *ppv = self;
   ++((offline_adapter*)self)->refcount;
   return 0;
@@ -601,19 +621,33 @@ u32 TRT_GUEST_ABI out_release(void* self) {
 }
 int TRT_GUEST_ABI out_qi(void* self, const void* riid, void** ppv) {
   if (!ppv) return TRT_E_INVALIDARG;
+  *ppv = nullptr;
+  // Version-aware (BUG-6 rule): the vtbl below serves the full IDXGIOutput
+  // chain through IDXGIOutput6 (29 slots). IIDs verified verbatim against
+  // the xwin SDK dxgi.h..dxgi1_6.h DEFINE_GUID block. Anything else fails
+  // VISIBLY with E_NOINTERFACE.
   if (out_guid_eq(riid, 0x00000000, 0x0000, 0x0000, 0xC0, 0x00, 0x00, 0x00,
-                  0x00, 0x00, 0x00, 0x46) ||
+                  0x00, 0x00, 0x00, 0x46) ||                      // IUnknown
       out_guid_eq(riid, 0xaec22fb8, 0x76f3, 0x4639, 0x9b, 0xe0, 0x28, 0xeb,
-                  0x43, 0xa6, 0x7a, 0x2e) ||
+                  0x43, 0xa6, 0x7a, 0x2e) ||                      // IDXGIObject
       out_guid_eq(riid, 0xae02eedb, 0xc735, 0x4690, 0x8d, 0x52, 0x5a, 0x8d,
-                  0xc2, 0x02, 0x13, 0xaa) ||
+                  0xc2, 0x02, 0x13, 0xaa) ||                      // IDXGIOutput
       out_guid_eq(riid, 0x00cddea8, 0x939b, 0x4b83, 0xa3, 0x40, 0xa6, 0x85,
-                  0x22, 0x66, 0x66, 0xcc)) {
+                  0x22, 0x66, 0x66, 0xcc) ||                      // IDXGIOutput1
+      out_guid_eq(riid, 0x595e39d1, 0x2724, 0x4663, 0x99, 0xb1, 0xda, 0x96,
+                  0x9d, 0xe2, 0x83, 0x64) ||                      // IDXGIOutput2
+      out_guid_eq(riid, 0x8a6bb301, 0x7e7e, 0x41f4, 0xa8, 0xe0, 0x5b, 0x32,
+                  0xf7, 0xf9, 0x9b, 0x18) ||                      // IDXGIOutput3
+      out_guid_eq(riid, 0xdc7dca35, 0x2196, 0x414d, 0x9f, 0x53, 0x61, 0x78,
+                  0x84, 0x03, 0x2a, 0x60) ||                      // IDXGIOutput4
+      out_guid_eq(riid, 0x80a07424, 0xab52, 0x42eb, 0x83, 0x3c, 0x0c, 0x42,
+                  0xfd, 0x28, 0x2d, 0x98) ||                      // IDXGIOutput5
+      out_guid_eq(riid, 0x068346e8, 0xaaec, 0x4b84, 0xad, 0xd7, 0x13, 0x7f,
+                  0x51, 0x3f, 0x77, 0xa1)) {                      // IDXGIOutput6
     *ppv = self;
     out_addref(self);
     return 0;
   }
-  *ppv = nullptr;
   return TRT_E_NOINTERFACE;
 }
 
@@ -778,7 +812,53 @@ int TRT_GUEST_ABI out_dup_output(void*, void*, void** ppDup) {
   return TRT_E_NOTIMPL;
 }
 
-const void* g_offline_output_vtbl[23] = {
+// ---- IDXGIOutput2..IDXGIOutput6 (SDK dxgi1_3.h..dxgi1_6.h ABI) ----------
+// SupportsOverlays: the DXGI_OUTPUT_DESC1-era probes; honest FALSE / named
+// E_NOTIMPL — CoreWindow composition owns overlays on console.
+int TRT_GUEST_ABI out_supports_overlays(void*) { return 0; }  // FALSE
+int TRT_GUEST_ABI out_check_overlay_support(void*, const void*, void*, u32* flags) {
+  if (flags) *flags = 0;
+  return (int)0x887A0004u;  // DXGI_ERROR_UNSUPPORTED: no overlay support
+}
+int TRT_GUEST_ABI out_check_overlay_colorspace(void*, const void*, void*, u32* flags) {
+  if (flags) *flags = 0;
+  return (int)0x887A0004u;  // DXGI_ERROR_UNSUPPORTED
+}
+int TRT_GUEST_ABI out_dup_output1(void*, u32, u32, const void*, void** ppDup) {
+  if (ppDup) *ppDup = nullptr;
+  return TRT_E_NOTIMPL;
+}
+// GetDesc1 (IDXGIOutput6): DXGI_OUTPUT_DESC1 — the HDR/colorimetry probe
+// modern engines (UE5/DECIMA/REDengine) run at boot. BitsPerColor 10 +
+// sRGB color space, scRGB luminance window: honest RDNA2-class values.
+int TRT_GUEST_ABI out_get_desc1(void*, void* desc1) {
+  if (!desc1) return TRT_E_INVALIDARG;
+  // DXGI_OUTPUT_DESC1 x64: DESC prefix is 96 bytes (DeviceName[32] WCHAR +
+  // RECT + Rotation + HMONITOR), then BitsPerColor(4) ColorSpace(4)
+  // RedPrimary/GreenPrimary/BluePrimary/WhitePoint (8 floats)
+  // MinLuminance MaxLuminance MaxFullFrameLuminance (3 floats) = 148.
+  out_get_desc(nullptr, desc1);  // fill the DESC prefix (DeviceName/RECT/...)
+  u32* bpc = (u32*)((u8*)desc1 + 96);
+  *bpc = 10;                     // BitsPerColor
+  *(u32*)((u8*)desc1 + 100) = 0; // DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709 (0)
+  float* f = (float*)((u8*)desc1 + 104);
+  f[0] = 0.640f; f[1] = 0.330f;  // RedPrimary
+  f[2] = 0.300f; f[3] = 0.600f;  // GreenPrimary
+  f[4] = 0.150f; f[5] = 0.060f;  // BluePrimary
+  f[6] = 0.3127f; f[7] = 0.3290f;// WhitePoint
+  f[8] = 0.0f;                   // MinLuminance
+  f[9] = 1499.0f;                // MaxLuminance
+  f[10] = 799.0f;                // MaxFullFrameLuminance
+  return 0;
+}
+int TRT_GUEST_ABI out_check_hw_composition(void*, u32* flags) {
+  if (!flags) return TRT_E_INVALIDARG;
+  *flags = 2u;  // DXGI_HARDWARE_COMPOSITION_SUPPORT_FLAG_WINDOWED
+  return 0;
+}
+
+// IDXGIOutput6 vtable: 29 slots (SDK dxgi1_6.h IDXGIOutput6Vtbl order)
+const void* g_offline_output_vtbl[29] = {
     (const void*)&out_qi,               // 0
     (const void*)&out_addref,           // 1
     (const void*)&out_release,          // 2
@@ -802,6 +882,12 @@ const void* g_offline_output_vtbl[23] = {
     (const void*)&out_find_closest1,    // 20 FindClosestMatchingMode1
     (const void*)&out_notimpl_p1,       // 21 GetDisplaySurfaceData1
     (const void*)&out_dup_output,       // 22 DuplicateOutput
+    (const void*)&out_supports_overlays,        // 23 IDXGIOutput2
+    (const void*)&out_check_overlay_support,    // 24 IDXGIOutput3
+    (const void*)&out_check_overlay_colorspace, // 25 IDXGIOutput4
+    (const void*)&out_dup_output1,              // 26 IDXGIOutput5
+    (const void*)&out_get_desc1,                // 27 IDXGIOutput6::GetDesc1
+    (const void*)&out_check_hw_composition,     // 28 IDXGIOutput6::CheckHardwareCompositionSupport
 };
 offline_output g_offline_output_obj = {g_offline_output_vtbl, 1};
 
@@ -1122,8 +1208,21 @@ int TRT_GUEST_ABI fake_EnumAdapterByGpuPreference(void* self, u32 idx, u32 pref,
   return fake_EnumAdapters1(self, idx, out);
 }
 
-// IDXGIFactory6 vtable: 30 slots
-const void* g_factory_vtbl[30] = {
+// ---- IDXGIFactory7 (SDK dxgi1_6.h; IID a4966eed-76db-44da-84c1-ee9a7afb20a8)
+// The QI accepts the Factory7 IID (is_factory_iid), so the vtbl MUST cover
+// its slots — a 30-slot table handed to a Factory7 QI is the exact BUG-1
+// class (call off the end of the vtbl). Adapters never change under the
+// runtime (one RDNA2 SoC), so register=success+cookie, unregister=S_OK.
+int TRT_GUEST_ABI fake_RegisterAdaptersChangedEvent(void*, void* hEvent, u32* cookie) {
+  static std::atomic<u32> s_cookie{1};
+  if (cookie) *cookie = s_cookie.fetch_add(1);
+  (void)hEvent;
+  return 0;  // S_OK
+}
+int TRT_GUEST_ABI fake_UnregisterAdaptersChangedEvent(void*, u32) { return 0; }
+
+// IDXGIFactory7 vtable: 32 slots
+const void* g_factory_vtbl[32] = {
     (const void*)&fake_QueryInterface,                  // 0
     (const void*)&fake_AddRef,                          // 1
     (const void*)&fake_Release,                         // 2
@@ -1154,7 +1253,21 @@ const void* g_factory_vtbl[30] = {
     (const void*)&fake_EnumWarpAdapter,                 // 27
     (const void*)&fake_CheckFeatureSupport,             // 28
     (const void*)&fake_EnumAdapterByGpuPreference,      // 29
+    (const void*)&fake_RegisterAdaptersChangedEvent,    // 30 IDXGIFactory7
+    (const void*)&fake_UnregisterAdaptersChangedEvent,  // 31 IDXGIFactory7
 };
+// ABI pins (the TRIANGLE-GATE rule): a vtbl serves exactly the interface
+// versions whose slot count it covers. SDK: IDXGIFactory2=25, Factory3=26,
+// Factory4=27, Factory5=28 (+CheckFeatureSupport), Factory6=30, Factory7=32.
+static_assert(sizeof(g_factory_vtbl) / sizeof(g_factory_vtbl[0]) == 32,
+              "factory vtbl must cover IDXGIFactory7 (32 slots)");
+
+// SDK: IDXGIOutput=11, Output1=23, Output2=24, Output3=25, Output4=26,
+// Output5=27, Output6=29.
+static_assert(sizeof(g_offline_output_vtbl) / sizeof(g_offline_output_vtbl[0]) == 29,
+              "output vtbl must cover IDXGIOutput6 (29 slots)");
+static_assert(sizeof(g_offline_adapter_vtbl) / sizeof(g_offline_adapter_vtbl[0]) == 19,
+              "adapter vtbl must cover IDXGIAdapter4 (19 slots)");
 
 fake_factory g_factory_obj = {g_factory_vtbl, 1};
 

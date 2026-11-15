@@ -32,3 +32,27 @@ EXPORTS
     RtlUnwindEx
     GetSystemInfo
     GetTickCount64
+    GetCurrentProcess
+    ; ---- work-order item 12 remainder: jobs / console / toolhelp / mitigation
+    CreateJobObjectW
+    CreateJobObjectA
+    SetInformationJobObject
+    AssignProcessToJobObject
+    TerminateJobObject
+    OpenJobObjectW
+    OpenJobObjectA
+    IsProcessInJob
+    AllocConsole
+    FreeConsole
+    AttachConsole
+    GetConsoleCP
+    CreateToolhelp32Snapshot
+    Module32FirstW
+    Module32NextW
+    Module32FirstA
+    Module32NextA
+    CloseToolhelp32Snapshot
+    GetProcessMitigationPolicy
+    SetProcessMitigationPolicy
+    SetThreadStackGuarantee
+    GetThreadStackGuarantee

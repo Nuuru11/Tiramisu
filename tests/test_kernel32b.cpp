@@ -1,0 +1,193 @@
+// tiramisu/tests/test_kernel32b.cpp
+// Work-order item 12 remainder: job objects, console attach, the toolhelp
+// MODULE32 walk over the REAL guest image registry, the mitigation-policy /
+// stack-guarantee surface, and the nvapi/nvml/atiadl honest-stub modules.
+// The guest PE (tests/guest_kernel32b.c) runs the whole sequence through the
+// IAT + LoadLibraryW/GetProcAddress and writes its checksum to C:\results.txt
+// through the VFS; this host verifies every bit and the on-disk bytes.
+#include "../src/trt/trt.h"
+#include "../src/trt/images.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <string>
+
+extern "C" {
+int trt_bridge_register_kernel32(void);
+int trt_bridge_register_nvapi(void);
+}
+
+namespace {
+
+struct extent { void* base; size_t len; };
+extent g_extents[16];
+int g_extent_count = 0;
+
+void* linux_alloc(size_t bytes, u64 preferred_base) {
+  void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
+                 bytes, PROT_READ | PROT_WRITE,
+                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
+                                : (MAP_PRIVATE | MAP_ANONYMOUS),
+                 -1, 0);
+  if (p == MAP_FAILED) return nullptr;
+  if (g_extent_count < 16) {
+    g_extents[g_extent_count].base = p;
+    g_extents[g_extent_count].len = bytes;
+    ++g_extent_count;
+  }
+  return p;
+}
+int linux_protect(void* base, size_t bytes, unsigned prot) {
+  int p = 0;
+  if (prot & TRT_PROT_R) p |= PROT_READ;
+  if (prot & TRT_PROT_W) p |= PROT_WRITE;
+  if (prot & TRT_PROT_X) p |= PROT_EXEC;
+  const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+  const uintptr_t b = (uintptr_t)base & ~(uintptr_t)(page - 1);
+  const size_t len = ((uintptr_t)base + bytes - b + page - 1) & ~(uintptr_t)(page - 1);
+  return mprotect((void*)b, len, p);
+}
+void linux_release(void* base, size_t) {
+  for (int i = 0; i < g_extent_count; ++i)
+    if (g_extents[i].base == base) {
+      munmap(base, g_extents[i].len);
+      g_extents[i].base = nullptr;
+      return;
+    }
+}
+void linux_log(const char* line) { printf("  [trt] %s\n", line); }
+
+u8* read_file(const char* path, size_t* size) {
+  FILE* f = fopen(path, "rb");
+  if (!f) return nullptr;
+  fseek(f, 0, SEEK_END);
+  const long n = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  u8* buf = (u8*)malloc((size_t)n);
+  const size_t got = fread(buf, 1, (size_t)n, f);
+  fclose(f);
+  *size = got;
+  return buf;
+}
+
+// call a Win64 guest: shadow space + rcx/rdx/r8, result in rax
+// (arguments read through MEMORY constraints BEFORE %rsp moves — see
+// test_game_boot.cpp for why)
+u64 win64_call(void* fn, u64 a, u64 b, u64 c) {
+  u64 args[3] = {a, b, c};
+  u64 ret;
+  asm volatile(
+    "movq %[a0], %%rcx\n"
+    "movq %[a1], %%rdx\n"
+    "movq %[a2], %%r8\n"
+    "subq $48, %%rsp\n"
+    "call *%[fn]\n"
+    "addq $48, %%rsp\n"
+    : "=a"(ret)
+    : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
+      [fn] "r"(fn)
+    : "rcx", "rdx", "r8", "r9", "r10", "r11",
+      "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "memory", "cc");
+  return ret;
+}
+
+int failures = 0;
+#define CHECK(cond, msg)                                             \
+  do {                                                               \
+    if (cond) printf("  PASS %s\n", msg);                            \
+    else { printf("  FAIL %s\n", msg); ++failures; }                 \
+  } while (0)
+
+}  // namespace
+
+int main(int argc, char** argv) {
+  setvbuf(stdout, NULL, _IONBF, 0);
+  if (argc < 2) {
+    printf("usage: test_kernel32b <guest_kernel32b.exe>\n");
+    return 2;
+  }
+  size_t size = 0;
+  u8* file = read_file(argv[1], &size);
+  if (!file) { printf("cannot read %s\n", argv[1]); return 2; }
+
+  trt_backend be{&linux_alloc, &linux_protect, &linux_release, &linux_log,
+                 nullptr};
+  trt_bridge_boot(&be);
+  trt_bridge_register_kernel32();
+  trt_bridge_register_nvapi();
+
+  printf("tiramisu kernel32b (jobs/console/toolhelp/mitigation + GPU stubs) "
+         "test\n");
+
+  // VFS: C:\ -> scratch drive_c, Z:\ -> the test's own dir
+  char drive_c[] = "/tmp/tiramisu-k32b.XXXXXX";
+  mkdtemp(drive_c);
+  char exe_dir[512];
+  snprintf(exe_dir, sizeof(exe_dir), "%s", argv[1]);
+  *(strrchr(exe_dir, '/')) = 0;
+  trt_vfs_mount("c:", drive_c);
+  trt_vfs_mount("z:", exe_dir);
+  trt_bridge_set_exe_path("Z:\\guest_kernel32b.exe");
+
+  trt_resolver rs;
+  trt_resolver_default(&rs);
+  trt_image* img = nullptr;
+  const int rc = trt_map_pe(&be, &rs, file, size, &img);
+  CHECK(rc == TRT_OK, "guest PE maps (kernel32 gap surface bound)");
+  if (rc != TRT_OK || !img) {
+    printf("  map failed: %s\n", trt_errstr(rc));
+    free(file);
+    return 1;
+  }
+  CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
+  // the module list the toolhelp snapshot walks: entry 0 = the main exe
+  trt_images_register_main(img, "guest_kernel32b.exe");
+
+  const u64 ret = win64_call(img->base + img->entry_rva,
+                             (u64)(uintptr_t)img->base, 1, 0);
+  char det[96];
+  snprintf(det, sizeof(det), "guest returned 0x%08llx",
+           (unsigned long long)ret);
+  CHECK(ret == 0x3FFFu, det);
+
+  CHECK(ret & 0x0001u, "job: CreateJobObjectW + Assign(self) + SetInfo(EXTENDED, PROCESS_MEMORY) + Terminate + IsProcessInJob");
+  CHECK(ret & 0x0002u, "job: OpenJobObjectW honest-fails NULL + ERROR_FILE_NOT_FOUND");
+  CHECK(ret & 0x0004u, "console: AllocConsole -> TRUE");
+  CHECK(ret & 0x0008u, "console: GetConsoleCP -> 437");
+  CHECK(ret & 0x0010u, "console: FreeConsole -> TRUE");
+  CHECK(ret & 0x0020u, "toolhelp: CreateToolhelp32Snapshot(TH32CS_SNAPMODULE) -> valid handle");
+  CHECK(ret & 0x0040u, "toolhelp: Module32FirstW -> exe module with nonzero base/size/name");
+  CHECK(ret & 0x0080u, "toolhelp: Module32NextW terminates FALSE + ERROR_NO_MORE_FILES");
+  CHECK(ret & 0x0100u, "toolhelp: CloseToolhelp32Snapshot -> TRUE");
+  CHECK(ret & 0x0200u, "mitigation: GetProcessMitigationPolicy -> TRUE, all-zero buffer");
+  CHECK(ret & 0x0400u, "nvapi: NvAPI_Initialize -> -160 + QueryInterface -> NULL");
+  CHECK(ret & 0x0800u, "nvml: nvmlInit_v2 -> NVML_ERROR_NOT_SUPPORTED (9)");
+  CHECK(ret & 0x1000u, "atiadl: ADL2_Main_Control_Create -> ADL_ERR_NOT_SUPPORTED (-9)");
+  CHECK(ret & 0x2000u, "threading: Set/GetThreadStackGuarantee round-trip");
+
+  // the guest wrote its checksum through the VFS — verify ON DISK
+  std::string res_path = std::string(drive_c) + "/results.txt";
+  FILE* rf = fopen(res_path.c_str(), "rb");
+  CHECK(rf != nullptr, "guest created C:\\results.txt through the VFS");
+  if (rf) {
+    u32 stored = 0;
+    if (fread(&stored, 4, 1, rf) == 1) {}
+    fclose(rf);
+    char d2[96];
+    snprintf(d2, sizeof(d2), "stored checksum == returned (0x%08x)", stored);
+    CHECK(stored == (u32)ret, d2);
+  }
+
+  trt_unmap(&be, img);
+  free(file);
+
+  if (failures) {
+    printf("\nRESULT: %d FAIL\n", failures);
+    return 1;
+  }
+  printf("\nRESULT: ALL PASS\n");
+  return 0;
+}

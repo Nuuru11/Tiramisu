@@ -8,12 +8,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 extern "C" {
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_user32(void);
 int trt_bridge_register_ole(void);
+
+// sync primitive shared with the kernel32 bridge (bridge_thread.cpp) —
+// used to create the events CoWaitForMultipleHandles waits on
+u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
+                                 const u16* name);
+
+// the STA wait under test (bridge_ole.cpp, declared in bridge_ole.h)
+int TRT_GUEST_ABI ole_CoWaitForMultipleHandles(u32 flags, u32 timeout_ms,
+                                               u32 count, const void* handles,
+                                               u32* index_out);
 }
 
 namespace {
@@ -139,6 +150,44 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x080u, "SafeArrayDestroy");
   CHECK(ret & 0x100u, "OleInitialize (already-initialized S_FALSE)");
   CHECK(ret & 0x200u, "CoUninitialize nesting unwind (no crash)");
+
+  // ---- CoWaitForMultipleHandles: the STA wait (work-order item 16) ----
+  // Called directly on the host — the bridge is TRT_GUEST_ABI (ms_abi), the
+  // same ABI the guest uses, so the host can exercise it without a guest PE.
+  {
+    u64 ev_sig = trt_CreateEventW(nullptr, true, true, nullptr);
+    u64 ev_uns = trt_CreateEventW(nullptr, true, false, nullptr);
+    u32 idx = 0xDEADBEEFu;
+
+    const int hr_ok =
+        ole_CoWaitForMultipleHandles(0, 1000, 1, &ev_sig, &idx);
+    CHECK(hr_ok == 0 && idx == 0,
+          "CoWaitForMultipleHandles signaled event -> S_OK index 0");
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    const int hr_pend =
+        ole_CoWaitForMultipleHandles(0, 50, 1, &ev_uns, &idx);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    const long dt_ms = (ts1.tv_sec - ts0.tv_sec) * 1000 +
+                       (ts1.tv_nsec - ts0.tv_nsec) / 1000000;
+    CHECK(hr_pend == (int)0x80010127,
+          "CoWaitForMultipleHandles 50ms unsignaled -> RPC_S_CALLPENDING");
+    CHECK(dt_ms >= 45 && dt_ms < 2000,
+          "CoWaitForMultipleHandles timeout honored (~50ms wall)");
+
+    const u64 bad = 0;
+    CHECK(ole_CoWaitForMultipleHandles(0, 10, 1, &bad, &idx) == (int)0x80070006,
+          "CoWaitForMultipleHandles invalid handle -> E_HANDLE");
+    CHECK(ole_CoWaitForMultipleHandles(0, 10, 0, &ev_sig, &idx) ==
+              (int)0x80070057,
+          "CoWaitForMultipleHandles zero handles -> E_INVALIDARG");
+
+    // COWAIT_WAITALL on two signaled events -> S_OK
+    u64 both[2] = {ev_sig, ev_sig};
+    CHECK(ole_CoWaitForMultipleHandles(1, 100, 2, both, &idx) == 0,
+          "CoWaitForMultipleHandles WAITALL on signaled pair -> S_OK");
+  }
 
   free(file);
   if (failures) {

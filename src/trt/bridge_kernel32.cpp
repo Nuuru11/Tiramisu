@@ -1373,6 +1373,9 @@ void* file_alloc(FILE* os, u8 mode, const char* vpath = nullptr) {
 
 // extern-C accessor for the gap bridge (bridge_kernel32_gap.cpp)
 extern "C" char* trt_gap_cwd(void) { return g_cwd; }
+// extern-C accessor for the gap bridge: the guest exe path (toolhelp
+// MODULEENTRY32W.szExePath for the main module reads this)
+extern "C" const char* trt_gap_exepath(void) { return g_exepath; }
 
 } // namespace
 
@@ -1719,9 +1722,14 @@ void* trt_file_bytes(void* handle, size_t* size) {
 int TRT_STDCALL trt_sync_close(u64 handle);
 
 int TRT_STDCALL trt_CloseHandle(void* h) {
-  // Dispatch order: sync objects -> memory mappings -> open files.
+  // Dispatch order: sync objects -> memory mappings -> gap registries
+  // (toolhelp snapshots + job records, tag-checked) -> open files.
   if (trt_sync_close((u64)(uintptr_t)h)) return 1;
   if (trt_mem_close_handle(h)) return 1;
+  {
+    extern int trt_gap_handle_close(void* h);
+    if (trt_gap_handle_close(h)) return 1;
+  }
   std::lock_guard<std::mutex> lk(g_files_mu);
   u32 idx = 0;
   if (!file_at_locked(h, &idx)) return 1;  // non-file handles: pretend closed
@@ -3226,7 +3234,7 @@ int TRT_STDCALL trt_GetCPInfo(u32 codepage, void* cpinfo) {
 }
 
 u32 TRT_STDCALL trt_GetConsoleCP(void) { return 437; }
-u32 TRT_STDCALL trt_GetConsoleOutputCP(void) { return 437; }
+u32 TRT_STDCALL trt_GetConsoleOutputCP(void) { return 65001; }  // UTF-8
 
 int TRT_STDCALL trt_GetStringTypeW(u32 type, const u16* src, int count,
                                    u16* types) {
@@ -6142,10 +6150,10 @@ int TRT_STDCALL trt_GetConsoleScreenBufferInfo(void* h, void* info) {
 void* TRT_STDCALL trt_GetConsoleWindow(void) { return nullptr; }
 
 int TRT_STDCALL trt_AttachConsole(u32 pid) {
-  (void)pid;
-  trt_core_log("kernel32: AttachConsole -> FALSE (no console in AppContainer)");
-  err_ref_for_current_thread() = 6;
-  return 0;
+  (void)pid;  // ATTACH_PARENT_PROCESS (0xFFFFFFFF) and any pid: same record
+  trt_core_log("kernel32: AttachConsole -> TRUE (headless console record; "
+               "no host stdio pipe)");
+  return 1;
 }
 
 // AppModel surface (imported via api-ms-win-appmodel-runtime-l1-1-*.dll by

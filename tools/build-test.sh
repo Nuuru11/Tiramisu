@@ -680,3 +680,29 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_d3d12_triangle.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_d3d12_triangle"
 "$out/test_d3d12_triangle" "$out/guest_triangle.exe"
+
+# --- 37. ntdll native surface: NtCreateFile/NtReadFile onto VFS, NtCreateEvent/
+#         NtWaitForSingleObject/NtSignalAndWaitForSingleObject, RaiseFailFast ---
+rm -f "$out/ntdll.lib"
+"$LLD_LINK" /lib /def:src/guest/ntdll.def /out:"$out/ntdll.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_ntdll.c -o "$out/guest_ntdll.obj"
+"$LLD_LINK" "$out/guest_ntdll.obj" "$out/ntdll.lib" "$out/kernel32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_ntdll_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2100000 /OUT:"$out/guest_ntdll.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_ntdll.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_ntdll"
+"$out/test_ntdll" "$out/guest_ntdll.exe"
+
+# --- 38. kernel32 gap: job objects, console, Toolhelp Module32, mitigation,
+#         stack guarantee + nvapi/nvml/atiadl honest stubs ---
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c tests/guest_kernel32b.c -o "$out/guest_kernel32b.obj"
+"$LLD_LINK" "$out/guest_kernel32b.obj" "$out/kernel32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_k32b_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_kernel32b.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_kernel32b.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_kernel32b"
+"$out/test_kernel32b" "$out/guest_kernel32b.exe"

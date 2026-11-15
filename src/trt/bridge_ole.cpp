@@ -22,6 +22,11 @@ static void line(const char* s) { trt_core_log(s); }
 }
 #define log_line(s_) olelog::line(s_)
 
+// sync primitive shared with the kernel32 bridge (bridge_thread.cpp)
+extern "C" u32 TRT_STDCALL trt_WaitForMultipleObjects(u32 count,
+                                                      const u64* handles,
+                                                      bool wait_all, u32 ms);
+
 extern "C" {
 
 namespace {
@@ -32,6 +37,8 @@ constexpr int S_FALSE_ = 1;
 constexpr int E_NOINTERFACE_ = (int)0x80004002;
 constexpr int E_OUTOFMEMORY_ = (int)0x8007000E;
 constexpr int E_INVALIDARG_ = (int)0x80070057;
+constexpr int E_HANDLE_ = (int)0x80070006;
+constexpr int RPC_S_CALLPENDING_ = (int)0x80010127;
 constexpr int REGDB_E_CLASSNOTREG_ = (int)0x80040154;
 constexpr int CO_E_CLASSSTRING_ = (int)0x800401F3;
 
@@ -553,6 +560,31 @@ int TRT_GUEST_ABI ole_CoGetApartmentType(u32* apt_type, u32* qualifier) {
   return S_OK_;
 }
 
+// ---- CoWaitForMultipleHandles: the STA wait modern engines use instead of
+// MsgWaitForMultipleObjectsEx. On the console there is no real message pump
+// to drain inside the wait — the wait rides on the SAME sync primitives the
+// kernel32 bridge hands out (trt_WaitForMultipleObjects), so events created
+// via kernel32 or NtCreateEvent are all waitable here. COWAIT_WAITALL (0x1)
+// is honored; COWAIT_ALERTABLE needs no special handling (no APC pump). ----
+int TRT_GUEST_ABI ole_CoWaitForMultipleHandles(u32 flags, u32 timeout_ms,
+                                                u32 count,
+                                                const void* handles,
+                                                u32* index_out) {
+  if (!handles || count == 0 || !index_out) return E_INVALIDARG_;
+  *index_out = 0;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "ole: CoWaitForMultipleHandles(n=%u flags=%u timeout=%ums)",
+           count, flags, timeout_ms);
+  log_line(line);
+  const u32 r = trt_WaitForMultipleObjects(count, (const u64*)handles,
+                                           (flags & 0x1u) != 0, timeout_ms);
+  if (r == 0xFFFFFFFFu) return E_HANDLE_;        // wait failed / bad handle
+  if (r == 0x102u) return RPC_S_CALLPENDING_;    // timed out
+  *index_out = r;                                // signaled index (0 if WAITALL)
+  return S_OK_;
+}
+
 namespace {
 
 // ---- OleInitialize / DragDrop / ErrorInfo / Marshaling ----
@@ -702,6 +734,7 @@ int trt_bridge_register_ole(void) {
       {"CoRevokeInitializeSpy", (void*)&ole_CoRevokeInitializeSpy},
       {"CreateStreamOnHGlobal", (void*)&ole_CreateStreamOnHGlobal},
       {"GetHGlobalFromStream", (void*)&ole_GetHGlobalFromStream},
+      {"CoWaitForMultipleHandles", (void*)&ole_CoWaitForMultipleHandles},
   };
   static const trt_named_fn k_oleaut[] = {
       {"SysAllocString", (void*)&ole_SysAllocString},

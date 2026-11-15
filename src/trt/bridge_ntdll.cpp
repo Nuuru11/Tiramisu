@@ -47,12 +47,33 @@ const char* trt_file_vpath(void* h);
 int TRT_STDCALL trt_CloseHandle(void* h);
 int TRT_STDCALL trt_VerifyVersionInfoW(void* vi, u32 type_mask, u64 cond_mask);
 
+// Cross-bridge sync/exit primitives (defined in bridge_thread.cpp /
+// bridge_kernel32.cpp). The Nt* wrappers route onto exactly these so guest
+// events and waits are the SAME objects kernel32 hands out.
+u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
+                                  const u16* name);
+int TRT_STDCALL trt_SetEvent(u64 handle);
+int TRT_STDCALL trt_ResetEvent(u64 handle);
+u32 TRT_STDCALL trt_WaitForSingleObjectEx(u64 handle, u32 ms, int alertable);
+void TRT_STDCALL trt_ExitProcess(u32 code);
+void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
+                                  void* sa, u32 disposition, u32 flags,
+                                  void* tmpl);
+
 namespace {
 
 constexpr u32 k_status_ok = 0x00000000u;
 constexpr u32 k_status_not_implemented = 0xC0000002u;
 constexpr u32 k_status_invalid_handle = 0xC0000008u;
 constexpr u32 k_status_invalid_parameter = 0xC000000Du;
+constexpr u32 k_status_end_of_file = 0xC0000011u;
+constexpr u32 k_status_timeout = 0x00000102u;
+constexpr u32 k_status_object_name_not_found = 0xC000000Fu;
+constexpr u32 k_status_object_path_not_found = 0xC000003Au;
+constexpr u32 k_status_object_name_invalid = 0xC0000033u;
+constexpr u32 k_status_name_collision = 0xC0000035u;
+constexpr u32 k_status_sharing_violation = 0xC0000068u;
+constexpr u32 k_status_write_protect = 0xC00000A2u;
 constexpr u32 k_status_buffer_overflow = 0x80000005u;
 
 u32 TRT_GUEST_ABI nt_RtlNtStatusToDosError(u32 status) {
@@ -250,10 +271,16 @@ u32 TRT_GUEST_ABI nt_EtwEventActivityIdControl(u32 ctrl, void* guid) {
 u32 dos_to_ntstatus(u32 e) {
   switch (e) {
     case 0: return 0x00000000u;
+    case 2: return k_status_object_name_not_found;
+    case 3: return k_status_object_path_not_found;
+    case 5: return 0xC0000022u;    // STATUS_ACCESS_DENIED
+    case 6: return k_status_invalid_handle;
     case 8: return 0xC0000017u;    // STATUS_NO_MEMORY
+    case 19: return k_status_write_protect;
+    case 32: return k_status_sharing_violation;
+    case 80: return k_status_name_collision;
     case 87: return 0xC000000Du;   // STATUS_INVALID_PARAMETER
     case 487: return 0xC0000018u;  // STATUS_CONFLICTING_ADDRESSES
-    case 5: return 0xC0000022u;    // STATUS_ACCESS_DENIED
     default: return 0xC0000001u;   // STATUS_UNSUCCESSFUL
   }
 }
@@ -323,6 +350,256 @@ struct nt_unicode_str {
   u32 pad;
   u16* buffer;
 };
+
+// ---- NtCreateFile / NtReadFile: the native NT file surface, routed onto the
+// same VFS the kernel32 CreateFileW bridge uses (trt_CreateFileW does the
+// path resolution, image materialization, copy-on-write and handle alloc —
+// NtCreateFile only translates the NT-shaped arguments onto it). ----
+
+// OBJECT_ATTRIBUTES (x64): Length, RootDirectory, ObjectName, Attributes,
+// SecurityDescriptor, SecurityQualityOfService.
+struct nt_object_attr {
+  u32 length;
+  u32 pad;
+  void* root_directory;
+  nt_unicode_str* object_name;
+  u32 attributes;
+  u32 pad2;
+  void* security_descriptor;
+  void* security_qos;
+};
+
+// NT CreateDisposition -> kernel32 CreateFileW disposition.
+// NT: 0 SUPERSEDE, 1 OPEN, 2 CREATE, 3 OPEN_IF, 4 OVERWRITE, 5 OVERWRITE_IF
+// k32: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING, 4 OPEN_ALWAYS,
+//      5 TRUNCATE_EXISTING
+u32 nt_disp_to_k32(u32 disp) {
+  switch (disp) {
+    case 0: return 2;  // FILE_SUPERSEDE    -> CREATE_ALWAYS
+    case 1: return 3;  // FILE_OPEN        -> OPEN_EXISTING
+    case 2: return 1;  // FILE_CREATE      -> CREATE_NEW
+    case 3: return 4;  // FILE_OPEN_IF     -> OPEN_ALWAYS
+    case 4: return 5;  // FILE_OVERWRITE   -> TRUNCATE_EXISTING
+    case 5: return 2;  // FILE_OVERWRITE_IF-> CREATE_ALWAYS
+    default: return 0;
+  }
+}
+
+// IOSB Information for a successful create/open (FILE_SUPERSEDED=0 .. )
+u32 nt_disp_opened_info(u32 k32_disp) {
+  switch (k32_disp) {
+    case 1: return 2;  // FILE_CREATED
+    case 2: return 3;  // FILE_OVERWRITTEN
+    case 5: return 3;  // FILE_OVERWRITTEN
+    default: return 1; // FILE_OPENED
+  }
+}
+
+u32 TRT_GUEST_ABI nt_NtCreateFile(void** file_handle, u32 desired_access,
+                                  void* obj_attr, void* iosb_ptr,
+                                  const i64* allocation_size,
+                                  u32 file_attributes, u32 share_access,
+                                  u32 create_disposition, u32 create_options,
+                                  void* ea_buffer, u32 ea_length) {
+  (void)allocation_size; (void)file_attributes; (void)share_access;
+  (void)ea_buffer; (void)ea_length;
+  io_status_block* iosb = (io_status_block*)iosb_ptr;
+  if (!file_handle || !obj_attr || !iosb) return k_status_invalid_parameter;
+  *file_handle = nullptr;
+  iosb->status = k_status_invalid_parameter;
+  iosb->info = 0;
+  nt_object_attr* oa = (nt_object_attr*)obj_attr;
+  nt_unicode_str* us = oa->object_name;
+  if (!us || !us->buffer || us->length < 2) {
+    return k_status_invalid_parameter;
+  }
+  // UNICODE_STRING Length is in BYTES and the buffer is not necessarily
+  // null-terminated: copy + terminate into a local narrow buffer.
+  const u32 chars = us->length / 2u;
+  char name[520];
+  if (chars >= sizeof(name)) {
+    iosb->status = k_status_object_name_invalid;
+    return k_status_object_name_invalid;
+  }
+  for (u32 i = 0; i < chars; ++i) name[i] = (char)(u8)us->buffer[i];
+  name[chars] = 0;
+  // NT-style prefix: \??\ (RtlDosPathNameToNtPathName form) -> strip it.
+  if (name[0] == '\\' && name[1] == '?' && name[2] == '?' && name[3] == '\\') {
+    u32 o = 0;
+    for (u32 i = 4; name[i]; ++i) name[o++] = name[i];
+    name[o] = 0;
+  }
+  // RootDirectory-relative open: prepend the directory handle's VFS path.
+  if (oa->root_directory && name[0] != '\\' &&
+      !(name[0] && name[1] == ':')) {
+    const char* base = trt_file_vpath(oa->root_directory);
+    if (!base) {
+      iosb->status = k_status_invalid_handle;
+      return k_status_invalid_handle;
+    }
+    char full[520];
+    snprintf(full, sizeof(full), "%s\\%s", base, name);
+    for (u32 i = 0; ; ++i) {
+      name[i] = full[i];
+      if (!full[i]) break;
+    }
+  }
+  if (create_options & 0x1u /*FILE_DIRECTORY_FILE*/) {
+    // Directory handles are not part of the VFS file surface: fail visibly.
+    char line[128];
+    snprintf(line, sizeof(line),
+             "ntdll: NtCreateFile(%s) FILE_DIRECTORY_FILE -> "
+             "STATUS_NOT_IMPLEMENTED",
+             name);
+    trt_core_log(line);
+    iosb->status = k_status_not_implemented;
+    return k_status_not_implemented;
+  }
+  const u32 k32_disp = nt_disp_to_k32(create_disposition);
+  if (k32_disp == 0) return k_status_invalid_parameter;
+  // DesiredAccess: FILE_APPEND_DATA (0x4) alone must still open for write.
+  u32 access = desired_access;
+  if (access & 0x4u) access |= 0x2u;  // FILE_WRITE_DATA
+  u16 wname[520];
+  u32 wi = 0;
+  for (; name[wi]; ++wi) wname[wi] = (u16)(u8)name[wi];
+  wname[wi] = 0;
+  void* h = trt_CreateFileW(wname, access, share_access, nullptr, k32_disp,
+                            file_attributes, nullptr);
+  if (!h || h == (void*)(uintptr_t)-1) {
+    const u32 st = dos_to_ntstatus(trt_GetLastError());
+    char line[160];
+    snprintf(line, sizeof(line), "ntdll: NtCreateFile(%s disp=%u) -> 0x%08X",
+             name, create_disposition, st);
+    trt_core_log(line);
+    iosb->status = st;
+    return st;
+  }
+  *file_handle = h;
+  iosb->status = k_status_ok;
+  iosb->info = nt_disp_opened_info(k32_disp);
+  return k_status_ok;
+}
+
+u32 TRT_GUEST_ABI nt_NtReadFile(void* h, void* ev, void* apc, void* apc_ctx,
+                                void* iosb_ptr, void* buf, u32 len,
+                                const i64* byte_offset, void* key) {
+  (void)ev; (void)apc; (void)apc_ctx; (void)key;
+  io_status_block* iosb = (io_status_block*)iosb_ptr;
+  FILE* os = trt_file_os(h);
+  if (!os) {
+    if (iosb) { iosb->status = k_status_invalid_handle; iosb->info = 0; }
+    return k_status_invalid_handle;
+  }
+  if (!buf && len) {
+    if (iosb) { iosb->status = k_status_invalid_parameter; iosb->info = 0; }
+    return k_status_invalid_parameter;
+  }
+  if (byte_offset && *byte_offset >= 0) {
+    fseek(os, (long)*byte_offset, SEEK_SET);
+  }
+  const size_t got = len ? fread(buf, 1, len, os) : 0;
+  if (len == 0) {
+    if (iosb) { iosb->status = k_status_ok; iosb->info = 0; }
+    return k_status_ok;
+  }
+  if (got == 0) {
+    // Read at end-of-file: STATUS_END_OF_FILE, zero bytes transferred.
+    if (iosb) { iosb->status = k_status_end_of_file; iosb->info = 0; }
+    return k_status_end_of_file;
+  }
+  if (iosb) { iosb->status = k_status_ok; iosb->info = (u64)got; }
+  return k_status_ok;
+}
+
+// ---- Nt event surface: routed onto the SAME sync objects kernel32's
+// CreateEventW/WaitForSingleObject bridge allocates (bridge_thread.cpp) —
+// an event created through NtCreateEvent is signalable by kernel32 SetEvent
+// and vice versa. ----
+
+u32 TRT_GUEST_ABI nt_NtCreateEvent(void** event_handle, u32 desired_access,
+                                   void* obj_attr, u32 event_type,
+                                   u8 initial_state) {
+  (void)desired_access;
+  if (!event_handle) return k_status_invalid_parameter;
+  *event_handle = nullptr;
+  // EVENT_TYPE: 0 NotificationEvent (manual-reset), 1 SynchronizationEvent
+  // (auto-reset). Anything else is not an event type.
+  if (event_type > 1) return k_status_invalid_parameter;
+  const u16* name = nullptr;
+  u16 wname[256];
+  const nt_object_attr* oa = (const nt_object_attr*)obj_attr;
+  if (oa) {
+    const nt_unicode_str* us = oa->object_name;
+    if (us && us->buffer && us->length >= 2) {
+      const u32 chars = us->length / 2u;
+      const u32 cap = chars < 255u ? chars : 255u;
+      for (u32 i = 0; i < cap; ++i) wname[i] = us->buffer[i];
+      wname[cap] = 0;
+      name = wname;
+    }
+  }
+  const u64 h = trt_CreateEventW(nullptr, event_type == 0u, initial_state != 0,
+                                 name);
+  if (!h) return dos_to_ntstatus(trt_GetLastError());
+  *event_handle = (void*)(uintptr_t)h;
+  return k_status_ok;
+}
+
+u32 TRT_GUEST_ABI nt_NtSetEvent(void* h, i32* previous_state) {
+  if (!h || h == (void*)(uintptr_t)-1) return k_status_invalid_handle;
+  const u64 uh = (u64)(uintptr_t)h;
+  // PreviousState: probe with a zero-timeout wait (non-consuming for a
+  // manual-reset event; for an auto-reset event the consumed token is
+  // restored by the SetEvent below, so the end state is identical).
+  i32 prev = 0;
+  if (trt_WaitForSingleObjectEx(uh, 0, 0) == 0) prev = 1;
+  if (!trt_SetEvent(uh)) return k_status_invalid_handle;
+  if (previous_state) *previous_state = prev;
+  return k_status_ok;
+}
+
+u32 TRT_GUEST_ABI nt_NtWaitForSingleObject(void* h, u8 alertable,
+                                           const i64* timeout) {
+  if (!h || h == (void*)(uintptr_t)-1) return k_status_invalid_handle;
+  u32 ms = 0xFFFFFFFFu;  // no timeout argument -> wait forever
+  if (timeout) {
+    const i64 v = *timeout;
+    // 100-ns units, negative = relative to now. A positive value is an
+    // absolute deadline; treated as relative here (games pass relative).
+    u64 units = (v < 0) ? (u64)(-v) : (u64)v;
+    ms = (u32)((units + 9999u) / 10000u);
+  }
+  const u32 r = trt_WaitForSingleObjectEx((u64)(uintptr_t)h, ms, alertable != 0);
+  if (r == 0) return k_status_ok;
+  if (r == 0x102u) return k_status_timeout;  // STATUS_TIMEOUT == WAIT_TIMEOUT
+  return k_status_invalid_handle;
+}
+
+u32 TRT_GUEST_ABI nt_NtSignalAndWaitForSingleObject(void* signal_handle,
+                                                    void* wait_handle,
+                                                    u8 alertable,
+                                                    const i64* timeout) {
+  if (!signal_handle || signal_handle == (void*)(uintptr_t)-1) {
+    return k_status_invalid_handle;
+  }
+  const u32 set_r = nt_NtSetEvent(signal_handle, nullptr);
+  if (set_r != k_status_ok) return set_r;
+  return nt_NtWaitForSingleObject(wait_handle, alertable, timeout);
+}
+
+// ---- RaiseFailFastException: the fast-fail path is HONORED. The guest
+// asked to die; the same fatal path ExitProcess/TerminateProcess uses ends
+// the process (the offline harness traps it via trt_boot_exit_trap). ----
+u32 TRT_GUEST_ABI nt_RaiseFailFastException(void* exrec, void* ctx,
+                                            u32 flags) {
+  (void)exrec; (void)ctx; (void)flags;
+  trt_core_log("ntdll: RaiseFailFastException -> fail-fast honored (exit)");
+  // 0xC0000409 STATUS_STACK_BUFFER_OVERRUN / FAST_FAIL_FATAL_APP_EXIT;
+  // trt_ExitProcess masks to the low byte for the host exit code.
+  trt_ExitProcess(0x09);
+  return k_status_ok;  // unreachable when the exit path is honest
+}
 
 std::mutex g_nt_str_mu;
 std::unordered_set<void*> g_nt_str_allocs;
@@ -547,6 +824,14 @@ int trt_bridge_register_ntdll(void) {
       {"NtClose", (void*)&nt_NtClose},
       {"NtQueryInformationFile", (void*)&nt_NtQueryInformationFile},
       {"NtWriteFile", (void*)&nt_NtWriteFile},
+      {"NtCreateFile", (void*)&nt_NtCreateFile},
+      {"NtReadFile", (void*)&nt_NtReadFile},
+      {"NtCreateEvent", (void*)&nt_NtCreateEvent},
+      {"NtSetEvent", (void*)&nt_NtSetEvent},
+      {"NtWaitForSingleObject", (void*)&nt_NtWaitForSingleObject},
+      {"NtSignalAndWaitForSingleObject",
+       (void*)&nt_NtSignalAndWaitForSingleObject},
+      {"RaiseFailFastException", (void*)&nt_RaiseFailFastException},
       {"EtwEventRegister", (void*)&nt_EtwEventRegister},
       {"EtwEventUnregister", (void*)&nt_EtwEventUnregister},
       {"EtwEventWrite", (void*)&nt_EtwEventWrite},

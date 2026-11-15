@@ -781,6 +781,106 @@ std::vector<u8> build_min_pe64_dll() {
   return pe;
 }
 
+// ---------------------------------------------------------------------------
+// Wave 2F: DXGI ABI fidelity — adapter/factory/output version-aware QI.
+// Regression pins for the three live-tree gaps found by audit:
+//   (a) adp_qi accepted every IID blindly (silent lie -> contract breach)
+//   (b) Factory7 QI succeeded but the vtbl stopped at slot 29 (OOB call)
+//   (c) Output object stopped at IDXGIOutput1 (SupportsOverlays/GetDesc1 gone)
+// ---------------------------------------------------------------------------
+void test_wave2f_dxgi_abi() {
+  trt_gpu_hooks empty_hooks{};
+  trt_gpu_set_hooks(&empty_hooks);
+
+  using qi_fn = int (TRT_GUEST_ABI *)(void*, const void*, void**);
+  using rel_fn = u32 (TRT_GUEST_ABI *)(void*);
+  using enum1_fn = int (TRT_GUEST_ABI *)(void*, u32, void**);
+
+  const raw_guid iid_unk = {0x00000000u, 0x0000, 0x0000, {0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+  const raw_guid iid_fac7 = {0xA4966EEDu, 0x76DB, 0x44DA, {0x84,0xC1,0xEE,0x9A,0x7A,0xFB,0x20,0xA8}};
+  const raw_guid iid_adp1 = {0x29038F61u, 0x3839, 0x4626, {0x91,0xFD,0x08,0x68,0x79,0x01,0x1A,0x05}};
+  const raw_guid iid_adp4 = {0x3C8D99D1u, 0x4FBF, 0x4181, {0xA8,0x2C,0xAF,0x66,0xBF,0x7B,0xD2,0x4E}};
+  const raw_guid iid_garbage = {0xDEADBEEFu, 0x0000, 0x0000, {0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08}};
+  const raw_guid iid_out6 = {0x068346E8u, 0xAAEC, 0x4B84, {0xAD,0xD7,0x13,0x7F,0x51,0x3F,0x77,0xA1}};
+  const raw_guid iid_out2 = {0x595E39D1u, 0x2724, 0x4663, {0x99,0xB1,0xDA,0x96,0x9D,0xE2,0x83,0x64}};
+
+  // (b) Factory7 QI + the two new tail methods callable, in-ABI
+  void* fac = nullptr;
+  CHECK(trt_CreateDXGIFactory2(0, (void*)&iid_fac7, &fac) == 0 && fac != nullptr,
+        "CreateDXGIFactory2(IID_IDXGIFactory7) succeeds");
+  using reg_fn = int (TRT_GUEST_ABI *)(void*, void*, u32*);
+  using unreg_fn = int (TRT_GUEST_ABI *)(void*, u32);
+  u32 cookie = 0;
+  CHECK(fac && slot<reg_fn>(fac, 30)(fac, nullptr, &cookie) == 0 && cookie != 0,
+        "IDXGIFactory7::RegisterAdaptersChangedEvent(slot 30) S_OK with cookie");
+  CHECK(fac && slot<unreg_fn>(fac, 31)(fac, cookie) == 0,
+        "IDXGIFactory7::UnregisterAdaptersChangedEvent(slot 31) S_OK");
+
+  // (a) adapter QI is version-aware: full chain accepted, garbage rejected
+  void* adapter = nullptr;
+  CHECK(fac && slot<enum1_fn>(fac, 12)(fac, 0, &adapter) == 0 && adapter != nullptr,
+        "IDXGIFactory1::EnumAdapters1(0) returns offline adapter");
+  if (adapter) {
+    CHECK(slot<qi_fn>(adapter, 0)(adapter, &iid_adp1, &adapter) == 0,
+          "adapter QI(IID_IDXGIAdapter1) succeeds");
+    CHECK(slot<qi_fn>(adapter, 0)(adapter, &iid_adp4, &adapter) == 0,
+          "adapter QI(IID_IDXGIAdapter4) succeeds");
+    void* nope = (void*)(uintptr_t)0x1;
+    CHECK(slot<qi_fn>(adapter, 0)(adapter, &iid_garbage, &nope) == (int)0x80004002u &&
+              nope == nullptr,
+          "adapter QI(random IID) fails E_NOINTERFACE (fail-visible, not silent)");
+    // adapter vtbl covers IDXGIAdapter4::GetDesc3 at slot 18
+    using desc3_fn = int (TRT_GUEST_ABI *)(void*, void*);
+    u8 desc[328];
+    CHECK(slot<desc3_fn>(adapter, 18)(adapter, desc) == 0,
+          "IDXGIAdapter4::GetDesc3(slot 18) callable");
+    slot<rel_fn>(adapter, 2)(adapter);
+  }
+
+  // (c) output QI covers the Output2..Output6 chain + GetDesc1 callable
+  using enum_out_fn = int (TRT_GUEST_ABI *)(void*, u32, void**);
+  if (fac) {
+    // fetch a fresh adapter and enumerate its output
+    void* adp2 = nullptr;
+    CHECK(slot<enum1_fn>(fac, 12)(fac, 0, &adp2) == 0 && adp2 != nullptr,
+          "fresh adapter for output walk");
+    if (adp2) {
+      void* out = nullptr;
+      CHECK(slot<enum_out_fn>(adp2, 7)(adp2, 0, &out) == 0 && out != nullptr,
+            "IDXGIAdapter::EnumOutputs(0) returns offline output");
+      if (out) {
+        CHECK(slot<qi_fn>(out, 0)(out, &iid_out2, &out) == 0,
+              "output QI(IID_IDXGIOutput2) succeeds (SupportsOverlays served)");
+        CHECK(slot<qi_fn>(out, 0)(out, &iid_out6, &out) == 0,
+              "output QI(IID_IDXGIOutput6) succeeds (GetDesc1/HDR served)");
+        void* nope = (void*)(uintptr_t)0x1;
+        CHECK(slot<qi_fn>(out, 0)(out, &iid_garbage, &nope) == (int)0x80004002u &&
+                  nope == nullptr,
+              "output QI(random IID) fails E_NOINTERFACE");
+        // SupportsOverlays at slot 23 (IDXGIOutput2)
+        using overlays_fn = int (TRT_GUEST_ABI *)(void*);
+        CHECK(slot<overlays_fn>(out, 23)(out) == 0,
+              "IDXGIOutput2::SupportsOverlays(slot 23) callable");
+        // GetDesc1 at slot 27: DESC prefix 96 bytes, BitsPerColor at +96,
+        // ColorSpace +100, 8 floats +104..+135, MinLum +136, MaxLum +140.
+        using desc1_fn = int (TRT_GUEST_ABI *)(void*, void*);
+        u8 d1[160];
+        CHECK(slot<desc1_fn>(out, 27)(out, d1) == 0 &&
+                  *(u32*)(d1 + 96) == 10u && *(float*)(d1 + 140) > 0.0f,
+              "IDXGIOutput6::GetDesc1(slot 27) fills BitsPerColor=10 + MaxLuminance");
+        slot<rel_fn>(out, 2)(out);
+      }
+      slot<rel_fn>(adp2, 2)(adp2);
+    }
+  }
+
+  // IUnknown always works on the factory
+  void* unk = nullptr;
+  CHECK(fac && slot<qi_fn>(fac, 0)(fac, &iid_unk, &unk) == 0 && unk == fac,
+        "factory QI(IID_IUnknown) succeeds");
+  if (fac) slot<rel_fn>(fac, 2)(fac);
+}
+
 void test_wave2e_sys_net_d3d9() {
   // Case-insensitive DLL deduplication
   char dll_tpl[] = "/tmp/trt_w2_dll_XXXXXX";
@@ -1232,6 +1332,7 @@ int main() {
   test_wave2c_vfs_cow();
   test_wave2d_vmem_jit();
   test_wave2e_sys_net_d3d9();
+  test_wave2f_dxgi_abi();
 
   printf("\nRESULT: %s\n", g_failures ? "FAIL" : "ALL PASS");
   return g_failures ? 1 : 0;

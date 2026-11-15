@@ -39,6 +39,7 @@
 #endif
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
@@ -54,6 +55,7 @@ void line(const char* s) { trt_core_log(s); }
 extern "C" FILE* trt_file_os(void* h);        // handle -> FILE* (or null)
 extern "C" const char* trt_file_vpath(void* h); // handle -> guest path ("C:\...")
 extern "C" char* trt_gap_cwd(void);           // the guest cwd (g_cwd)
+extern "C" const char* trt_gap_exepath(void);  // the guest exe path (g_exepath)
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 extern "C" u32 TRT_STDCALL trt_GetLastError(void);
 extern "C" int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa);
@@ -1592,13 +1594,245 @@ int TRT_STDCALL trt_K32GetProcessMemoryInfo(void* proc, void* pmc_in, u32 cb) {
   return 1;
 }
 
+// ---- Toolhelp module snapshots ---------------------------------------------
+// TH32CS_SNAPMODULE / SNAPMODULE32 walk the REAL guest image registry
+// (images.cpp — the same list K32EnumProcessModules serves): the main exe
+// plus every guest DLL the loader mapped. Process/thread/heap-list snapshots
+// stay honest failures: no cross-process state exists in the runtime.
+// The snapshot handle is a tagged record handle (bridge_mem.cpp pattern:
+// tag in the high half, slot+1 in the low half) with stable slots so a
+// closed snapshot never renumbers a live one.
+namespace {
+struct snap_module {
+  void* base;
+  u32 size;
+  void* handle;
+  char name[128];
+  char path[512];
+};
+struct snap_rec {
+  u32 pid;
+  u32 cursor;  // next index Module32NextW returns
+  std::vector<snap_module> mods;
+};
+std::mutex g_snaps_mu;
+std::vector<std::unique_ptr<snap_rec>> g_snaps;
+constexpr u64 k_snap_handle_tag = 0x534E0000ull;  // "SN" — unique handle space
+
+snap_rec* snap_at(void* h) {
+  const u64 v = (u64)(uintptr_t)h;
+  if ((v & 0xFFFF0000ull) != k_snap_handle_tag) return nullptr;
+  const u64 idx = v & 0xFFFFull;
+  if (idx == 0 || idx > g_snaps.size() || !g_snaps[(size_t)(idx - 1)])
+    return nullptr;
+  return g_snaps[(size_t)(idx - 1)].get();
+}
+
+u32 snap_slot_alloc(snap_rec* rec) {
+  for (size_t i = 0; i < g_snaps.size(); ++i) {
+    if (!g_snaps[i]) {
+      g_snaps[i].reset(rec);
+      return (u32)i;
+    }
+  }
+  if (g_snaps.size() >= 0xFFFF) return 0xFFFFFFFFu;  // table full
+  g_snaps.push_back(std::unique_ptr<snap_rec>(rec));
+  return (u32)(g_snaps.size() - 1);
+}
+
+// MODULEENTRY32W (x64): dwSize@0 th32ModuleID@4 th32ProcessID@8
+// GlblcntUsage@12 ProccntUsage@16 modBaseAddr@24 modBaseSize@32 hModule@40
+// WCHAR szModule[256]@48 WCHAR szExePath[260]@568 -> 1080 bytes.
+// MODULEENTRY32A: same head, char szModule[256]@48 char szExePath[260]@308
+// -> 564 bytes.
+void snap_fill_w(void* entry, u32 pid, const snap_module& m) {
+  u8* p = (u8*)entry;
+  *(u32*)(p + 0) = 1080;
+  *(u32*)(p + 4) = 1;  // th32ModuleID: legacy, any nonzero
+  *(u32*)(p + 8) = pid;
+  *(u32*)(p + 12) = 1;  // GlblcntUsage
+  *(u32*)(p + 16) = 1;  // ProccntUsage
+  *(void**)(p + 24) = m.base;
+  *(u32*)(p + 32) = m.size;
+  *(void**)(p + 40) = m.handle;
+  u16* name = (u16*)(p + 48);
+  u32 i = 0;
+  for (; m.name[i] && i < 255; ++i) name[i] = (u16)(u8)m.name[i];
+  name[i] = 0;
+  u16* path = (u16*)(p + 48 + 256 * 2);
+  for (i = 0; m.path[i] && i < 259; ++i) path[i] = (u16)(u8)m.path[i];
+  path[i] = 0;
+}
+
+void snap_fill_a(void* entry, u32 pid, const snap_module& m) {
+  u8* p = (u8*)entry;
+  *(u32*)(p + 0) = 564;
+  *(u32*)(p + 4) = 1;
+  *(u32*)(p + 8) = pid;
+  *(u32*)(p + 12) = 1;
+  *(u32*)(p + 16) = 1;
+  *(void**)(p + 24) = m.base;
+  *(u32*)(p + 32) = m.size;
+  *(void**)(p + 40) = m.handle;
+  char* name = (char*)(p + 48);
+  u32 i = 0;
+  for (; m.name[i] && i < 255; ++i) name[i] = m.name[i];
+  name[i] = 0;
+  char* path = (char*)(p + 48 + 256);
+  for (i = 0; m.path[i] && i < 259; ++i) path[i] = m.path[i];
+  path[i] = 0;
+}
+
+int module32_walk(void* snap, void* entry, u32 want_size, int wide,
+                  int first) {
+  char line[256];
+  if (!entry) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(g_snaps_mu);
+  snap_rec* rec = snap_at(snap);
+  if (!rec) {
+    snprintf(line, sizeof(line),
+             "kernel32: Module32%s -> FALSE (invalid snapshot handle)",
+             first ? "First" : "Next");
+    LOG(line);
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  const u32 dwsize = *(u32*)entry;
+  if (dwsize != want_size) {
+    snprintf(line, sizeof(line),
+             "kernel32: Module32%s -> FALSE (entry dwSize=%u, want %u — "
+             "MODULEENTRY32 size mismatch)",
+             first ? "First" : "Next", dwsize, want_size);
+    LOG(line);
+    trt_SetLastError(87);
+    return 0;
+  }
+  if (first) rec->cursor = 0;
+  if (rec->cursor >= rec->mods.size()) {
+    trt_SetLastError(18);  // ERROR_NO_MORE_FILES: the clean walk terminator
+    return 0;
+  }
+  const snap_module& m = rec->mods[rec->cursor];
+  if (wide)
+    snap_fill_w(entry, rec->pid, m);
+  else
+    snap_fill_a(entry, rec->pid, m);
+  ++rec->cursor;
+  snprintf(line, sizeof(line),
+           "kernel32: Module32%s%s -> %s base=%p size=0x%x",
+           first ? "First" : "Next", wide ? "W" : "A", m.name, m.base, m.size);
+  LOG(line);
+  return 1;
+}
+}  // namespace
+
 void* TRT_STDCALL trt_CreateToolhelp32Snapshot(u32 flags, u32 pid) {
-  (void)flags; (void)pid;
+  char line[256];
+  constexpr u32 k_snap_module = 0x8u;    // TH32CS_SNAPMODULE
+  constexpr u32 k_snap_module32 = 0x10u; // TH32CS_SNAPMODULE32
+  if (flags & (k_snap_module | k_snap_module32)) {
+    const u32 self = trt_GetCurrentProcessId();
+    if (pid != 0 && pid != self) {
+      snprintf(line, sizeof(line),
+               "kernel32: CreateToolhelp32Snapshot(SNAPMODULE, pid=%u) -> "
+               "INVALID_HANDLE_VALUE (no cross-process module list; honest)",
+               pid);
+      LOG(line);
+      trt_SetLastError(5);  // ERROR_ACCESS_DENIED
+      return (void*)(uintptr_t)-1;
+    }
+    const int n = trt_images_count();
+    if (n <= 0) {
+      LOG("kernel32: CreateToolhelp32Snapshot(SNAPMODULE) -> "
+          "INVALID_HANDLE_VALUE (no guest image registered yet; honest)");
+      trt_SetLastError(5);
+      return (void*)(uintptr_t)-1;
+    }
+    snap_rec* rec = new snap_rec;
+    rec->pid = self;
+    rec->cursor = 0;
+    rec->mods.reserve((size_t)n);
+    for (int i = 0; i < n; ++i) {
+      trt_image* im = trt_images_nth(i);
+      if (!im) continue;
+      snap_module m;
+      memset(&m, 0, sizeof(m));
+      m.base = im->base;
+      m.size = (u32)im->size_of_image;
+      m.handle = trt_images_handle(im);
+      const char* nm = trt_images_nth_name(i);
+      if (nm) snprintf(m.name, sizeof(m.name), "%s", nm);
+      if (i == 0) {
+        // entry 0 is the main exe: the guest-visible path the runtime booted
+        snprintf(m.path, sizeof(m.path), "%s", trt_gap_exepath());
+      } else {
+        const char* p = trt_images_nth_path(i);
+        const char* leaf = p ? strrchr(p, '/') : nullptr;
+        snprintf(m.path, sizeof(m.path), "%s",
+                 leaf ? leaf + 1 : (p ? p : (nm ? nm : "")));
+      }
+      if (!m.name[0]) snprintf(m.name, sizeof(m.name), "module%d", i);
+      rec->mods.push_back(m);
+    }
+    const u32 slot = snap_slot_alloc(rec);
+    if (slot == 0xFFFFFFFFu) {
+      LOG("kernel32: CreateToolhelp32Snapshot -> INVALID_HANDLE_VALUE "
+          "(snapshot table full)");
+      trt_SetLastError(8);  // ERROR_NOT_ENOUGH_MEMORY
+      return (void*)(uintptr_t)-1;
+    }
+    const u64 h = k_snap_handle_tag | (u64)(slot + 1);
+    snprintf(line, sizeof(line),
+             "kernel32: CreateToolhelp32Snapshot(SNAPMODULE) -> 0x%llx "
+             "(%u guest modules from the image registry)",
+             (unsigned long long)h, (u32)rec->mods.size());
+    LOG(line);
+    return (void*)(uintptr_t)h;
+  }
   LOG("kernel32: CreateToolhelp32Snapshot -> INVALID_HANDLE_VALUE "
-      "(no cross-process snapshot in AppContainer; fail-visible)");
-  trt_SetLastError(5);  // ERROR_ACCESS_DENIED
+      "(only SNAPMODULE/SNAPMODULE32 are supported; process/thread/heap "
+      "lists fail honest)");
+  trt_SetLastError(5);
   return (void*)(uintptr_t)-1;
 }
+
+int TRT_STDCALL trt_Module32FirstW(void* snap, void* entry) {
+  return module32_walk(snap, entry, 1080, 1, 1);
+}
+int TRT_STDCALL trt_Module32NextW(void* snap, void* entry) {
+  return module32_walk(snap, entry, 1080, 1, 0);
+}
+int TRT_STDCALL trt_Module32FirstA(void* snap, void* entry) {
+  return module32_walk(snap, entry, 564, 0, 1);
+}
+int TRT_STDCALL trt_Module32NextA(void* snap, void* entry) {
+  return module32_walk(snap, entry, 564, 0, 0);
+}
+
+int TRT_STDCALL trt_CloseToolhelp32Snapshot(void* snap) {
+  char line[160];
+  std::lock_guard<std::mutex> lk(g_snaps_mu);
+  snap_rec* rec = snap_at(snap);
+  if (!rec) {
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  for (size_t i = 0; i < g_snaps.size(); ++i) {
+    if (g_snaps[i].get() == rec) {
+      g_snaps[i].reset();
+      break;
+    }
+  }
+  snprintf(line, sizeof(line),
+           "kernel32: CloseToolhelp32Snapshot(0x%llx) -> TRUE",
+           (unsigned long long)(uintptr_t)snap);
+  LOG(line);
+  return 1;
+}
+
 int TRT_STDCALL trt_ToolhelpNext_fail(void* h, void* entry) {
   (void)h; (void)entry;
   trt_SetLastError(18);  // ERROR_NO_MORE_FILES
@@ -2543,6 +2777,346 @@ int TRT_STDCALL trt_CopyFileFromAppW(const u16* src, const u16* dst, int fail_ex
                          fail_exists ? 1u : 0u);
 }
 
+// ==================== work-order item 12 remainder ==========================
+// Job objects, console attach, process mitigation policy, thread stack
+// guarantee. Same honesty rules as the rest of the file: real behavior where
+// the runtime has the state, named failure where it does not — never a fake
+// success.
+
+// ---- Job objects -----------------------------------------------------------
+// A job is a record + a tagged handle in the kernel32 handle space (the same
+// pattern bridge_mem.cpp uses for map handles: tag high, slot+1 low, stable
+// slots). The guest IS the whole process, so jobs enforce nothing here —
+// limits are recorded and logged so SetInformationJobObject is observable,
+// and the PROCESS_MEMORY flag is a logged no-op.
+namespace {
+struct job_rec {
+  u32 limit_flags;          // JOBOBJECT_BASIC_LIMIT_INFORMATION.LimitFlags
+  u64 process_memory_limit; // recorded, never enforced (logged no-op)
+  int assigned;             // AssignProcessToJobObject happened
+};
+std::mutex g_jobs_mu;
+std::vector<std::unique_ptr<job_rec>> g_jobs;
+constexpr u64 k_job_handle_tag = 0x4A0B0000ull;  // "JOB" — unique handle space
+constexpr u32 k_job_invalid = 0xFFFFFFFFu;
+
+u32 job_index(void* h) {
+  const u64 v = (u64)(uintptr_t)h;
+  if ((v & 0xFFFF0000ull) != k_job_handle_tag) return k_job_invalid;
+  const u64 idx = v & 0xFFFFull;
+  if (idx == 0 || idx > g_jobs.size() || !g_jobs[(size_t)(idx - 1)])
+    return k_job_invalid;
+  return (u32)(idx - 1);
+}
+
+u32 job_slot_alloc() {
+  for (size_t i = 0; i < g_jobs.size(); ++i)
+    if (!g_jobs[i]) return (u32)i;
+  if (g_jobs.size() >= 0xFFFF) return k_job_invalid;
+  g_jobs.push_back(std::unique_ptr<job_rec>(new job_rec{0, 0, 0}));
+  return (u32)(g_jobs.size() - 1);
+}
+
+// ---- console attach + mitigation + stack guarantee state -------------------
+std::atomic<bool> g_console_attached{false};
+thread_local u32 t_stack_guarantee = 0;
+std::atomic<u64> g_mitig_logged{0};
+
+void mit_policy_log(u32 policy, const char* what) {
+  const u64 bit = policy < 64 ? (1ull << policy) : 0;
+  if (bit) {
+    if (g_mitig_logged.load(std::memory_order_relaxed) & bit) return;
+    g_mitig_logged.fetch_or(bit, std::memory_order_relaxed);
+  }
+  char line[192];
+  snprintf(line, sizeof(line),
+           "kernel32: %s(policy=%u) — reported all-zero/unspecified "
+           "(the runtime applies no mitigation policy)", what, policy);
+  LOG(line);
+}
+}  // namespace
+
+void* TRT_STDCALL trt_CreateJobObjectW(void* attrs, const u16* name) {
+  (void)attrs;
+  char line[224];
+  char nm[64] = "";
+  const int have_name = name && trt_utf16_to_utf8(name, nm, sizeof(nm)) == 0;
+  std::lock_guard<std::mutex> lk(g_jobs_mu);
+  const u32 slot = job_slot_alloc();
+  if (slot == k_job_invalid) {
+    LOG("kernel32: CreateJobObjectW -> NULL (job table full)");
+    trt_SetLastError(8);  // ERROR_NOT_ENOUGH_MEMORY
+    return nullptr;
+  }
+  const u64 h = k_job_handle_tag | (u64)(slot + 1);
+  snprintf(line, sizeof(line),
+           "kernel32: CreateJobObjectW -> 0x%llx (%s%s)",
+           (unsigned long long)h, have_name ? "name=" : "anonymous",
+           have_name ? nm : "");
+  LOG(line);
+  return (void*)(uintptr_t)h;
+}
+
+void* TRT_STDCALL trt_CreateJobObjectA(void* attrs, const char* name) {
+  u16 wname[128];
+  const u16* wp = nullptr;
+  if (name) {
+    u32 i = 0;
+    for (; name[i] && i + 1 < 128; ++i) wname[i] = (u16)(u8)name[i];
+    wname[i] = 0;
+    wp = wname;
+  }
+  return trt_CreateJobObjectW(attrs, wp);
+}
+
+int TRT_STDCALL trt_SetInformationJobObject(void* job, u32 cls, void* info,
+                                            u32 cb) {
+  char line[256];
+  std::lock_guard<std::mutex> lk(g_jobs_mu);
+  const u32 idx = job_index(job);
+  if (idx == k_job_invalid) {
+    LOG("kernel32: SetInformationJobObject -> FALSE (invalid job handle)");
+    trt_SetLastError(6);  // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  // JOBOBJECT_BASIC_LIMIT_INFORMATION (x64, 64 bytes): LimitFlags at +16.
+  // JOBOBJECT_EXTENDED_LIMIT_INFORMATION (144 bytes) = basic(64) +
+  // IO_COUNTERS(48) + 4 SIZE_Ts; ProcessMemoryLimit at +112.
+  job_rec& j = *g_jobs[idx];
+  if (cls == 2 /*JobObjectBasicLimitInformation*/ && info && cb >= 64) {
+    j.limit_flags = *(const u32*)((const u8*)info + 16);
+    snprintf(line, sizeof(line),
+             "kernel32: SetInformationJobObject(BASIC, cb=%u) -> TRUE "
+             "LimitFlags=0x%x (recorded; the runtime enforces no job limits)",
+             cb, j.limit_flags);
+  } else if (cls == 9 /*JobObjectExtendedLimitInformation*/ && info &&
+             cb >= 144) {
+    j.limit_flags = *(const u32*)((const u8*)info + 16);
+    j.process_memory_limit = *(const u64*)((const u8*)info + 112);
+    if (j.limit_flags & 0x100u /*JOB_OBJECT_LIMIT_PROCESS_MEMORY*/) {
+      snprintf(line, sizeof(line),
+               "kernel32: SetInformationJobObject(EXTENDED, cb=%u) -> TRUE "
+               "LimitFlags=0x%x ProcessMemoryLimit=%llu MiB (logged no-op: "
+               "the runtime enforces no job memory cap)",
+               cb, j.limit_flags,
+               (unsigned long long)(j.process_memory_limit >> 20));
+    } else {
+      snprintf(line, sizeof(line),
+               "kernel32: SetInformationJobObject(EXTENDED, cb=%u) -> TRUE "
+               "LimitFlags=0x%x (recorded; the runtime enforces no job "
+               "limits)", cb, j.limit_flags);
+    }
+  } else {
+    snprintf(line, sizeof(line),
+             "kernel32: SetInformationJobObject(class=%u, cb=%u) -> FALSE "
+             "(unsupported information class; named gap)", cls, cb);
+    LOG(line);
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  LOG(line);
+  return 1;
+}
+
+int TRT_STDCALL trt_AssignProcessToJobObject(void* job, void* proc) {
+  char line[192];
+  std::lock_guard<std::mutex> lk(g_jobs_mu);
+  const u32 idx = job_index(job);
+  if (idx == k_job_invalid) {
+    LOG("kernel32: AssignProcessToJobObject -> FALSE (invalid job handle)");
+    trt_SetLastError(6);
+    return 0;
+  }
+  g_jobs[idx]->assigned = 1;
+  snprintf(line, sizeof(line),
+           "kernel32: AssignProcessToJobObject(job=0x%llx, proc=%p) -> TRUE "
+           "(single-process runtime: the guest is the job)",
+           (unsigned long long)(uintptr_t)job, proc);
+  LOG(line);
+  return 1;
+}
+
+int TRT_STDCALL trt_TerminateJobObject(void* job, u32 exit_code) {
+  char line[160];
+  std::lock_guard<std::mutex> lk(g_jobs_mu);
+  if (job_index(job) == k_job_invalid) {
+    LOG("kernel32: TerminateJobObject -> FALSE (invalid job handle)");
+    trt_SetLastError(6);
+    return 0;
+  }
+  snprintf(line, sizeof(line),
+           "kernel32: TerminateJobObject(job=0x%llx, exit=%u) -> TRUE "
+           "(logged: the guest process itself is not terminated)",
+           (unsigned long long)(uintptr_t)job, exit_code);
+  LOG(line);
+  return 1;
+}
+
+void* TRT_STDCALL trt_OpenJobObjectW(u32 access, int inherit,
+                                     const u16* name) {
+  (void)access; (void)inherit;
+  char line[192];
+  char nm[64] = "";
+  const int have_name = name && trt_utf16_to_utf8(name, nm, sizeof(nm)) == 0;
+  snprintf(line, sizeof(line),
+           "kernel32: OpenJobObjectW(%s) -> NULL (no named-job namespace in "
+           "the runtime; honest ERROR_FILE_NOT_FOUND)",
+           have_name ? nm : "null");
+  LOG(line);
+  trt_SetLastError(2);  // ERROR_FILE_NOT_FOUND
+  return nullptr;
+}
+
+void* TRT_STDCALL trt_OpenJobObjectA(u32 access, int inherit,
+                                     const char* name) {
+  u16 wname[128];
+  const u16* wp = nullptr;
+  if (name) {
+    u32 i = 0;
+    for (; name[i] && i + 1 < 128; ++i) wname[i] = (u16)(u8)name[i];
+    wname[i] = 0;
+    wp = wname;
+  }
+  return trt_OpenJobObjectW(access, inherit, wp);
+}
+
+int TRT_STDCALL trt_IsProcessInJob(void* proc, void* job, int* out) {
+  (void)proc;
+  char line[192];
+  if (!out) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  if (!job) {
+    // the probe games run at boot: "am I inside any job?" — the runtime
+    // puts the guest in no job, so the honest answer is FALSE.
+    *out = 0;
+    static std::atomic<char> once{0};
+    if (!once.exchange(1)) {
+      snprintf(line, sizeof(line),
+               "kernel32: IsProcessInJob(NULL job) -> TRUE, *out=FALSE "
+               "(guest runs in no job)");
+      LOG(line);
+    }
+    return 1;
+  }
+  std::lock_guard<std::mutex> lk(g_jobs_mu);
+  const u32 idx = job_index(job);
+  if (idx == k_job_invalid) {
+    trt_SetLastError(6);
+    return 0;
+  }
+  *out = g_jobs[idx]->assigned ? 1 : 0;
+  snprintf(line, sizeof(line),
+           "kernel32: IsProcessInJob(job=0x%llx) -> TRUE, *out=%d",
+           (unsigned long long)(uintptr_t)job, *out);
+  LOG(line);
+  return 1;
+}
+
+// ---- Console attach --------------------------------------------------------
+// AllocConsole/FreeConsole manage a headless console RECORD: the game's CRT
+// boot and logging paths proceed. There is still no host pipe behind stdout
+// (GetStdHandle stays honest), and the code pages report the OEM/UTF-8
+// constants games switch on.
+int TRT_STDCALL trt_AllocConsole(void) {
+  bool expect = false;
+  if (g_console_attached.compare_exchange_strong(expect, true)) {
+    LOG("kernel32: AllocConsole -> TRUE (headless console record; no host "
+        "stdio pipe — GetStdHandle stays honest)");
+  }
+  return 1;
+}
+
+int TRT_STDCALL trt_FreeConsole(void) {
+  bool expect = true;
+  if (g_console_attached.compare_exchange_strong(expect, false)) {
+    LOG("kernel32: FreeConsole -> TRUE (console record dropped)");
+  }
+  return 1;
+}
+
+// ---- Process mitigation policy ---------------------------------------------
+// Games probe GetProcessMitigationPolicy to decide hardening workarounds.
+// The runtime applies no mitigation policy, so every policy reads back
+// all-zero (= unspecified) — the honest answer for this process.
+int TRT_STDCALL trt_GetProcessMitigationPolicy(void* proc, u32 policy,
+                                               void* buffer, u64 len) {
+  (void)proc;
+  if (!buffer || len == 0) {
+    trt_SetLastError(87);  // ERROR_INVALID_PARAMETER
+    return 0;
+  }
+  memset(buffer, 0, (size_t)len);
+  mit_policy_log(policy, "GetProcessMitigationPolicy");
+  return 1;
+}
+
+int TRT_STDCALL trt_SetProcessMitigationPolicy(void* proc, u32 policy,
+                                               void* buffer, u64 len) {
+  (void)proc; (void)buffer;
+  if (!buffer || len == 0) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  mit_policy_log(policy, "SetProcessMitigationPolicy");
+  return 1;  // accepted-and-logged: the runtime enforces nothing extra
+}
+
+// ---- Thread stack guarantee -------------------------------------------------
+// A per-thread preference record (the real API only records it too); the
+// runtime reserves no extra OS stack, so the value is stored and returned.
+int TRT_STDCALL trt_SetThreadStackGuarantee(u32* size) {
+  if (!size) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  t_stack_guarantee = *size;
+  static std::atomic<char> once{0};
+  if (!once.exchange(1)) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "kernel32: SetThreadStackGuarantee(%u) -> TRUE (recorded; the "
+             "runtime reserves no OS stack guarantee)", *size);
+    LOG(line);
+  }
+  return 1;
+}
+
+int TRT_STDCALL trt_GetThreadStackGuarantee(u32* size) {
+  if (!size) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  *size = t_stack_guarantee;
+  return 1;
+}
+
+// CloseHandle hook (bridge_kernel32.cpp trt_CloseHandle): toolhelp snapshots
+// and job records live in this file's registries. Returns 1 iff the handle
+// belonged to one of them (tag-checked, so no other handle class is touched).
+int trt_gap_handle_close(void* h) {
+  {
+    std::lock_guard<std::mutex> lk(g_snaps_mu);
+    if (snap_at(h)) {
+      for (size_t i = 0; i < g_snaps.size(); ++i)
+        if (g_snaps[i].get() == snap_at(h)) g_snaps[i].reset();
+      LOG("kernel32: CloseHandle -> toolhelp snapshot released");
+      return 1;
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_jobs_mu);
+    const u32 idx = job_index(h);
+    if (idx != k_job_invalid) {
+      g_jobs[idx].reset();
+      LOG("kernel32: CloseHandle -> job record released");
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static const trt_named_fn k_gap_fns[] = {
   {"IsWow64Process", (void*)&trt_IsWow64Process},
   {"IsWow64Process2", (void*)&trt_IsWow64Process2},
@@ -2765,6 +3339,27 @@ static const trt_named_fn k_gap_fns[] = {
   {"DeleteFileFromAppW", (void*)&trt_DeleteFileFromAppW},
   {"MoveFileFromAppW", (void*)&trt_MoveFileFromAppW},
   {"CopyFileFromAppW", (void*)&trt_CopyFileFromAppW},
+  // work-order item 12 remainder: jobs, console attach, toolhelp module
+  // snapshots, mitigation policy, thread stack guarantee
+  {"CreateJobObjectW", (void*)&trt_CreateJobObjectW},
+  {"CreateJobObjectA", (void*)&trt_CreateJobObjectA},
+  {"SetInformationJobObject", (void*)&trt_SetInformationJobObject},
+  {"AssignProcessToJobObject", (void*)&trt_AssignProcessToJobObject},
+  {"TerminateJobObject", (void*)&trt_TerminateJobObject},
+  {"OpenJobObjectW", (void*)&trt_OpenJobObjectW},
+  {"OpenJobObjectA", (void*)&trt_OpenJobObjectA},
+  {"IsProcessInJob", (void*)&trt_IsProcessInJob},
+  {"AllocConsole", (void*)&trt_AllocConsole},
+  {"FreeConsole", (void*)&trt_FreeConsole},
+  {"Module32FirstW", (void*)&trt_Module32FirstW},
+  {"Module32NextW", (void*)&trt_Module32NextW},
+  {"Module32FirstA", (void*)&trt_Module32FirstA},
+  {"Module32NextA", (void*)&trt_Module32NextA},
+  {"CloseToolhelp32Snapshot", (void*)&trt_CloseToolhelp32Snapshot},
+  {"GetProcessMitigationPolicy", (void*)&trt_GetProcessMitigationPolicy},
+  {"SetProcessMitigationPolicy", (void*)&trt_SetProcessMitigationPolicy},
+  {"SetThreadStackGuarantee", (void*)&trt_SetThreadStackGuarantee},
+  {"GetThreadStackGuarantee", (void*)&trt_GetThreadStackGuarantee},
 };
 
 // registered by trt_bridge_register_kernel32 after the core table

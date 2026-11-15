@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "../trt/trt.h"
 #include "../trt/bridge_res.h"
+#include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
 #include "../trt/input.h"
 #include "../trt/images.h"
@@ -893,6 +894,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_set_vmem_hooks(&uwp_reserve, &uwp_commit, &uwp_decommit);
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
+  trt_bridge_register_nvapi();  // nvapi/nvml/atiadl honest not-supported stubs
   trt_bridge_register_user32();
   // PE resources: FindResource/LoadResource/LockResource/LoadStringW walk
   // the game's own .rsrc directory (kernel32 surface, bridge_res.cpp)

@@ -46,6 +46,10 @@ int TRT_GUEST_ABI ole_CoCreateFreeThreadedMarshaler(void* outer, void** out);
 int TRT_GUEST_ABI ole_PropVariantClear(void* p);
 int TRT_GUEST_ABI ole_RoGetAgileReference(u32 opts, const void* iid,
                                           void* unk, void** out);
+int TRT_GUEST_ABI ole_CoWaitForMultipleHandles(u32 flags, u32 timeout_ms,
+                                               u32 count,
+                                               const void* handles,
+                                               u32* index_out);
 int TRT_GUEST_ABI ole_CoCreateGuid(void* out);
 i32 TRT_GUEST_ABI ole_StringFromGUID2(const void* guid, u16* out, i32 cap);
 
