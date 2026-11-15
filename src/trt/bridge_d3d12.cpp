@@ -590,9 +590,25 @@ const void* g_cmdlist_vtbl[60] = {
 };
 
 // ---- ID3D12CommandQueue ----------------------------------------------------
+// Real ABI: ID3D12CommandQueue has exactly 13 vtable slots (0-12).
+//   0-2  IUnknown (QueryInterface, AddRef, Release)
+//   3-6  ID3D12Object (GetPrivateData, SetPrivateData, SetPrivateDataInterface,
+//        SetName)
+//   7    ID3D12Pageable::GetDevice
+//   8    ExecuteCommandLists
+//   9    Signal
+//   10   Wait
+//   11   GetTimestampFrequency
+//   12   GetClockCalibration
+// The vtbl below must stay in exactly this order; d3d12_vtbl_selfcheck()
+// enforces it at registration time.
 struct d3d12_queue : com_base {
   d3d12_queue_desc_t desc{};
   std::atomic<u64> executed_lists{0};
+  // TRIANGLE GATE support: ExecuteCommandLists records the submitted command
+  // lists here so offline tests can assert the game's submission landed.
+  std::mutex mu;
+  std::vector<void*> recorded_lists;
 };
 
 void queue_destroy(com_base* b) {
@@ -621,7 +637,14 @@ void TRT_GUEST_ABI queue_copy_tile(void*, void*, const void*, const void*, void*
 
 void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
   auto* q = (d3d12_queue*)self;
-  if (count && lists) q->executed_lists += count;
+  if (!count || !lists) return;
+  q->executed_lists += count;
+  {
+    std::lock_guard<std::mutex> lk(q->mu);
+    for (u32 i = 0; i < count; ++i) {
+      if (lists[i]) q->recorded_lists.push_back(lists[i]);
+    }
+  }
 }
 
 void TRT_GUEST_ABI queue_marker_evt(void*, u32, const void*, u32) {}
@@ -656,27 +679,66 @@ d3d12_queue_desc_t* TRT_GUEST_ABI queue_get_desc(void* self, d3d12_queue_desc_t*
   return ret;
 }
 
-const void* g_queue_vtbl[19] = {
-    (const void*)&queue_qi,
-    (const void*)&base_addref,
-    (const void*)&base_release,
-    (const void*)&child_get_priv,
-    (const void*)&child_set_priv,
-    (const void*)&child_set_priv_iface,
-    (const void*)&child_set_name,
-    (const void*)&child_get_device,
-    (const void*)&queue_update_tile,
-    (const void*)&queue_copy_tile,
-    (const void*)&queue_exec_lists,
-    (const void*)&queue_marker_evt,
-    (const void*)&queue_marker_evt,
-    (const void*)&queue_end_evt,
-    (const void*)&queue_signal,
-    (const void*)&queue_wait,
-    (const void*)&queue_ts_freq,
-    (const void*)&queue_clock_cal,
-    (const void*)&queue_get_desc,
+// Exact ID3D12CommandQueue ABI: 13 slots, ExecuteCommandLists at slot 8.
+// NOTE: queue_update_tile / queue_copy_tile / queue_marker_evt / queue_end_evt
+// / queue_get_desc remain defined above but are intentionally NOT registered
+// in the vtbl — ID3D12CommandQueue has no such methods, and padding the table
+// was what pushed Signal/Wait/ExecuteCommandLists onto the wrong slots
+// (BUG-1: every game's render submission silently no-oped).
+const void* g_queue_vtbl[13] = {
+    (const void*)&queue_qi,             // 0  IUnknown::QueryInterface
+    (const void*)&base_addref,          // 1  IUnknown::AddRef
+    (const void*)&base_release,         // 2  IUnknown::Release
+    (const void*)&child_get_priv,       // 3  ID3D12Object::GetPrivateData
+    (const void*)&child_set_priv,       // 4  ID3D12Object::SetPrivateData
+    (const void*)&child_set_priv_iface, // 5  ID3D12Object::SetPrivateDataInterface
+    (const void*)&child_set_name,       // 6  ID3D12Object::SetName
+    (const void*)&child_get_device,     // 7  ID3D12Pageable::GetDevice
+    (const void*)&queue_exec_lists,     // 8  ExecuteCommandLists  <- critical
+    (const void*)&queue_signal,         // 9  Signal
+    (const void*)&queue_wait,           // 10 Wait
+    (const void*)&queue_ts_freq,        // 11 GetTimestampFrequency
+    (const void*)&queue_clock_cal,      // 12 GetClockCalibration
 };
+
+static_assert(sizeof(g_queue_vtbl) / sizeof(g_queue_vtbl[0]) == 13,
+              "ID3D12CommandQueue ABI: exactly 13 vtable slots (0-12)");
+
+// Runtime ABI guard for the TRIANGLE GATE: verifies the queue vtbl layout
+// slot-by-slot (the function identities that games depend on). Returns false
+// (and logs the first bad slot) if any slot is wrong; called from
+// trt_bridge_register_d3d12 so a reorder cannot regress silently.
+int d3d12_vtbl_selfcheck(void) {
+  const void* want[13] = {
+      (const void*)&queue_qi,
+      (const void*)&base_addref,
+      (const void*)&base_release,
+      (const void*)&child_get_priv,
+      (const void*)&child_set_priv,
+      (const void*)&child_set_priv_iface,
+      (const void*)&child_set_name,
+      (const void*)&child_get_device,
+      (const void*)&queue_exec_lists,
+      (const void*)&queue_signal,
+      (const void*)&queue_wait,
+      (const void*)&queue_ts_freq,
+      (const void*)&queue_clock_cal,
+  };
+  for (int i = 0; i < 13; ++i) {
+    if (g_queue_vtbl[i] != want[i]) {
+      char line[96];
+      snprintf(line, sizeof(line), "d3d12: vtbl selfcheck FAILED slot %d", i);
+      trt_core_log(line);
+      return 0;
+    }
+  }
+  // Structural sanity: the critical slot must hold ExecuteCommandLists.
+  if (g_queue_vtbl[8] != (const void*)&queue_exec_lists) {
+    trt_core_log("d3d12: vtbl selfcheck FAILED slot 8 (ExecuteCommandLists)");
+    return 0;
+  }
+  return 1;
+}
 
 // ---- ID3D12Device4 ---------------------------------------------------------
 struct d3d12_device : com_base {
@@ -694,6 +756,11 @@ int TRT_GUEST_ABI dev_qi(void* self, const void* riid, void** ppv) {
       guid_eq(riid, 0x30baa41eu, 0xb15b, 0x475c, 0xa0, 0xbb, 0x1a, 0xf5, 0xc5, 0xb6, 0x43, 0x28) || // ID3D12Device2
       guid_eq(riid, 0x81dadc15u, 0x2bad, 0x4392, 0x93, 0xc5, 0x10, 0x13, 0x45, 0xc4, 0xaa, 0x98) || // ID3D12Device3
       guid_eq(riid, 0xe865df17u, 0xa9ee, 0x46f9, 0xa4, 0x63, 0x30, 0x98, 0x31, 0x5a, 0xa2, 0xe5) || // ID3D12Device4
+      guid_eq(riid, 0x8b4f173bu, 0x2fea, 0x4b80, 0x8f, 0x58, 0x43, 0x07, 0x19, 0x1a, 0xb9, 0x5d) || // ID3D12Device5
+      guid_eq(riid, 0xc70b221bu, 0x40e4, 0x4a17, 0x89, 0xaf, 0x02, 0x5a, 0x07, 0x27, 0xa6, 0xdc) || // ID3D12Device6
+      guid_eq(riid, 0x5c014b53u, 0x68a1, 0x4b9b, 0x8b, 0xd1, 0xdd, 0x60, 0x46, 0xb9, 0x35, 0x8b) || // ID3D12Device7
+      guid_eq(riid, 0x9218e6bbu, 0xf944, 0x4f7e, 0xa7, 0x5c, 0xb1, 0xb2, 0xc7, 0xb7, 0x01, 0xf3) || // ID3D12Device8
+      guid_eq(riid, 0x4c80e962u, 0xf032, 0x4f60, 0xbc, 0x9e, 0xeb, 0xc2, 0xcf, 0xa1, 0xd8, 0x3c) || // ID3D12Device9
       guid_eq(riid, 0xc7e2816fu, 0xb6fa, 0x4f91, 0xa5, 0x72, 0x9e, 0x5c, 0x78, 0x64, 0x75, 0x38)) { // ID3D12Object
     *ppv = self;
     base_addref(self);
@@ -1264,6 +1331,12 @@ const trt_named_fn k_d3d12_fns[] = {
 };
 
 int trt_bridge_register_d3d12(void) {
+  // TRIANGLE GATE ABI guard: fail loudly (and visibly) if the CommandQueue
+  // vtbl ever drifts from the real ID3D12CommandQueue layout again.
+  if (!d3d12_vtbl_selfcheck()) {
+    trt_core_log("d3d12: CommandQueue vtbl ABI check FAILED - refusing registration");
+    return -1;
+  }
   const int n = (int)(sizeof(k_d3d12_fns) / sizeof(k_d3d12_fns[0]));
   trt_module_register("d3d12.dll", TRT_ROUTE_BUILTIN, k_d3d12_fns, n);
   trt_module_register("d3d12core.dll", TRT_ROUTE_BUILTIN, k_d3d12_fns, n);

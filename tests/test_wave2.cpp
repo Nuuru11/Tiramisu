@@ -316,7 +316,7 @@ void test_wave2a_d3d12() {
   using exec_fn = void (TRT_GUEST_ABI *)(void*, u32, void* const*);
   slot<cl_draw_fn>(cl, 12)(cl, 3, 1, 0, 0);
   CHECK(slot<cl_close_fn>(cl, 9)(cl) == 0, "ID3D12GraphicsCommandList::Close succeeds");
-  slot<exec_fn>(queue, 10)(queue, 1, &cl);
+  slot<exec_fn>(queue, 8)(queue, 1, &cl);  // BUG-1 fix: ECL is slot 8
 
   void* fence = nullptr;
   using create_fence_fn = int (TRT_GUEST_ABI *)(void*, u64, u32, const void*, void**);
@@ -328,7 +328,7 @@ void test_wave2a_d3d12() {
   u64 ev = trt_CreateEventW(nullptr, 0, 0, nullptr);
   CHECK(ev != 0, "CreateEventW for fence completion succeeds");
   slot<set_ev_fn>(fence, 9)(fence, 42, (void*)(uintptr_t)ev);
-  CHECK(slot<q_sig_fn>(queue, 14)(queue, fence, 42) == 0 &&
+  CHECK(slot<q_sig_fn>(queue, 9)(queue, fence, 42) == 0 &&  // BUG-1: Signal = slot 9
             trt_WaitForSingleObject(ev, 500) == 0u &&
             slot<f_val_fn>(fence, 8)(fence) == 42ULL,
         "CommandQueue::Signal triggers Fence SetEventOnCompletion + updates CompletedValue");

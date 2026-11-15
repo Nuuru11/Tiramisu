@@ -1557,6 +1557,175 @@ int main() {
     }
   }
 
+  // ---- Sprint 1 gap batch: interlocked + Rtl memory + system info ----------
+  // 1B/1C are NEW registrations (implemented fresh in bridge_kernel32.cpp);
+  // 1D (GetSystemInfo, GetNativeSystemInfo, GetEnvironmentVariableW,
+  // VirtualAllocEx, VirtualFreeEx) verifies the existing bridge_mem /
+  // bridge_sys kernel32 table entries resolve. Every typedef carries
+  // TRT_STDCALL: the bridges are ms_abi — resolving a pointer and calling it
+  // through a SysV typedef passes garbage arguments.
+  {
+    auto kfn = [&](const char* mod, const char* sym) -> void* {
+      return trt_resolve_module(nullptr, mod, sym, 0);
+    };
+    // (a) every name resolves through the module tables
+    CHECK(kfn("kernel32.dll", "InterlockedIncrement") != nullptr &&
+              kfn("kernel32.dll", "InterlockedDecrement") != nullptr &&
+              kfn("kernel32.dll", "InterlockedExchangeAdd") != nullptr &&
+              kfn("kernel32.dll", "InterlockedExchange") != nullptr &&
+              kfn("kernel32.dll", "InterlockedCompareExchange") != nullptr &&
+              kfn("kernel32.dll", "InterlockedIncrement64") != nullptr &&
+              kfn("kernel32.dll", "InterlockedDecrement64") != nullptr &&
+              kfn("kernel32.dll", "InterlockedExchangeAdd64") != nullptr &&
+              kfn("kernel32.dll", "InterlockedCompareExchange64") != nullptr,
+          "Sprint 1B: interlocked exports present in the kernel32 table");
+    CHECK(kfn("kernel32.dll", "RtlCopyMemory") != nullptr &&
+              kfn("kernel32.dll", "RtlMoveMemory") != nullptr &&
+              kfn("kernel32.dll", "RtlZeroMemory") != nullptr &&
+              kfn("kernel32.dll", "RtlFillMemory") != nullptr,
+          "Sprint 1C: Rtl memory primitives present in the kernel32 table");
+    CHECK(kfn("ntdll.dll", "RtlCopyMemory") != nullptr &&
+              kfn("ntdll.dll", "RtlMoveMemory") != nullptr &&
+              kfn("ntdll.dll", "RtlZeroMemory") != nullptr &&
+              kfn("ntdll.dll", "RtlFillMemory") != nullptr,
+          "Sprint 1C: Rtl memory primitives merged into the ntdll table");
+    CHECK(kfn("kernel32.dll", "GetSystemInfo") != nullptr &&
+              kfn("kernel32.dll", "GetNativeSystemInfo") != nullptr &&
+              kfn("kernel32.dll", "GetEnvironmentVariableW") != nullptr &&
+              kfn("kernel32.dll", "VirtualAllocEx") != nullptr &&
+              kfn("kernel32.dll", "VirtualFreeEx") != nullptr,
+          "Sprint 1D: system-info exports present in the kernel32 table");
+
+    // (b) interlocked semantics: Increment/Decrement return the NEW value,
+    // ExchangeAdd/CompareExchange return the OLD value
+    using Inc_t   = i32(TRT_STDCALL*)(volatile i32*);
+    using ExAdd_t = i32(TRT_STDCALL*)(volatile i32*, i32);
+    using CmpEx_t = i32(TRT_STDCALL*)(volatile i32*, i32, i32);
+    auto pInc   = (Inc_t)kfn("kernel32.dll", "InterlockedIncrement");
+    auto pDec   = (Inc_t)kfn("kernel32.dll", "InterlockedDecrement");
+    auto pExAdd = (ExAdd_t)kfn("kernel32.dll", "InterlockedExchangeAdd");
+    auto pCmpEx = (CmpEx_t)kfn("kernel32.dll", "InterlockedCompareExchange");
+    if (pInc && pExAdd && pDec && pCmpEx) {
+      volatile i32 v = 41;
+      CHECK(pInc(&v) == 42, "InterlockedIncrement returns the NEW value");
+      CHECK(pExAdd(&v, 10) == 42 && v == 52,
+            "InterlockedExchangeAdd returns the OLD value");
+      CHECK(pDec(&v) == 51, "InterlockedDecrement returns the NEW value");
+      CHECK(pCmpEx(&v, 99, 51) == 51 && v == 99,
+            "InterlockedCompareExchange returns the OLD value and swaps on match");
+    }
+    using Inc64_t   = i64(TRT_STDCALL*)(volatile i64*);
+    using ExAdd64_t = i64(TRT_STDCALL*)(volatile i64*, i64);
+    auto pInc64   = (Inc64_t)kfn("kernel32.dll", "InterlockedIncrement64");
+    auto pExAdd64 = (ExAdd64_t)kfn("kernel32.dll", "InterlockedExchangeAdd64");
+    if (pInc64 && pExAdd64) {
+      volatile i64 v64 = -2;
+      CHECK(pInc64(&v64) == -1, "InterlockedIncrement64 returns the NEW 64-bit value");
+      CHECK(pExAdd64(&v64, 7) == -1 && v64 == 6,
+            "InterlockedExchangeAdd64 returns the OLD 64-bit value");
+    }
+
+    // (c) Rtl memory primitives copy/zero/fill bytes
+    using RtlCopy_t = void(TRT_STDCALL*)(void*, const void*, u64);
+    using RtlZero_t = void(TRT_STDCALL*)(void*, u64);
+    using RtlFill_t = void(TRT_STDCALL*)(void*, u64, u8);
+    auto pCopy = (RtlCopy_t)kfn("kernel32.dll", "RtlCopyMemory");
+    auto pMove = (RtlCopy_t)kfn("kernel32.dll", "RtlMoveMemory");
+    auto pZero = (RtlZero_t)kfn("kernel32.dll", "RtlZeroMemory");
+    auto pFill = (RtlFill_t)kfn("kernel32.dll", "RtlFillMemory");
+    if (pCopy && pZero && pFill) {
+      u8 ra[16], rb[16];
+      for (int i = 0; i < 16; ++i) ra[i] = (u8)(0x40 + i);
+      memset(rb, 0xEE, sizeof(rb));
+      pCopy(rb, ra, sizeof(ra));
+      bool copied = true;
+      for (int i = 0; i < 16; ++i) copied = copied && rb[i] == (u8)(0x40 + i);
+      CHECK(copied, "RtlCopyMemory copies bytes");
+      pZero(rb, sizeof(rb));
+      bool zeroed = true;
+      for (int i = 0; i < 16; ++i) zeroed = zeroed && rb[i] == 0;
+      CHECK(zeroed, "RtlZeroMemory zeroes the buffer");
+      pFill(rb, sizeof(rb), 0xA5);
+      bool filled = true;
+      for (int i = 0; i < 16; ++i) filled = filled && rb[i] == 0xA5;
+      CHECK(filled, "RtlFillMemory fills the fill byte");
+    }
+    if (pMove) {
+      u8 ra[8], rb[16];
+      for (int i = 0; i < 8; ++i) ra[i] = (u8)(0x60 + i);
+      memset(rb, 0xC3, sizeof(rb));
+      pMove(rb, ra, sizeof(ra));
+      CHECK(rb[0] == 0x60 && rb[7] == 0x67 && rb[8] == 0xC3,
+            "RtlMoveMemory copies exactly the requested bytes");
+    }
+
+    // (d) GetSystemInfo fills a plausible SYSTEM_INFO (Win64 layout)
+    using GetSysInfo_t = void(TRT_STDCALL*)(void*);
+    auto pGsi  = (GetSysInfo_t)kfn("kernel32.dll", "GetSystemInfo");
+    auto pGnsi = (GetSysInfo_t)kfn("kernel32.dll", "GetNativeSystemInfo");
+    if (pGsi) {
+      u8 si[48] = {};
+      pGsi(si);
+      const u16 arch  = *(u16*)(si + 0);
+      const u32 page  = *(u32*)(si + 4);
+      const u32 nproc = *(u32*)(si + 0x20);
+      const u32 gran  = *(u32*)(si + 0x28);
+      CHECK(arch == 9 /*PROCESSOR_ARCHITECTURE_AMD64*/ && page == 4096 &&
+                nproc >= 1 && gran == 65536,
+            "GetSystemInfo fills a plausible SYSTEM_INFO (page 4096, procs >= 1)");
+      if (pGnsi) {
+        pGnsi(si);
+        CHECK(*(u32*)(si + 4) == 4096,
+              "GetNativeSystemInfo matches (no WOW64 downgrade)");
+      }
+    }
+
+    // (e) GetEnvironmentVariableW round-trips a variable set through the
+    // kernel32 SetEnvironmentVariableW store (the PyInstaller onefile path)
+    using GetEnvW_t = u32(TRT_STDCALL*)(const u16*, u16*, u32);
+    using SetEnvW_t = int(TRT_STDCALL*)(const u16*, const u16*);
+    auto pGetEnv = (GetEnvW_t)kfn("kernel32.dll", "GetEnvironmentVariableW");
+    auto pSetEnv = (SetEnvW_t)kfn("kernel32.dll", "SetEnvironmentVariableW");
+    if (pGetEnv && pSetEnv) {
+      u16 wname[32], wval[32], wbuf[64];
+      make_u16("TRT_SPRINT1_ENV", wname, 32);
+      make_u16("gap_batch_ok", wval, 32);
+      CHECK(pSetEnv(wname, wval) == 1,
+            "SetEnvironmentVariableW accepts the value");
+      const u32 need = pGetEnv(wname, nullptr, 0);
+      CHECK(need == 13 /*strlen("gap_batch_ok")+1*/,
+            "GetEnvironmentVariableW returns a set variable's length");
+      const u32 got = pGetEnv(wname, wbuf, 64);
+      bool val_ok = (got == need);
+      for (u32 i = 0; val_ok && i + 1 < got; ++i) val_ok = (wbuf[i] == wval[i]);
+      CHECK(val_ok, "GetEnvironmentVariableW reads the value back");
+      pSetEnv(wname, nullptr);  // clean the store
+    }
+
+    // (f) VirtualAllocEx/VirtualFreeEx accept the pseudo current-process
+    // handle and behave like VirtualAlloc/VirtualFree
+    using VAllocEx_t = void*(TRT_STDCALL*)(void*, void*, u64, u32, u32);
+    using VFreeEx_t  = int(TRT_STDCALL*)(void*, void*, u64, u32);
+    auto pVax = (VAllocEx_t)kfn("kernel32.dll", "VirtualAllocEx");
+    auto pVfx = (VFreeEx_t)kfn("kernel32.dll", "VirtualFreeEx");
+    if (pVax && pVfx) {
+      void* vmem = pVax((void*)(uintptr_t)-1 /*pseudo current process*/,
+                        nullptr, 65536, 0x3000u /*RESERVE|COMMIT*/,
+                        0x04u /*PAGE_READWRITE*/);
+      CHECK(vmem != nullptr,
+            "VirtualAllocEx(pseudo process) commits like VirtualAlloc");
+      if (vmem) {
+        CHECK(pVfx((void*)(uintptr_t)-1, vmem, 0, 0x8000u /*MEM_RELEASE*/) == 1,
+              "VirtualFreeEx(pseudo process) releases the region");
+      }
+      trt_SetLastError(0);
+      void* bad = pVax((void*)(uintptr_t)0xBEEF0000, nullptr, 65536,
+                       0x3000u, 0x04u);
+      CHECK(bad == nullptr && trt_GetLastError() == 5u /*ACCESS_DENIED*/,
+            "VirtualAllocEx rejects a foreign process handle");
+    }
+  }
+
   printf("\nRESULT: %s\n", g_failures ? "FAIL" : "ALL PASS");
   return g_failures ? 1 : 0;
 }

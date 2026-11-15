@@ -89,12 +89,41 @@ so the CLI path never runs; the live session ran it via import (see
   IL2CPP internals doc). So C++ EH is load-bearing for gameplay, not an edge
   case: every `try/catch` in C# game code goes through our unwinder.
 
-**In flight RIGHT NOW by the live session (do not duplicate):**
-Wave 1 streaming/windowed `MapViewOfFile` + view reclamation
-(`tests/test_wave1.cpp`), audio/wasapi polish, `api-ms-win-appmodel-runtime` →
-kernel32 rule (landed ~14:00, closing OrTMM's last named blocker), a
-dstorage/blanket-0 regression root-cause. Re-check `git diff --stat` before
-starting anything.
+**In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
+- **Agent C**: GDI boot-path audit + CreateCompatibleBitmap/GetStockObject fill
+  (`bridge_gdi.cpp`) — STILL RUNNING.
+- Orchestrator: working tree commits after all three report; then TRIANGLE GATE
+  (Sprint-2 item 21) is next. Master prompt renamed to
+  `TIRAMISU-MASTER-PROMPT.md` (commit 9e259c6). Re-check `git diff --stat`
+  before starting anything.
+
+**LANDED (same orchestrated wave, 2026-11-15, all verified offline):**
+- **BUG-1 FIXED** (`bridge_d3d12.cpp`): CommandQueue vtbl rebuilt 19 -> 13
+  entries in exact ABI order — ExecuteCommandLists at slot 8 (was a no-op
+  UpdateTile at slot 8, exec at 10), Signal 9, Wait 10, ts-freq 11,
+  clock-cal 12. ECL now records submitted lists (TRIANGLE GATE-ready).
+  static_assert(13) + runtime `d3d12_vtbl_selfcheck()` fail-named.
+- **BUG-6 FIXED**: Device QI chain extended to ID3D12Device5-9 (SDK-verbatim
+  GUIDs; the master prompt's example Device5 GUID was wrong, headers win).
+- **Sprint-1 1B/1C LANDED** (`bridge_kernel32.cpp`): 9 Interlocked* exports
+  (fixed-width i32/i64, correct new/old-value semantics) + RtlCopy/Move/
+  Zero/FillMemory, registered on kernel32+kernelbase, Rtl* merged into ntdll.
+- **Sprint-1 1D VERIFIED already-registered** (GetSystemInfo/NativeSystemInfo/
+  GetEnvironmentVariableW/VirtualAllocEx/VirtualFreeEx were in the merged
+  table; the master prompt's gap list was stale here).
+- **Sprint-1 1J LANDED** (`bridge_res.cpp` NEW): PE resource directory walk —
+  FindResourceW/A/ExW, SizeofResource, LoadResource, LockResource (returns
+  real mapped-image pointer), Unlock/FreeResource, EnumResourceNamesW,
+  LoadStringW (real string-table format). Section-relative offset rebasing
+  measured the hard way (first walk SIGSEGV'd treating child offsets as
+  image-relative). Registered on kernel32; wired into host `main.cpp` boot +
+  `build-host.sh` + `build-test.sh` suite 35.
+- **Test evidence**: `test_d3d12` 24/24 ALL PASS (new), `test_wave1` 112/112
+  (28 new), `test_res` 20/20 (new; real guest PE with hand-built .rsrc via
+  `tools/build_guest_res.sh` + `tools/gen_guest_res.py`), `test_wave2` ALL
+  PASS after slot-constant update (10->8, 14->9), test_engine/test_stage5/
+  test_libload ALL PASS, **RACCOIN re-booted `1 booted, 0 failed`** with the
+  whole wave linked (log `/tmp/opencode/raccoin-reswave.log`).
 
 ---
 

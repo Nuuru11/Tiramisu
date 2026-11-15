@@ -12,6 +12,7 @@
 #include "webxfer.h"
 #include "settings.h"
 #include "../trt/trt.h"
+#include "../trt/bridge_res.h"
 #include "../trt/iso.h"
 #include "../trt/input.h"
 #include "../trt/images.h"
@@ -893,6 +894,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
+  // PE resources: FindResource/LoadResource/LockResource/LoadStringW walk
+  // the game's own .rsrc directory (kernel32 surface, bridge_res.cpp)
+  trt_bridge_register_res();
   // BUILTIN graphics/media/GDI/D3D11/DXGI bridges remain registered from
   // trt_bridge_boot; only bind ws2_32 and bcrypt to real SYSTEM UWP DLLs.
   trt_module_register("ws2_32.dll", TRT_ROUTE_SYSTEM, nullptr, 0);

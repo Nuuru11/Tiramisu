@@ -6177,6 +6177,65 @@ u32 TRT_STDCALL trt_GetCurrentPackagePath(u32* len, u16* path) {
   return 15700u;
 }
 
+// ---- Sprint 1 gap batch: interlocked primitives (master prompt 1B) -------
+// Win32 signed semantics: InterlockedIncrement/Decrement return the NEW
+// value; InterlockedExchangeAdd/Exchange/CompareExchange return the OLD.
+// Windows 'volatile long*' is a 32-bit target and 'volatile __int64*' is
+// 64-bit — fixed-width i32/i64 keeps both the ms_abi guest and the host
+// honest, and __atomic builtins give the required full-barrier semantics.
+i32 TRT_STDCALL trt_InterlockedIncrement(volatile i32* v) {
+  return __atomic_add_fetch(v, 1, __ATOMIC_SEQ_CST);
+}
+i32 TRT_STDCALL trt_InterlockedDecrement(volatile i32* v) {
+  return __atomic_sub_fetch(v, 1, __ATOMIC_SEQ_CST);
+}
+i32 TRT_STDCALL trt_InterlockedExchangeAdd(volatile i32* v, i32 add) {
+  return __atomic_fetch_add(v, add, __ATOMIC_SEQ_CST);
+}
+i32 TRT_STDCALL trt_InterlockedExchange(volatile i32* v, i32 value) {
+  return __atomic_exchange_n(v, value, __ATOMIC_SEQ_CST);
+}
+i32 TRT_STDCALL trt_InterlockedCompareExchange(volatile i32* dest, i32 exch,
+                                               i32 comparand) {
+  i32 expected = comparand;
+  __atomic_compare_exchange_n(dest, &expected, exch, false,
+                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return expected;  // the OLD value, Windows convention
+}
+i64 TRT_STDCALL trt_InterlockedIncrement64(volatile i64* v) {
+  return __atomic_add_fetch(v, 1, __ATOMIC_SEQ_CST);
+}
+i64 TRT_STDCALL trt_InterlockedDecrement64(volatile i64* v) {
+  return __atomic_sub_fetch(v, 1, __ATOMIC_SEQ_CST);
+}
+i64 TRT_STDCALL trt_InterlockedExchangeAdd64(volatile i64* v, i64 add) {
+  return __atomic_fetch_add(v, add, __ATOMIC_SEQ_CST);
+}
+i64 TRT_STDCALL trt_InterlockedCompareExchange64(volatile i64* dest, i64 exch,
+                                                 i64 comparand) {
+  i64 expected = comparand;
+  __atomic_compare_exchange_n(dest, &expected, exch, false,
+                              __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+  return expected;
+}
+
+// ---- Sprint 1 gap batch: Rtl memory primitives (master prompt 1C) --------
+// winnt.h defines CopyMemory/ZeroMemory/FillMemory as macros that expand to
+// these Rtl names; ntdll + kernel32 carry the Rtl names as real exports, so
+// GetProcAddress(kernel32, "RtlCopyMemory") must bind too. All VOID.
+void TRT_STDCALL trt_RtlCopyMemory(void* dst, const void* src, u64 n) {
+  memcpy(dst, src, (size_t)n);
+}
+void TRT_STDCALL trt_RtlMoveMemory(void* dst, const void* src, u64 n) {
+  memmove(dst, src, (size_t)n);
+}
+void TRT_STDCALL trt_RtlZeroMemory(void* dst, u64 n) {
+  memset(dst, 0, (size_t)n);
+}
+void TRT_STDCALL trt_RtlFillMemory(void* dst, u64 n, u8 fill) {
+  memset(dst, (int)fill, (size_t)n);
+}
+
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
   {"HeapCreate", (void*)&trt_HeapCreate},
@@ -6265,6 +6324,21 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"InterlockedPushEntrySList", (void*)&trt_InterlockedPushEntrySList},
   {"InterlockedPopEntrySList", (void*)&trt_InterlockedPopEntrySList},
   {"InterlockedFlushSList", (void*)&trt_InterlockedFlushSList},
+  // Sprint 1 gap batch (master prompt 1B + 1C): interlocked primitives and
+  // the Rtl memory macros-as-functions games reach through GetProcAddress
+  {"InterlockedIncrement", (void*)&trt_InterlockedIncrement},
+  {"InterlockedDecrement", (void*)&trt_InterlockedDecrement},
+  {"InterlockedExchangeAdd", (void*)&trt_InterlockedExchangeAdd},
+  {"InterlockedExchange", (void*)&trt_InterlockedExchange},
+  {"InterlockedCompareExchange", (void*)&trt_InterlockedCompareExchange},
+  {"InterlockedIncrement64", (void*)&trt_InterlockedIncrement64},
+  {"InterlockedDecrement64", (void*)&trt_InterlockedDecrement64},
+  {"InterlockedExchangeAdd64", (void*)&trt_InterlockedExchangeAdd64},
+  {"InterlockedCompareExchange64", (void*)&trt_InterlockedCompareExchange64},
+  {"RtlCopyMemory", (void*)&trt_RtlCopyMemory},
+  {"RtlMoveMemory", (void*)&trt_RtlMoveMemory},
+  {"RtlZeroMemory", (void*)&trt_RtlZeroMemory},
+  {"RtlFillMemory", (void*)&trt_RtlFillMemory},
   {"QueryDepthSList", (void*)&trt_QueryDepthSList},
   {"InitializeCriticalSectionAndSpinCount",
    (void*)&trt_InitializeCriticalSectionAndSpinCount},
@@ -6361,6 +6435,20 @@ int trt_bridge_register_kernel32(void) {
   // builtin surface (Wine does the same via spec forwarders)
   trt_module_register("kernelbase.dll", TRT_ROUTE_BUILTIN, k_kernel32_fns,
                        (int)(sizeof(k_kernel32_fns) / sizeof(k_kernel32_fns[0])));
+  // Sprint 1 gap batch (1C): ntdll also exports the four Rtl memory
+  // primitives. Merge them into the ntdll table once the ntdll bridge has
+  // upgraded it to BUILTIN (boot order guarantees it already has; the route
+  // guard keeps a hypothetical late-order host from replacing the module).
+  if (trt_module_route("ntdll.dll") == TRT_ROUTE_BUILTIN) {
+    static const trt_named_fn k_nt_rtl[] = {
+        {"RtlCopyMemory", (void*)&trt_RtlCopyMemory},
+        {"RtlMoveMemory", (void*)&trt_RtlMoveMemory},
+        {"RtlZeroMemory", (void*)&trt_RtlZeroMemory},
+        {"RtlFillMemory", (void*)&trt_RtlFillMemory},
+    };
+    trt_module_register("ntdll.dll", TRT_ROUTE_BUILTIN, k_nt_rtl,
+                        (int)(sizeof(k_nt_rtl) / sizeof(k_nt_rtl[0])));
+  }
   // the OrTMM-audit gap batch (file/locale/time/process surface)
   {
     extern void trt_gap_register(void);

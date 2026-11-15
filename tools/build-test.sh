@@ -654,3 +654,11 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_settings.cpp src/host/settings.cpp \
   -o "$out/test_settings"
 "$out/test_settings"
+
+# --- 35. PE resource directory: .rsrc walk + FindResource/LoadResource/
+#         LockResource/SizeofResource/LoadStringW/EnumResourceNamesW ---
+bash tools/build_guest_res.sh
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_res.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_res"
+"$out/test_res" "$out/guest_res.exe"
