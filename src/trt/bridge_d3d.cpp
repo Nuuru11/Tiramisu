@@ -1055,9 +1055,15 @@ int TRT_GUEST_ABI fake_CreateSwapChainForHwnd(void* self, void* device, void* hw
   return create_swapchain_impl(device, w, h, fmt, cnt, swapchain);
 }
 int TRT_GUEST_ABI fake_CreateSwapChainForCoreWindow(void* self, void* device, void* core_window,
-                                       void* desc, void* restrict_info,
+                                       void* desc, void* fullscreen_desc,
+                                       void* restrict_info,
                                        void** swapchain) {
-  (void)self; (void)core_window; (void)restrict_info;
+  // REAL Win64 ABI (IDXGIFactory2::CreateSwapChainForCoreWindow): self,
+  // pDevice, pWindow, pDesc, pFullscreenDesc, pRestrictToOutput, ppSwapChain
+  // — 7 params. The fullscreen_desc slot was MISSING (the handler used to
+  // read pRestrictToOutput as the out-pointer); caught by the TRIANGLE GATE
+  // guest on its first run.
+  (void)self; (void)core_window; (void)fullscreen_desc; (void)restrict_info;
   const u32* d = (const u32*)desc;
   return create_swapchain_impl(device, d ? d[0] : 0, d ? d[1] : 0,
                                d ? d[2] : 87, d ? d[7] : 2, swapchain);

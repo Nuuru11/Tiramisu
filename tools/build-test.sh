@@ -662,3 +662,21 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_res.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_res"
 "$out/test_res" "$out/guest_res.exe"
+
+# --- 36. D3D12 TRIANGLE GATE: full render path through a real guest PE ---
+# (device -> queue -> alloc -> list -> rootsig -> pso -> resource -> draw ->
+#  close -> ExecuteCommandLists -> fence -> swapchain -> Present; the fixture
+#  that caught the CreateSwapChainForCoreWindow ABI bug on its first run)
+rm -f "$out/d3d12.lib" "$out/dxgi.lib"
+"$LLD_LINK" /lib /def:src/guest/d3d12.def /out:"$out/d3d12.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/dxgi.def /out:"$out/dxgi.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_triangle.c -o "$out/guest_triangle.obj"
+"$LLD_LINK" "$out/guest_triangle.obj" "$out/kernel32.lib" "$out/d3d12.lib" \
+  "$out/dxgi.lib" \
+  /NODEFAULTLIB /ENTRY:triangle_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_triangle.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d12_triangle.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_d3d12_triangle"
+"$out/test_d3d12_triangle" "$out/guest_triangle.exe"

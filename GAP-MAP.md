@@ -90,7 +90,8 @@ so the CLI path never runs; the live session ran it via import (see
   case: every `try/catch` in C# game code goes through our unwinder.
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
-- (none — the three-agent wave is complete and committed; next: TRIANGLE GATE)
+- (none — the three-agent wave + TRIANGLE GATE are complete and committed;
+  next: console M0 when DP credentials arrive)
 - Orchestrator: Master prompt renamed to `TIRAMISU-MASTER-PROMPT.md`
   (commit 9e259c6). Re-check `git diff --stat` before starting anything.
 
@@ -132,6 +133,30 @@ so the CLI path never runs; the live session ran it via import (see
   `test_gdi` ALL PASS both argless (module-table resolution) and with the
   legacy guest-PE flow; RACCOIN re-booted `1 booted, 0 failed` again with
   GDI wave linked (log `/tmp/opencode/raccoin-gdiwave.log`).
+- **Sprint-2 item 21 LANDED — THE D3D12 TRIANGLE GATE**
+  (`tests/test_d3d12_triangle.cpp` + `src/guest/guest_triangle.c` +
+  `src/guest/d3d12.def`/`dxgi.def`): a synthetic freestanding game walks the
+  FULL D3D12 render path through the real loader — device -> queue ->
+  allocator -> list -> rootsig -> PSO -> committed vertex buffer ->
+  SetRootSignature/SetPipelineState/IASetVertexBuffers (GPU VA read back
+  from the resource itself) -> DrawInstanced(3,1,0,0) -> Close ->
+  ExecuteCommandLists (slot 8) -> fence SetEventOnCompletion/Signal ->
+  CreateSwapChainForCoreWindow (queue-as-device, the D3D12 DXGI rule) ->
+  Present. 12 ladder markers printed; host cross-checks the guest's queue
+  pointer via `trt_d3d12_queue_recorded_count` (new accessor) — the
+  submission RECORDED host-side on the object the guest created.
+  **The gate caught a real ABI bug on its first run**:
+  `fake_CreateSwapChainForCoreWindow` was missing the `pFullscreenDesc`
+  param (6 vs the real 7-param ABI) — the out-pointer read one stack slot
+  off, saved from a null write only by its own null check ->
+  E_NOINTERFACE for every UWP D3D12 game. Fixed in `bridge_d3d.cpp`
+  (CreateSwapChainForHwnd was already correct). Plus fail-visible log
+  lines for DrawInstanced/ECL, ABI static-asserts pinning the resource(15)
+  /fence(11)/cmdlist(60) vtbls, `CreateEventW`/`WaitForSingleObject` added
+  to the kernel32 def stub. Suite 36 in build-test.sh.
+  Evidence: 12/12 markers + ALL PASS (log `/tmp/opencode/tri.log`);
+  regressions test_game_boot/test_d3d12/test_wave2/test_d3d ALL PASS;
+  RACCOIN `1 booted, 0 failed` (log `/tmp/opencode/raccoin-tri.log`).
 
 ---
 

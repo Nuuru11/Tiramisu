@@ -307,6 +307,8 @@ const void* g_fence_vtbl[11] = {
     (const void*)&fence_set_event,
     (const void*)&fence_signal,
 };
+static_assert(sizeof(g_fence_vtbl) / sizeof(g_fence_vtbl[0]) == 11,
+              "ID3D12Fence vtbl must stay 11 slots (Win64 ABI)");
 
 // ---- ID3D12DescriptorHeap --------------------------------------------------
 struct d3d12_desc_heap : com_base {
@@ -430,6 +432,9 @@ const void* g_resource_vtbl[15] = {
     (const void*)&res_read_sub,
     (const void*)&res_get_heap_props,
 };
+// ABI pins: a reorder here silently breaks every D3D12 game's resource calls.
+static_assert(sizeof(g_resource_vtbl) / sizeof(g_resource_vtbl[0]) == 15,
+              "ID3D12Resource vtbl must stay 15 slots (Win64 ABI)");
 
 // ---- ID3D12RootSignature / PipelineState / QueryHeap / CommandSignature ----
 struct d3d12_simple_child : com_base {
@@ -518,7 +523,18 @@ int TRT_GUEST_ABI cmd_reset(void* self, void* alloc, void*) {
   return k_s_ok;
 }
 void TRT_GUEST_ABI cmd_clear_state(void*, void*) {}
-void TRT_GUEST_ABI cmd_draw_inst(void* self, u32, u32, u32, u32) { ++((d3d12_cmd_list*)self)->draws; }
+void TRT_GUEST_ABI cmd_draw_inst(void* self, u32 verts, u32 insts, u32 sv,
+                                 u32 siv) {
+  auto* cl = (d3d12_cmd_list*)self;
+  ++cl->draws;
+  // fail-visible: the draw is RECORDED into the list (offline never renders);
+  // the TRIANGLE GATE asserts this line exists in the host log.
+  char line[96];
+  snprintf(line, sizeof(line),
+           "d3d12: cl DrawInstanced(%u,%u,%u,%u) recorded (draws=%u)",
+           verts, insts, sv, siv, cl->draws);
+  trt_core_log(line);
+}
 void TRT_GUEST_ABI cmd_draw_idx(void* self, u32, u32, u32, i32, u32) { ++((d3d12_cmd_list*)self)->draws; }
 void TRT_GUEST_ABI cmd_dispatch(void* self, u32, u32, u32) { ++((d3d12_cmd_list*)self)->dispatches; }
 void TRT_GUEST_ABI cmd_barrier(void* self, u32 n, const void*) { ((d3d12_cmd_list*)self)->barriers += n; }
@@ -588,6 +604,8 @@ const void* g_cmdlist_vtbl[60] = {
     (const void*)&cmd_noop,            // 58 EndEvent
     (const void*)&cmd_draw_inst,       // 59 ExecuteIndirect
 };
+static_assert(sizeof(g_cmdlist_vtbl) / sizeof(g_cmdlist_vtbl[0]) == 60,
+              "ID3D12GraphicsCommandList vtbl must stay 60 slots (Win64 ABI)");
 
 // ---- ID3D12CommandQueue ----------------------------------------------------
 // Real ABI: ID3D12CommandQueue has exactly 13 vtable slots (0-12).
@@ -645,6 +663,12 @@ void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
       if (lists[i]) q->recorded_lists.push_back(lists[i]);
     }
   }
+  // fail-visible: submission landed; the TRIANGLE GATE asserts this line.
+  char line[80];
+  snprintf(line, sizeof(line),
+           "d3d12: queue ExecuteCommandLists(%u) recorded (total=%llu)", count,
+           (unsigned long long)q->executed_lists.load());
+  trt_core_log(line);
 }
 
 void TRT_GUEST_ABI queue_marker_evt(void*, u32, const void*, u32) {}
@@ -1163,6 +1187,19 @@ void trt_d3d12_set_hooks(const trt_d3d12_hooks* hooks) {
 }
 
 const trt_d3d12_hooks* trt_d3d12_hooks_get(void) { return &g_hooks; }
+
+// TRIANGLE GATE accessor: how many command lists this queue has recorded via
+// ExecuteCommandLists (slot 8). -1 if the pointer is not a bridge queue.
+// The host test reads the queue pointer the GUEST created out of the guest's
+// results file and asserts the submission actually landed host-side.
+int trt_d3d12_queue_recorded_count(void* obj) {
+  if (!obj) return -1;
+  std::lock_guard<std::mutex> lk(g_track_mu);
+  if (g_queues.count(obj) == 0) return -1;
+  auto* q = (d3d12_queue*)obj;
+  std::lock_guard<std::mutex> lk2(q->mu);
+  return (int)q->recorded_lists.size();
+}
 
 int trt_d3d12_is_queue(void* obj) {
   if (!obj) return 0;

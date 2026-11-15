@@ -60,6 +60,11 @@ int TRT_GUEST_ABI trt_D3D12SerializeVersionedRootSignature(const void* desc,
 int TRT_GUEST_ABI trt_D3D12GetInterface(const void* rclsid, const void* riid,
                                         void** out_iface);
 
+// TRIANGLE GATE: host-side assert that a guest-created queue actually
+// recorded the guest's ExecuteCommandLists submission (see bridge_d3d12.cpp).
+// Returns the recorded-list count, or -1 if the pointer is not a queue.
+int trt_d3d12_queue_recorded_count(void* queue);
+
 #ifdef __cplusplus
 }
 #endif

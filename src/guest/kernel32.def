@@ -6,6 +6,8 @@ EXPORTS
     CreateFileW
     WriteFile
     CloseHandle
+    CreateEventW
+    WaitForSingleObject
     GetEnvironmentStringsW
     GetModuleFileNameW
     LoadLibraryW
