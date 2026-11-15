@@ -86,4 +86,16 @@ for exe in "${EXES[@]}"; do
   if [[ $p -ne 0 && $p -ne 1 ]]; then rc=1; fi
 done
 
+# --- D3D12 TRIANGLE GATE (Sprint-2 item 21): the full D3D12 render path ---
+# through a real guest PE. Every D3D12 bridge change must keep this green
+# offline before console work — the fixture that caught the
+# CreateSwapChainForCoreWindow ABI bug on its first run.
+tri_report="$out/triangle-gate-report.md"
+{
+  printf '# D3D12 TRIANGLE GATE — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  printf '\n12 markers: DEVICE/QUEUE/ALLOC/LIST/ROOTSIG/PSO/RESOURCE/DRAW RECORDED/LIST CLOSED/ECL EXECUTED/FENCE SIGNALED/PRESENTED.\n\n'
+} > "$tri_report"
+"$out/test_d3d12_triangle" "$out/guest_triangle.exe" 2>&1 | tee -a "$tri_report"
+[[ ${PIPESTATUS[0]} -eq 0 ]] || rc=1
+
 exit $rc

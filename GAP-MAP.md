@@ -153,7 +153,8 @@ so the CLI path never runs; the live session ran it via import (see
   (CreateSwapChainForHwnd was already correct). Plus fail-visible log
   lines for DrawInstanced/ECL, ABI static-asserts pinning the resource(15)
   /fence(11)/cmdlist(60) vtbls, `CreateEventW`/`WaitForSingleObject` added
-  to the kernel32 def stub. Suite 36 in build-test.sh.
+  to the kernel32 def stub. Suite 36 in build-test.sh + gate stage in
+  corpus-run.sh.
   Evidence: 12/12 markers + ALL PASS (log `/tmp/opencode/tri.log`);
   regressions test_game_boot/test_d3d12/test_wave2/test_d3d ALL PASS;
   RACCOIN `1 booted, 0 failed` (log `/tmp/opencode/raccoin-tri.log`).
