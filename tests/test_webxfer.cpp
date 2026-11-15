@@ -261,6 +261,53 @@ int main() {
           "DELETE /api/game removes game directory cleanly");
   }
 
+  // 9. Settings: GET defaults, POST partial update, persistence, bad input
+  {
+    std::string g = http_req(port, "GET", "/api/settings", "");
+    CHECK(g.find("200 OK") != std::string::npos &&
+              g.find("\"default_input\":\"auto\"") != std::string::npos &&
+              g.find("\"os_build\":19045") != std::string::npos &&
+              g.find("\"write_watch\":true") != std::string::npos,
+          "GET /api/settings returns defaults");
+
+    std::string p1 = http_req(port, "POST", "/api/settings",
+                              "{\"mouse_speed\":77,\"pad_vibration\":false,"
+                              "\"default_input\":\"pad2kbm\"}");
+    CHECK(p1.find("200 OK") != std::string::npos && p1.find("saved") != std::string::npos,
+          "POST /api/settings partial update saved");
+
+    std::string g2 = http_req(port, "GET", "/api/settings", "");
+    CHECK(g2.find("\"mouse_speed\":77") != std::string::npos &&
+              g2.find("\"pad_vibration\":false") != std::string::npos &&
+              g2.find("\"default_input\":\"pad2kbm\"") != std::string::npos &&
+              g2.find("\"write_watch\":true") != std::string::npos,
+          "POST /api/settings partial update visible in GET");
+
+    // persistence: settings.ini written under LocalState with the values
+    const std::string ini = read_str_file(root + "/settings.ini");
+    CHECK(ini.find("mouse_speed=77") != std::string::npos &&
+              ini.find("pad_vibration=0") != std::string::npos &&
+              ini.find("default_input=pad2kbm") != std::string::npos,
+          "settings.ini persisted to LocalState");
+
+    // out-of-range ints are clamped, not rejected
+    std::string p2 = http_req(port, "POST", "/api/settings",
+                              "{\"mouse_speed\":9999,\"log_lines\":-5}");
+    std::string g3 = http_req(port, "GET", "/api/settings", "");
+    CHECK(p2.find("200 OK") != std::string::npos &&
+              g3.find("\"mouse_speed\":100") != std::string::npos &&
+              g3.find("\"log_lines\":4") != std::string::npos,
+          "POST /api/settings clamps out-of-range values");
+
+    // dashboard page carries the settings card + connect card
+    std::string page = http_req(port, "GET", "/", "");
+    CHECK(page.find("200 OK") != std::string::npos &&
+              page.find("Console Settings") != std::string::npos &&
+              page.find("/api/settings") != std::string::npos &&
+              page.find("Connect (Scan or Type)") != std::string::npos,
+          "dashboard HTML ships settings + connect cards");
+  }
+
   longan::webxfer_shutdown();
   std::string cmd = "rm -rf " + root;
   (void)system(cmd.c_str());

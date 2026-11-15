@@ -72,6 +72,11 @@
 #  include <sys/stat.h>
 #  include <errno.h>
 
+// Host-settings hook (weak: absent when trt runs without the host layer —
+// offline tests). File-scope near the top: clang rejects attributed
+// block-scope extern declarations.
+extern "C" bool trt_settings_write_watch() __attribute__((weak));
+
 namespace {
 
 // ---- heap allocation registry: HeapSize/HeapReAlloc need the byte size of
@@ -415,15 +420,13 @@ extern "C" int trt_va_try_promote_rx(u64 fault_addr) {
 // incremental-GC probe. Both surfaces MUST answer honestly:
 //   * host _WIN32 (console): passthrough to the real kernel32 APIs — they
 //     exist and work inside a UWP AppContainer; a fake failure would disable
-//     GWW_VDB and cost frame hitches for nothing.
+//     GWW_VDB and cost frame hitches for nothing. Prototypes come from the
+//     SDK's memoryapi.h (WINAPI_PARTITION_APP) — do NOT redeclare them here
+//     (conflicting types = compile error); resolve via GetProcAddress.
 //   * Linux gate: /proc/self/pagemap soft-dirty emulation (bit 55; survives
 //     the unprivileged PFN masking — the bit is what GWW needs). Reset via
 //     /proc/self/clear_refs "4".
 // Anything else fails named (never a lying success = GC mis-mark = corruption).
-#if defined(_WIN32)
-extern "C" u32 __stdcall GetWriteWatch(u32, void*, u64, void**, u64*, u32*);
-extern "C" u32 __stdcall ResetWriteWatch(void*, u64);
-#endif
 static u32 ww_host_GetWriteWatch(u32 flags, void* addr, u64 bytes, void** addrs,
                                  u64* count, u32* gran) {
 #if defined(_WIN32)
@@ -486,6 +489,16 @@ u32 TRT_STDCALL trt_GetWriteWatch(u32 flags, void* addr, u64 bytes, void** addrs
     return (u32)-1;
   }
   if (gran) *gran = 4096;
+  // user kill-switch (dashboard setting): force the honest fail so a GC
+  // deterministically picks MPROTECT_VDB.
+  if (trt_settings_write_watch && !trt_settings_write_watch()) {
+    trt_core_log(
+        "kernel32: GetWriteWatch -> ERROR_INVALID_PARAMETER (disabled in "
+        "settings; GC falls back to MPROTECT_VDB)");
+    if (count) *count = 0;
+    set_err_for_current_thread(87);
+    return (u32)-1;
+  }
   // host passthrough first (console truth)
   if (ww_host_GetWriteWatch(flags, addr, bytes, addrs, count, gran) != (u32)-1) {
     return 0;

@@ -59,23 +59,34 @@ int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 
 // ---- system information ----
 
-// GetVersionExW(OSVERSIONINFOW*)
+// Host-settings hook (weak: absent when trt runs without the host layer —
+// offline tests). File-scope: clang rejects attributed block-scope externs.
+extern "C" void trt_settings_os(int*, int*, int*) __attribute__((weak));
+
+// GetVersionExW(OSVERSIONINFOW*) — reports the USER-SET OS personality
+// (dashboard settings), not a hardcoded constant: engines gate install/run
+// paths on the version, and Win11-only builds check build >= 22000.
 u32 TRT_STDCALL trt_GetVersionExW(void* info) {
   if (!info) return 0;
+  // values come from the host settings layer (defaults: Win10 22H2)
+  int mj = 10, mn = 0, bd = 19045;
+  if (trt_settings_os) trt_settings_os(&mj, &mn, &bd);
   // LPOSTROSVERSIONINFOW: dwOSVersionInfoSize, dwMajorVersion, dwMinorVersion,
   // dwBuildNumber, dwPlatformId, szCSDVersion[128]
   u32* p = (u32*)info;
   p[0] = 276;   // sizeof(OSVERSIONINFOW)
-  p[1] = 10;    // Windows 10
-  p[2] = 0;
-  p[3] = 19045; // build
+  p[1] = (u32)mj;
+  p[2] = (u32)mn;
+  p[3] = (u32)bd;
   p[4] = 2;     // VER_PLATFORM_WIN32_NT
   return 1;
 }
 
 u32 TRT_STDCALL trt_GetVersion(void) {
-  // Win10 = 0x0A000006 (major 10, minor 0)
-  return 0x0A000006u;
+  int mj = 10, mn = 0, bd = 19045;
+  if (trt_settings_os) trt_settings_os(&mj, &mn, &bd);
+  // major<<16 | minor<<8 | build-hi-clip (Win10 = 0x0A000006 shape)
+  return ((u32)mj << 16) | ((u32)mn << 8) | (u32)((bd >> 14) & 0xFFu);
 }
 
 // GetSystemInfo(SYSTEM_INFO*)

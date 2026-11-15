@@ -8,7 +8,7 @@
 Wine's job, targeting UWP instead of POSIX.
 
 ![Status](https://img.shields.io/badge/status-PoC%20boots%20real%20Steam%20games-brightgreen)
-![Gates](https://img.shields.io/badge/offline%20gates-37%2F37%20pass-brightgreen)
+![Gates](https://img.shields.io/badge/offline%20gates-38%2F38%20pass-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
 ![Guests](https://img.shields.io/badge/guest-PE64%20%2B%20Unity%20IL2CPP-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -88,6 +88,26 @@ DRM-free builds, and `.iso` disc images (read-only mounted drive with lazy
 per-file extraction under the 5 GB console budget). 32-bit x86 games are not
 supported yet (see [GAP-MAP](GAP-MAP.md)).
 
+## 🖥️ Dashboard (TV) & phone/web dashboard
+
+The launcher on the TV has three screens — cycle with **RB/LB** (or `Tab`):
+
+- **Shelf** — game list (U/D pick, L/R choose the exe when a game has several),
+  A launches, Y opens the Steam QR link, R3/F1 toggles gamepad-as-mouse.
+  The LAN URL + QR for game transfer is always on screen.
+- **Settings** — editable rows: default input mode (`auto`/`controller`/`kbm`/
+  `pad2kbm`), pad-as-mouse + wheel speed, pad vibration on/off, the **Windows
+  version reported to games** (major.minor.build, Win11 personality toggle),
+  write-watch GC on/off (GetWriteWatch kill-switch), Steam link on/off,
+  QR overlay on/off, log tail size. Every change persists to
+  `LocalState\settings.ini` and applies to guests immediately.
+- **Live log** — the same ring the web dashboard shows, streamed from memory.
+
+The phone/PC web dashboard (open the LAN URL shown on the TV, or scan the QR)
+adds a Connect card, the game manager (upload folder/zip, pick exe, per-game
+args/appid/input, launch/stop/delete), the live log, and the **same settings
+editor** (`GET/POST /api/settings`) — all offline-gated in `tests/test_webxfer.cpp`.
+
 ## 🚀 Quick start (console)
 
 ```sh
@@ -104,7 +124,7 @@ by default" ON** (5 GB limit, not 1 GB).
 ## 🔨 Build (Linux, all cross)
 
 ```sh
-tools/build-test.sh    # full offline gate: 37 suites, real PE guests executed
+tools/build-test.sh    # full offline gate: 38 suites, real PE guests executed
 tools/build-test-cached.sh   # fast variant
 ```
 

@@ -450,8 +450,24 @@ void trt_pad_set_vibration(u32 index, u16 left_motor, u16 right_motor) {
   }
 }
 
+namespace {
+
+// Host-settings hooks (weak: absent when trt runs without the host layer —
+// offline tests). File-scope because clang rejects attributed block-scope
+// extern declarations.
+extern "C" bool trt_settings_pad_vibration() __attribute__((weak));
+
+} // namespace
+
 bool trt_pad_get_vibration(u32 index, u16* left_motor, u16* right_motor) {
   if (index >= 4) return false;
+  // host kill-switch (dashboard setting): swallow guest rumble requests.
+  if (trt_settings_pad_vibration && !trt_settings_pad_vibration()) {
+    if (left_motor) *left_motor = 0;
+    if (right_motor) *right_motor = 0;
+    g.pads[index].vib_dirty = false;
+    return true;  // consumed, silently zeroed (user chose no vibration)
+  }
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   const bool dirty = g.pads[index].vib_dirty;
   if (left_motor) *left_motor = g.pads[index].vib_left;

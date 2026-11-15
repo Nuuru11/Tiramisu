@@ -38,6 +38,12 @@ int g_selected = 0;
 std::string g_qr_text;
 uint8_t g_qr[qrcodegen_BUFFER_LEN_MAX];
 int g_qr_size = 0;
+
+// dashboard screens
+ui_screen g_screen = UI_SHELF;
+std::vector<ui_setting> g_set_rows;
+int g_set_selected = 0;
+std::vector<std::wstring> g_log_tail;
 }
 
 void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
@@ -106,6 +112,17 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
   g_setup_finished = finished;
 }
 
+void ui_set_screen(ui_screen s) { g_screen = s; }
+
+void ui_set_settings(const ui_setting* rows, int count, int selected) {
+  g_set_rows.assign(rows, rows + (count > 0 ? count : 0));
+  g_set_selected = selected;
+}
+
+void ui_set_log_tail(const std::vector<std::wstring>& lines) {
+  g_log_tail = lines;
+}
+
 void ui_set_qr(const std::string& qr_text) {
   g_qr_text = qr_text;
   g_qr_size = 0;
@@ -147,6 +164,102 @@ void draw_qr_overlay(float m) {
   wbr->Release();
   text_out(g_small, qx - 14, qy + q + 18, q + 28, g_h * 0.04f,
            L"SCAN OR OPEN LAN URL", g_teal);
+}
+
+void draw_tabs(float m) {
+  // three-screen tab strip: SHELF / SETTINGS / LOG — teal on the active tab
+  const wchar_t* names[3] = {L"SHELF", L"SETTINGS", L"LIVE LOG"};
+  const float tab_w = g_w * 0.115f, tab_h = g_h * 0.052f;
+  for (int i = 0; i < 3; ++i) {
+    const float tx = m + i * (tab_w + g_w * 0.012f);
+    D2D1_RECT_F bg{tx, m * 0.52f, tx + tab_w, m * 0.52f + tab_h};
+    if ((int)g_screen == i) g_ctx->FillRectangle(&bg, g_teal);
+    else {
+      D2D1_COLOR_F slate{0.10f, 0.13f, 0.17f, 0.85f};
+      ID2D1SolidColorBrush* sbr = nullptr;
+      g_ctx->CreateSolidColorBrush(slate, &sbr);
+      g_ctx->FillRectangle(&bg, sbr);
+      sbr->Release();
+    }
+    D2D1_COLOR_F fg{0.94f, 0.96f, 0.97f, 1.0f};
+    ID2D1SolidColorBrush* fbr = nullptr;
+    g_ctx->CreateSolidColorBrush(fg, &fbr);
+    D2D1_RECT_F tr{tx + 10, m * 0.52f, tx + tab_w, m * 0.52f + tab_h};
+    // small centered label
+    g_ctx->DrawText(names[i], (UINT32)wcslen(names[i]), g_small, tr, fbr);
+    fbr->Release();
+  }
+}
+
+void draw_settings_screen(float m, float y0) {
+  if (g_set_rows.empty()) {
+    text_out(g_text, m, y0, g_w - 2 * m, g_h * 0.06f,
+             L"No settings rows (host not ready)", g_dim);
+    return;
+  }
+  const float row_h = g_h * 0.058f;
+  const float lab_w = g_w * 0.38f;
+  const float val_w = g_w * 0.34f;
+  wchar_t hint[128];
+  const ui_setting& sel = g_set_rows[g_set_selected];
+  if (sel.is_bool) wcscpy(hint, L"A: toggle");
+  else if (sel.is_choice) wcscpy(hint, L"LEFT/RIGHT: change");
+  else if (sel.is_int) wcscpy(hint, L"UP/DOWN: change");
+  else wcscpy(hint, L"keyboard: type a new value");
+  const int max_rows = 12;
+  int start = 0;
+  if ((int)g_set_rows.size() > max_rows) {
+    start = g_set_selected - 6;
+    if (start < 0) start = 0;
+    if (start + max_rows > (int)g_set_rows.size())
+      start = (int)g_set_rows.size() - max_rows;
+  }
+  int shown = 0;
+  for (int i = start;
+       i < (int)g_set_rows.size() && shown < max_rows; ++i, ++shown) {
+    const float ry = y0 + shown * row_h;
+    if (i == g_set_selected) {
+      D2D1_RECT_F sel{m - 12, ry - 3, m + g_w - 2 * m + 12, ry + row_h};
+      g_ctx->FillRectangle(&sel, g_teal);
+    }
+    D2D1_COLOR_F onsel{0.05f, 0.07f, 0.086f, 1.0f};
+    ID2D1SolidColorBrush* fg = g_dim;
+    if (i == g_set_selected) g_ctx->CreateSolidColorBrush(onsel, &fg);
+    text_out(g_text, m, ry, lab_w, row_h, g_set_rows[i].label,
+             i == g_set_selected ? fg : g_brush);
+    std::wstring val = g_set_rows[i].value;
+    if (g_set_rows[i].is_bool) {
+      val = (wcscmp(g_set_rows[i].value, L"1") == 0) ? L"ON" : L"OFF";
+    }
+    text_out(g_text, m + lab_w, ry, val_w, row_h, val.c_str(),
+             i == g_set_selected ? fg : g_teal);
+    if (i == g_set_selected) fg->Release();
+  }
+  text_out(g_small, m, g_h - m * 1.15f, g_w - 2 * m, g_h * 0.04f, hint,
+           g_dim);
+}
+
+void draw_log_screen(float m, float y0) {
+  const float row_h = g_h * 0.040f;
+  const int max_rows = (int)((g_h - y0 - m * 1.2f) / row_h);
+  int start = (int)g_log_tail.size() - max_rows;
+  if (start < 0) start = 0;
+  float y = y0;
+  for (size_t i = (size_t)start; i < g_log_tail.size(); ++i) {
+    text_out(g_small, m, y, g_w - 2 * m, row_h, g_log_tail[i].c_str(), g_dim);
+    y += row_h;
+  }
+  if (g_log_tail.empty())
+    text_out(g_text, m, y0, g_w - 2 * m, row_h * 2,
+             L"Log is empty — boot activity lands here live", g_dim);
+}
+
+void draw_lan_link(float m) {
+  // the transfer URL, big enough to type from a laptop across the room
+  if (g_qr_text.empty()) return;
+  std::wstring url(g_qr_text.begin(), g_qr_text.end());
+  text_out(g_small, m, g_h - m * 0.62f, g_w - 2 * m, g_h * 0.042f,
+           (L"LAN LINK  " + url).c_str(), g_teal);
 }
 
 void ui_render() {
@@ -203,14 +316,37 @@ void ui_render() {
       return;
     }
 
-    // title
-    text_out(g_title, m, m * 0.55f, g_w - 2 * m, g_h * 0.1f, L"Tiramisu", g_teal);
+    // title + tab strip
+    text_out(g_title, m, m * 0.55f, g_w * 0.5f, g_h * 0.1f, L"Tiramisu", g_teal);
+    draw_tabs(m);
 
     // transfer URL + status lines
     float y = m + g_h * 0.1f;
     for (const auto& l : g_lines) {
       text_out(g_small, m, y, g_w - 2 * m, g_h * 0.045f, l.c_str(), g_dim);
       y += g_h * 0.042f;
+    }
+
+    if (g_screen == UI_SETTINGS) {
+      draw_settings_screen(m, y + g_h * 0.01f);
+      draw_qr_overlay(m);
+      draw_lan_link(m);
+      g_ctx->EndDraw();
+      if (bmp) bmp->Release();
+      surf->Release();
+      g_ctx->SetTarget(old_target);
+      if (old_target) old_target->Release();
+      return;
+    }
+    if (g_screen == UI_LOG) {
+      draw_log_screen(m, y + g_h * 0.01f);
+      draw_lan_link(m);
+      g_ctx->EndDraw();
+      if (bmp) bmp->Release();
+      surf->Release();
+      g_ctx->SetTarget(old_target);
+      if (old_target) old_target->Release();
+      return;
     }
 
     // game shelf (scrollable 6-row window clear of bottom-right QR)
@@ -266,6 +402,7 @@ void ui_render() {
     }
 
     draw_qr_overlay(m);
+    draw_lan_link(m);
 
     g_ctx->EndDraw();
     if (bmp) bmp->Release();

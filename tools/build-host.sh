@@ -23,7 +23,7 @@ echo "offline loader test: PASS"
 UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --out "$out/layout/tiramisu.exe" --jobs "$(nproc)" \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
-  src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp \
+  src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp \
   src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_d3d12.cpp src/trt/bridge_reg.cpp \

@@ -24,10 +24,10 @@
 
 ## 1. Ground truth (measured 2026-11-14)
 
-**Gates on the current tree (2026-11-15, ehfix19):**
-`build-test.sh` → gate_rc=0, 37× `RESULT: ALL PASS` (incl. the new
-funclet-rethrow + boundary-escape fixtures) · corpus-run EXE stage:
-RACCOIN 1 booted/0 failed (7/7 ladder), Go Next demo.exe 1/0 with
+**Gates on the current tree (2026-11-15, ui+settings wave):**
+`build-test.sh` → gate_rc=0, 38× `RESULT: ALL PASS` (incl. the new
+funclet-rethrow + boundary-escape fixtures + test_settings) · corpus-run EXE
+stage: RACCOIN 1 booted/0 failed (7/7 ladder), Go Next demo.exe 1/0 with
 UNITYMAIN2 REACHED, OrTMM 1/0, GoWLauncher 1/0.
 
 **RACCOIN.exe** (real Unity IL2CPP Steam game, now in `corpus-local/raccoin/`,

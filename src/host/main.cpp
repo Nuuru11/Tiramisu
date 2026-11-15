@@ -10,6 +10,7 @@
 #include "swapchain.h"
 #include "ui.h"
 #include "webxfer.h"
+#include "settings.h"
 #include "../trt/trt.h"
 #include "../trt/iso.h"
 #include "../trt/input.h"
@@ -79,6 +80,13 @@ bool g_mouse_mode = false;
 bool g_booted = false;
 bool g_setup_done = false;      // first-run setup screen flag
 bool g_setup_active = false;    // currently showing the setup screen
+
+// dashboard settings screen state (rows mirror longan::host_settings;
+// the string/int buffers are edited here, applied via settings_store)
+longan::ui_setting g_set_rows[9];
+int g_set_count = 0;
+int g_set_selected = 0;
+longan::ui_screen g_screen = longan::UI_SHELF;
 
 void set_guest_status(std::string s) {
   std::lock_guard<std::mutex> lk(g_status_mu);
@@ -1129,6 +1137,132 @@ void steam_begin() {
   }).detach();
 }
 
+// ---------------- dashboard: settings rows + screen nav ----------------
+// Rows mirror the live host_settings; edited in place, applied+persisted on
+// change. Value buffers are the ui_setting value[] arrays themselves (UTF-16,
+// what the renderer draws).
+const wchar_t* k_input_choices[4] = {L"auto", L"controller", L"kbm",
+                                     L"pad2kbm"};
+
+void sync_settings_rows() {
+  const auto& s = longan::settings_get();
+  auto set_bool = [](longan::ui_setting& r, bool v) {
+    r.is_bool = true; r.is_choice = false; r.is_int = false;
+    r.value[0] = v ? L'1' : L'0'; r.value[1] = 0;
+  };
+  int i = 0;
+  // 0 default input
+  wcscpy(g_set_rows[i].label, L"Default input mode");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = true;
+  g_set_rows[i].is_int = false;
+  int ci = 0;
+  for (int k = 0; k < 4; ++k)
+    if (wcscmp(k_input_choices[k], u82ws(s.default_input).c_str()) == 0) ci = k;
+  wcscpy(g_set_rows[i].value, k_input_choices[ci]);
+  g_set_rows[i].value[63] = 0;
+  ++i;
+  // 1 mouse speed
+  wcscpy(g_set_rows[i].label, L"Pad-as-mouse speed (1-100)");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = false;
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.mouse_speed);
+  ++i;
+  // 2 wheel speed
+  wcscpy(g_set_rows[i].label, L"Pad wheel speed (1-100)");
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.wheel_speed);
+  ++i;
+  // 3 vibration
+  wcscpy(g_set_rows[i].label, L"Pad vibration (guest rumble)");
+  set_bool(g_set_rows[i], s.pad_vibration);
+  ++i;
+  // 4 OS personality
+  wcscpy(g_set_rows[i].label, L"OS reported to games (major.minor.build)");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = false;
+  g_set_rows[i].is_int = false;
+  swprintf(g_set_rows[i].value, 64, L"%d.%d.%d", s.os_major, s.os_minor,
+           s.os_build);
+  ++i;
+  // 5 Win11 personality
+  wcscpy(g_set_rows[i].label, L"Win11 personality (build 22000+)");
+  set_bool(g_set_rows[i], s.win11_personality);
+  ++i;
+  // 6 write watch
+  wcscpy(g_set_rows[i].label, L"Write-watch GC (GetWriteWatch)");
+  set_bool(g_set_rows[i], s.write_watch);
+  ++i;
+  // 7 steam auth
+  wcscpy(g_set_rows[i].label, L"Steam QR link (own account)");
+  set_bool(g_set_rows[i], s.steam_auth);
+  ++i;
+  // 8 show QR
+  wcscpy(g_set_rows[i].label, L"Show QR / LAN link on TV");
+  set_bool(g_set_rows[i], s.show_qr);
+  ++i;
+  g_set_count = i;
+}
+
+// Apply the current row buffers back into host_settings and persist.
+void apply_settings_rows() {
+  longan::host_settings s = longan::settings_get();
+  for (int i = 0; i < g_set_count; ++i) {
+    const longan::ui_setting& r = g_set_rows[i];
+    if (i == 0) {
+      for (int k = 0; k < 4; ++k)
+        if (wcscmp(r.value, k_input_choices[k]) == 0) {
+          char buf[16];
+          size_t n = 0;
+          for (const wchar_t* p = k_input_choices[k]; *p && n < 15; ++p)
+            buf[n++] = (char)*p;
+          buf[n] = 0;
+          s.default_input = buf;
+        }
+    } else if (i == 1) s.mouse_speed = _wtoi(r.value);
+    else if (i == 2) s.wheel_speed = _wtoi(r.value);
+    else if (i == 3) s.pad_vibration = (wcscmp(r.value, L"1") == 0);
+    else if (i == 4) swscanf(r.value, L"%d.%d.%d", &s.os_major, &s.os_minor,
+                             &s.os_build);
+    else if (i == 5) s.win11_personality = (wcscmp(r.value, L"1") == 0);
+    else if (i == 6) s.write_watch = (wcscmp(r.value, L"1") == 0);
+    else if (i == 7) s.steam_auth = (wcscmp(r.value, L"1") == 0);
+    else if (i == 8) s.show_qr = (wcscmp(r.value, L"1") == 0);
+  }
+  longan::settings_store(s, g_local_state);
+  char line[128];
+  longan::log_line("settings: saved from the TV dashboard");
+  (void)line;
+}
+
+// Cycle/edit the selected row: dir = -1/+1 for LR cycles and int edit,
+// toggle for bools. Returns true when something changed.
+bool edit_setting_row(int dir) {
+  if (g_set_selected < 0 || g_set_selected >= g_set_count) return false;
+  longan::ui_setting& r = g_set_rows[g_set_selected];
+  if (r.is_bool && dir == 1) {
+    r.value[0] = (wcscmp(r.value, L"1") == 0) ? L'0' : L'1';
+    r.value[1] = 0;
+    return true;
+  }
+  if (r.is_choice) {
+    int cur = 0;
+    for (int k = 0; k < 4; ++k)
+      if (wcscmp(r.value, k_input_choices[k]) == 0) cur = k;
+    cur = (cur + dir + 4) % 4;
+    wcscpy(r.value, k_input_choices[cur]);
+    return true;
+  }
+  if (r.is_int) {
+    // mouse/wheel speeds: step 2 for mouse, 5 for wheel
+    const int step = (g_set_selected == 2) ? 5 : 2;
+    int v = _wtoi(r.value) + dir * step;
+    if (v < 1) v = 1;
+    if (v > 100) v = 100;
+    swprintf(r.value, 64, L"%d", v);
+    return true;
+  }
+  return false;  // text row: keyboard edits through CoreWindow
+}
+
 // ---------------- the app ----------------
 struct tiramisu_host
     : implements<tiramisu_host, IFrameworkViewSource, IFrameworkView> {
@@ -1249,6 +1383,12 @@ struct tiramisu_host
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
 
+    // ---- persisted settings (dashboard-editable; consumed by bridges) ----
+    const int applied = longan::settings_load(g_local_state);
+    snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
+             applied);
+    longan::log_line(line);
+
     // ---- setup screen: steps update live as boot proceeds ----
     g_setup_active = true;
     auto setup_steps = [](std::initializer_list<std::wstring> done,
@@ -1319,6 +1459,7 @@ struct tiramisu_host
       {
         static bool d_up = false, d_dn = false, d_lt = false, d_rt = false,
                     a_btn = false, y_btn = false, rs_btn = false, vkbd_btn = false;
+        static bool lb_btn = false, rb_btn = false;
         static bool mm_was_active = false, mm_was_rt = false, mm_was_lt = false,
                     mm_was_rb = false, mm_was_lb = false, mm_was_ls = false,
                     mm_was_a = false, mm_was_b = false, mm_was_x = false,
@@ -1327,6 +1468,33 @@ struct tiramisu_host
                     mm_was_d = false, guest_was_running = false;
         static int mm_wheel_tick = 0, vm_hold_ticks = 0;
         const u16 b = pad_ok ? xs.Gamepad.wButtons : 0;
+        // RB/LB cycle dashboard screens (shelf -> settings -> log) on the
+        // launcher; keyboard: Tab / Shift+Tab.
+        const bool want_rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ||
+                             trt_key_down(0x09 /*VK_TAB*/);
+        const bool want_lb = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) ||
+                             (trt_key_down(0x10 /*VK_SHIFT*/) &&
+                              trt_key_down(0x09 /*VK_TAB*/));
+        if (!g_guest_running.load() && g_setup_active == false) {
+          if (want_rb && !rb_btn) {
+            rb_btn = true;
+            g_screen = (longan::ui_screen)(((int)g_screen + 1) % 3);
+            longan::ui_set_screen(g_screen);
+            if (g_screen == longan::UI_SETTINGS) {
+              sync_settings_rows();
+              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+            }
+          } else if (!want_rb) rb_btn = false;
+          if (want_lb && !lb_btn) {
+            lb_btn = true;
+            g_screen = (longan::ui_screen)(((int)g_screen + 2) % 3);
+            longan::ui_set_screen(g_screen);
+            if (g_screen == longan::UI_SETTINGS) {
+              sync_settings_rows();
+              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+            }
+          } else if (!want_lb) lb_btn = false;
+        }
         const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) ||
                              trt_key_down(0x26 /*VK_UP*/) || trt_key_down('W');
         const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) ||
@@ -1368,7 +1536,7 @@ struct tiramisu_host
         } else if (!want_vkbd) {
           vkbd_btn = false;
         }
-        if (!g_guest_running.load()) {
+        if (!g_guest_running.load() && g_screen == longan::UI_SHELF) {
           if (want_up && !d_up) {
             d_up = true;
             if (g_selected > 0) --g_selected;
@@ -1418,6 +1586,34 @@ struct tiramisu_host
             y_btn = true;
             steam_begin();
           } else if (!want_st) y_btn = false;
+        } else if (!g_guest_running.load() && g_screen == longan::UI_SETTINGS) {
+          // settings screen nav: up/down select, LR edit + persist, A toggle
+          if (want_up && !d_up) {
+            d_up = true;
+            if (g_set_selected > 0) {
+              --g_set_selected;
+              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+            }
+          } else if (!want_up) d_up = false;
+          if (want_dn && !d_dn) {
+            d_dn = true;
+            if (g_set_selected + 1 < g_set_count) {
+              ++g_set_selected;
+              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+            }
+          } else if (!want_dn) d_dn = false;
+          if (want_lt && !d_lt) {
+            d_lt = true;
+            if (edit_setting_row(-1)) apply_settings_rows();
+          } else if (!want_lt) d_lt = false;
+          if (want_rt && !d_rt) {
+            d_rt = true;
+            if (edit_setting_row(1)) apply_settings_rows();
+          } else if (!want_rt) d_rt = false;
+          if (want_go && !a_btn) {
+            a_btn = true;
+            if (edit_setting_row(1)) apply_settings_rows();
+          } else if (!want_go) a_btn = false;
         } else {
           d_up = d_dn = d_lt = d_rt = a_btn = y_btn = false;
         }
@@ -1574,7 +1770,10 @@ struct tiramisu_host
       longan::swapchain_restore_d3d11();
 
       // ---- UI ----
-      longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
+      // QR/LAN link shown only when the user kept it on (settings)
+      longan::ui_set_qr((longan::settings_get().show_qr && !g_steam_busy)
+                            ? longan::webxfer_url()
+                            : (g_steam_busy ? g_steam_qr : std::string()));
       if (!g_setup_active) {
         std::vector<longan::ui_game> uig;
         for (const auto& ge : g_games) {
@@ -1602,8 +1801,26 @@ struct tiramisu_host
           lines.push_back(u82ws(g_games[g_selected].compat));
         }
         lines.push_back(
-            L"U/D: game  L/R: exe  A: launch  Y: steam  R3/F1: mouse  Hold View+Menu: stop");
+            L"RB/LB or Tab: screens  U/D: game  L/R: exe  A: launch  Y: steam");
+        lines.push_back(
+            L"R3/F1: mouse mode  Back+X: keyboard  Hold View+Menu: stop");
         longan::ui_set_lines(lines);
+      }
+      if (g_screen == longan::UI_LOG && !g_setup_active) {
+        // live log tail on the LOG screen: pull the in-memory ring
+        static char logbuf[16384];
+        logbuf[0] = 0;
+        longan::log_get_recent(logbuf, sizeof(logbuf));
+        std::vector<std::wstring> tail;
+        const char* p = logbuf;
+        while (*p && tail.size() < 60) {
+          const char* nl = strchr(p, '\n');
+          std::string one = nl ? std::string(p, nl - p) : std::string(p);
+          if (!one.empty()) tail.push_back(u82ws(one));
+          if (!nl) break;
+          p = nl + 1;
+        }
+        longan::ui_set_log_tail(tail);
       }
       longan::swapchain_render_frame((m_frames % 180) / 180.0f);
       longan::ui_render();

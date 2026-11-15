@@ -16,6 +16,7 @@
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
 #include "host_log.h"
+#include "settings.h"
 
 #ifdef _WIN32
   #define WIN32_LEAN_AND_MEAN
@@ -543,10 +544,25 @@ const char* k_upload_page =
   "@media(max-width:560px){.game-cfg{grid-template-columns:1fr}}"
   "pre{background:#080b0f;border:1px solid #1c2530;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#a8c0cc;white-space:pre-wrap}"
   ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#172430;color:#7ccbd6}"
+  ".connect{display:flex;gap:16px;align-items:center;flex-wrap:wrap}"
+  "#qrx canvas{border:8px solid #fff;border-radius:8px;background:#fff}"
+  ".conn-info{flex:1;min-width:220px}"
+  ".conn-url{font-size:18px;font-weight:600;color:#44d9ec;word-break:break-all}"
+  ".conn-sub{font-size:13px;color:#8ea8b5;margin-top:6px}"
+  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #17212e}"
+  ".setrow label{font-size:14px;color:#cfe2ec}"
+  ".setrow input,.setrow select{width:100%}"
+  "@media(max-width:560px){.setrow{grid-template-columns:1fr}}"
   "</style></head><body>"
   "<header><div><h1>Tiramisu</h1><span class=pill id=runpill>Shelf Ready</span></div>"
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
+  "<div class=card><h2>Connect (Scan or Type)</h2>"
+  "<div class=connect><div id=qrx></div><div class=conn-info>"
+  "<div class=conn-url id=connurl>—</div>"
+  "<div class=conn-sub>This page IS the console dashboard — you are already connected.</div>"
+  "<div class=conn-sub style='color:#5a7684'>The TV shows the same QR under Settings → “Show QR / LAN link on TV”.</div>"
+  "</div></div></div>"
   "<div class=card><h2>Add Any PC / Steam Game (Unpacked Folder or .zip)</h2>"
   "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b> or <b>.zip</b> here, or use the buttons below</div>"
   "<div class=row style='margin-bottom:10px'>"
@@ -558,6 +574,10 @@ const char* k_upload_page =
   "<div id=bar><div id=fill></div></div>"
   "<div id=log style='font-size:13px;color:#8ea8b5;min-height:18px'>Ready over LAN</div></div>"
   "<div class=card><h2>Games on Xbox Console</h2><div id=list><span style='color:#678'>loading...</span></div></div>"
+  "<div class=card><h2>Console Settings</h2>"
+  "<div id=setwrap><span style='color:#678'>loading settings...</span></div>"
+  "<div class=row style='margin-top:10px'><button class=btn onclick=saveSettings()>Save Settings</button>"
+  "<span id=setstat style='color:#8ea8b5;font-size:13px'></span></div></div>"
   "<div class=card><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
   "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div>"
   "<pre id=logs style='margin-top:10px'>Click Refresh Logs or wait for auto-refresh...</pre></div>"
@@ -630,6 +650,35 @@ const char* k_upload_page =
   "async function refreshStatus(){try{const s=await(await fetch('/api/status')).json();"
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Shelf Ready';}catch{}}"
   "async function loadLogs(){E('logs').textContent=await(await fetch('/api/logs')).text();}"
+  // ---- settings editor ----
+  "const SET_DEFS=["
+  "['default_input','Default input mode','choice',['auto','controller','kbm','pad2kbm']],"
+  "['mouse_speed','Pad-as-mouse speed (1-100)','int',null],"
+  "['wheel_speed','Pad wheel speed (1-100)','int',null],"
+  "['pad_vibration','Pad vibration (guest rumble)','bool',null],"
+  "['os_major','OS reported to games — major','int',null],"
+  "['os_minor','OS minor','int',null],"
+  "['os_build','OS build (19045=Win10 22H2, 22000+=Win11)','int',null],"
+  "['win11_personality','Win11 personality','bool',null],"
+  "['write_watch','Write-watch GC (GetWriteWatch)','bool',null],"
+  "['steam_auth','Steam QR link (own account)','bool',null],"
+  "['show_qr','Show QR / LAN link on TV','bool',null],"
+  "['log_lines','Dashboard log tail lines (4-40)','int',null]];"
+  "async function loadSettings(){"
+  "let s;try{s=await(await fetch('/api/settings')).json();}catch{E('setwrap').innerHTML='<span style=\"color:#a66\">settings unavailable</span>';return;}"
+  "E('setwrap').innerHTML=SET_DEFS.map(d=>{const [k,lab,ty,chs]=d;const v=s[k];"
+  "if(ty==='bool')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>'"
+  "+'<option value=\"1\"'+(v?' selected':'')+'>ON</option><option value=\"0\"'+(!v?' selected':'')+'>OFF</option></select></div>';"
+  "if(ty==='choice')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>"
+  "+'+chs.map(c=>'<option value=\"'+c+'\"'+(c===v?' selected':'')+'>'+c+'</option>').join('')+'</select></div>';"
+  "return '<div class=setrow><label>'+lab+'</label><input id=set_'+k+' type=number value=\"'+v+'\"></div>';}).join('');}"
+  "async function saveSettings(){const p={};SET_DEFS.forEach(d=>{const k=d[0],ty=d[2];const el=E('set_'+k);if(!el)return;"
+  "if(ty==='bool')p[k]=el.value==='1';else if(ty==='int')p[k]=parseInt(el.value||'0',10);else p[k]=el.value;});"
+  "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
+  "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
+  // ---- connect card: derive this page's own URL as the LAN link ----
+  "E('connurl').textContent=location.href.split('?')[0];"
+  "loadSettings();"
   "refresh();refreshStatus();setInterval(refreshStatus,2000);setInterval(loadLogs,4000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
@@ -998,6 +1047,81 @@ void handle_client(sock_t s) {
     }
     g_upload_total = 0;
     g_upload_done = 0;
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/settings") {
+    // settings as JSON for the dashboard editor
+    const auto& s_set = settings_get();
+    std::string j = "{";
+    char sbuf[256];
+    snprintf(sbuf, sizeof(sbuf),
+             "\"default_input\":\"%s\",\"mouse_speed\":%d,"
+             "\"wheel_speed\":%d,\"pad_vibration\":%s,",
+             s_set.default_input.c_str(), s_set.mouse_speed, s_set.wheel_speed,
+             s_set.pad_vibration ? "true" : "false");
+    j += sbuf;
+    snprintf(sbuf, sizeof(sbuf),
+             "\"os_major\":%d,\"os_minor\":%d,\"os_build\":%d,"
+             "\"win11_personality\":%s,",
+             s_set.os_major, s_set.os_minor, s_set.os_build,
+             s_set.win11_personality ? "true" : "false");
+    j += sbuf;
+    snprintf(sbuf, sizeof(sbuf),
+             "\"write_watch\":%s,\"steam_auth\":%s,\"show_qr\":%s,"
+             "\"log_lines\":%d}",
+             s_set.write_watch ? "true" : "false",
+             s_set.steam_auth ? "true" : "false",
+             s_set.show_qr ? "true" : "false", s_set.log_lines);
+    j += sbuf;
+    respond(s, "200 OK", "application/json", j);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/settings") {
+    // body: JSON with any subset of the setting keys; unknown keys ignored.
+    // `pre` already holds bytes read with the header — drain exactly.
+    std::string body;
+    if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "bad body");
+      return;
+    }
+    if (body.size() > 1800) {
+      respond(s, "400 Bad Request", "text/plain", "body too large");
+      return;
+    }
+    host_settings st = settings_get();
+    auto get_bool = [&](const char* k, bool* v) {
+      const std::string pt = std::string("\"") + k + "\":true";
+      const std::string pf = std::string("\"") + k + "\":false";
+      if (body.find(pt) != std::string::npos) *v = true;
+      else if (body.find(pf) != std::string::npos) *v = false;
+    };
+    auto get_int = [&](const char* k, int* v) {
+      const std::string pt = std::string("\"") + k + "\":";
+      const size_t p = body.find(pt);
+      if (p == std::string::npos) return;
+      *v = atoi(body.c_str() + p + pt.size());
+    };
+    get_bool("pad_vibration", &st.pad_vibration);
+    get_bool("win11_personality", &st.win11_personality);
+    get_bool("write_watch", &st.write_watch);
+    get_bool("steam_auth", &st.steam_auth);
+    get_bool("show_qr", &st.show_qr);
+    get_int("mouse_speed", &st.mouse_speed);
+    get_int("wheel_speed", &st.wheel_speed);
+    get_int("os_major", &st.os_major);
+    get_int("os_minor", &st.os_minor);
+    get_int("os_build", &st.os_build);
+    get_int("log_lines", &st.log_lines);
+    const std::string dip = "\"default_input\":\"";
+    const size_t dp = body.find(dip);
+    if (dp != std::string::npos) {
+      const size_t e = body.find('"', dp + dip.size());
+      if (e != std::string::npos)
+        st.default_input = body.substr(dp + dip.size(), e - dp - dip.size());
+    }
+    settings_store(st, g_local_state_dir);
+    log_line("settings: saved from the web dashboard");
+    respond(s, "200 OK", "application/json", "{\"saved\":true}");
     return;
   }
   respond(s, "404 Not Found", "text/plain", "not found");
