@@ -90,12 +90,9 @@ so the CLI path never runs; the live session ran it via import (see
   case: every `try/catch` in C# game code goes through our unwinder.
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
-- **Agent C**: GDI boot-path audit + CreateCompatibleBitmap/GetStockObject fill
-  (`bridge_gdi.cpp`) — STILL RUNNING.
-- Orchestrator: working tree commits after all three report; then TRIANGLE GATE
-  (Sprint-2 item 21) is next. Master prompt renamed to
-  `TIRAMISU-MASTER-PROMPT.md` (commit 9e259c6). Re-check `git diff --stat`
-  before starting anything.
+- (none — the three-agent wave is complete and committed; next: TRIANGLE GATE)
+- Orchestrator: Master prompt renamed to `TIRAMISU-MASTER-PROMPT.md`
+  (commit 9e259c6). Re-check `git diff --stat` before starting anything.
 
 **LANDED (same orchestrated wave, 2026-11-15, all verified offline):**
 - **BUG-1 FIXED** (`bridge_d3d12.cpp`): CommandQueue vtbl rebuilt 19 -> 13
@@ -124,6 +121,17 @@ so the CLI path never runs; the live session ran it via import (see
   PASS after slot-constant update (10->8, 14->9), test_engine/test_stage5/
   test_libload ALL PASS, **RACCOIN re-booted `1 booted, 0 failed`** with the
   whole wave linked (log `/tmp/opencode/raccoin-reswave.log`).
+- **Sprint-1 1A LANDED** (`bridge_gdi.cpp`, measured — the master prompt's
+  list was stale): GetDC/ReleaseDC were user32-only, now shared into the
+  gdi32 table (same handler, both tables); GetStockObject case 10
+  (OEM_FIXED_FONT) returned NULL — splash-text killer — now a real handle,
+  stock ids 11-19 labels corrected to the real Win32 table; BitBlt/
+  StretchBlt/PatBlt/StretchDIBits/SetDIBitsToDevice/TextOut*/ExtTextOut*/
+  SaveDC/RestoreDC/SetMapMode made fail-visible (named log lines, never
+  silent). CreateCompatibleBitmap + GetDeviceCaps were already real.
+  `test_gdi` ALL PASS both argless (module-table resolution) and with the
+  legacy guest-PE flow; RACCOIN re-booted `1 booted, 0 failed` again with
+  GDI wave linked (log `/tmp/opencode/raccoin-gdiwave.log`).
 
 ---
 

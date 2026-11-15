@@ -2,6 +2,11 @@
 // The gdi32 bridge: a freestanding guest creates a font, selects it into
 // a user32 DC, deletes it; the host verifies the record lifecycle through
 // the shared log and the guest's return bits.
+//
+// Sprint 1A (GDI boot path): with no guest exe argument the test resolves
+// the boot-path surface straight through the module table and drives it
+// from the host via TRT_STDCALL (ms_abi) function pointers — the same
+// handlers a game's gdi32! imports bind to.
 #include "../src/trt/trt.h"
 
 #include <stdio.h>
@@ -112,17 +117,30 @@ int failures = 0;
     else { printf("  FAIL %s\n", msg); ++failures; }                 \
   } while (0)
 
+// Sprint 1A boot-path surface. Typedefs MUST carry TRT_STDCALL
+// (ms_abi, src/trt/pe.h): a SysV call through one of these pointers
+// enters the Win64 ABI exactly like the win64_call trampoline.
+typedef void* (TRT_STDCALL* fn_getdc)(void*);
+typedef int (TRT_STDCALL* fn_releasedc)(void*, void*);
+typedef void* (TRT_STDCALL* fn_ccdc)(void*);
+typedef void* (TRT_STDCALL* fn_ccbmp)(void*, int, int);
+typedef void* (TRT_STDCALL* fn_stock)(int);
+typedef void* (TRT_STDCALL* fn_select)(void*, void*);
+typedef int (TRT_STDCALL* fn_delobj)(void*);
+typedef int (TRT_STDCALL* fn_delete_dc)(void*);
+typedef int (TRT_STDCALL* fn_blt9)(void*, int, int, int, int, void*, int, int,
+                                   u32);
+typedef int (TRT_STDCALL* fn_sblt)(void*, int, int, int, int, void*, int, int,
+                                   int, int, u32);
+typedef int (TRT_STDCALL* fn_caps)(void*, int);
+
+void* resolve_gdi(const char* name) {
+  return trt_resolve_module(nullptr, "gdi32.dll", name, 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    printf("usage: test_gdi <guest.exe>\n");
-    return 2;
-  }
-  size_t size = 0;
-  u8* file = read_file(argv[1], &size);
-  if (!file) { printf("cannot read %s\n", argv[1]); return 2; }
-
   trt_backend be{&linux_alloc, &linux_protect, &linux_release, &linux_log,
                  nullptr};
   trt_bridge_boot(&be);
@@ -137,44 +155,122 @@ int main(int argc, char** argv) {
   CHECK(trt_module_route("user32.dll") == TRT_ROUTE_BUILTIN,
         "user32.dll routes BUILTIN (shared DC space)");
 
-  trt_resolver rs;
-  trt_resolver_default(&rs);
-  trt_image* img = nullptr;
-  const int rc = trt_map_pe(&be, &rs, file, size, &img);
-  CHECK(rc == TRT_OK, "guest PE maps (gdi32 + user32 GetDC bound)");
-  if (rc != TRT_OK || !img) {
-    printf("  map failed: %s (%s)\n", trt_errstr(rc),
-           img ? img->last_detail : "no image");
+  // ---- guest-PE flow (existing coverage; needs a guest exe argument) ----
+  if (argc >= 2) {
+    size_t size = 0;
+    u8* file = read_file(argv[1], &size);
+    if (!file) { printf("cannot read %s\n", argv[1]); return 2; }
+
+    trt_resolver rs;
+    trt_resolver_default(&rs);
+    trt_image* img = nullptr;
+    const int rc = trt_map_pe(&be, &rs, file, size, &img);
+    CHECK(rc == TRT_OK, "guest PE maps (gdi32 + user32 GetDC bound)");
+    if (rc != TRT_OK || !img) {
+      printf("  map failed: %s (%s)\n", trt_errstr(rc),
+             img ? img->last_detail : "no image");
+      free(file);
+      printf("RESULT: %d FAIL\n", failures ? failures : 1);
+      return 1;
+    }
+    CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
+
+    const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
+    printf("  guest returned 0x%llx (want 0xff)\n", (unsigned long long)ret);
+
+    CHECK((ret & 0x01u) != 0, "GetDC handed out a real DC record");
+    CHECK((ret & 0x02u) != 0, "CreateFontIndirectW returned a handle");
+    CHECK((ret & 0x04u) != 0, "SelectObject recorded per-DC state");
+    CHECK((ret & 0x08u) != 0, "DeleteObject freed the record (select-after fails)");
+    CHECK((ret & 0x10u) != 0, "GetStockObject is stable");
+    CHECK((ret & 0x20u) != 0, "stock object selected; ReleaseDC released");
+    CHECK((ret & 0x40u) != 0, "garbage DC -> SelectObject NULL (fail-visible)");
+    CHECK((ret & 0x80u) != 0, "SetBkMode/SetTextColor/SetBkColor recorded");
+
+    // host-side lifecycle evidence in the log
+    CHECK(log_contains("gdi32: CreateFontIndirectW h=") &&
+              log_contains("lfHeight=-24"),
+          "log names the created font with its lfHeight");
+    CHECK(log_count_of("gdi32: DeleteObject") == 1,
+          "exactly one DeleteObject (the freed font)");
+    CHECK(log_contains("not a user32 DC -> NULL"),
+          "the garbage-DC select was named");
+    CHECK(log_contains("user32: GetDC") == false,  // GetDC itself is silent-ok
+          "no misleading GetDC failure noise");
+
+    trt_unmap(&be, img);
     free(file);
-    return 1;
+  } else {
+    printf("  (no guest exe: module-table surface only)\n");
   }
-  CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
-  const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0xff)\n", (unsigned long long)ret);
+  // ---- Sprint 1A: gdi32 boot path resolved through the module table ----
+  CHECK(resolve_gdi("GetDC") != nullptr,
+        "gdi32!GetDC resolves (shared user32 handler)");
+  CHECK(resolve_gdi("ReleaseDC") != nullptr,
+        "gdi32!ReleaseDC resolves (shared user32 handler)");
+  CHECK(resolve_gdi("BitBlt") != nullptr, "gdi32!BitBlt resolves");
+  CHECK(resolve_gdi("StretchBlt") != nullptr, "gdi32!StretchBlt resolves");
+  CHECK(resolve_gdi("CreateCompatibleDC") != nullptr,
+        "gdi32!CreateCompatibleDC resolves");
+  CHECK(resolve_gdi("CreateCompatibleBitmap") != nullptr,
+        "gdi32!CreateCompatibleBitmap resolves");
+  CHECK(resolve_gdi("GetStockObject") != nullptr,
+        "gdi32!GetStockObject resolves");
 
-  CHECK((ret & 0x01u) != 0, "GetDC handed out a real DC record");
-  CHECK((ret & 0x02u) != 0, "CreateFontIndirectW returned a handle");
-  CHECK((ret & 0x04u) != 0, "SelectObject recorded per-DC state");
-  CHECK((ret & 0x08u) != 0, "DeleteObject freed the record (select-after fails)");
-  CHECK((ret & 0x10u) != 0, "GetStockObject is stable");
-  CHECK((ret & 0x20u) != 0, "stock object selected; ReleaseDC released");
-  CHECK((ret & 0x40u) != 0, "garbage DC -> SelectObject NULL (fail-visible)");
-  CHECK((ret & 0x80u) != 0, "SetBkMode/SetTextColor/SetBkColor recorded");
+  const fn_stock stock = (fn_stock)resolve_gdi("GetStockObject");
+  if (stock) {
+    void* white = stock(0);   // WHITE_BRUSH
+    void* black = stock(4);   // BLACK_BRUSH
+    void* nullb = stock(5);   // NULL_BRUSH
+    void* oemf  = stock(10);  // OEM_FIXED_FONT
+    void* pal   = stock(15);  // DEFAULT_PALETTE
+    CHECK(white && black && nullb && oemf && pal,
+          "GetStockObject WHITE/BLACK/NULL_BRUSH, OEM_FIXED_FONT, "
+          "DEFAULT_PALETTE all non-NULL");
+    CHECK(white == stock(0), "GetStockObject stable for the same id");
+    const fn_delobj delobj = (fn_delobj)resolve_gdi("DeleteObject");
+    CHECK(delobj && delobj(nullb) == 1,
+          "DeleteObject on a stock handle is a no-op (TRUE)");
+  } else {
+    CHECK(false, "GetStockObject callable");
+  }
 
-  // host-side lifecycle evidence in the log
-  CHECK(log_contains("gdi32: CreateFontIndirectW h=") &&
-            log_contains("lfHeight=-24"),
-        "log names the created font with its lfHeight");
-  CHECK(log_count_of("gdi32: DeleteObject") == 1,
-        "exactly one DeleteObject (the freed font)");
-  CHECK(log_contains("not a user32 DC -> NULL"),
-        "the garbage-DC select was named");
-  CHECK(log_contains("user32: GetDC") == false,  // GetDC itself is silent-ok
-        "no misleading GetDC failure noise");
+  const fn_getdc getdc = (fn_getdc)resolve_gdi("GetDC");
+  const fn_releasedc releasedc = (fn_releasedc)resolve_gdi("ReleaseDC");
+  const fn_ccdc ccdc = (fn_ccdc)resolve_gdi("CreateCompatibleDC");
+  const fn_ccbmp ccbmp = (fn_ccbmp)resolve_gdi("CreateCompatibleBitmap");
+  const fn_blt9 bitblt = (fn_blt9)resolve_gdi("BitBlt");
+  const fn_sblt sblt = (fn_sblt)resolve_gdi("StretchBlt");
+  const fn_select selobj = (fn_select)resolve_gdi("SelectObject");
+  const fn_delete_dc deldc = (fn_delete_dc)resolve_gdi("DeleteDC");
+  if (getdc && releasedc && ccdc && ccbmp && bitblt && sblt && selobj && deldc) {
+    void* hdc = getdc(nullptr);
+    CHECK(hdc != nullptr, "gdi32!GetDC(NULL) handed out a DC record");
+    void* memdc = ccdc(hdc);
+    CHECK(memdc != nullptr, "CreateCompatibleDC off the window DC");
+    void* hbmp = ccbmp(memdc, 64, 64);
+    CHECK(hbmp != nullptr, "CreateCompatibleBitmap 64x64 on the memory DC");
+    CHECK(selobj(memdc, hbmp) != nullptr, "bitmap selected into the memory DC");
+    CHECK(bitblt(memdc, 0, 0, 64, 64, hdc, 0, 0, 0x00CC0020u) == 1,
+          "BitBlt SRCCOPY -> TRUE");
+    CHECK(sblt(memdc, 0, 0, 32, 32, hdc, 0, 0, 64, 64, 0x00CC0020u) == 1,
+          "StretchBlt SRCCOPY -> TRUE");
+    CHECK(log_contains("gdi32: BitBlt 64x64") &&
+              log_contains("gdi32: StretchBlt"),
+          "blits name themselves in the log (fail-visible, never silent)");
+    const fn_caps caps = (fn_caps)resolve_gdi("GetDeviceCaps");
+    CHECK(caps && caps(hdc, 8) == 1920 && caps(hdc, 10) == 1080 &&
+              caps(hdc, 12) == 32 && caps(hdc, 14) == 1,
+          "GetDeviceCaps HORZRES/VERTRES/BITSPIXEL/PLANES plausible");
+    CHECK(releasedc(nullptr, hdc) == 1, "gdi32!ReleaseDC released the window DC");
+    CHECK(deldc(memdc) == 1, "DeleteDC released the memory DC");
+    const fn_delobj delobj2 = (fn_delobj)resolve_gdi("DeleteObject");
+    if (delobj2) delobj2(hbmp);  // free the compatible bitmap record
+  } else {
+    CHECK(false, "boot-path DC/blit surface callable");
+  }
 
-  trt_unmap(&be, img);
-  free(file);
   if (failures) {
     printf("RESULT: %d FAIL\n", failures);
     return 1;

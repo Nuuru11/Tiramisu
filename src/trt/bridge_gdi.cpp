@@ -236,16 +236,16 @@ void* TRT_GUEST_ABI trt_GetStockObject(i32 obj) {
     case 6:  return (void*)(uintptr_t)0x80000006u;  // WHITE_PEN
     case 7:  return (void*)(uintptr_t)0x80000017u;  // BLACK_PEN
     case 8:  return (void*)(uintptr_t)0x80000018u;  // NULL_PEN
-    case 11: return (void*)(uintptr_t)0x8000001Bu;  // OEM_FIXED_FONT
-    case 12: return (void*)(uintptr_t)0x8000001Cu;  // ANSI_FIXED_FONT
-    case 13: return (void*)(uintptr_t)0x8000001Du;  // ANSI_VAR_FONT
-    case 14: return (void*)(uintptr_t)0x8000001Eu;  // SYSTEM_FONT
-    case 15: return (void*)(uintptr_t)0x8000001Fu;  // DEVICE_DEFAULT_FONT
-    case 16: return (void*)(uintptr_t)0x80000020u;  // DEFAULT_PALETTE
-    case 17: return (void*)(uintptr_t)0x80000021u;  // SYSTEM_FIXED_FONT
-    case 18: return (void*)(uintptr_t)0x80000022u;  // DEFAULT_GUI_FONT
-    case 19: return (void*)(uintptr_t)0x80000023u;  // DC_BRUSH
-    case 20: return (void*)(uintptr_t)0x80000024u;  // DC_PEN
+    case 10: return (void*)(uintptr_t)0x80000019u;  // OEM_FIXED_FONT
+    case 11: return (void*)(uintptr_t)0x8000001Bu;  // ANSI_FIXED_FONT
+    case 12: return (void*)(uintptr_t)0x8000001Cu;  // ANSI_VAR_FONT
+    case 13: return (void*)(uintptr_t)0x8000001Du;  // SYSTEM_FONT
+    case 14: return (void*)(uintptr_t)0x8000001Eu;  // DEVICE_DEFAULT_FONT
+    case 15: return (void*)(uintptr_t)0x8000001Fu;  // DEFAULT_PALETTE
+    case 16: return (void*)(uintptr_t)0x80000020u;  // SYSTEM_FIXED_FONT
+    case 17: return (void*)(uintptr_t)0x80000021u;  // DEFAULT_GUI_FONT
+    case 18: return (void*)(uintptr_t)0x80000022u;  // DC_BRUSH
+    case 19: return (void*)(uintptr_t)0x80000023u;  // DC_PEN
     default: {
       char line[96];
       snprintf(line, sizeof(line),
@@ -277,10 +277,12 @@ int TRT_GUEST_ABI trt_DeleteDC(void* hdc) {
 }
 int TRT_GUEST_ABI trt_SaveDC(void* hdc) {
   (void)hdc;
+  log_line("gdi32: SaveDC (DC state not saved: fail-visible)");
   return 1;
 }
 int TRT_GUEST_ABI trt_RestoreDC(void* hdc, int nSavedDC) {
   (void)hdc; (void)nSavedDC;
+  log_line("gdi32: RestoreDC (no saved state to restore: fail-visible)");
   return 1;
 }
 
@@ -377,8 +379,13 @@ int TRT_GUEST_ABI trt_SetDIBitsToDevice(void* hdc, int xDest, int yDest, u32 w,
                                         u32 h, int xSrc, int ySrc, u32 StartScan,
                                         u32 cLines, const void* lpvBits,
                                         const void* lpbmi, u32 ColorUse) {
-  (void)hdc; (void)xDest; (void)yDest; (void)w; (void)h; (void)xSrc;
-  (void)ySrc; (void)StartScan; (void)lpvBits; (void)lpbmi; (void)ColorUse;
+  (void)hdc; (void)xSrc; (void)StartScan; (void)lpvBits; (void)lpbmi;
+  (void)ColorUse;
+  char line[144];
+  snprintf(line, sizeof(line),
+           "gdi32: SetDIBitsToDevice %ux%u @(%d,%d) "
+           "(DIB blit not drawn: fail-visible)", w, h, xDest, yDest);
+  log_line(line);
   return (int)cLines;
 }
 
@@ -387,27 +394,46 @@ int TRT_GUEST_ABI trt_StretchDIBits(void* hdc, int xDest, int yDest,
                                     int ySrc, int SrcWidth, int SrcHeight,
                                     const void* lpBits, const void* lpbmi,
                                     u32 iUsage, u32 rop) {
-  (void)hdc; (void)xDest; (void)yDest; (void)DestWidth; (void)DestHeight;
-  (void)xSrc; (void)ySrc; (void)SrcWidth; (void) lpBits; (void)lpbmi;
+  (void)hdc; (void)xSrc; (void)ySrc; (void)lpBits; (void)lpbmi;
   (void)iUsage; (void)rop;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "gdi32: StretchDIBits %dx%d -> %dx%d @(%d,%d) "
+           "(DIB blit not drawn: fail-visible)",
+           SrcWidth, SrcHeight, DestWidth, DestHeight, xDest, yDest);
+  log_line(line);
   return SrcHeight;
 }
 
 int TRT_GUEST_ABI trt_BitBlt(void* hdc, int x, int y, int cx, int cy,
                              void* hdcSrc, int x1, int y1, u32 rop) {
-  (void)hdc; (void)x; (void)y; (void)cx; (void)cy;
-  (void)hdcSrc; (void)x1; (void)y1; (void)rop;
+  (void)hdc; (void)hdcSrc; (void)x1; (void)y1;
+  char line[128];
+  snprintf(line, sizeof(line),
+           "gdi32: BitBlt %dx%d @(%d,%d) rop=0x%x (blit not drawn: fail-visible)",
+           cx, cy, x, y, rop);
+  log_line(line);
   return 1;
 }
 int TRT_GUEST_ABI trt_StretchBlt(void* hdcDest, int xDest, int yDest, int wDest,
                                  int hDest, void* hdcSrc, int xSrc, int ySrc,
                                  int wSrc, int hSrc, u32 rop) {
-  (void)hdcDest; (void)xDest; (void)yDest; (void)wDest; (void)hDest;
-  (void)hdcSrc; (void)xSrc; (void)ySrc; (void)wSrc; (void)hSrc; (void)rop;
+  (void)hdcDest; (void)hdcSrc; (void)xSrc; (void)ySrc;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "gdi32: StretchBlt %dx%d -> %dx%d @(%d,%d) rop=0x%x "
+           "(blit not drawn: fail-visible)",
+           wSrc, hSrc, wDest, hDest, xDest, yDest, rop);
+  log_line(line);
   return 1;
 }
 int TRT_GUEST_ABI trt_PatBlt(void* hdc, int x, int y, int w, int h, u32 rop) {
-  (void)hdc; (void)x; (void)y; (void)w; (void)h; (void)rop;
+  (void)hdc;
+  char line[128];
+  snprintf(line, sizeof(line),
+           "gdi32: PatBlt %dx%d @(%d,%d) rop=0x%x (blit not drawn: fail-visible)",
+           w, h, x, y, rop);
+  log_line(line);
   return 1;
 }
 u32 TRT_GUEST_ABI trt_GetPixel(void* hdc, int x, int y) {
@@ -439,7 +465,7 @@ void* TRT_GUEST_ABI trt_SelectObject(void* hdc, void* hobj) {
     return nullptr;
   }
   void* prev = trt_user32_dc_selected(hdc);
-  if (!prev) prev = (void*)(uintptr_t)0x8000001Eu;  // default SYSTEM_FONT stock handle
+  if (!prev) prev = (void*)(uintptr_t)0x8000001Eu;  // default stock font handle
   trt_user32_dc_set_selected(hdc, hobj);
   return prev;
 }
@@ -585,18 +611,30 @@ int TRT_GUEST_ABI trt_GetTextMetricsA(void* hdc, void* lptm) {
   return 1;
 }
 int TRT_GUEST_ABI trt_TextOutW(void* hdc, int x, int y, const u16* lpString, int c) {
-  (void)hdc; (void)x; (void)y; (void)lpString; (void)c;
+  (void)hdc; (void)x; (void)y; (void)lpString;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: TextOutW c=%d (glyphs not drawn: fail-visible)", c);
+  log_line(line);
   return 1;
 }
 int TRT_GUEST_ABI trt_TextOutA(void* hdc, int x, int y, const char* lpString, int c) {
-  (void)hdc; (void)x; (void)y; (void)lpString; (void)c;
+  (void)hdc; (void)x; (void)y; (void)lpString;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: TextOutA c=%d (glyphs not drawn: fail-visible)", c);
+  log_line(line);
   return 1;
 }
 int TRT_GUEST_ABI trt_ExtTextOutW(void* hdc, int x, int y, u32 options,
                                   const void* lprect, const u16* lpString,
                                   u32 c, const int* lpDx) {
   (void)hdc; (void)x; (void)y; (void)options; (void)lprect;
-  (void)lpString; (void)c; (void)lpDx;
+  (void)lpString; (void)lpDx;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: ExtTextOutW c=%u (glyphs not drawn: fail-visible)", c);
+  log_line(line);
   return 1;
 }
 int TRT_GUEST_ABI trt_AddFontResourceExW(const u16* name, u32 fl, void* res) {
@@ -630,7 +668,12 @@ int TRT_GUEST_ABI trt_GetClipBox(void* hdc, void* lprect) {
   return 2;
 }
 int TRT_GUEST_ABI trt_SetMapMode(void* hdc, int iMode) {
-  (void)hdc; (void)iMode;
+  (void)hdc;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: SetMapMode mode=%d (mapping not applied: fail-visible)",
+           iMode);
+  log_line(line);
   return 1;  // MM_TEXT
 }
 int TRT_GUEST_ABI trt_GetMapMode(void* hdc) {
@@ -753,6 +796,12 @@ int TRT_GUEST_ABI trt_GetDeviceCaps(void* hdc, int index) {
   return v;
 }
 
+// ---- shared with bridge_user32.cpp ----------------------------------------
+// Games import GetDC/ReleaseDC from gdi32 as well as user32; the same
+// user32 DC-record handlers serve both tables (extern decls, no duplication).
+extern "C" void* TRT_STDCALL trt_GetDC(void* hwnd);
+extern "C" int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc);
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"CreateFontIndirectW", (void*)&trt_CreateFontIndirectW},
@@ -780,6 +829,8 @@ int trt_bridge_register_gdi(void) {
       {"CreateDCW", (void*)&trt_CreateDCW},
       {"CreateDCA", (void*)&trt_CreateDCA},
       {"DeleteDC", (void*)&trt_DeleteDC},
+      {"GetDC", (void*)&trt_GetDC},
+      {"ReleaseDC", (void*)&trt_ReleaseDC},
       {"SaveDC", (void*)&trt_SaveDC},
       {"RestoreDC", (void*)&trt_RestoreDC},
       {"CreateBitmap", (void*)&trt_CreateBitmap},
