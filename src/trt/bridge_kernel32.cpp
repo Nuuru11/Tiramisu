@@ -65,6 +65,8 @@
 #  include <ucontext.h>
 #  include <unistd.h>
 #  include <dirent.h>
+#  include <fcntl.h>
+#  include <sys/mman.h>
 #endif
 #  include <time.h>
 #  include <sys/stat.h>
@@ -409,32 +411,185 @@ extern "C" int trt_va_try_promote_rx(u64 fault_addr) {
   return 1;
 }
 
-// Write-watch (MEM_WRITE_WATCH / GetWriteWatch): NOT faithfully available —
-// there is no soft-dirty path on the console (W^X AppContainer), and a lying
-// success would let a GC mis-mark and corrupt the heap. bdwgc (Unity/IL2CPP)
-// probes both and falls back to MPROTECT_VDB when either fails, which only
-// needs VirtualProtect + fault routing. Fail named, never silently succeed.
+// Write-watch (MEM_WRITE_WATCH / GetWriteWatch) — the bdwgc (Unity IL2CPP)
+// incremental-GC probe. Both surfaces MUST answer honestly:
+//   * host _WIN32 (console): passthrough to the real kernel32 APIs — they
+//     exist and work inside a UWP AppContainer; a fake failure would disable
+//     GWW_VDB and cost frame hitches for nothing.
+//   * Linux gate: /proc/self/pagemap soft-dirty emulation (bit 55; survives
+//     the unprivileged PFN masking — the bit is what GWW needs). Reset via
+//     /proc/self/clear_refs "4".
+// Anything else fails named (never a lying success = GC mis-mark = corruption).
+#if defined(_WIN32)
+extern "C" u32 __stdcall GetWriteWatch(u32, void*, u64, void**, u64*, u32*);
+extern "C" u32 __stdcall ResetWriteWatch(void*, u64);
+#endif
+static u32 ww_host_GetWriteWatch(u32 flags, void* addr, u64 bytes, void** addrs,
+                                 u64* count, u32* gran) {
+#if defined(_WIN32)
+  using fn_t = u32(__stdcall*)(u32, void*, u64, void**, u64*, u32*);
+  static fn_t fn = (fn_t)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "GetWriteWatch");
+  if (fn) return fn(flags, addr, bytes, addrs, count, gran);
+  return (u32)-1;
+#else
+  (void)flags; (void)addr; (void)bytes; (void)addrs; (void)count; (void)gran;
+  return (u32)-1;  // no host fallback; caller uses the emulator below
+#endif
+}
+static bool eh_trace_enabled();
+static bool ww_pagemap_entry_dirty(u64 pagemap_off) {
+  // returns 1 dirty, 0 clean, -1 error. Requires PRESENT: this kernel marks
+  // fresh never-faulted anonymous pages soft-dirty=1 while absent (measured:
+  // entry bit 55 set, bit 63 clear, zero writes) — absent pages cannot have
+  // been written, so reporting them would be a lying over-report.
+  if (!((pagemap_off >> 63) & 1)) return 0;
+  return (int)((pagemap_off >> 55) & 1);
+}
+// One-time probe: does soft-dirty actually WORK on this kernel? Several
+// 6.x kernels strip the bit for unprivileged pagemap readers (all entries
+// read 0 even after fresh first-touch writes). Trusting a dead bit would
+// answer "0 dirty pages" to a GC = heap corruption. Probe before trust.
+static bool ww_softdirty_works() {
+  static const bool works = [] {
+#if defined(_WIN32)
+    return false;  // console uses real GetWriteWatch passthrough
+#else
+    // NO clear_refs here: "4" clears soft-dirty bits PROCESS-WIDE and would
+    // wipe the dirty bits of memory the caller already wrote (measured:
+    // first GWW call returned n=0 for pages written before it). A fresh
+    // first-touch write sets the bit without touching anything else.
+    const size_t sz = 4096;
+    void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return false;
+    ((volatile u8*)p)[0] = 1;  // first-touch fault should set soft-dirty
+    const int pm = open("/proc/self/pagemap", O_RDONLY);
+    if (pm < 0) { munmap(p, sz); return false; }
+    u64 ent = 0;
+    const bool ok =
+        pread(pm, &ent, 8, ((uintptr_t)p / 4096) * 8) == 8 &&
+        ww_pagemap_entry_dirty(ent) == 1;
+    close(pm);
+    munmap(p, sz);
+    return ok;
+#endif
+  }();
+  return works;
+}
 u32 TRT_STDCALL trt_GetWriteWatch(u32 flags, void* addr, u64 bytes, void** addrs,
                                   u64* count, u32* gran) {
-  (void)flags; (void)addr; (void)bytes; (void)addrs;
-  if (count) *count = 0;
+  if (!addr || !count || !gran || (flags & ~1u)) {
+    if (count) *count = 0;
+    if (gran) *gran = 4096;
+    set_err_for_current_thread(87);
+    return (u32)-1;
+  }
   if (gran) *gran = 4096;
-  trt_core_log("kernel32: GetWriteWatch -> ERROR_INVALID_PARAMETER (write-watch unavailable; GC falls back to MPROTECT_VDB)");
+  // host passthrough first (console truth)
+  if (ww_host_GetWriteWatch(flags, addr, bytes, addrs, count, gran) != (u32)-1) {
+    return 0;
+  }
+#if !defined(_WIN32)
+  // soft-dirty emulation: /proc/self/pagemap, one u64 per 4K page.
+  // ONLY if the kernel actually honors the bit (probed once — several 6.x
+  // kernels strip it unprivileged; a dead bit silently answering "clean"
+  // would corrupt a trusting GC). Otherwise fail named: bdwgc falls back
+  // to MPROTECT_VDB, which needs only VirtualProtect + fault routing.
+  if (!ww_softdirty_works()) {
+    trt_core_log(
+        "kernel32: GetWriteWatch -> ERROR_INVALID_PARAMETER (soft-dirty dead on "
+        "this kernel; GC falls back to MPROTECT_VDB)");
+    if (count) *count = 0;
+    set_err_for_current_thread(87);
+    return (u32)-1;
+  }
+  // soft-dirty emulation: /proc/self/pagemap, one u64 per 4K page
+  const uintptr_t start = (uintptr_t)addr & ~(uintptr_t)4095ULL;
+  const uintptr_t end =
+      ((uintptr_t)addr + bytes + 4095ULL) & ~(uintptr_t)4095ULL;
+  const int pm = open("/proc/self/pagemap", O_RDONLY);
+  if (pm < 0) {
+    trt_core_log(
+        "kernel32: GetWriteWatch -> ERROR_INVALID_PARAMETER (pagemap unreadable; "
+        "GC falls back to MPROTECT_VDB)");
+    if (count) *count = 0;
+    set_err_for_current_thread(87);
+    return (u32)-1;
+  }
+  u64 cap = count ? *count : 0;
+  u64 n = 0;
+  bool overflow = false;
+  for (uintptr_t p = start; p < end; p += 4096) {
+    u64 ent = 0;
+    const off_t off = (off_t)((p / 4096) * sizeof(u64));
+    if (pread(pm, &ent, sizeof(ent), off) != sizeof(ent)) continue;
+    if (!ww_pagemap_entry_dirty(ent)) continue;
+    if (n < cap && addrs) {
+      addrs[n] = (void*)p;
+    } else if (n >= cap) {
+      overflow = true;
+    }
+    ++n;
+  }
+  close(pm);
+  if (count) *count = n;
+  if ((flags & 1u /*WRITE_WATCH_FLAG_RESET*/) && n > 0) {
+    FILE* cr = fopen("/proc/self/clear_refs", "w");
+    if (cr) {
+      fputs("4\n", cr);
+      fclose(cr);
+    }
+  }
+  if (overflow) {
+    set_err_for_current_thread(1455);  // ERROR_OUT_OF_MEMORY: buffer too small
+    return (u32)-1;
+  }
+  if (eh_trace_enabled()) {
+    char t[128];
+    snprintf(t, sizeof(t),
+             "kernel32: GetWriteWatch -> %llu dirty pages in [0x%llx..0x%llx)",
+             (unsigned long long)n, (unsigned long long)start,
+             (unsigned long long)end);
+    trt_core_log(t);
+  }
+  return 0;
+#else
+  if (count) *count = 0;
   set_err_for_current_thread(87);
   return (u32)-1;
+#endif
 }
 u32 TRT_STDCALL trt_ResetWriteWatch(void* addr, u64 bytes) {
-  (void)addr; (void)bytes;
+#if defined(_WIN32)
+  using fn_t = u32(__stdcall*)(void*, u64);
+  static fn_t fn = (fn_t)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                               "ResetWriteWatch");
+  if (fn) return fn(addr, bytes);
+#endif
+#if !defined(_WIN32)
+  // LIMITATION (named): Linux clear_refs "4" clears soft-dirty PROCESS-WIDE,
+  // not just [addr, addr+bytes) — broader than Win32 semantics. Harmless for
+  // bdwgc (it resets once per GC cycle after scanning everything) and the
+  // console uses the real per-range kernel32 API.
+  if (addr && bytes) {
+    FILE* cr = fopen("/proc/self/clear_refs", "w");
+    if (cr) {
+      fputs("4\n", cr);
+      fclose(cr);
+      return 0;
+    }
+  }
+#endif
   set_err_for_current_thread(87);
   return 87;
 }
 
 void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
-  if (type & 0x00200000u /*MEM_WRITE_WATCH*/) {
-    trt_core_log("kernel32: VirtualAlloc(MEM_WRITE_WATCH) rejected (write-watch unavailable)");
-    set_err_for_current_thread(87);
-    return nullptr;
-  }
+  // MEM_WRITE_WATCH is a REQUEST modifier, not an allocation type: real
+  // Windows accepts it silently alongside MEM_RESERVE|COMMIT (bdwgc probes
+  // with exactly this combination). Rejecting it fails the whole GC probe.
+  type &= ~0x00200000u;
   if (!(type & 0x3000u)) {
     set_err_for_current_thread(87);  // INVALID_PARAMETER
     return nullptr;

@@ -1512,6 +1512,51 @@ int main() {
           "Wave 6F: alertable GetQueuedCompletionStatusEx dispatches APC with WAIT_IO_COMPLETION");
   }
 
+  // ---- Wave 6G: write-watch (bdwgc/IL2CPP incremental-GC probe surface) ----
+  // bdwgc probes GetProcAddress("GetWriteWatch") + VirtualAlloc(MEM_WRITE_
+  // WATCH|MEM_RESERVE|COMMIT, PAGE_READWRITE). Both must answer honestly.
+  {
+    auto kfn = [&](const char* mod, const char* sym) -> void* {
+      return trt_resolve_module(nullptr, mod, sym, 0);
+    };
+    using GWWatch_t = u32(TRT_STDCALL*)(u32, void*, u64, void**, u64*, u32*);
+    using RWW_t     = u32(TRT_STDCALL*)(void*, u64);
+    using VirtualAlloc_t = void*(TRT_STDCALL*)(void*, u64, u32, u32);
+    auto pGww = (GWWatch_t)kfn("kernel32.dll", "GetWriteWatch");
+    auto pRww = (RWW_t)kfn("kernel32.dll", "ResetWriteWatch");
+    auto pValloc = (VirtualAlloc_t)kfn("kernel32.dll", "VirtualAlloc");
+    CHECK(pGww != nullptr && pRww != nullptr && pValloc != nullptr,
+          "write-watch exports present in the bridge table");
+    if (pGww && pValloc) {
+      // the exact bdwgc probe: MEM_WRITE_WATCH (0x200000) | RESERVE|COMMIT
+      constexpr u32 MEM_WW = 0x1000u | 0x2000u | 0x00200000u;
+      void* gc = pValloc(nullptr, 1 << 20, MEM_WW, 0x04u /*PAGE_READWRITE*/);
+      CHECK(gc != nullptr,
+            "VirtualAlloc(MEM_WRITE_WATCH|RESERVE|COMMIT) accepted (GC probe lives)");
+      if (gc) {
+        volatile u8* bytes = (volatile u8*)gc;
+        bytes[0 * 4096] = 1;  // touch page 0
+        bytes[3 * 4096] = 2;  // touch page 3
+        // enter a scope so the compiler keeps the volatile stores
+        u64 n = 8;
+        void* addrs[8] = {};
+        u32 gran = 0;
+        const u32 rc = pGww(0 /*no reset*/, gc, 1 << 20, addrs, &n, &gran);
+        CHECK(rc == 0, "GetWriteWatch answers success (host passthrough or soft-dirty)");
+        CHECK(n == 2 && addrs[0] == gc &&
+                  addrs[1] == (void*)((u8*)gc + 3 * 4096),
+              "GetWriteWatch reports exactly the 2 written pages, page-granular");
+        // reset then re-query: clean means n == 0
+        if (pRww) pRww(gc, 1 << 20);
+        u64 n2 = 8;
+        void* addrs2[8] = {};
+        const u32 rc2 = pGww(0, gc, 1 << 20, addrs2, &n2, &gran);
+        CHECK(rc2 == 0 && n2 == 0, "after ResetWriteWatch the region reports clean");
+        pValloc(gc, 0, 0x8000u /*MEM_RELEASE*/, 0);
+      }
+    }
+  }
+
   printf("\nRESULT: %s\n", g_failures ? "FAIL" : "ALL PASS");
   return g_failures ? 1 : 0;
 }

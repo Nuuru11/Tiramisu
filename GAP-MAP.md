@@ -183,11 +183,17 @@ loader + translator ladder.
    probe call — GWW_VDB is enabled only if BOTH succeed; otherwise it falls
    back to MPROTECT_VDB (write-protect + fault) or DEFAULT_VDB (all pages
    dirty: correct, but incremental GC off → frame hitches).
-   - Implement honestly on Linux: soft-dirty via `/proc/self/pagemap`, accept
-     `MEM_WRITE_WATCH (0x200000)` in `trt_VirtualAlloc`.
-   - On console expect the probe to FAIL (W^X, see W3) → MPROTECT_VDB → which
-     requires our fault→guest-VEH routing to be solid (W1 dependency).
-   - Never fake it: a lying success = GC mis-marking = heap corruption.
+   - **DONE 2026-11-15 (honest, dual-surface):** `VirtualAlloc` accepts
+     `MEM_WRITE_WATCH` as a request modifier (real Windows semantics); on the
+     console `_WIN32` passthrough to the real kernel32 GWW; on Linux gate,
+     soft-dirty emulation via `/proc/self/pagemap` gated behind a one-time
+     liveness probe (bit 55, and bit 63 present required — this 6.14 kernel
+     marks fresh absent pages dirty; a dead bit or clear_refs wipe would
+     silently lie "clean" to a GC = heap corruption, so it fails named →
+     bdwgc falls back to MPROTECT_VDB). Known limitation: Linux
+     `ResetWriteWatch` clear_refs "4" is process-wide (console: real
+     per-range API). Gate: `test_wave1` Wave 6G (GC probe exact-shape,
+     2-page dirty report, reset-clean).
 2. **`dwmapi.dll`** (UnityPlayer: `DwmGetWindowAttribute`,
    `DwmSetWindowAttribute`) — honest record / fail-visible.
 3. After W2: run the **C++-resolver audit** (`tests/audit_boot.cpp`) over all
@@ -237,8 +243,8 @@ No console claim without a TV screenshot + the log pull.
 | # | Item | Status | Trigger to start |
 |---|---|---|---|
 | 1 | Streaming/windowed `MapViewOfFile`, unmap reclamation, >64 maps | **IN FLIGHT** (test_wave1.cpp) | — |
-| 2 | `DispatcherQueue` passthrough: `RoGetActivationFactory('Windows.System.DispatcherQueue')` → NOTREG today | open | UnityPlayer calls it early; on console combase is REAL — passthrough to the console's own RoGetActivationFactory first, offline answer NOTREG named |
-| 3 | GetWriteWatch honest impl (W2) | open | frame hitches / GC assert in log |
+| 2 | `DispatcherQueue` passthrough | **DONE 2026-11-15** (offline DQC/DQ factories + QI in bridge_winrt.cpp; test_console_pack §9) | UnityPlayer calls it early; on console combase is REAL — passthrough first |
+| 3 | GetWriteWatch honest impl (W2) | **DONE 2026-11-15** (dual-surface honest: console passthrough / Linux soft-dirty+probe; test_wave1 Wave 6G) | frame hitches / GC assert in log |
 | 4 | IOCP/OVERLAPPED async + dstorage | dstorage DllMain already runs | streaming asserts |
 | 5 | Memory ceiling (5 GB game budget) | partly in flight (streaming maps) | any real game OOM |
 | 6 | Perf: pump/present pacing, guest-on-render-thread | session-2 Wave-1 plan | first-frame stutter |
