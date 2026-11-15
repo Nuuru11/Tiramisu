@@ -88,5 +88,5 @@ sys.path.insert(0, "tools")
     return 0
 
 
-if __name__ == 'main':
+if __name__ == '__main__':
     sys.exit(main())

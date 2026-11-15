@@ -18,6 +18,11 @@ extern "C" {
 
 int trt_bridge_register_dsound(void);
 
+void trt_dsound_bind_sink(int (*submit)(const void* pcm, u32 bytes, u32 rate,
+                                        u32 channels, u32 bytes_per_sample,
+                                        void* user),
+                          void* user);
+
 #ifdef __cplusplus
 }
 #endif

@@ -43,9 +43,10 @@ void w2a(const u16* in, char* out, u32 cap) {
 
 // ---- symbol-search records (one per SymInitialize) ----
 struct sym_rec { u32 tag; void* base; };
-sym_rec g_sym[4];
+sym_rec g_sym[16];
+u32 g_sym_options = 0;
 void* sym_alloc(void* base) {
-  for (u32 i = 0; i < 4; ++i) {
+  for (u32 i = 0; i < 16; ++i) {
     if (!g_sym[i].tag) {
       g_sym[i].tag = 0x5359u;  // 'SY'
       g_sym[i].base = base;
@@ -56,7 +57,7 @@ void* sym_alloc(void* base) {
 }
 bool sym_valid(void* h) {
   const u32 v = (u32)(uintptr_t)h;
-  return (v >> 16) == 0x5359u && (v & 0xFFFFu) < 4 && g_sym[v & 0xFFFFu].tag;
+  return (v >> 16) == 0x5359u && (v & 0xFFFFu) < 16 && g_sym[v & 0xFFFFu].tag;
 }
 
 // the guest path a dump lands at (game dir through the VFS)
@@ -107,6 +108,38 @@ int TRT_GUEST_ABI dbg_SymFromAddr(void* proc, u64 addr, u64* displacement,
            "stays unnamed)", (unsigned long long)addr);
   log_line(line);
   return 0;
+}
+
+int TRT_GUEST_ABI dbg_SymGetLineFromAddr64(void* proc, u64 addr, u32* displacement,
+                                           void* line64) {
+  char line[192];
+  (void)proc; (void)line64;
+  if (displacement) *displacement = 0;
+  snprintf(line, sizeof(line),
+           "dbghelp: SymGetLineFromAddr64 -> FALSE (no PDBs on console; "
+           "addr=0x%llx)", (unsigned long long)addr);
+  log_line(line);
+  return 0;
+}
+
+int TRT_GUEST_ABI dbg_SymCleanup(void* proc) {
+  for (u32 i = 0; i < 16; ++i) {
+    if (g_sym[i].tag && g_sym[i].base == proc) {
+      g_sym[i].tag = 0;
+      g_sym[i].base = nullptr;
+    }
+  }
+  return 1;
+}
+
+u32 TRT_GUEST_ABI dbg_SymSetOptions(u32 options) {
+  const u32 prev = g_sym_options;
+  g_sym_options = options;
+  return prev;
+}
+
+u32 TRT_GUEST_ABI dbg_SymGetOptions(void) {
+  return g_sym_options;
 }
 
 u64 TRT_GUEST_ABI dbg_SymLoadModuleEx(void* proc, void* file, const u16* name,
@@ -215,11 +248,19 @@ int TRT_GUEST_ABI dbg_MiniDumpWriteDump(void* proc, u32 pid, void* file_h,
 
 int trt_bridge_register_dbghelp(void) {
   static const trt_named_fn k_fns[] = {
-      {"SymInitialize", (void*)&dbg_SymInitializeW},
+      {"SymInitialize", (void*)&dbg_SymInitializeA},
       {"SymInitializeW", (void*)&dbg_SymInitializeW},
       {"SymInitializeA", (void*)&dbg_SymInitializeA},
+      {"SymCleanup", (void*)&dbg_SymCleanup},
+      {"SymSetOptions", (void*)&dbg_SymSetOptions},
+      {"SymGetOptions", (void*)&dbg_SymGetOptions},
       {"SymFromAddr", (void*)&dbg_SymFromAddr},
       {"SymFromAddrW", (void*)&dbg_SymFromAddr},
+      {"SymFromAddr64", (void*)&dbg_SymFromAddr},
+      {"SymGetSymFromAddr64", (void*)&dbg_SymFromAddr},
+      {"SymGetLineFromAddr64", (void*)&dbg_SymGetLineFromAddr64},
+      {"SymGetLineFromAddrW64", (void*)&dbg_SymGetLineFromAddr64},
+      {"SymGetLineFromAddr", (void*)&dbg_SymGetLineFromAddr64},
       {"SymLoadModuleEx", (void*)&dbg_SymLoadModuleEx},
       {"SymRegisterFunctionEntryCallback64",
        (void*)&dbg_SymRegisterFunctionEntryCallback64},

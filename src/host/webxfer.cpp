@@ -1,99 +1,417 @@
 // tiramisu/src/host/webxfer.cpp
-// HTTP game-transfer server on raw ws2_32 (real DLL on console, SYSTEM route).
-// Protocol kept deliberately simple so phone browsers need nothing special:
-//   GET  /              -> phone upload page (dark, Tiramisu-styled)
-//   PUT  /upload/<name> -> raw body streamed to LocalState\incoming\<name>;
-//                          .zip gets extracted into games\<stem>\
-//   GET  /games         -> JSON list (name, exes[])
-//   POST /launch/<name> -> set launch flag; the host loop boots the guest
-// Streams bodies straight to disk (games are GBs; nothing buffered in RAM).
+// Concurrent LAN HTTP game-transfer & management server (WinSock2 on UWP, POSIX
+// sockets on Linux offline tests).
+// Endpoints:
+//   GET  /                                      -> Mobile + Desktop Web Dashboard
+//   GET  /games                                 -> JSON array of games + exes + config
+//   GET  /api/status                            -> JSON live status & upload progress
+//   GET  /api/logs                              -> Tail of tiramisu.log
+//   GET  /progress/<id>                         -> Fractional upload progress 0..1
+//   PUT  /upload/<name>.zip                     -> Streaming .zip upload -> extract to games\<stem>
+//   PUT  /api/upload-file?game=<n>&rel=<path>   -> Streaming unpacked folder file upload
+//   POST /launch/<name> | /api/launch/<name>    -> Launch game on TV
+//   POST /api/stop                              -> Request clean stop of active guest game
+//   POST /api/rescan                            -> Force immediate game library rescan
+//   POST /api/config/<name>                     -> Save exe / appid / args / input preset
+//   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
 #include "host_log.h"
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #pragma comment(lib, "ws2_32.lib")
+  using sock_t = SOCKET;
+  static const sock_t kBadSock = INVALID_SOCKET;
+  #define XFER_SEP '\\'
+#else
+  #include <arpa/inet.h>
+  #include <dirent.h>
+  #include <netdb.h>
+  #include <netinet/in.h>
+  #include <sys/socket.h>
+  #include <sys/stat.h>
+  #include <unistd.h>
+  #ifdef __linux__
+    #include <ifaddrs.h>
+  #endif
+  using sock_t = int;
+  static const sock_t kBadSock = -1;
+  #define XFER_SEP '/'
+#endif
 
 #include "vendor/miniz.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
-
-#pragma comment(lib, "ws2_32.lib")
 
 namespace longan {
 
 namespace {
 
+std::mutex g_mu;
 webxfer_state g;
 std::atomic<bool> g_stop{false};
-SOCKET g_listener = INVALID_SOCKET;
+std::atomic<int> g_workers{0};
+sock_t g_listener = kBadSock;
 
-std::string g_games_dir;    // LocalState\games
-std::string g_incoming;     // LocalState\incoming
+std::string g_local_state_dir;
+std::string g_games_dir;
+std::string g_incoming;
 
-// ---------- filesystem helpers (CRT on the LocalState paths) ----------
+std::atomic<uint64_t> g_upload_total{0};
+std::atomic<uint64_t> g_upload_done{0};
+
+void sock_close(sock_t s) {
+  if (s == kBadSock) return;
+#ifdef _WIN32
+  closesocket(s);
+#else
+  close(s);
+#endif
+}
+
+struct sock_guard {
+  sock_t s;
+  ~sock_guard() { sock_close(s); }
+};
+
+std::string xfer_lower(std::string s) {
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
+
+bool xfer_ieq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string trim_ws(const std::string& s) {
+  size_t a = 0;
+  while (a < s.size() && (unsigned char)s[a] <= ' ') ++a;
+  size_t b = s.size();
+  while (b > a && (unsigned char)s[b - 1] <= ' ') --b;
+  return s.substr(a, b - a);
+}
+
+// ---------- cross-platform filesystem helpers ----------
 bool dir_exists(const std::string& p) {
+#ifdef _WIN32
   DWORD a = GetFileAttributesA(p.c_str());
-  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+  return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) != 0;
+#else
+  struct stat st{};
+  return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+#endif
 }
 
 void mkdirs(const std::string& p) {
   std::string cur;
   for (size_t i = 0; i <= p.size(); ++i) {
-    if (i == p.size() || p[i] == '\\') {
+    if (i == p.size() || p[i] == '\\' || p[i] == '/') {
       cur = p.substr(0, i);
-      if (!cur.empty() && !dir_exists(cur)) CreateDirectoryA(cur.c_str(), nullptr);
+      if (!cur.empty() && cur != "/" &&
+          !(cur.size() == 2 && cur[1] == ':') && !dir_exists(cur)) {
+#ifdef _WIN32
+        CreateDirectoryA(cur.c_str(), nullptr);
+#else
+        mkdir(cur.c_str(), 0755);
+#endif
+      }
     }
   }
 }
 
-bool read_file(const std::string& p, std::string* out) {
-  FILE* f = fopen(p.c_str(), "rb");
-  if (!f) return false;
-  char buf[8192];
-  size_t n;
-  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) out->append(buf, n);
-  fclose(f);
-  return true;
-}
+struct dir_ent {
+  std::string name;
+  bool is_dir = false;
+  uint64_t size = 0;
+};
 
-void list_dir(const std::string& dir, std::vector<std::string>* names) {
+void list_dir_entries(const std::string& dir, std::vector<dir_ent>* out) {
+  out->clear();
+#ifdef _WIN32
   WIN32_FIND_DATAA fd;
   HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
   if (h == INVALID_HANDLE_VALUE) return;
   do {
-    const std::string n = fd.cFileName;
-    if (n != "." && n != "..") names->push_back(n);
+    std::string n = fd.cFileName;
+    if (n == "." || n == "..") continue;
+    dir_ent e;
+    e.name = std::move(n);
+    e.is_dir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    e.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    out->push_back(std::move(e));
   } while (FindNextFileA(h, &fd));
   FindClose(h);
+#else
+  DIR* d = opendir(dir.c_str());
+  if (!d) return;
+  while (dirent* ent = readdir(d)) {
+    std::string n = ent->d_name;
+    if (n == "." || n == "..") continue;
+    std::string full = dir + "/" + n;
+    struct stat st{};
+    if (stat(full.c_str(), &st) != 0) continue;
+    dir_ent e;
+    e.name = std::move(n);
+    e.is_dir = S_ISDIR(st.st_mode);
+    e.size = e.is_dir ? 0 : (uint64_t)st.st_size;
+    out->push_back(std::move(e));
+  }
+  closedir(d);
+#endif
 }
 
-// primary exe = largest exe, folder-name match wins
-std::string pick_exe(const std::string& game_dir, const std::string& game_name) {
-  std::vector<std::string> files;
-  list_dir(game_dir, &files);
-  std::string best;
-  uint64_t best_size = 0;
-  for (const auto& f : files) {
-    const size_t dot = f.rfind('.');
-    if (dot == std::string::npos ||
-        _stricmp(f.c_str() + dot, ".exe") != 0) continue;
-    WIN32_FILE_ATTRIBUTE_DATA fa;
-    uint64_t sz = 0;
-    if (GetFileAttributesExA((game_dir + "\\" + f).c_str(),
-                             GetFileExInfoStandard, &fa))
-      sz = ((uint64_t)fa.nFileSizeHigh << 32) | fa.nFileSizeLow;
-    const bool name_match = _stricmp(f.substr(0, dot).c_str(), game_name.c_str()) == 0;
-    if (name_match || best_size == 0 || sz > best_size) {
-      best = f;
-      best_size = sz;
-      if (name_match) break;
+bool remove_tree(const std::string& dir) {
+  if (!dir_exists(dir)) return false;
+  std::vector<dir_ent> ents;
+  list_dir_entries(dir, &ents);
+  for (const auto& e : ents) {
+    std::string child = dir + std::string(1, XFER_SEP) + e.name;
+    if (e.is_dir) remove_tree(child);
+    else {
+#ifdef _WIN32
+      DeleteFileA(child.c_str());
+#else
+      unlink(child.c_str());
+#endif
     }
   }
-  return best;
+#ifdef _WIN32
+  return RemoveDirectoryA(dir.c_str()) != 0;
+#else
+  return rmdir(dir.c_str()) == 0;
+#endif
+}
+
+std::string read_small_text(const std::string& p) {
+  FILE* f = fopen(p.c_str(), "rb");
+  if (!f) return {};
+  char buf[2048];
+  size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+  fclose(f);
+  buf[n] = 0;
+  return trim_ws(buf);
+}
+
+bool write_or_clear_text(const std::string& p, const std::string& val) {
+  std::string v = trim_ws(val);
+  if (v.empty()) {
+    remove(p.c_str());
+    return true;
+  }
+  FILE* f = fopen(p.c_str(), "wb");
+  if (!f) return false;
+  fwrite(v.data(), 1, v.size(), f);
+  fclose(f);
+  return true;
+}
+
+std::string read_log_tail(const std::string& p, size_t max_bytes = 16384) {
+  FILE* f = fopen(p.c_str(), "rb");
+  if (!f) return "(no logs yet)";
+  fseek(f, 0, SEEK_END);
+  long sz = ftell(f);
+  if (sz <= 0) {
+    fclose(f);
+    return "(log empty)";
+  }
+  long off = (sz > (long)max_bytes) ? (sz - (long)max_bytes) : 0;
+  fseek(f, off, SEEK_SET);
+  std::string out((size_t)(sz - off), '\0');
+  size_t n = fread(&out[0], 1, out.size(), f);
+  out.resize(n);
+  fclose(f);
+  if (off > 0) {
+    size_t nl = out.find('\n');
+    if (nl != std::string::npos) out = out.substr(nl + 1);
+  }
+  return out;
+}
+
+// ---------- URL decoding & strict path sanitization ----------
+int hex_val(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+  if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+  return -1;
+}
+
+std::string url_decode(const std::string& s, bool plus_is_space = false) {
+  std::string out;
+  out.reserve(s.size());
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '%' && i + 2 < s.size()) {
+      int h = hex_val(s[i + 1]);
+      int l = hex_val(s[i + 2]);
+      if (h >= 0 && l >= 0) {
+        out.push_back((char)((h << 4) | l));
+        i += 2;
+        continue;
+      }
+    } else if (plus_is_space && s[i] == '+') {
+      out.push_back(' ');
+      continue;
+    }
+    out.push_back(s[i]);
+  }
+  return out;
+}
+
+std::string query_param(const std::string& query, const std::string& key) {
+  size_t pos = 0;
+  while (pos < query.size()) {
+    size_t amp = query.find('&', pos);
+    std::string kv = (amp == std::string::npos) ? query.substr(pos)
+                                                : query.substr(pos, amp - pos);
+    size_t eq = kv.find('=');
+    if (eq != std::string::npos && kv.substr(0, eq) == key) {
+      return url_decode(kv.substr(eq + 1), true);
+    }
+    if (amp == std::string::npos) break;
+    pos = amp + 1;
+  }
+  return {};
+}
+
+bool sanitize_game_name(const std::string& raw, std::string* out) {
+  std::string s = trim_ws(raw);
+  if (s.empty() || s.size() > 160 || s == "." || s == "..") return false;
+  if (s.find("..") != std::string::npos) return false;
+  for (unsigned char c : s) {
+    if (c < 0x20 || c == '/' || c == '\\' || c == ':' || c == '\0' ||
+        c == '<' || c == '>' || c == '"' || c == '|' || c == '?' || c == '*') {
+      return false;
+    }
+  }
+  *out = s;
+  return true;
+}
+
+bool sanitize_rel_path(const std::string& raw, char sep, std::string* out) {
+  if (raw.empty() || raw.size() > 512) return false;
+  std::vector<std::string> parts;
+  std::string cur;
+  for (size_t i = 0; i <= raw.size(); ++i) {
+    if (i == raw.size() || raw[i] == '/' || raw[i] == '\\') {
+      if (!cur.empty()) {
+        if (cur == "." || cur == ".." || cur.find("..") != std::string::npos) {
+          return false;
+        }
+        for (unsigned char c : cur) {
+          if (c < 0x20 || c == ':') return false;
+        }
+        parts.push_back(cur);
+        cur.clear();
+      }
+    } else {
+      cur.push_back(raw[i]);
+    }
+  }
+  if (parts.empty()) return false;
+  std::string res;
+  for (size_t i = 0; i < parts.size(); ++i) {
+    if (i) res.push_back(sep);
+    res += parts[i];
+  }
+  *out = res;
+  return true;
+}
+
+// ---------- Exe scanner ----------
+bool xfer_is_junk_exe(const std::string& fn) {
+  const std::string s = xfer_lower(fn);
+  return s.find("unitycrashhandler") != std::string::npos ||
+         s.find("crashreport") != std::string::npos ||
+         s.find("ueprereq") != std::string::npos ||
+         s.find("ue4prereq") != std::string::npos ||
+         s.find("ue5prereq") != std::string::npos ||
+         s.find("vcredist") != std::string::npos ||
+         s.find("vc_redist") != std::string::npos ||
+         s.find("dxsetup") != std::string::npos ||
+         s.find("dotnet") != std::string::npos ||
+         s.find("unins0") != std::string::npos ||
+         s.find("uninstall") != std::string::npos;
+}
+
+struct exe_item {
+  std::string rel;
+  int score = 0;
+  uint64_t size = 0;
+};
+
+void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
+                      const std::string& game_name, int depth,
+                      std::vector<exe_item>* out) {
+  if (depth > 5) return;
+  const std::string sep(1, XFER_SEP);
+  const std::string dir = rel_dir.empty() ? base_dir : (base_dir + sep + rel_dir);
+  std::vector<dir_ent> ents;
+  list_dir_entries(dir, &ents);
+  const std::string g_low = xfer_lower(game_name);
+  for (const auto& e : ents) {
+    if (e.name == "__MACOSX") continue;
+    const std::string rel = rel_dir.empty() ? e.name : (rel_dir + sep + e.name);
+    if (e.is_dir) {
+      collect_exes_rec(base_dir, rel, game_name, depth + 1, out);
+      continue;
+    }
+    const size_t dot = e.name.rfind('.');
+    if (dot == std::string::npos || !xfer_ieq(e.name.substr(dot), ".exe")) continue;
+    if (xfer_is_junk_exe(e.name)) continue;
+    const std::string stem_low = xfer_lower(e.name.substr(0, dot));
+    int sc = (depth == 0) ? 60 : (depth == 1 ? 30 : 0);
+    if (stem_low == g_low || stem_low == g_low + "-win64-shipping") sc += 200;
+    if (stem_low.size() > 15 &&
+        stem_low.rfind("-win64-shipping") == stem_low.size() - 15) sc += 120;
+    out->push_back({rel, sc, e.size});
+  }
+}
+
+void scan_game_exes(const std::string& game_dir, const std::string& game_name,
+                    std::vector<std::string>* out_exes, std::string* selected) {
+  out_exes->clear();
+  selected->clear();
+  std::vector<exe_item> items;
+  collect_exes_rec(game_dir, "", game_name, 0, &items);
+  std::sort(items.begin(), items.end(), [](const exe_item& a, const exe_item& b) {
+    if (a.score != b.score) return a.score > b.score;
+    if (a.size != b.size) return a.size > b.size;
+    return a.rel < b.rel;
+  });
+  for (const auto& it : items) out_exes->push_back(it.rel);
+  if (out_exes->empty()) return;
+  *selected = (*out_exes)[0];
+  const std::string cfg_exe =
+      read_small_text(game_dir + std::string(1, XFER_SEP) + "tiramisu_exe.txt");
+  if (!cfg_exe.empty()) {
+    for (const auto& ex : *out_exes) {
+      std::string a = ex, b = cfg_exe;
+      for (char& c : a) if (c == '\\') c = '/';
+      for (char& c : b) if (c == '\\') c = '/';
+      if (xfer_ieq(a, b)) {
+        *selected = ex;
+        break;
+      }
+    }
+  }
 }
 
 // ---------- zip extraction (miniz) ----------
@@ -107,22 +425,18 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
   }
   const int n = (int)mz_zip_reader_get_num_files(&zip);
   int extracted = 0;
-  char safe_name[256];
   for (int i = 0; i < n; ++i) {
     mz_zip_archive_file_stat st{};
     if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
     if (st.m_is_directory) continue;
-    // sanitize: no absolute parts, no ..
-    const char* base = st.m_filename;
-    while (*base == '/' || *base == '\\') ++base;
-    if (strstr(base, "..")) continue;
-    snprintf(safe_name, sizeof(safe_name), "%s", base);
-    for (char* q = safe_name; *q; ++q) if (*q == '/') *q = '\\';
-    const std::string out_path = dest + "\\" + safe_name;
-    const size_t slash = out_path.rfind('\\');
+    std::string rel;
+    if (!sanitize_rel_path(st.m_filename, XFER_SEP, &rel)) continue;
+    const std::string out_path = dest + std::string(1, XFER_SEP) + rel;
+    const size_t slash = out_path.rfind(XFER_SEP);
     if (slash != std::string::npos) mkdirs(out_path.substr(0, slash));
-    mz_zip_reader_extract_to_file(&zip, i, out_path.c_str(), 0);
-    ++extracted;
+    if (mz_zip_reader_extract_to_file(&zip, i, out_path.c_str(), 0)) {
+      ++extracted;
+    }
   }
   mz_zip_reader_end(&zip);
   char tmp[128];
@@ -131,29 +445,75 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
   return extracted > 0;
 }
 
-// ---------- game list + http plumbing ----------
+// ---------- JSON + lightweight config parsing ----------
 std::string json_escape(const std::string& s) {
   std::string r;
   for (char c : s) {
     if (c == '"' || c == '\\') { r += '\\'; r += c; }
+    else if (c == '\n') r += "\\n";
+    else if (c == '\r') r += "\\r";
     else if ((uint8_t)c < 0x20) r += ' ';
     else r += c;
   }
   return r;
 }
 
+bool parse_json_str_field(const std::string& json, const char* key, std::string* out) {
+  const std::string needle = std::string("\"") + key + "\"";
+  size_t k = json.find(needle);
+  if (k == std::string::npos) return false;
+  size_t col = json.find(':', k + needle.size());
+  if (col == std::string::npos) return false;
+  size_t q1 = json.find('"', col + 1);
+  if (q1 == std::string::npos) return false;
+  std::string val;
+  for (size_t i = q1 + 1; i < json.size(); ++i) {
+    if (json[i] == '\\' && i + 1 < json.size()) {
+      ++i;
+      if (json[i] == 'n') val.push_back('\n');
+      else if (json[i] == 'r') val.push_back('\r');
+      else val.push_back(json[i]);
+    } else if (json[i] == '"') {
+      *out = val;
+      return true;
+    } else {
+      val.push_back(json[i]);
+    }
+  }
+  return false;
+}
+
 std::string games_json() {
-  std::vector<std::string> dirs;
-  list_dir(g_games_dir, &dirs);
+  std::vector<dir_ent> ents;
+  list_dir_entries(g_games_dir, &ents);
+  std::sort(ents.begin(), ents.end(), [](const dir_ent& a, const dir_ent& b) {
+    return a.name < b.name;
+  });
+  const std::string sep(1, XFER_SEP);
   std::string j = "[";
   bool first = true;
-  for (const auto& d : dirs) {
-    if (!dir_exists(g_games_dir + "\\" + d)) continue;
-    const std::string exe = pick_exe(g_games_dir + "\\" + d, d);
+  for (const auto& d : ents) {
+    if (!d.is_dir) continue;
+    const std::string gdir = g_games_dir + sep + d.name;
+    std::vector<std::string> exes;
+    std::string exe;
+    scan_game_exes(gdir, d.name, &exes, &exe);
     if (exe.empty()) continue;
+    const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
+    const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
+    std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
+    if (input.empty()) input = "auto";
     if (!first) j += ",";
     first = false;
-    j += "{\"name\":\"" + json_escape(d) + "\",\"exe\":\"" + json_escape(exe) + "\"}";
+    j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
+         json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
+         "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
+         json_escape(input) + "\",\"exes\":[";
+    for (size_t i = 0; i < exes.size(); ++i) {
+      if (i) j += ",";
+      j += "\"" + json_escape(exes[i]) + "\"";
+    }
+    j += "]}";
   }
   return j + "]";
 }
@@ -161,260 +521,728 @@ std::string games_json() {
 const char* k_upload_page =
   "<!doctype html><html><head><meta charset=utf-8>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>Tiramisu</title><style>"
-  "body{background:#0e1116;color:#e6e9ef;font-family:-apple-system,sans-serif;"
-  "max-width:560px;margin:0 auto;padding:24px}"
-  "h1{color:#20808d;font-weight:700;margin:0 0 4px}h2{font-size:15px;color:#8aa;}"
-  "input[type=file]{width:100%;padding:14px;border:1px dashed #20808d;border-radius:10px;"
-  "background:#131922;color:#9fb3b8;margin:14px 0}"
-  "button{width:100%;padding:14px;border:0;border-radius:10px;background:#20808d;"
-  "color:#fff;font-size:16px;font-weight:700}"
-  "button:disabled{background:#2a3a3e}"
-  ".g{display:flex;justify-content:space-between;align-items:center;"
-  "padding:12px;border:1px solid #1d2733;border-radius:10px;margin:8px 0}"
-  ".g b{color:#e6e9ef}.g span{color:#7d8c96;font-size:13px}"
-  ".l{background:#1d4f57;color:#bfe9ef;font-size:13px;padding:8px 12px;"
-  "border-radius:8px;font-weight:700}"
-  "#bar{height:6px;background:#1d2733;border-radius:3px;overflow:hidden;margin:10px 0}"
-  "#fill{height:100%;width:0;background:#20808d}"
-  "#log{font-size:13px;color:#7d8c96;min-height:20px}</style></head><body>"
-  "<h1>Tiramisu</h1><h2>Windows games on Xbox — phone transfer</h2>"
-  "<input type=file id=f>"
+  "<title>Tiramisu Console Dashboard</title><style>"
+  "*{box-sizing:border-box}"
+  "body{background:#0b0f14;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+  "max-width:780px;margin:0 auto;padding:20px}"
+  "header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}"
+  "h1{color:#29a8b8;font-size:24px;margin:0}h2{font-size:15px;color:#8fa6b2;margin:0 0 10px}"
+  ".card{background:#121821;border:1px solid #1e2a38;border-radius:12px;padding:16px;margin-bottom:16px}"
+  ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
+  ".btn{padding:10px 14px;border:0;border-radius:8px;background:#20808d;color:#fff;font-weight:700;cursor:pointer;font-size:14px}"
+  ".btn:hover{background:#2898a7}.btn:disabled{background:#2a3a3e;color:#789}"
+  ".btn-sec{background:#1c2735;color:#cfe2ec}.btn-danger{background:#8b2635;color:#ffd6dc}"
+  "input,select{background:#0b1017;color:#e6edf3;border:1px solid #263649;border-radius:8px;padding:8px 10px;font-size:14px}"
+  ".drop{border:2px dashed #20808d;border-radius:10px;padding:20px;text-align:center;color:#9bb5bf;background:#0e141c;margin-bottom:10px}"
+  ".drop.over{border-color:#44d9ec;background:#11232c}"
+  "#bar{height:8px;background:#1b2532;border-radius:4px;overflow:hidden;margin:10px 0}"
+  "#fill{height:100%;width:0;background:#29a8b8;transition:width .2s}"
+  ".game{background:#0f151e;border:1px solid #1f2c3c;border-radius:10px;padding:12px;margin-bottom:10px}"
+  ".game-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}"
+  ".game-cfg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}"
+  "@media(max-width:560px){.game-cfg{grid-template-columns:1fr}}"
+  "pre{background:#080b0f;border:1px solid #1c2530;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#a8c0cc;white-space:pre-wrap}"
+  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#172430;color:#7ccbd6}"
+  "</style></head><body>"
+  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill>Shelf Ready</span></div>"
+  "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
+  "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
+  "<div class=card><h2>Add Any PC / Steam Game (Unpacked Folder or .zip)</h2>"
+  "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b> or <b>.zip</b> here, or use the buttons below</div>"
+  "<div class=row style='margin-bottom:10px'>"
+  "<input id=gname placeholder='Game Name (auto from folder/zip)' style='flex:1;min-width:180px'>"
+  "<button class=btn onclick=\"document.getElementById('fdir').click()\">Pick Folder</button>"
+  "<button class='btn btn-sec' onclick=\"document.getElementById('fzip').click()\">Pick .zip</button>"
+  "<input type=file id=fdir webkitdirectory directory multiple style='display:none'>"
+  "<input type=file id=fzip accept='.zip' style='display:none'></div>"
   "<div id=bar><div id=fill></div></div>"
-  "<button id=up onclick=go()>Upload game (.zip of the game folder)</button>"
-  "<div id=log></div><hr style='border-color:#1d2733'>"
-  "<h2 style=margin-top:18px>Games on this console</h2><div id=list>"
-  "<span style=color:#556>loading…</span></div>"
+  "<div id=log style='font-size:13px;color:#8ea8b5;min-height:18px'>Ready over LAN</div></div>"
+  "<div class=card><h2>Games on Xbox Console</h2><div id=list><span style='color:#678'>loading...</span></div></div>"
+  "<div class=card><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
+  "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div>"
+  "<pre id=logs style='margin-top:10px'>Click Refresh Logs or wait for auto-refresh...</pre></div>"
   "<script>"
-  "function L(){fetch('/games').then(r=>r.json()).then(g=>{const e=document.getElementById('list');"
-  "e.innerHTML=g.length?'':'<span style=color:#556>none yet — upload a zip</span>';"
-  "g.forEach(x=>{const d=document.createElement('div');d.className='g';"
-  "d.innerHTML='<b>'+x.name+'</b><span class=l onclick=\"go2(\\''+x.name+'\\')\">LAUNCH ▶</span>';"
-  "e.appendChild(d);});});}"
-  "function go2(n){document.getElementById('log').textContent='launching '+n+' — look at the TV';"
-  "fetch('/launch/'+encodeURIComponent(n),{method:'POST'}).then(L);}"
-  "function go(){const f=document.getElementById('f').files[0];if(!f)return;"
-  "const b=document.getElementById('up');b.disabled=1;"
-  "const t=setInterval(()=>{fetch('/progress/'+encodeURIComponent(f.name)).then(r=>r.text()).then(t=>{"
-  "document.getElementById('fill').style.width=Math.min(99,parseFloat(t)*100)+'%';});},800);"
-  "fetch('/upload/'+encodeURIComponent(f.name),{method:'PUT',body:f})"
-  ".then(r=>r.text()).then(s=>{clearInterval(t);"
-  "document.getElementById('fill').style.width='100%';b.disabled=0;"
-  "document.getElementById('log').textContent=s;L();});}"
-  "L();</script></body></html>";
+  "const E=id=>document.getElementById(id);"
+  "function setLog(s){E('log').textContent=s;}"
+  "function safeRel(p){return p.split('/').filter(Boolean).join('/');}"
+  "async function uploadFiles(items,forcedRoot){"
+  "if(!items.length)return;"
+  "let g=(E('gname').value||'').trim();"
+  "if(!g){g=forcedRoot||(items[0].rel.split('/')[0]||'UploadedGame');g=g.replace(/\\.zip$/i,'');E('gname').value=g;}"
+  "let total=0,done=0;items.forEach(x=>total+=x.file.size);"
+  "setLog('Uploading '+items.length+' files ('+(total/1048576).toFixed(1)+' MB) -> '+g+'...');"
+  "let idx=0;"
+  "async function worker(){while(idx<items.length){const cur=items[idx++];"
+  "let rel=safeRel(cur.rel);const p0=rel.indexOf('/');"
+  "if(!forcedRoot&&p0>0&&rel.slice(0,p0)===g)rel=rel.slice(p0+1);"
+  "if(cur.stripFirst&&rel.includes('/'))rel=rel.slice(rel.indexOf('/')+1);"
+  "const url='/api/upload-file?game='+encodeURIComponent(g)+'&rel='+encodeURIComponent(rel);"
+  "const r=await fetch(url,{method:'PUT',body:cur.file});"
+  "if(!r.ok)throw new Error('HTTP '+r.status+' on '+rel);"
+  "done+=cur.file.size;E('fill').style.width=(total?Math.min(100,done/total*100):100)+'%';}}"
+  "try{await Promise.all([worker(),worker(),worker()]);"
+  "setLog('Uploaded '+items.length+' files to '+g+' — ready to Launch!');refresh();}catch(e){setLog('Upload error: '+e.message);}}"
+  "async function uploadZip(f){if(!f)return;"
+  "setLog('Uploading '+f.name+'...');E('fill').style.width='5%';"
+  "const t=setInterval(()=>{fetch('/progress/'+encodeURIComponent(f.name)).then(r=>r.text()).then(v=>{"
+  "E('fill').style.width=Math.min(99,parseFloat(v)*100)+'%';});},600);"
+  "try{const r=await fetch('/upload/'+encodeURIComponent(f.name),{method:'PUT',body:f});"
+  "clearInterval(t);E('fill').style.width='100%';setLog(await r.text());refresh();}"
+  "catch(e){clearInterval(t);setLog('Error: '+e.message);}}"
+  "E('fzip').onchange=e=>{if(e.target.files[0])uploadZip(e.target.files[0]);};"
+  "E('fdir').onchange=e=>{const fs=[...e.target.files];if(!fs.length)return;"
+  "const root=(fs[0].webkitRelativePath||fs[0].name).split('/')[0];"
+  "uploadFiles(fs.map(f=>({file:f,rel:f.webkitRelativePath||f.name,stripFirst:true})),root);};"
+  "async function walkEntry(ent,prefix,out){if(ent.isFile){"
+  "const f=await new Promise(res=>ent.file(res));out.push({file:f,rel:prefix+f.name,stripFirst:false});"
+  "}else if(ent.isDirectory){const rdr=ent.createReader();"
+  "const all=[];while(true){const b=await new Promise(res=>rdr.readEntries(res));if(!b.length)break;all.push(...b);}"
+  "for(const c of all)await walkEntry(c,prefix+ent.name+'/',out);}}"
+  "const dz=E('dz');"
+  "dz.ondragover=e=>{e.preventDefault();dz.classList.add('over');};"
+  "dz.ondragleave=()=>dz.classList.remove('over');"
+  "dz.ondrop=async e=>{e.preventDefault();dz.classList.remove('over');"
+  "const items=[...(e.dataTransfer.items||[])];"
+  "const ents=items.map(i=>i.webkitGetAsEntry?i.webkitGetAsEntry():null).filter(Boolean);"
+  "if(ents.length===1&&ents[0].isFile&&/\\.zip$/i.test(ents[0].name)){const f=await new Promise(r=>ents[0].file(r));return uploadZip(f);}"
+  "if(ents.length){const out=[];for(const en of ents)await walkEntry(en,'',out);"
+  "const root=ents[0].isDirectory?ents[0].name:'';await uploadFiles(out.map(x=>({...x,stripFirst:ents[0].isDirectory})),root);}"
+  "else if(e.dataTransfer.files.length){uploadZip(e.dataTransfer.files[0]);}};"
+  "async function launch(n){setLog('Launching '+n+' — look at TV');await fetch('/launch/'+encodeURIComponent(n),{method:'POST'});refreshStatus();}"
+  "async function stopGame(){setLog('Stopping active game...');await fetch('/api/stop',{method:'POST'});refreshStatus();}"
+  "async function rescan(){await fetch('/api/rescan',{method:'POST'});refresh();}"
+  "async function delGame(n){if(!confirm('Delete '+n+'?'))return;await fetch('/api/game/'+encodeURIComponent(n),{method:'DELETE'});refresh();}"
+  "async function saveCfg(idx,name){const p={exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
+  "await fetch('/api/config/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
+  "setLog('Saved config for '+name);refresh();}"
+  "function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
+  "async function refresh(){const g=await(await fetch('/games')).json();const el=E('list');"
+  "if(!g.length){el.innerHTML='<span style=\"color:#678\">No games yet — drag a game folder or .zip above</span>';return;}"
+  "el.innerHTML=g.map((x,i)=>{const opts=(x.exes||[x.exe]).map(e=>'<option value=\"'+esc(e)+'\"'+(e===x.exe?' selected':'')+'>'+esc(e)+'</option>').join('');"
+  "const inps=['auto','controller','kbm','pad2kbm'].map(m=>'<option value=\"'+m+'\"'+(m===x.input?' selected':'')+'>Input: '+m+'</option>').join('');"
+  "return '<div class=game><div class=game-top><b>'+esc(x.name)+'</b><div class=row>'"
+  "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\')\">Launch ▶</button>'"
+  "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+',\\''+esc(x.name)+'\\')\">Save</button>'"
+  "+'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button></div></div>'"
+  "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
+  "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
+  "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
+  "async function refreshStatus(){try{const s=await(await fetch('/api/status')).json();"
+  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Shelf Ready';}catch{}}"
+  "async function loadLogs(){E('logs').textContent=await(await fetch('/api/logs')).text();}"
+  "refresh();refreshStatus();setInterval(refreshStatus,2000);setInterval(loadLogs,4000);</script></body></html>";
 
-uint64_t g_upload_total = 0;   // bytes expected (current upload)
-uint64_t g_upload_done = 0;    // bytes written so far
+bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
+                    std::string* out) {
+  out->clear();
+  if (len > 1024ull * 1024ull) return false;
+  out->reserve((size_t)len);
+  size_t take_pre = std::min<size_t>(pre_len, (size_t)len);
+  if (take_pre) out->append(pre, take_pre);
+  uint64_t got = take_pre;
+  char buf[4096];
+  while (got < len && !g_stop) {
+    int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
+    int n = recv(s, buf, want, 0);
+    if (n <= 0) break;
+    out->append(buf, (size_t)n);
+    got += (uint64_t)n;
+  }
+  return got == len;
+}
 
-// stream N bytes from the socket to a file; returns bytes written
-uint64_t stream_to_file(SOCKET s, const char* path, uint64_t len) {
+uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
+                        const char* path, uint64_t len) {
   FILE* f = fopen(path, "wb");
   if (!f) return 0;
-  char buf[65536];
   uint64_t got = 0;
+  if (pre && pre_len) {
+    size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
+    if (wr) {
+      fwrite(pre, 1, wr, f);
+      got += wr;
+      g_upload_done += wr;
+    }
+  }
+  char buf[65536];
   while (got < len && !g_stop) {
-    const int want = (int)((len - got) < sizeof(buf) ? (len - got) : sizeof(buf));
+    const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
     const int n = recv(s, buf, want, 0);
     if (n <= 0) break;
     fwrite(buf, 1, (size_t)n, f);
     got += (uint64_t)n;
-    g_upload_done = got;
+    g_upload_done += (uint64_t)n;
   }
   fclose(f);
   return got;
 }
 
-void respond(SOCKET s, const char* code, const char* ctype,
-             const std::string& body) {
-  char hdr[256];
-  snprintf(hdr, sizeof(hdr),
-           "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-           "Connection: close\r\n\r\n", code, ctype, body.size());
-  send(s, hdr, (int)strlen(hdr), 0);
-  send(s, body.c_str(), (int)body.size(), 0);
+void send_all(sock_t s, const char* data, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    int n = send(s, data + sent, (int)(len - sent), 0);
+    if (n <= 0) break;
+    sent += (size_t)n;
+  }
 }
 
+void respond(sock_t s, const char* code, const char* ctype,
+             const std::string& body) {
+  char hdr[256];
+  int hl = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                    "Connection: close\r\n\r\n", code, ctype, body.size());
+  if (hl > 0) send_all(s, hdr, (size_t)hl);
+  if (!body.empty()) send_all(s, body.data(), body.size());
+}
 
-void handle(SOCKET s) {
-  char req[8192];
+void handle_client(sock_t s) {
+  sock_guard sg{s};
+  char req[16384];
   int rl = 0;
-  // read until \r\n\r\n
+  int hdr_end = -1;
   while (rl < (int)sizeof(req) - 1) {
-    const int n = recv(s, req + rl, 1, 0);
-    if (n <= 0) return;
+    int n = recv(s, req + rl, (int)sizeof(req) - 1 - rl, 0);
+    if (n <= 0) break;
     rl += n;
-    if (rl > 4 && strncmp(req + rl - 4, "\r\n\r\n", 4) == 0) break;
-  }
-  req[rl] = 0;
-
-  char method[16] = {}, path[2048] = {};
-  uint64_t content_len = 0;
-  sscanf(req, "%15s %2047s", method, path);
-  for (const char* p = req; *p; ++p) {  // case-insensitive Content-Length
-    if ((p[0] == 'C' || p[0] == 'c') &&
-        _strnicmp(p, "content-length:", 15) == 0) {
-      content_len = strtoull(p + 15, nullptr, 10);
+    req[rl] = 0;
+    const char* end = strstr(req, "\r\n\r\n");
+    if (end) {
+      hdr_end = (int)(end - req) + 4;
       break;
     }
   }
+  if (hdr_end < 0) return;
 
-  char line[256];
-  std::string url_path = path;
+  const char* pre = req + hdr_end;
+  const size_t pre_len = (size_t)(rl - hdr_end);
 
-  if (strcmp(method, "GET") == 0 && url_path.rfind("/progress/", 0) == 0) {
-    snprintf(line, sizeof(line), "%f",
-             g_upload_total ? (double)g_upload_done / (double)g_upload_total
-                            : 0.0);
-    respond(s, "200 OK", "text/plain", line);
+  char method[16] = {}, raw_target[2048] = {};
+  if (sscanf(req, "%15s %2047s", method, raw_target) != 2) {
+    respond(s, "400 Bad Request", "text/plain", "malformed request");
+    return;
+  }
+
+  uint64_t content_len = 0;
+  bool expect_100 = false;
+  std::string hdrs(req, (size_t)hdr_end);
+  std::string hdrs_low = xfer_lower(hdrs);
+  size_t clp = hdrs_low.find("\r\ncontent-length:");
+  if (clp != std::string::npos) {
+    content_len = strtoull(hdrs_low.c_str() + clp + 17, nullptr, 10);
+  }
+  if (hdrs_low.find("\r\nexpect: 100-continue") != std::string::npos) {
+    expect_100 = true;
+  }
+
+  std::string target = raw_target;
+  std::string url_path = target;
+  std::string query;
+  size_t qm = target.find('?');
+  if (qm != std::string::npos) {
+    url_path = target.substr(0, qm);
+    query = target.substr(qm + 1);
+  }
+
+  if (strcmp(method, "GET") == 0 && url_path == "/") {
+    respond(s, "200 OK", "text/html; charset=utf-8", k_upload_page);
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/games") {
+    std::lock_guard<std::mutex> lk(g_mu);
     respond(s, "200 OK", "application/json", games_json());
     return;
   }
-  if (strcmp(method, "GET") == 0 &&
-      (url_path == "/" || url_path.rfind("/?", 0) == 0)) {
-    respond(s, "200 OK", "text/html", k_upload_page);
+  if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
+    std::lock_guard<std::mutex> lk(g_mu);
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+             "{\"running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
+             "\"last_upload\":\"%s\",\"last_error\":\"%s\","
+             "\"upload_done\":%llu,\"upload_total\":%llu}",
+             g.running ? "true" : "false",
+             json_escape(g.running_game).c_str(),
+             json_escape(g.url).c_str(),
+             json_escape(g.last_upload).c_str(),
+             json_escape(g.last_error).c_str(),
+             (unsigned long long)g_upload_done.load(),
+             (unsigned long long)g_upload_total.load());
+    respond(s, "200 OK", "application/json", buf);
     return;
   }
-  if (strcmp(method, "POST") == 0 && url_path.rfind("/launch/", 0) == 0) {
-    const std::string name = url_path.substr(8);
-    g.launch_name = name;
-    g.launch_requested = true;
+  if (strcmp(method, "GET") == 0 && url_path == "/api/logs") {
+    const std::string logp =
+        g_local_state_dir + std::string(1, XFER_SEP) + "tiramisu.log";
+    respond(s, "200 OK", "text/plain; charset=utf-8", read_log_tail(logp));
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path.rfind("/progress/", 0) == 0) {
+    char line[64];
+    uint64_t tot = g_upload_total.load();
+    uint64_t dn = g_upload_done.load();
+    snprintf(line, sizeof(line), "%f", tot ? (double)dn / (double)tot : 0.0);
+    respond(s, "200 OK", "text/plain", line);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 &&
+      (url_path.rfind("/launch/", 0) == 0 || url_path.rfind("/api/launch/", 0) == 0)) {
+    const size_t off = (url_path.rfind("/api/launch/", 0) == 0) ? 12 : 8;
+    std::string raw_name = url_decode(url_path.substr(off), false);
+    std::string name;
+    if (!sanitize_game_name(raw_name, &name)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game name");
+      return;
+    }
+    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
+    if (!dir_exists(gdir)) {
+      respond(s, "404 Not Found", "text/plain", "game not found");
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.launch_name = name;
+      g.launch_requested = true;
+    }
     respond(s, "200 OK", "text/plain", "launching " + name);
     return;
   }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/stop") {
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.stop_requested = true;
+    }
+    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/rescan") {
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+    }
+    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    return;
+  }
+  if ((strcmp(method, "DELETE") == 0 && url_path.rfind("/api/game/", 0) == 0) ||
+      (strcmp(method, "POST") == 0 && url_path.rfind("/api/delete/", 0) == 0)) {
+    const size_t off = (strcmp(method, "DELETE") == 0) ? 10 : 12;
+    std::string name;
+    if (!sanitize_game_name(url_decode(url_path.substr(off), false), &name)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game name");
+      return;
+    }
+    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
+    if (!dir_exists(gdir)) {
+      respond(s, "404 Not Found", "text/plain", "not found");
+      return;
+    }
+    if (!remove_tree(gdir)) {
+      respond(s, "500 Server Error", "text/plain", "delete failed");
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+    }
+    respond(s, "200 OK", "application/json", "{\"deleted\":true}");
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path.rfind("/api/config/", 0) == 0) {
+    std::string name;
+    if (!sanitize_game_name(url_decode(url_path.substr(12), false), &name)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game name");
+      return;
+    }
+    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + name;
+    if (!dir_exists(gdir)) {
+      respond(s, "404 Not Found", "text/plain", "game not found");
+      return;
+    }
+    std::string body;
+    if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "bad body");
+      return;
+    }
+    std::string exe_v, app_v, arg_v, inp_v;
+    bool has_exe = parse_json_str_field(body, "exe", &exe_v);
+    bool has_app = parse_json_str_field(body, "appid", &app_v);
+    bool has_arg = parse_json_str_field(body, "args", &arg_v);
+    bool has_inp = parse_json_str_field(body, "input", &inp_v);
+    const std::string sep(1, XFER_SEP);
+    if (has_exe) {
+      std::string safe_exe;
+      if (!exe_v.empty() && !sanitize_rel_path(exe_v, '\\', &safe_exe)) {
+        respond(s, "400 Bad Request", "text/plain", "invalid exe path");
+        return;
+      }
+      write_or_clear_text(gdir + sep + "tiramisu_exe.txt", safe_exe);
+    }
+    if (has_app) {
+      std::string digits;
+      for (char c : app_v) if (c >= '0' && c <= '9') digits.push_back(c);
+      write_or_clear_text(gdir + sep + "steam_appid.txt", digits);
+    }
+    if (has_arg) {
+      for (char& c : arg_v) if (c == '\r' || c == '\n') c = ' ';
+      write_or_clear_text(gdir + sep + "tiramisu_args.txt", arg_v);
+    }
+    if (has_inp) {
+      std::string mode = xfer_lower(trim_ws(inp_v));
+      if (mode != "controller" && mode != "kbm" && mode != "pad2kbm") mode.clear();
+      write_or_clear_text(gdir + sep + "tiramisu_input.txt", mode);
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+    }
+    respond(s, "200 OK", "application/json", "{\"saved\":true}");
+    return;
+  }
+  if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
+      url_path == "/api/upload-file") {
+    std::string game_raw = query_param(query, "game");
+    std::string rel_raw = query_param(query, "rel");
+    std::string game, rel;
+    if (!sanitize_game_name(game_raw, &game) ||
+        !sanitize_rel_path(rel_raw, XFER_SEP, &rel)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game or rel path");
+      return;
+    }
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const std::string sep(1, XFER_SEP);
+    const std::string gdir = g_games_dir + sep + game;
+    const std::string out_path = gdir + sep + rel;
+    const size_t sl = out_path.rfind(XFER_SEP);
+    if (sl != std::string::npos) mkdirs(out_path.substr(0, sl));
+    g_upload_total += content_len;
+    uint64_t got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
+    if (got != content_len) {
+      remove(out_path.c_str());
+      respond(s, "500 Server Error", "text/plain", "incomplete file");
+      return;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.last_upload = game + " -> " + rel;
+      g.last_error.clear();
+      g.rescan_requested = true;
+    }
+    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    return;
+  }
   if (strcmp(method, "PUT") == 0 && url_path.rfind("/upload/", 0) == 0) {
-    std::string fname = url_path.substr(8);
-    // sanitize
-    for (auto& c : fname)
-      if (c == '/' || c == '\\' || c == ':') c = '_';
+    std::string fname = url_decode(url_path.substr(8), false);
+    for (auto& c : fname) if (c == '/' || c == '\\' || c == ':') c = '_';
     if (fname.find("..") != std::string::npos || fname.empty()) {
       respond(s, "400 Bad Request", "text/plain", "bad name");
       return;
     }
-    const std::string tmp = g_incoming + "\\" + fname;
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const std::string sep(1, XFER_SEP);
+    const std::string tmp = g_incoming + sep + fname;
     g_upload_total = content_len;
-    const uint64_t got = stream_to_file(s, tmp.c_str(), content_len);
+    g_upload_done = 0;
+    const uint64_t got = stream_to_file(s, pre, pre_len, tmp.c_str(), content_len);
     if (got != content_len) {
       remove(tmp.c_str());
-      g.last_error = "upload incomplete";
+      {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g.last_error = "upload incomplete";
+      }
       respond(s, "500 Server Error", "text/plain", "incomplete");
+      g_upload_total = 0;
+      g_upload_done = 0;
       return;
     }
     char mb[32];
     snprintf(mb, sizeof(mb), "%.1f MB", (double)got / 1048576.0);
-    if (fname.size() > 4 && _stricmp(fname.c_str() + fname.size() - 4, ".zip") == 0) {
+    if (fname.size() > 4 && xfer_ieq(fname.substr(fname.size() - 4), ".zip")) {
       const size_t stem = fname.rfind('.');
-      std::string game_name = fname.substr(0, stem);
-      const std::string dest = g_games_dir + "\\" + game_name;
+      std::string game_name;
+      if (!sanitize_game_name(fname.substr(0, stem), &game_name)) {
+        remove(tmp.c_str());
+        respond(s, "400 Bad Request", "text/plain", "bad zip name");
+        g_upload_total = 0;
+        g_upload_done = 0;
+        return;
+      }
+      const std::string dest = g_games_dir + sep + game_name;
       mkdirs(dest);
       std::string note;
       const bool ok = extract_zip(tmp, dest, &note);
       remove(tmp.c_str());
       if (ok) {
-        g.last_upload = game_name + " (" + mb + ", " + note + ")";
+        {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_upload = game_name + " (" + mb + ", " + note + ")";
+          g.last_error.clear();
+          g.rescan_requested = true;
+        }
         respond(s, "200 OK", "text/plain",
                 "extracted: " + game_name + " — " + note +
-                ". Hit LAUNCH, then look at the TV.");
+                ". Hit Launch, then look at the TV.");
       } else {
-        g.last_error = "zip extract failed: " + note;
+        {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_error = "zip extract failed: " + note;
+        }
         respond(s, "500 Server Error", "text/plain", "extract failed");
       }
     } else {
-      g.last_error = "only .zip supported (zip the game folder)";
+      remove(tmp.c_str());
+      {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g.last_error = "use .zip or folder upload (/api/upload-file)";
+      }
       respond(s, "400 Bad Request", "text/plain",
-              "zip the game folder and upload the .zip");
+              "drop a game folder or upload a .zip");
     }
     g_upload_total = 0;
     g_upload_done = 0;
     return;
   }
-  respond(s, "404 Not Found", "text/plain", "nope");
+  respond(s, "404 Not Found", "text/plain", "not found");
 }
 
 void listener_thread() {
   while (!g_stop) {
-    SOCKET c = accept(g_listener, nullptr, nullptr);
-    if (c == INVALID_SOCKET) continue;
-    handle(c);
-    closesocket(c);
+    sock_t c = accept(g_listener, nullptr, nullptr);
+    if (c == kBadSock) {
+      if (g_stop) break;
+      continue;
+    }
+    if (g_workers.load() < 16) {
+      g_workers.fetch_add(1);
+      std::thread([c]() {
+        handle_client(c);
+        g_workers.fetch_sub(1);
+      }).detach();
+    } else {
+      handle_client(c);
+    }
   }
+}
+
+std::string pick_best_lan_ip() {
+  std::string best_ip = "127.0.0.1";
+  int best_score = 0;
+
+  // 1. OS outbound-route query via UDP connect (sends zero packets on wire)
+  sock_t probe = socket(AF_INET, SOCK_DGRAM, 0);
+  if (probe != kBadSock) {
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(53);
+    inet_pton(AF_INET, "1.1.1.1", &dst.sin_addr);
+    if (connect(probe, (sockaddr*)&dst, sizeof(dst)) == 0) {
+      sockaddr_in local{};
+      socklen_t len = sizeof(local);
+      if (getsockname(probe, (sockaddr*)&local, &len) == 0) {
+        char buf[64] = {};
+        if (inet_ntop(AF_INET, &local.sin_addr, buf, sizeof(buf))) {
+          int sc = webxfer_score_ipv4(buf);
+          if (sc > best_score) {
+            best_score = sc;
+            best_ip = buf;
+          }
+        }
+      }
+    }
+    sock_close(probe);
+  }
+
+  // 2. Hostname getaddrinfo sweep for LAN interfaces
+  char host[128] = {};
+  if (gethostname(host, sizeof(host) - 1) == 0 && host[0]) {
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_INET;
+    if (getaddrinfo(host, nullptr, &hints, &res) == 0 && res) {
+      for (addrinfo* p = res; p; p = p->ai_next) {
+        if (!p->ai_addr || p->ai_family != AF_INET) continue;
+        sockaddr_in* a = (sockaddr_in*)p->ai_addr;
+        char buf[64] = {};
+        if (inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf))) {
+          int sc = webxfer_score_ipv4(buf);
+          if (sc > best_score) {
+            best_score = sc;
+            best_ip = buf;
+          }
+        }
+      }
+      freeaddrinfo(res);
+    }
+  }
+
+#if !defined(_WIN32) && defined(__linux__)
+  ifaddrs* ifa = nullptr;
+  if (getifaddrs(&ifa) == 0 && ifa) {
+    for (ifaddrs* p = ifa; p; p = p->ifa_next) {
+      if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+      sockaddr_in* a = (sockaddr_in*)p->ifa_addr;
+      char buf[64] = {};
+      if (inet_ntop(AF_INET, &a->sin_addr, buf, sizeof(buf))) {
+        int sc = webxfer_score_ipv4(buf);
+        if (sc > best_score) {
+          best_score = sc;
+          best_ip = buf;
+        }
+      }
+    }
+    freeifaddrs(ifa);
+  }
+#endif
+
+  return best_ip;
 }
 
 } // namespace
 
-std::string webxfer_start(const std::string& local_state, int display_w) {
-  (void)display_w;
+int webxfer_score_ipv4(const char* dotted) {
+  if (!dotted || !dotted[0]) return 0;
+  uint32_t a = 0, b = 0, c = 0, d = 0;
+  if (sscanf(dotted, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 ||
+      a > 255 || b > 255 || c > 255 || d > 255) {
+    return 0;
+  }
+  if (a == 127u || (a == 169u && b == 254u) || a == 0u) return 0;
+  if (a == 192u && b == 168u) return 300;
+  if (a == 10u) return 250;
+  if (a == 172u && b >= 16u && b <= 31u) return 200;
+  return 100;
+}
+
+std::string webxfer_start_port(const std::string& local_state, unsigned short port) {
+  webxfer_shutdown();
+#ifdef _WIN32
   WSADATA wsa{};
   if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    std::lock_guard<std::mutex> lk(g_mu);
     g.last_error = "WSAStartup failed";
     return {};
   }
-  g_games_dir = local_state + "\\games";
-  g_incoming = local_state + "\\incoming";
-  mkdirs(g_games_dir);
-  mkdirs(g_incoming);
+#endif
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g = webxfer_state{};
+    g_local_state_dir = local_state;
+    const std::string sep(1, XFER_SEP);
+    g_games_dir = local_state + sep + "games";
+    g_incoming = local_state + sep + "incoming";
+    mkdirs(g_games_dir);
+    mkdirs(g_incoming);
+  }
 
   g_listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (g_listener == INVALID_SOCKET) {
+  if (g_listener == kBadSock) {
+    std::lock_guard<std::mutex> lk(g_mu);
     g.last_error = "socket() failed";
     return {};
   }
+  int yes = 1;
+  setsockopt(g_listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons(g.port);
+  addr.sin_port = htons(port);
   if (bind(g_listener, (sockaddr*)&addr, sizeof(addr)) != 0 ||
-      listen(g_listener, 4) != 0) {
+      listen(g_listener, 16) != 0) {
+    sock_close(g_listener);
+    g_listener = kBadSock;
+    std::lock_guard<std::mutex> lk(g_mu);
     g.last_error = "bind/listen failed (port taken?)";
     return {};
   }
+
+  sockaddr_in bound{};
+  socklen_t blen = sizeof(bound);
+  unsigned short real_port = port;
+  if (getsockname(g_listener, (sockaddr*)&bound, &blen) == 0) {
+    real_port = ntohs(bound.sin_port);
+  }
+
   g_stop = false;
   std::thread(listener_thread).detach();
-  g.running = true;
 
-  // resolve a LAN IP for display (best-effort)
-  char host[64] = "?";
-  gethostname(host, sizeof(host));
-  addrinfo hints{}, *res = nullptr;
-  hints.ai_family = AF_INET;
-  if (getaddrinfo(host, nullptr, &hints, &res) == 0 && res) {
-    sockaddr_in* a = (sockaddr_in*)res->ai_addr;
-    inet_ntop(AF_INET, &a->sin_addr, host, sizeof(host));
-    freeaddrinfo(res);
+  const std::string ip = pick_best_lan_ip();
+  std::string url;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g.port = real_port;
+    g.running = true;
+    g.url = "http://" + ip + ":" + std::to_string(real_port);
+    url = g.url;
   }
-  g.url = std::string("http://") + host + ":" + std::to_string(g.port);
-  char line[192];
-  snprintf(line, sizeof(line), "webxfer: serving %s -> %s", g.url.c_str(),
+
+  char line[256];
+  snprintf(line, sizeof(line), "webxfer: serving %s -> %s", url.c_str(),
            g_games_dir.c_str());
   log_line(line);
-  return g.url;
+  return url;
+}
+
+std::string webxfer_start(const std::string& local_state, int display_w) {
+  (void)display_w;
+  return webxfer_start_port(local_state, 9127);
 }
 
 bool webxfer_poll_launch(std::string* out_name) {
+  std::lock_guard<std::mutex> lk(g_mu);
   if (!g.launch_requested) return false;
   g.launch_requested = false;
   if (out_name) *out_name = g.launch_name;
   return true;
 }
 
+bool webxfer_poll_stop() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g.stop_requested) return false;
+  g.stop_requested = false;
+  return true;
+}
+
+bool webxfer_poll_rescan() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g.rescan_requested) return false;
+  g.rescan_requested = false;
+  return true;
+}
+
+void webxfer_set_running_game(const std::string& name) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g.running_game = name;
+}
+
 void webxfer_shutdown() {
   g_stop = true;
-  if (g_listener != INVALID_SOCKET) {
-    closesocket(g_listener);
-    g_listener = INVALID_SOCKET;
+  if (g_listener != kBadSock) {
+    sock_close(g_listener);
+    g_listener = kBadSock;
   }
+  for (int i = 0; i < 50 && g_workers.load() > 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+#ifdef _WIN32
   WSACleanup();
+#endif
+  std::lock_guard<std::mutex> lk(g_mu);
+  g.running = false;
 }
 
-// expose upload status for the TV overlay
 std::string webxfer_status_line() {
-  if (!g.last_upload.empty()) return "xfer: " + g.last_upload;
-  if (!g.last_error.empty()) return "xfer ERR: " + g.last_error;
-  return g.running ? ("transfer: " + g.url) : "transfer: offline";
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g.last_upload.empty()) return "xfer: " + g.last_upload + "  |  " + g.url;
+  if (!g.last_error.empty()) return "xfer ERR: " + g.last_error + "  |  " + g.url;
+  return g.running ? ("LAN Dashboard: " + g.url) : "transfer: offline";
 }
 
-std::string webxfer_url() { return g.url; }
+std::string webxfer_url() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g.url;
+}
+
+unsigned short webxfer_port() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g.port;
+}
 
 } // namespace longan

@@ -112,6 +112,7 @@ i16 TRT_STDCALL trt_GetAsyncKeyState(int);
 int TRT_STDCALL trt_GetCursorPos(void*);
 int TRT_STDCALL trt_TranslateMessage(const void*);
 i64 TRT_STDCALL trt_DispatchMessageW(const void*);
+i64 TRT_STDCALL trt_SendMessageW(void*, u32, u64, i64);
 int TRT_STDCALL trt_WriteFile(void*, const void*, u32, u32*, void*);
 int TRT_STDCALL trt_PeekMessageW(void*, void*, u32, u32, u32);
 void* TRT_STDCALL trt_CreateFileW(const u16*, u32, u32, void*, u32, u32, void*);
@@ -149,6 +150,7 @@ int main(int argc, char** argv) {
       {"GetCursorPos", (void*)&trt_GetCursorPos},
       {"TranslateMessage", (void*)&trt_TranslateMessage},
       {"DispatchMessageW", (void*)&trt_DispatchMessageW},
+      {"SendMessageW", (void*)&trt_SendMessageW},
       {"WriteFile", (void*)&trt_WriteFile},
       {"PeekMessageW", (void*)&trt_PeekMessageW},
       {"CreateFileW", (void*)&trt_CreateFileW},
@@ -196,9 +198,10 @@ int main(int argc, char** argv) {
            (unsigned long long)ret);
   CHECK((ret & 0x40000000u) == 0x40000000u, det);
   // exact: every term is a distinct bit (pumped=2 => +0x20)
-  CHECK(ret == 0x41F19120u, "checksum exact-match (all bridges verified)");
+  CHECK(ret == 0x43F19120u, "checksum exact-match (all bridges verified)");
   CHECK(ret & 0x00000100, "window created");
   CHECK(ret & 0x00001000, "WndProc invoked via DispatchMessage");
+  CHECK(ret & 0x02000000, "WndProc Win64 ABI 4-arg + 64-bit return");
   CHECK(ret & 0x00010000, "GetAsyncKeyState ran (no key = clean)");
   CHECK(ret & 0x000100000, "HeapAlloc through bridge");
   CHECK(ret & 0x00200000, "QueryPerformanceCounter through bridge");
@@ -222,6 +225,14 @@ int main(int argc, char** argv) {
 
   trt_unmap(&be, img);
   free(file);
+
+  static int pump_calls = 0;
+  pump_calls = 0;
+  trt_set_pump([]() { ++pump_calls; });
+  u8 dummy_msg[48] = {};
+  trt_PeekMessageW(dummy_msg, nullptr, 0, 0, 1);
+  trt_set_pump(nullptr);
+  CHECK(pump_calls == 1, "PeekMessageW invokes host pump when queue empties");
 
   printf(failures ? "\nRESULT: %d FAILURES\n" : "\nRESULT: ALL PASS\n",
          failures);

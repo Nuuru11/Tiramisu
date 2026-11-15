@@ -31,9 +31,11 @@ __attribute__((dllimport)) i32 GSTD WaitOnAddress(const void* addr, u32 ms,
                                                   u32 flags);
 __attribute__((dllimport)) void GSTD WakeByAddress(const void* addr);
 __attribute__((dllimport)) void GSTD WakeByAddressAll(const void* addr);
-// api-set contract: combase family
-__attribute__((dllimport)) void* GSTD WindowsCreateString(const u16* src,
-                                                           u32 len);
+// api-set contract: combase family (real WinRT 3-arg ABI)
+__attribute__((dllimport)) i32 GSTD WindowsCreateString(const u16* src,
+                                                        u32 len,
+                                                        void** out_hstr);
+__attribute__((dllimport)) i32 GSTD WindowsDeleteString(void* hstr);
 // advapi32: registry (STUB today)
 __attribute__((dllimport)) i32 GSTD RegOpenKeyExW(void* key, const u16* sub,
                                                    u32 opts, void* sam,
@@ -53,11 +55,12 @@ u32 GSTD real_load_boot(u64 a, u64 b, u64 c) {
   const u32 r1 = (u32)WaitOnAddress((const void*)0x1234, 0, 1);
   bits |= (r1 == 0) ? 0x1u : 0u;      // WAIT_OK
 
-  // 2. contract -> combase: the call must reach the real function and
-  //    return its argument (the fake echoes the pointer back)
+  // 2. contract -> combase: the call must reach the real WinRT HSTRING bridge
   static const u16 src[] = {'h', 'i', 0};
-  void* s = WindowsCreateString(src, 2);
-  bits |= (s == (void*)src) ? 0x2u : 0u;
+  void* s = (void*)0;
+  const i32 hr2 = WindowsCreateString(src, 2, &s);
+  const i32 hr2d = s ? WindowsDeleteString(s) : -1;
+  bits |= (hr2 == 0 && s != (void*)0 && hr2d == 0) ? 0x2u : 0u;
 
   // 3. advapi32: the registry bridge answers with a NAMED error for a bad
   //    handle - a failure, not a silent success

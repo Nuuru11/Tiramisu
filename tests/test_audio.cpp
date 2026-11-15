@@ -168,6 +168,80 @@ int main(int argc, char** argv) {
   CHECK(g_submit_channels == 2, "the sink got the channel count (2)");
   CHECK(g_submit_width == 2, "the sink got 16-bit samples");
 
+  // XAudio 2.7 COM path (CLSID_XAudio2) + X3DAudio1_7 + XAPOFX1_5
+  {
+    using CoInitEx_t = int(TRT_GUEST_ABI*)(void*, u32);
+    using CoCreate_t = int(TRT_GUEST_ABI*)(const u8*, void*, u32, const u8*, void**);
+    auto pCoInit = (CoInitEx_t)trt_resolve_module(nullptr, "ole32.dll", "CoInitializeEx", 0);
+    auto pCoCreate = (CoCreate_t)trt_resolve_module(nullptr, "ole32.dll", "CoCreateInstance", 0);
+    static const u8 k_clsid_xa27[16] = {
+        0x85, 0x86, 0x50, 0x5A, 0x54, 0xA2, 0xBA, 0x4F,
+        0x9B, 0x82, 0x9A, 0x24, 0xB0, 0x03, 0x06, 0xAF};
+    if (pCoInit) pCoInit(nullptr, 0);
+    void* xa27 = nullptr;
+    const int cchr = pCoCreate ? pCoCreate(k_clsid_xa27, nullptr, 1, k_clsid_xa27, &xa27) : -1;
+    u32 dev_cnt = 0;
+    u16 dev_name[64] = {};
+    u8 dev_details[1100] = {};
+    void* mv27 = nullptr;
+    int init_hr = -1, gdd_hr = -1, mv_hr = -1;
+    if (cchr == 0 && xa27) {
+      void** vt = *(void***)xa27;
+      using GetCnt_t = int(TRT_GUEST_ABI*)(void*, u32*);
+      using GetDet_t = int(TRT_GUEST_ABI*)(void*, u32, void*);
+      using Init_t = int(TRT_GUEST_ABI*)(void*, u32, u32);
+      using CrtMv_t = int(TRT_GUEST_ABI*)(void*, void**, u32, u32, u32, u32, const void*);
+      using Rel_t = u32(TRT_GUEST_ABI*)(void*);
+      ((GetCnt_t)vt[3])(xa27, &dev_cnt);
+      gdd_hr = ((GetDet_t)vt[4])(xa27, 0, dev_details);
+      memcpy(dev_name, dev_details + 4, 64);
+      init_hr = ((Init_t)vt[5])(xa27, 0, 1);
+      mv_hr = ((CrtMv_t)vt[10])(xa27, &mv27, 2, 48000, 0, 0, nullptr);
+      ((Rel_t)vt[2])(xa27);
+    }
+    CHECK(cchr == 0 && xa27 != nullptr && dev_cnt >= 1 && gdd_hr == 0 &&
+              dev_name[0] != 0 && init_hr == 0 && mv_hr == 0 && mv27 != nullptr,
+          "XAudio2.7 COM CLSID_XAudio2 Initialize/GetDeviceDetails/CreateMasteringVoice works");
+
+    using X3DInit_t = int(TRT_GUEST_ABI*)(u32, float, u8*);
+    using X3DCalc_t = void(TRT_GUEST_ABI*)(const u8*, const void*, const void*, u32, void*);
+    using CrtFX_t = int(TRT_GUEST_ABI*)(const u8*, void**, const void*, u32);
+    auto pX3Init = (X3DInit_t)trt_resolve_module(nullptr, "x3daudio1_7.dll", "X3DAudioInitialize", 0);
+    auto pX3Calc = (X3DCalc_t)trt_resolve_module(nullptr, "x3daudio1_7.dll", "X3DAudioCalculate", 0);
+    auto pCrtFX = (CrtFX_t)trt_resolve_module(nullptr, "xapofx1_5.dll", "CreateFX", 0);
+    u8 x3d_inst[20] = {};
+    struct { float fx, fy, fz, tx, ty, tz, px, py, pz, vx, vy, vz; const void* c; }
+        lst{0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, nullptr},
+        emt{0, 0, 1, 0, 1, 0, 10, 0, 0, 0, 0, 0, nullptr};
+    // Match minimal x3d_emitter layout tail (CurveDistanceScaler near end) -> set full block
+    struct {
+      const void* pCone;
+      float orientF[3], orientT[3], pos[3], vel[3];
+      float innerR, innerRAngle; u32 ch; float chRad;
+      const float* chAz; const void* curves[5];
+      float curve, doppler;
+    } em2{};
+    em2.pos[0] = 2.0f;
+    em2.ch = 1;
+    em2.curve = 1.0f;
+    float mtx[8] = {};
+    struct { float* pMatrixCoefficients; float* pDelayTimes; u32 SrcChannels; u32 DstChannels;
+             float LPFDirectCoefficient, LPFReverbCoefficient, ReverbLevel, DopplerFactor,
+             EmitterToListenerAngle, EmitterToListenerDistance, EmitterVelocityComponent,
+             ListenerVelocityComponent; } dsp{mtx, nullptr, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0};
+    (void)emt;
+    void* xapo = nullptr;
+    const int x3ok = pX3Init ? pX3Init(3, 343.5f, x3d_inst) : -1;
+    if (x3ok == 0 && pX3Calc) pX3Calc(x3d_inst, &lst, &em2, 1, &dsp);
+    const int fxok = pCrtFX ? pCrtFX(k_clsid_xa27, &xapo, nullptr, 0) : -1;
+    if (xapo) {
+      void** fvt = *(void***)xapo;
+      ((u32(TRT_GUEST_ABI*)(void*))fvt[2])(xapo);
+    }
+    CHECK(x3ok == 0 && dsp.EmitterToListenerDistance > 1.5f && fxok == 0 && xapo != nullptr,
+          "x3daudio1_7.dll + xapofx1_5.dll attenuation and CreateFX succeed");
+  }
+
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;
 }

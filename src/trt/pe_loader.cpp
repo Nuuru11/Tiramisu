@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if !defined(_WIN32)
+#  include <pthread.h>
+#endif
+#include <atomic>
+#include <mutex>
 #include <vector>
 #include <string>
 
@@ -24,59 +29,209 @@ void logf_be(const trt_backend* be, const char* msg) {
 }
 
 // ---------------------------------------------------------------------------
-// STAGE 7: shared guest TEB (one per process, like a real thread's TEB).
+// Per-thread guest TEB + dynamic .tls template instantiation:
 // Guest code reads:
-//   gs:[0x08] StackLimit, gs:[0x10] StackBase  (MSVC stack checks:
-//     UnityPlayer!UnityMain2 faults on `mov %gs:0x10,%r11` when the base
-//     is 0 — measured live),
-//   gs:[0x30] Self pointer (NTDLL-style code compares it),
-//   gs:[0x58] ThreadLocalStoragePointer -> array[index] = module block.
-// One TEB means every mapped image's TLS block is visible to every other
-// image's code, and guest->bridge->guest dispatches (WNDPROC etc.) that
-// lose the gs swap still see the correct TEB.
+//   gs:[0x08] StackBase, gs:[0x10] StackLimit (MSVC stack checks),
+//   gs:[0x30] Self pointer,
+//   gs:[0x58] ThreadLocalStoragePointer -> thread's own array[index] -> block.
+// Each mapped PE with a TLS directory registers a template (raw bytes +
+// zero-fill size). Every OS thread materializes its own independent copy of
+// every module's TLS block via epoch checking before entering guest code.
 // ---------------------------------------------------------------------------
-#define TRT_TEB_SIZE 0x4000u          // 16 KiB: room for a big TLS array
-#define TRT_TEB_TLS_ARRAY_OFF 0x600u  // gs:[0x58] points here
-#define TRT_TEB_MAX_TLS_SLOTS \
-  ((TRT_TEB_SIZE - TRT_TEB_TLS_ARRAY_OFF) / sizeof(void*))
+#define TRT_TEB_SIZE 0x4000u          // shared PEB/fallback storage
+#define TRT_TEB_TLS_ARRAY_OFF 0x600u
+
+#if defined(_WIN32)
+// Leave indices [0..15] clear for host static/WinRT implicit TLS slots (_tls_index).
+constexpr u32 k_guest_tls_first_index = 16;
+extern "C" unsigned long _tls_index;
+#else
+constexpr u32 k_guest_tls_first_index = 0;
+#endif
+
+struct tls_template {
+  u32 index = 0;
+  std::vector<u8> raw;
+  size_t total_size = 0;
+};
 
 } // namespace
 
-// STAGE 7 shared guest TEB — file-scope so images.cpp can install it for
-// any guest call, even when the called image has no TLS directory of its
-// own (the exe with no TLS dir still calls into UnityPlayer.dll, which
-// reads gs:[0x10] for stack checks).
+static std::mutex g_teb_mu;
 static u8* g_guest_teb = nullptr;
-static u32 g_guest_tls_next = 0;  // Windows allocates index 0 first
+static u32 g_guest_tls_next = k_guest_tls_first_index;
+static std::atomic<u32> g_tls_epoch{1};
+static std::vector<tls_template> g_tls_templates;
 
-void* trt_guest_teb_acquire(u32* out_index) {
+struct ThreadTlsState {
+  alignas(16) u8 teb[0x1900]{};
+  void** slots = nullptr;
+  size_t cap = 0;
+  std::vector<void**> retired_arrays;
+  u32 epoch = 0;
+  bool teb_inited = false;
+  ~ThreadTlsState() {
+    if (slots) {
+      for (size_t i = k_guest_tls_first_index; i < cap; ++i) {
+        free(slots[i]);
+      }
+      free(slots);
+      slots = nullptr;
+    }
+    for (void** old : retired_arrays) free(old);
+  }
+};
+
+static thread_local ThreadTlsState t_tls_state;
+
+static void fill_teb_stack(u8* teb) {
+  // NT_TIB offsets: gs:[0x08] = StackBase (high), gs:[0x10] = StackLimit (low, 4K-aligned).
+  u64 stack_lim = ((u64)(uintptr_t)teb - 0x100000) & ~0xFFFULL;
+  u64 stack_base = (u64)(uintptr_t)teb & ~0xFFFULL;
+#if !defined(_WIN32)
+  pthread_attr_t attr;
+  void* sb = nullptr;
+  size_t ss = 0;
+  if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+    if (pthread_attr_getstack(&attr, &sb, &ss) == 0 && sb && ss) {
+      stack_lim = ((u64)(uintptr_t)sb + 0xFFFULL) & ~0xFFFULL;
+      stack_base = (((u64)(uintptr_t)sb + (u64)ss)) & ~0xFFFULL;
+    }
+    pthread_attr_destroy(&attr);
+  }
+#endif
+  *(u64*)(teb + 0x08) = stack_base;  // StackBase  (high addr)
+  *(u64*)(teb + 0x10) = stack_lim;   // StackLimit (low addr)
+}
+
+extern "C" u32 TRT_STDCALL trt_GetCurrentThreadId(void);
+
+static u8* ensure_shared_teb() {
+  std::lock_guard<std::mutex> lk(g_teb_mu);
   if (!g_guest_teb) {
-    g_guest_teb = (u8*)calloc(1, TRT_TEB_SIZE);
-    if (!g_guest_teb) return nullptr;
-    void** tls_array = (void**)(g_guest_teb + TRT_TEB_TLS_ARRAY_OFF);
-    // generous fake stack bounds so guest stack checks pass; the guest
-    // runs on the HOST stack (several MiB) — point at a wide plausible
-    // window ending at the TEB allocation
-    *(u64*)(g_guest_teb + 0x08) = (u64)(uintptr_t)g_guest_teb - 0x100000; // StackLimit
-    *(u64*)(g_guest_teb + 0x10) = (u64)(uintptr_t)g_guest_teb;           // StackBase
+    u8* teb = (u8*)calloc(1, TRT_TEB_SIZE);
+    if (!teb) return nullptr;
+    void** tls_array = (void**)(teb + TRT_TEB_TLS_ARRAY_OFF);
+    fill_teb_stack(teb);
     // gs:[0x60] = PEB pointer (guest CRT reads it: gs:0x60 -> PEB+0x20
-    //NumberOfProcessors etc.). Build a minimal PEB right after the TEB.
-    u8* peb = g_guest_teb + 0x2000;
-    *(u64*)(g_guest_teb + 0x60) = (u64)(uintptr_t)peb;
-    // PEB+0x20 = ProcessParameters (a POINTER the CRT dereferences: Unity-
-    // CrashHandler reads [peb+0x20] then [pp+8]); point at a zeroed block
-    static u8* s_pp;  // one PEB per process, one ProcessParameters block
+    // NumberOfProcessors etc.). Build a minimal PEB right after the TEB.
+    u8* peb = teb + 0x2000;
+    *(u64*)(teb + 0x60) = (u64)(uintptr_t)peb;
+    static u8* s_pp;
     if (!s_pp) s_pp = (u8*)calloc(1, 0x400);
     *(u64*)(peb + 0x20) = (u64)(uintptr_t)s_pp;
-    *(u64*)(peb + 0x28) = 0;  // no debug heap markers
-    *(u64*)(g_guest_teb + 0x30) = (u64)(uintptr_t)g_guest_teb;           // Self
-    *(void**)(g_guest_teb + 0x58) = (void*)tls_array;
-  }
-  if (out_index && g_guest_tls_next < TRT_TEB_MAX_TLS_SLOTS) {
-    // caller plugs tls_array[idx] right after we return the TEB
-    *out_index = g_guest_tls_next++;
+    *(u64*)(peb + 0x28) = 0;
+    *(u32*)(peb + 0xB8) = 8;                    // NumberOfProcessors
+    *(u64*)(teb + 0x30) = (u64)(uintptr_t)teb;  // Self
+    *(u64*)(teb + 0x40) = 0x1000;               // ClientId.UniqueProcess
+    *(u64*)(teb + 0x48) = (u64)trt_GetCurrentThreadId();  // ClientId.UniqueThread
+    *(void**)(teb + 0x58) = (void*)tls_array;
+    g_guest_teb = teb;
   }
   return g_guest_teb;
+}
+
+static void sync_thread_tls_state() {
+  ThreadTlsState& ts = t_tls_state;
+  const u32 cur_epoch = g_tls_epoch.load(std::memory_order_acquire);
+  if (ts.teb_inited && ts.epoch == cur_epoch && ts.slots != nullptr) return;
+
+  u8* shared = ensure_shared_teb();
+  if (!shared) return;
+
+  if (!ts.teb_inited) {
+    memset(ts.teb, 0, sizeof(ts.teb));
+    fill_teb_stack(ts.teb);
+    *(u64*)(ts.teb + 0x30) = (u64)(uintptr_t)ts.teb;  // Self
+    *(u64*)(ts.teb + 0x40) = 0x1000;                  // ClientId.UniqueProcess
+    *(u64*)(ts.teb + 0x48) = (u64)trt_GetCurrentThreadId();  // ClientId.UniqueThread
+    *(u64*)(ts.teb + 0x60) = (u64)(uintptr_t)(shared + 0x2000);  // PEB
+    ts.teb_inited = true;
+  }
+
+  std::lock_guard<std::mutex> lk(g_teb_mu);
+  const size_t needed = (size_t)g_guest_tls_next;
+  size_t target_cap = ts.cap ? ts.cap : 512;
+  while (target_cap < needed) target_cap *= 2;
+  if (!ts.slots || target_cap > ts.cap) {
+    void** next = (void**)calloc(target_cap, sizeof(void*));
+    if (!next) return;
+    if (ts.slots) {
+      memcpy(next, ts.slots, ts.cap * sizeof(void*));
+      ts.retired_arrays.push_back(ts.slots);
+    }
+    ts.slots = next;
+    ts.cap = target_cap;
+  }
+
+  for (const tls_template& tpl : g_tls_templates) {
+    if (tpl.index < ts.cap && ts.slots[tpl.index] == nullptr) {
+      const size_t alloc_sz = tpl.total_size ? tpl.total_size : 1;
+      u8* block = (u8*)malloc(alloc_sz);
+      if (!block) continue;
+      if (!tpl.raw.empty()) memcpy(block, tpl.raw.data(), tpl.raw.size());
+      if (alloc_sz > tpl.raw.size()) {
+        memset(block + tpl.raw.size(), 0, alloc_sz - tpl.raw.size());
+      }
+      ts.slots[tpl.index] = block;
+    }
+  }
+
+  *(void**)(ts.teb + 0x58) = (void*)ts.slots;
+  ts.epoch = g_tls_epoch.load(std::memory_order_relaxed);
+}
+
+int trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
+                           u32* out_index) {
+  if (!out_index) return -1;
+  {
+    std::lock_guard<std::mutex> lk(g_teb_mu);
+    const u32 idx = g_guest_tls_next++;
+    tls_template tpl;
+    tpl.index = idx;
+    tpl.total_size = total_size ? total_size : (raw_size ? raw_size : 1);
+    if (raw && raw_size > 0) {
+      tpl.raw.assign(raw, raw + raw_size);
+    }
+    g_tls_templates.push_back(std::move(tpl));
+    g_tls_epoch.fetch_add(1, std::memory_order_release);
+    *out_index = idx;
+  }
+  sync_thread_tls_state();
+  return 0;
+}
+
+void trt_guest_tls_sync_thread(void) {
+  sync_thread_tls_state();
+}
+
+void** trt_guest_tls_array(void) {
+  sync_thread_tls_state();
+  return t_tls_state.slots;
+}
+
+void trt_guest_tls_bind_host_slot(void** host_tls, void** guest_tls) {
+#if defined(_WIN32)
+  if (!host_tls || !guest_tls || host_tls == guest_tls) return;
+  const u32 idx = (u32)_tls_index;
+  if (idx < k_guest_tls_first_index) {
+    guest_tls[idx] = host_tls[idx];
+  }
+#else
+  (void)host_tls;
+  (void)guest_tls;
+#endif
+}
+
+void* trt_guest_teb_acquire(u32* out_index) {
+  u8* shared = ensure_shared_teb();
+  if (!shared) return nullptr;
+  if (out_index) {
+    if (trt_guest_tls_register(nullptr, 0, 0, out_index) != 0) return nullptr;
+    return shared;
+  }
+  sync_thread_tls_state();
+  return t_tls_state.teb;
 }
 
 // fail: record stage detail, release mapping, return error code
@@ -166,15 +321,25 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section headers out of file");
 
   // ---- 3. allocate ----
+  const u16 file_chars = rd16((const u8*)&nt->file_header.characteristics);
+  const u16 dll_chars = rd16((const u8*)&nt->optional_header.dll_characteristics);
   const bool has_relocs = dirs[TRT_PE_DIR_RELOC].virtual_address != 0 &&
                           dirs[TRT_PE_DIR_RELOC].size != 0;
+  // A /DYNAMICBASE image without RELOCS_STRIPPED whose .reloc directory is empty
+  // contains zero absolute fixups (pure RIP-relative code) and can safely run
+  // off preferred base (critical on Xbox UWP where VirtualAllocFromApp cannot
+  // guarantee arbitrary ImageBase).
+  const bool can_relocate =
+      has_relocs ||
+      ((dll_chars & 0x0040u /*IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE*/) &&
+       !(file_chars & 0x0001u /*IMAGE_FILE_RELOCS_STRIPPED*/));
   void* base = be->alloc((size_t)size_of_image, preferred);
-  if (!base && has_relocs) {           // retry anywhere; relocs will fix it up
+  if (!base && can_relocate) {        // retry anywhere; relocs (if any) will fix it up
     base = be->alloc((size_t)size_of_image, 0);
     if (base) logf_be(be, "trt: preferred base unavailable, relocated");
   }
   if (!base)
-    return fail(&img, be, has_relocs ? TRT_ERR_ALLOC : TRT_ERR_NO_BASE,
+    return fail(&img, be, can_relocate ? TRT_ERR_ALLOC : TRT_ERR_NO_BASE,
                 "VirtualAlloc/map failed");
   memset(base, 0, (size_t)size_of_image);
 
@@ -208,15 +373,20 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     const u64 vsize = rd32((const u8*)&sh->virtual_size);
     const u64 rsize = rd32((const u8*)&sh->size_of_raw_data);
     const u64 roff = rd32((const u8*)&sh->pointer_to_raw_data);
-    if (va + vsize > size_of_image)
+    const u64 mem_sz = vsize ? vsize : rsize;
+    if (va + mem_sz > size_of_image)
       return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section VA+VSize > SizeOfImage");
     if (rsize) {
       if (roff + rsize > file_size)
         return fail(&img, be, TRT_ERR_SECTION_BOUNDS, "section raw data out of file");
-      memcpy(img.base + va, file + roff, (size_t)rsize);
+      // SizeOfRawData is FileAlignment-padded on disk and can exceed VirtualSize
+      // (and SizeOfImage) on the last section; PE loaders map at most mem_sz bytes.
+      u64 copy_sz = (vsize && rsize > vsize) ? vsize : rsize;
+      if (copy_sz > size_of_image - va) copy_sz = size_of_image - va;
+      memcpy(img.base + va, file + roff, (size_t)copy_sz);
     }
     // BSS tail already zero from memset
-    if (va + vsize > max_end) max_end = va + vsize;
+    if (va + mem_sz > max_end) max_end = va + mem_sz;
     char line[96];
     snprintf(line, sizeof(line), "trt: sec[%u] %.8s va=%llx sz=%llx%s",
              i, (const char*)sh->name, (unsigned long long)va,
@@ -230,10 +400,13 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
 
   // ---- 5. relocations (only when loaded off preferred base) ----
   if (delta != 0) {
-    if (!has_relocs)
+    if (!can_relocate)
       return fail(&img, be, TRT_ERR_NO_BASE, "delta != 0 and no reloc directory");
-    const u64 dir_va = dirs[TRT_PE_DIR_RELOC].virtual_address;
-    const u64 dir_sz = dirs[TRT_PE_DIR_RELOC].size;
+    if (!has_relocs) {
+      logf_be(be, "trt: dynamic-base image has empty .reloc (0 fixups); relocated");
+    } else {
+      const u64 dir_va = dirs[TRT_PE_DIR_RELOC].virtual_address;
+      const u64 dir_sz = dirs[TRT_PE_DIR_RELOC].size;
     if (dir_va + dir_sz > size_of_image)
       return fail(&img, be, TRT_ERR_RELOC_BOUNDS, "reloc dir out of image");
     u64 off = 0;
@@ -268,10 +441,11 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       }
       off += block_size;
     }
-    char line[96];
-    snprintf(line, sizeof(line), "trt: reloc delta=%llx fixed=%u",
-             (unsigned long long)delta, n_fixed);
-    logf_be(be, line);
+      char line[96];
+      snprintf(line, sizeof(line), "trt: reloc delta=%llx fixed=%u",
+               (unsigned long long)delta, n_fixed);
+      logf_be(be, line);
+    }
   } else {
     logf_be(be, "trt: loaded at preferred base, no reloc pass");
   }
@@ -291,12 +465,15 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       if (desc->name >= size_of_image || desc->first_thunk >= size_of_image)
         return fail(&img, be, TRT_ERR_IMPORT, "import descriptor out of image");
       const char* mod_name = (const char*)(img.base + desc->name);
+      const u64 int_rva = desc->original_first_thunk ? desc->original_first_thunk
+                                                     : desc->first_thunk;
       const u64 iat_rva = desc->first_thunk;
       u32 bound = 0;
       for (u64 t = iat_rva;; t += 8) {
-        if (t + 8 > size_of_image)
+        const u64 lt = int_rva + (t - iat_rva);
+        if (t + 8 > size_of_image || lt + 8 > size_of_image)
           return fail(&img, be, TRT_ERR_IMPORT, "IAT runs off image");
-        const u64 thunk = rd64(img.base + t);
+        const u64 thunk = rd64(img.base + lt);
         if (thunk == 0) break;  // terminator
         const char* sym_name = nullptr;
         u16 ordinal = 0;
@@ -397,31 +574,17 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                (unsigned long long)block_size);
       logf_be(be, probe);
       if (index_rva + 4 <= size_of_image && block_size > 0) {
-        u8* block = (u8*)malloc((size_t)(block_size ? block_size : 1));
-        if (block) {
-          if (raw_size) memcpy(block, img.base + raw_start_rva, (size_t)raw_size);
-          memset(block + raw_size, 0, (size_t)(block_size - raw_size));
-          // STAGE 7 fix: the old per-image hash index
-          // (0x100 + (base>>20 & 0xFFFF)) produced indices like 5376/6400
-          // that overflowed the 64-slot ThreadLocalStoragePointer inside a
-          // 4 KiB per-image TEB (measured live: UnityCrashHandler64 read
-          // tls_array[5376] = NULL and faulted). Now: ONE shared process
-          // TEB for every image (all modules see each other's TLS blocks,
-          // like a real Windows thread) with a small sequential index.
-          u32 tls_index = 0;
-          img.guest_teb = trt_guest_teb_acquire(&tls_index);
-          if (img.guest_teb) {
-            // NOTE: index 0 is legitimate (Windows allocates 0 first), so
-            // the guard is on the TEB pointer, not the index
-            *(u32*)(img.base + index_rva) = tls_index;
-            *(void**)((u8*)img.guest_teb + TRT_TEB_TLS_ARRAY_OFF +
-                      (size_t)tls_index * sizeof(void*)) = block;
-            char tline[128];
-            snprintf(tline, sizeof(tline),
-                     "trt: tls block size=%llu index=%u (shared process TEB)",
-                     (unsigned long long)block_size, tls_index);
-            logf_be(be, tline);
-          }
+        u32 tls_index = 0;
+        const u8* raw_ptr = raw_size ? (img.base + raw_start_rva) : nullptr;
+        if (trt_guest_tls_register(raw_ptr, (size_t)raw_size,
+                                   (size_t)block_size, &tls_index) == 0) {
+          img.guest_teb = ensure_shared_teb();
+          *(u32*)(img.base + index_rva) = tls_index;
+          char tline[160];
+          snprintf(tline, sizeof(tline),
+                   "trt: tls block size=%llu index=%u (per-thread TEB templates)",
+                   (unsigned long long)block_size, tls_index);
+          logf_be(be, tline);
         }
       }
     }
@@ -546,7 +709,7 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
   const trt_data_directory* ex =
       &nt->optional_header.directories[TRT_PE_DIR_EXCEPTION];
   if (ex->virtual_address && ex->size && be->register_unwind) {
-    const u32 count = ex->size / 8;  // RUNTIME_FUNCTION = 8 bytes
+    const u32 count = ex->size / 12;  // RUNTIME_FUNCTION = 12 bytes (3 x u32)
     const int rc = be->register_unwind(img->base, img->base + ex->virtual_address,
                                        count);
     char line[128];
@@ -649,7 +812,7 @@ extern "C" int trt_audit_imports(const u8* file, size_t file_size,
         return v;
       }();
       if (!desc.first_thunk && !desc.name) break;
-      u64 name_off, thunk_off;
+      u64 name_off;
       if (!fv_rva2off(fv, desc.name, &name_off)) {
         missing->push_back("<bad>DLL-name-unreadable");
         continue;
@@ -657,9 +820,11 @@ extern "C" int trt_audit_imports(const u8* file, size_t file_size,
       if (name_off >= file_size) break;
       const char* mod_name = (const char*)(file + name_off);
       if (strnlen(mod_name, 256) == 256) break;
+      const u32 ilt_rva = desc.original_first_thunk ? desc.original_first_thunk
+                                                    : desc.first_thunk;
       for (u64 t = 0;; t += 8) {
         u64 toff;
-        if (!fv_rva2off(fv, desc.first_thunk + t, &toff)) break;
+        if (!fv_rva2off(fv, ilt_rva + t, &toff)) break;
         if (toff + 8 > file_size) break;
         const u64 thunk = rd64(file + toff);
         if (thunk == 0) break;

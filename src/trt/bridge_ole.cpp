@@ -6,11 +6,15 @@
 // the fail-visible rule. That log line is how we discover which COM
 // classes a game actually needs on console.
 #include "bridge_ole.h"
+#include "bridge_wasapi.h"
 #include "thunk.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <mutex>
+#include <vector>
 
 // unique name, file scope, OUTSIDE extern "C" (the log_line collision rule)
 namespace olelog {
@@ -29,24 +33,23 @@ constexpr int E_NOINTERFACE_ = (int)0x80004002;
 constexpr int E_OUTOFMEMORY_ = (int)0x8007000E;
 constexpr int E_INVALIDARG_ = (int)0x80070057;
 constexpr int REGDB_E_CLASSNOTREG_ = (int)0x80040154;
-constexpr int CO_E_ALREADYINITIALIZED_ = (int)0x80040161;
+constexpr int CO_E_CLASSSTRING_ = (int)0x800401F3;
 
 // apartment model: a game passes COINIT_APARTMENTTHREADED (0x2) or
 // COINIT_MULTITHREADED (0x0); either is fine single-threaded
 constexpr u32 COINIT_APARTMENTTHREADED = 0x2;
 
-int g_init_count = 0;  // CoInitialize nesting
+int g_init_count = 0;     // CoInitialize nesting
 int g_last_init_mta = 0;  // model of the active CoInitializeEx (0=STA 1=MTA)
 
-// ---- CLSID personality registry ----
-constexpr u32 k_max_classes = 32;
+// ---- CLSID personality registry (uncapped, thread-safe) ----
 struct com_class {
   u8 clsid[16];
   trt_com_factory factory;
   void* user;
 };
-com_class g_classes[k_max_classes];
-u32 g_class_count = 0;
+std::mutex g_classes_mu;
+std::vector<com_class> g_classes;
 
 void clsid_to_str(const u8* g, char* out) {
   // {XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
@@ -64,18 +67,50 @@ void clsid_to_str(const u8* g, char* out) {
   out[o] = 0;
 }
 
+int hex_nibble(u16 c) {
+  if (c >= '0' && c <= '9') return (int)(c - '0');
+  if (c >= 'a' && c <= 'f') return (int)(c - 'a' + 10);
+  if (c >= 'A' && c <= 'F') return (int)(c - 'A' + 10);
+  return -1;
+}
+
+bool str_to_clsid(const u16* s, u8* out) {
+  if (!s || !out) return false;
+  int p = 0;
+  if (s[p] == '{') ++p;
+  const int order[16] = {3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15};
+  for (int i = 0; i < 16; ++i) {
+    if (i == 4 || i == 6 || i == 8 || i == 10) {
+      if (s[p] != '-') return false;
+      ++p;
+    }
+    int hi = hex_nibble(s[p++]);
+    int lo = hex_nibble(s[p++]);
+    if (hi < 0 || lo < 0) return false;
+    out[order[i]] = (u8)((hi << 4) | lo);
+  }
+  return true;
+}
+
 }  // namespace
 
 void trt_ole_register_class(const void* clsid, trt_com_factory factory,
                             void* user) {
-  if (!clsid || !factory || g_class_count >= k_max_classes) return;
-  com_class& c = g_classes[g_class_count++];
+  if (!clsid || !factory) return;
+  std::lock_guard<std::mutex> lk(g_classes_mu);
+  for (com_class& c : g_classes) {
+    if (memcmp(c.clsid, clsid, 16) == 0) {
+      c.factory = factory;
+      c.user = user;
+      return;
+    }
+  }
+  com_class c = {};
   memcpy(c.clsid, clsid, 16);
   c.factory = factory;
   c.user = user;
+  g_classes.push_back(c);
 }
-
-namespace {
 
 // ---- CoInitializeEx / CoInitialize / CoUninitialize ----
 int TRT_GUEST_ABI ole_CoInitializeEx(void* reserved, u32 model) {
@@ -96,6 +131,9 @@ void TRT_GUEST_ABI ole_CoUninitialize(void) {
   if (g_init_count) --g_init_count;
 }
 void TRT_GUEST_ABI ole_CoFreeUnusedLibraries(void) {}
+void TRT_GUEST_ABI ole_CoFreeUnusedLibrariesEx(u32 delay, u32 reserved) {
+  (void)delay; (void)reserved;
+}
 
 // ---- CoCreateInstance: dispatch to personalities, else fail VISIBLY ----
 int TRT_GUEST_ABI ole_CoCreateInstance(const void* clsid, void* outer,
@@ -105,14 +143,26 @@ int TRT_GUEST_ABI ole_CoCreateInstance(const void* clsid, void* outer,
   *out = nullptr;
   if (outer) return E_NOINTERFACE_;  // no aggregation
   const u8* g = (const u8*)clsid;
-  for (u32 i = 0; i < g_class_count; ++i) {
-    if (memcmp(g_classes[i].clsid, g, 16) == 0) {
-      char line[96];
-      snprintf(line, sizeof(line), "ole: CoCreateInstance -> personality %u",
-               i);
-      log_line(line);
-      return g_classes[i].factory(iid, out, g_classes[i].user);
+  trt_com_factory fn = nullptr;
+  void* user = nullptr;
+  u32 idx = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_classes_mu);
+    for (u32 i = 0; i < (u32)g_classes.size(); ++i) {
+      if (memcmp(g_classes[i].clsid, g, 16) == 0) {
+        fn = g_classes[i].factory;
+        user = g_classes[i].user;
+        idx = i;
+        break;
+      }
     }
+  }
+  if (fn) {
+    char line[96];
+    snprintf(line, sizeof(line), "ole: CoCreateInstance -> personality %u",
+             idx);
+    log_line(line);
+    return fn(iid, out, user);
   }
   char guid[40];
   clsid_to_str(g, guid);
@@ -126,7 +176,7 @@ int TRT_GUEST_ABI ole_CoCreateInstance(const void* clsid, void* outer,
 int TRT_GUEST_ABI ole_CoGetClassObject(const void* clsid, u32 context,
                                        void* reserved, const void* iid,
                                        void** out) {
-  // same dispatch surface, different entry (class factories)
+  (void)reserved;
   return ole_CoCreateInstance(clsid, nullptr, context, iid, out);
 }
 
@@ -143,6 +193,8 @@ u32 TRT_GUEST_ABI ole_CoTaskMemSize(void* p) {
   (void)p;
   return 0;  // Windows answers the alloc size; nothing depends on it here
 }
+
+namespace {
 
 // ---- OLEAUT: BSTR ----
 // BSTR = [u32 length-in-bytes][string bytes][\0\0], ptr points at the chars
@@ -200,20 +252,25 @@ int TRT_GUEST_ABI ole_SysReAllocString(u16** p, const u16* s) {
   *p = n;
   return 1;
 }
+int TRT_GUEST_ABI ole_SysReAllocStringLen(u16** p, const u16* s, u32 chars) {
+  if (!p) return 0;
+  u16* n = ole_SysAllocStringLen(s, chars);
+  if (!n) return 0;
+  ole_SysFreeString(*p);
+  *p = n;
+  return 1;
+}
 
 // ---- OLEAUT: variants ----
 void TRT_GUEST_ABI ole_VariantInit(void* v) {
-  if (v) memset(v, 0, 16);  // VARIANT is 24 bytes on x64 but vt+reserved
-                            // head is what Init touches
+  if (v) memset(v, 0, 16);  // VARIANT is 24 bytes on x64
 }
 void TRT_GUEST_ABI ole_VariantClear(void* v) {
-  // BSTRs in variants leak here — fine for a game boot path, named in log
   if (v) memset((u16*)v, 0, 2);  // vt = VT_EMPTY
 }
 void TRT_GUEST_ABI ole_VariantCopy(void* dst, const void* src) {
   if (dst && src) memcpy(dst, src, 24);
 }
-void TRT_GUEST_ABI ole_VariantInitN(void* v) { ole_VariantInit(v); }
 
 // ---- OLEAUT: safe arrays (minimal: 1D, no lock tracking) ----
 struct safearray {
@@ -226,20 +283,19 @@ struct safearray {
   u32 lower;
 };
 u16* TRT_GUEST_ABI ole_SafeArrayCreateVector(u32 vt, u32 lower, u32 elements) {
-  // element sizes for the VTs games actually use
   u32 eb = 0;
   switch (vt) {
-    case 2: case 3: case 4: eb = 2; break;   // I2, I4(2b), R4-ish small ints
-    case 5: case 6: case 7: eb = 8; break;   // R8/DATE/CY
-    case 11: eb = 1; break;                  // UI1
-    case 16: eb = 1; break;                  // I1
-    case 17: eb = 2; break;                  // UI2
-    case 18: eb = 4; break;                  // UI4
-    case 19: eb = 8; break;                  // I8
-    case 20: eb = 8; break;                  // UI8
-    case 22: eb = 4; break;                  // INT
-    case 23: eb = 4; break;                  // UINT
-    case 8: eb = 4; break;                   // BSTR (pointer-sized on x64)
+    case 2: case 3: case 4: eb = 2; break;
+    case 5: case 6: case 7: eb = 8; break;
+    case 11: eb = 1; break;
+    case 16: eb = 1; break;
+    case 17: eb = 2; break;
+    case 18: eb = 4; break;
+    case 19: eb = 8; break;
+    case 20: eb = 8; break;
+    case 22: eb = 4; break;
+    case 23: eb = 4; break;
+    case 8: eb = 4; break;
     default: eb = 4; break;
   }
   safearray* sa = (safearray*)malloc(sizeof(safearray));
@@ -285,9 +341,6 @@ u32 TRT_GUEST_ABI ole_SafeArrayGetDim(u16* h) {
   return h ? 1 : 0;
 }
 int TRT_GUEST_ABI ole_SafeArrayGetVartype(u16* h, u16* out) {
-  // OLEAUT32 ordinal #77 (Wine oleaut32.spec). GameAssembly.dll imports it
-  // by ordinal. Our SAFEARRAY model stores no vt, so report VT_VARIANT
-  // (the default element type Windows uses for untyped safearrays).
   static const u16 VT_VARIANT_ = 12;
   if (!h || !out) return E_INVALIDARG_;
   *out = VT_VARIANT_;
@@ -328,25 +381,22 @@ int TRT_GUEST_ABI ole_SafeArrayPutElement(u16* h, const i32* idx,
 void TRT_GUEST_ABI ole_PropVariantInit(void* p) {
   if (p) memset(p, 0, 8);
 }
-
-// ---- PropVariantClear / PropVariantCopy (UnityPlayer imports via ole32;
-// bridge_ole's VariantClear covers the BSTR-in-variant head, named leak) --
-int TRT_GUEST_ABI ole_PropVariantClear(void* p) {
-  ole_VariantClear(p);
-  return S_OK_;
-}
 int TRT_GUEST_ABI ole_PropVariantCopy(void* dst, const void* src) {
   if (!dst || !src) return E_INVALIDARG_;
   memcpy(dst, src, 24);
   return S_OK_;
 }
 
+}  // namespace
+
+int TRT_GUEST_ABI ole_PropVariantClear(void* p) {
+  ole_VariantClear(p);
+  return S_OK_;
+}
+
 // ---- GUID helpers ----
 int TRT_GUEST_ABI ole_CoCreateGuid(void* out) {
   if (!out) return E_INVALIDARG_;
-  // real CoCreateGuid = a random GUID; a fixed-but-unique-shaped GUID is
-  // fine for a load/boot path (nothing here compares two created GUIDs).
-  // Named in the log so any dependency on randomness is visible.
   static u8 counter = 0;
   u8* g = (u8*)out;
   for (int i = 0; i < 16; ++i) g[i] = 0;
@@ -366,37 +416,72 @@ i32 TRT_GUEST_ABI ole_StringFromGUID2(const void* guid, u16* out, i32 cap) {
   out[39] = 0;
   return 39;
 }
+
+namespace {
+
+int TRT_GUEST_ABI ole_StringFromCLSID(const void* rclsid, u16** lplpsz) {
+  if (!rclsid || !lplpsz) return E_INVALIDARG_;
+  u16* buf = (u16*)ole_CoTaskMemAlloc(40 * sizeof(u16));
+  if (!buf) return E_OUTOFMEMORY_;
+  ole_StringFromGUID2(rclsid, buf, 40);
+  *lplpsz = buf;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_CLSIDFromString(const u16* lpsz, void* pclsid) {
+  if (!pclsid) return E_INVALIDARG_;
+  if (!lpsz) {
+    memset(pclsid, 0, 16);
+    return S_OK_;
+  }
+  if (!str_to_clsid(lpsz, (u8*)pclsid)) return CO_E_CLASSSTRING_;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_IIDFromString(const u16* lpsz, void* lpiid) {
+  if (!lpsz) return E_INVALIDARG_;
+  return ole_CLSIDFromString(lpsz, lpiid);
+}
+int TRT_GUEST_ABI ole_ProgIDFromCLSID(const void* clsid, u16** lplpszProgID) {
+  (void)clsid;
+  if (lplpszProgID) *lplpszProgID = nullptr;
+  return REGDB_E_CLASSNOTREG_;
+}
+int TRT_GUEST_ABI ole_CLSIDFromProgID(const u16* progId, void* clsid) {
+  (void)progId;
+  if (clsid) memset(clsid, 0, 16);
+  return CO_E_CLASSSTRING_;
+}
 int TRT_GUEST_ABI ole_CoSetProxyBlanket(void* proxy, u32 a, u32 b,
                                         void* c, u32 d, u32 e, void* f,
                                         u32 g) {
   (void)proxy; (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g;
-  char line[96];
-  snprintf(line, sizeof(line),
-           "ole: CoSetProxyBlanket -> S_OK (no-op, single-process COM)");
-  log_line(line);
+  log_line("ole: CoSetProxyBlanket -> S_OK (no-op, single-process COM)");
   return S_OK_;
 }
-int TRT_GUEST_ABI ole_RoGetAgileReference(u32 opts, const void* iid,
-                                          void* unk, void** out) {
-  // no agile-referrer: return the object itself for IUnknown-shaped asks
-  // and name the gap otherwise (WinRT agility is named work if reached)
-  if (!out) return E_INVALIDARG_;
-  *out = nullptr;
-  (void)iid;
-  *out = unk;  // single-threaded guest: the agile ref IS the object
-  char line[96];
-  snprintf(line, sizeof(line),
-           "ole: RoGetAgileReference -> pass-through (single-threaded)");
-  log_line(line);
+int TRT_GUEST_ABI ole_CoInitializeSecurity(void* pSecDesc, i32 cAuthSvc,
+                                           void* asAuthSvc, void* pReserved1,
+                                           u32 dwAuthnLevel, u32 dwImpLevel,
+                                           void* pAuthList, u32 dwCapabilities,
+                                           void* pReserved3) {
+  (void)pSecDesc; (void)cAuthSvc; (void)asAuthSvc; (void)pReserved1;
+  (void)dwAuthnLevel; (void)dwImpLevel; (void)pAuthList;
+  (void)dwCapabilities; (void)pReserved3;
   return S_OK_;
 }
 
+}  // namespace
+
+int TRT_GUEST_ABI ole_RoGetAgileReference(u32 opts, const void* iid,
+                                          void* unk, void** out) {
+  (void)opts; (void)iid;
+  if (!out) return E_INVALIDARG_;
+  *out = unk;
+  log_line("ole: RoGetAgileReference -> pass-through (single-threaded)");
+  return S_OK_;
+}
+
+namespace {
+
 // ---- CoCreateFreeThreadedMarshaler ----
-// Unity (dstoragecore/ole32 surface) calls this to wrap its free-threaded
-// objects. Real minimal implementation: a refcounted IUnknown stub —
-// QueryInterface answers IUnknown/IID_IUnknown, AddRef/Release maintain the
-// refcount, nothing else. Marshaler semantics (GetMarshalSizeMax & co) are
-// named work items if the next dry-run demands them.
 struct ftm_stub {
   void** vtbl;   // IUnknown vtable: QI, AddRef, Release
   i32 refs;
@@ -406,14 +491,10 @@ i32 TRT_GUEST_ABI ftm_QueryInterface(void* self, const void* iid,
                                      void** out) {
   if (!out) return E_INVALIDARG_;
   *out = nullptr;
-  // accept only IUnknown (00000000-0000-0000-C000-000000000046): the first
-  // u32 of the IID is all we need to check for "any IID" pragmatism — no:
-  // fail-visible. Compare the full 16 bytes against IID_IUnknown.
   static const u8 k_iid_unknown[16] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                                        0x00, 0x00, 0xC0, 0x00, 0x00, 0x00,
                                        0x00, 0x00, 0x00, 0x46};
   if (iid && memcmp(iid, k_iid_unknown, 16) == 0) {
-    // AddRef semantics: increment through the object head
     ftm_stub* s = (ftm_stub*)self;
     ++s->refs;
     *out = self;
@@ -432,18 +513,19 @@ u32 TRT_GUEST_ABI ftm_Release(void* self) {
   return (u32)(left > 0 ? left : 0);
 }
 
+}  // namespace
+
 int TRT_GUEST_ABI ole_CoCreateFreeThreadedMarshaler(void* outer,
                                                     void** out) {
   if (!out) return E_INVALIDARG_;
   *out = nullptr;
-  if (outer) return E_NOINTERFACE_;  // no aggregation (matches ole32)
-  // IUnknown vtable: [QI, AddRef, Release]
+  if (outer) return E_NOINTERFACE_;
   static void* k_vtbl[3] = {
       (void*)&ftm_QueryInterface, (void*)&ftm_AddRef, (void*)&ftm_Release};
   ftm_stub* s = (ftm_stub*)malloc(sizeof(ftm_stub));
   if (!s) return E_OUTOFMEMORY_;
   s->vtbl = k_vtbl;
-  s->refs = 1;  // start at 1 like a fresh COM object
+  s->refs = 1;
   *out = s;
   char line[96];
   snprintf(line, sizeof(line),
@@ -453,24 +535,17 @@ int TRT_GUEST_ABI ole_CoCreateFreeThreadedMarshaler(void* outer,
   return S_OK_;
 }
 
-// ---- CoGetApartmentType (GameAssembly imports it via ole32) ----
-// Real minimal implementation: report the apartment CoInitializeEx set.
-//   APT_MTA = 1, APT_STA = 2 (the real enum values)
-// Never-initialized fails CO_E_NOTINITIALIZED (0x800401F0), matching ole32.
+// ---- CoGetApartmentType ----
 int TRT_GUEST_ABI ole_CoGetApartmentType(u32* apt_type, u32* qualifier) {
   if (!apt_type || !qualifier) return E_INVALIDARG_;
   *apt_type = 0;
   *qualifier = 0;
   if (g_init_count <= 0) {
-    char line[96];
-    snprintf(line, sizeof(line),
-             "ole: CoGetApartmentType -> CO_E_NOTINITIALIZED (no CoInitialize)");
-    log_line(line);
+    log_line("ole: CoGetApartmentType -> CO_E_NOTINITIALIZED (no CoInitialize)");
     return (int)0x800401F0;  // CO_E_NOTINITIALIZED
   }
-  // the LAST init model wins (matches CoInitializeEx nesting semantics)
   *apt_type = g_last_init_mta ? 1u /*APT_MTA*/ : 2u /*APT_STA*/;
-  *qualifier = 0u /*APTQUALIFIER_CURRENT */;
+  *qualifier = 0u /*APTQUALIFIER_CURRENT*/;
   char line[96];
   snprintf(line, sizeof(line), "ole: CoGetApartmentType -> %s",
            g_last_init_mta ? "MTA" : "STA");
@@ -478,15 +553,106 @@ int TRT_GUEST_ABI ole_CoGetApartmentType(u32* apt_type, u32* qualifier) {
   return S_OK_;
 }
 
-// ---- OleInitialize (same surface as CoInitialize for boot) ----
+namespace {
+
+// ---- OleInitialize / DragDrop / ErrorInfo / Marshaling ----
 int TRT_GUEST_ABI ole_OleInitialize(void* reserved) {
   return ole_CoInitializeEx(reserved, COINIT_APARTMENTTHREADED);
 }
 void TRT_GUEST_ABI ole_OleUninitialize(void) { ole_CoUninitialize(); }
 
+int TRT_GUEST_ABI ole_RegisterDragDrop(void* hwnd, void* dropTarget) {
+  (void)hwnd; (void)dropTarget;
+  log_line("ole: RegisterDragDrop -> S_OK (no desktop drag-drop on console)");
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_RevokeDragDrop(void* hwnd) {
+  (void)hwnd;
+  return S_OK_;
+}
+void TRT_GUEST_ABI ole_ReleaseStgMedium(void* pmedium) {
+  (void)pmedium;
+}
+int TRT_GUEST_ABI ole_OleGetClipboard(void** ppDataObj) {
+  if (ppDataObj) *ppDataObj = nullptr;
+  return E_NOINTERFACE_;
+}
+int TRT_GUEST_ABI ole_OleSetClipboard(void* pDataObj) {
+  (void)pDataObj;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_OleFlushClipboard(void) { return S_OK_; }
+
+static void* g_error_info = nullptr;
+int TRT_GUEST_ABI ole_SetErrorInfo(u32 dwReserved, void* perrinfo) {
+  (void)dwReserved;
+  g_error_info = perrinfo;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_GetErrorInfo(u32 dwReserved, void** pperrinfo) {
+  (void)dwReserved;
+  if (!pperrinfo) return E_INVALIDARG_;
+  *pperrinfo = g_error_info;
+  g_error_info = nullptr;
+  return *pperrinfo ? S_OK_ : S_FALSE_;
+}
+
+int TRT_GUEST_ABI ole_CoMarshalInterThreadInterfaceInStream(const void* riid,
+                                                            void* pUnk,
+                                                            void** ppStm) {
+  (void)riid;
+  if (!ppStm) return E_INVALIDARG_;
+  // Single-process COM: pass the interface pointer as the stream token
+  *ppStm = pUnk;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_CoGetInterfaceAndReleaseStream(void* pStm,
+                                                     const void* riid,
+                                                     void** ppv) {
+  (void)riid;
+  if (!ppv) return E_INVALIDARG_;
+  *ppv = pStm;
+  return S_OK_;
+}
+u32 TRT_GUEST_ABI ole_CoGetCurrentProcess(void) { return 1; }
+int TRT_GUEST_ABI ole_CoGetObjectContext(const void* riid, void** ppv) {
+  (void)riid;
+  if (ppv) *ppv = nullptr;
+  return E_NOINTERFACE_;
+}
+int TRT_GUEST_ABI ole_CoGetContextToken(u64* pToken) {
+  if (!pToken) return E_INVALIDARG_;
+  *pToken = 1;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_CoRegisterInitializeSpy(void* pSpy, u64* puliCookie) {
+  (void)pSpy;
+  if (puliCookie) *puliCookie = 1;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_CoRevokeInitializeSpy(u64 uliCookie) {
+  (void)uliCookie;
+  return S_OK_;
+}
+int TRT_GUEST_ABI ole_CreateStreamOnHGlobal(void* hGlobal, int fDeleteOnRelease,
+                                            void** ppstm) {
+  (void)hGlobal; (void)fDeleteOnRelease;
+  if (ppstm) *ppstm = nullptr;
+  log_line("ole: CreateStreamOnHGlobal -> E_NOINTERFACE (named gap)");
+  return E_NOINTERFACE_;
+}
+int TRT_GUEST_ABI ole_GetHGlobalFromStream(void* pstm, void** phglobal) {
+  (void)pstm;
+  if (phglobal) *phglobal = nullptr;
+  return E_INVALIDARG_;
+}
+
 }  // namespace
 
 int trt_bridge_register_ole(void) {
+  // Ensure WASAPI CLSID_MMDeviceEnumerator is registered into g_classes.
+  trt_bridge_register_wasapi();
+
   static const trt_named_fn k_ole32[] = {
       {"CoInitialize", (void*)&ole_CoInitialize},
       {"CoInitializeEx", (void*)&ole_CoInitializeEx},
@@ -499,6 +665,7 @@ int trt_bridge_register_ole(void) {
       {"CoTaskMemFree", (void*)&ole_CoTaskMemFree},
       {"CoTaskMemSize", (void*)&ole_CoTaskMemSize},
       {"CoFreeUnusedLibraries", (void*)&ole_CoFreeUnusedLibraries},
+      {"CoFreeUnusedLibrariesEx", (void*)&ole_CoFreeUnusedLibrariesEx},
       {"OleInitialize", (void*)&ole_OleInitialize},
       {"OleUninitialize", (void*)&ole_OleUninitialize},
       {"CoCreateFreeThreadedMarshaler",
@@ -508,8 +675,33 @@ int trt_bridge_register_ole(void) {
       {"PropVariantCopy", (void*)&ole_PropVariantCopy},
       {"CoCreateGuid", (void*)&ole_CoCreateGuid},
       {"StringFromGUID2", (void*)&ole_StringFromGUID2},
+      {"StringFromCLSID", (void*)&ole_StringFromCLSID},
+      {"CLSIDFromString", (void*)&ole_CLSIDFromString},
+      {"IIDFromString", (void*)&ole_IIDFromString},
+      {"ProgIDFromCLSID", (void*)&ole_ProgIDFromCLSID},
+      {"CLSIDFromProgID", (void*)&ole_CLSIDFromProgID},
       {"CoSetProxyBlanket", (void*)&ole_CoSetProxyBlanket},
+      {"CoInitializeSecurity", (void*)&ole_CoInitializeSecurity},
       {"RoGetAgileReference", (void*)&ole_RoGetAgileReference},
+      {"RegisterDragDrop", (void*)&ole_RegisterDragDrop},
+      {"RevokeDragDrop", (void*)&ole_RevokeDragDrop},
+      {"ReleaseStgMedium", (void*)&ole_ReleaseStgMedium},
+      {"OleGetClipboard", (void*)&ole_OleGetClipboard},
+      {"OleSetClipboard", (void*)&ole_OleSetClipboard},
+      {"OleFlushClipboard", (void*)&ole_OleFlushClipboard},
+      {"SetErrorInfo", (void*)&ole_SetErrorInfo},
+      {"GetErrorInfo", (void*)&ole_GetErrorInfo},
+      {"CoMarshalInterThreadInterfaceInStream",
+       (void*)&ole_CoMarshalInterThreadInterfaceInStream},
+      {"CoGetInterfaceAndReleaseStream",
+       (void*)&ole_CoGetInterfaceAndReleaseStream},
+      {"CoGetCurrentProcess", (void*)&ole_CoGetCurrentProcess},
+      {"CoGetObjectContext", (void*)&ole_CoGetObjectContext},
+      {"CoGetContextToken", (void*)&ole_CoGetContextToken},
+      {"CoRegisterInitializeSpy", (void*)&ole_CoRegisterInitializeSpy},
+      {"CoRevokeInitializeSpy", (void*)&ole_CoRevokeInitializeSpy},
+      {"CreateStreamOnHGlobal", (void*)&ole_CreateStreamOnHGlobal},
+      {"GetHGlobalFromStream", (void*)&ole_GetHGlobalFromStream},
   };
   static const trt_named_fn k_oleaut[] = {
       {"SysAllocString", (void*)&ole_SysAllocString},
@@ -518,18 +710,19 @@ int trt_bridge_register_ole(void) {
       {"SysStringLen", (void*)&ole_SysStringLen},
       {"SysStringByteLen", (void*)&ole_SysStringByteLen},
       {"SysAllocStringByteLen", (void*)&ole_SysAllocStringByteLen},
-      // Ordinal-only imports (Unity IL2CPP DLLs import OLEAUT32 purely by
-      // ordinal). The classic oleaut32 export ordinals (Wine oleaut32.spec):
+      {"SysReAllocString", (void*)&ole_SysReAllocString},
+      {"SysReAllocStringLen", (void*)&ole_SysReAllocStringLen},
       {"#2", (void*)&ole_SysAllocString},
       {"#3", (void*)&ole_SysReAllocString},
       {"#4", (void*)&ole_SysAllocStringLen},
+      {"#5", (void*)&ole_SysReAllocStringLen},
       {"#6", (void*)&ole_SysFreeString},
       {"#7", (void*)&ole_SysStringLen},
       {"#8", (void*)&ole_VariantInit},
       {"#9", (void*)&ole_VariantClear},
       {"#10", (void*)&ole_VariantCopy},
-      {"#12", (void*)&ole_VariantInit},   // VariantChangeType: named work item if CALLED
-      {"#15", (void*)&ole_SafeArrayCreateVector},  // SafeArrayCreate (vector covers the 1D case)
+      {"#12", (void*)&ole_VariantInit},
+      {"#15", (void*)&ole_SafeArrayCreateVector},
       {"#16", (void*)&ole_SafeArrayDestroy},
       {"#17", (void*)&ole_SafeArrayGetDim},
       {"#19", (void*)&ole_SafeArrayGetUBound},
@@ -540,13 +733,12 @@ int trt_bridge_register_ole(void) {
       {"#24", (void*)&ole_SafeArrayUnaccessData},
       {"#25", (void*)&ole_SafeArrayGetElement},
       {"#26", (void*)&ole_SafeArrayPutElement},
-      {"#77", (void*)&ole_SafeArrayGetVartype},  // SafeArrayGetVartype
+      {"#77", (void*)&ole_SafeArrayGetVartype},
       {"#149", (void*)&ole_SysStringByteLen},
       {"#150", (void*)&ole_SysAllocStringByteLen},
       {"#411", (void*)&ole_SafeArrayCreateVector},
-      {"#200", (void*)&ole_SysAllocStringByteLen},  // GetErrorInfo slot: legacy ordinals
-      {"#201", (void*)&ole_SysStringByteLen},       // SetErrorInfo slot: legacy ordinals
-      {"SysReAllocString", (void*)&ole_SysReAllocString},
+      {"#200", (void*)&ole_GetErrorInfo},
+      {"#201", (void*)&ole_SetErrorInfo},
       {"VariantInit", (void*)&ole_VariantInit},
       {"VariantClear", (void*)&ole_VariantClear},
       {"VariantCopy", (void*)&ole_VariantCopy},
@@ -562,15 +754,22 @@ int trt_bridge_register_ole(void) {
       {"SafeArrayGetLBound", (void*)&ole_SafeArrayGetLBound},
       {"SafeArrayGetElement", (void*)&ole_SafeArrayGetElement},
       {"SafeArrayPutElement", (void*)&ole_SafeArrayPutElement},
+      {"SetErrorInfo", (void*)&ole_SetErrorInfo},
+      {"GetErrorInfo", (void*)&ole_GetErrorInfo},
   };
   trt_module_register("ole32.dll", TRT_ROUTE_BUILTIN, k_ole32,
                       (int)(sizeof(k_ole32) / sizeof(k_ole32[0])));
   trt_module_register("oleaut32.dll", TRT_ROUTE_BUILTIN, k_oleaut,
                       (int)(sizeof(k_oleaut) / sizeof(k_oleaut[0])));
+  unsigned cls_count = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_classes_mu);
+    cls_count = (unsigned)g_classes.size();
+  }
   char line[96];
   snprintf(line, sizeof(line),
            "ole: ole32 + oleaut32 BUILTIN (%u CLSID personalities)",
-           g_class_count);
+           cls_count);
   log_line(line);
   return 0;
 }

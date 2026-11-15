@@ -31,18 +31,30 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <deque>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 namespace {
 
+constexpr size_t k_thunk_stride = 64;
+constexpr size_t k_thunks_per_page = 4096 / k_thunk_stride; // 64 slots per 4 KiB page
+
 struct thunk_entry {
-  char kind[16];
-  char mod[96];
-  char sym[96];
-  void* code;
+  std::string kind;
+  std::string mod;
+  std::string sym;
+  void* code = nullptr;
 };
 
-thunk_entry g_thunks[128];
-int g_thunk_count = 0;
+std::mutex g_thunk_mu;
+std::deque<thunk_entry> g_thunks;
+std::unordered_map<std::string, size_t> g_thunk_map;
+std::vector<unsigned char*> g_thunk_pages;
 
+std::mutex g_backend_mu;
 trt_backend g_backend;
 bool g_backend_set = false;
 
@@ -72,30 +84,61 @@ void put_u64(unsigned char* p, u64 v) {
   for (int i = 0; i < 8; ++i) p[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
 }
 
+void write_stub_slot(unsigned char* code, u64 index, u64 dispatch_addr) {
+  unsigned char* p = code;
+  memcpy(p, k_stub_head, sizeof(k_stub_head)); p += sizeof(k_stub_head);
+  memcpy(p, k_stub_arg_mov, sizeof(k_stub_arg_mov)); p += sizeof(k_stub_arg_mov);
+  put_u64(p, index); p += 8;
+  memcpy(p, k_stub_mov_r11, sizeof(k_stub_mov_r11)); p += sizeof(k_stub_mov_r11);
+  put_u64(p, dispatch_addr); p += 8;
+  memcpy(p, k_stub_call_r11, sizeof(k_stub_call_r11)); p += sizeof(k_stub_call_r11);
+  memcpy(p, k_stub_tail, sizeof(k_stub_tail));
+}
+
 } // namespace
 
 extern "C" {
 
 void trt_core_set_backend(const trt_backend* be) {
-  if (be) { g_backend = *be; g_backend_set = true; }
+  if (!be) return;
+  std::lock_guard<std::mutex> lk(g_backend_mu);
+  g_backend = *be;
+  g_backend_set = true;
 }
 
 const trt_backend* trt_core_backend(void) {
+  std::lock_guard<std::mutex> lk(g_backend_mu);
   return g_backend_set ? &g_backend : nullptr;
 }
 
 void trt_core_log(const char* line) {
-  if (g_backend_set && g_backend.log) g_backend.log(line);
+  void (*log_fn)(const char*) = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_backend_mu);
+    if (g_backend_set && g_backend.log) log_fn = g_backend.log;
+  }
+  if (log_fn) log_fn(line);
   else fprintf(stderr, "  [trt] %s\n", line);
 }
 
 // the target of every stub: names the symbol, returns 0
 extern "C" u64 trt_thunk_dispatch(u64 index) {
-  if (index < (u64)g_thunk_count) {
-    thunk_entry& e = g_thunks[index];
-    char line[256];
+  std::string kind, mod, sym;
+  bool found = false;
+  {
+    std::lock_guard<std::mutex> lk(g_thunk_mu);
+    if (index < (u64)g_thunks.size()) {
+      const thunk_entry& e = g_thunks[(size_t)index];
+      kind = e.kind;
+      mod = e.mod;
+      sym = e.sym;
+      found = true;
+    }
+  }
+  if (found) {
+    char line[512];
     snprintf(line, sizeof(line), "trt: %s %s!%s called (unimplemented)",
-             e.kind, e.mod, e.sym);
+             kind.c_str(), mod.c_str(), sym.c_str());
     trt_core_log(line);
   } else {
     trt_core_log("trt: thunk called with a bad index");
@@ -109,51 +152,53 @@ void* trt_thunk_make(const trt_backend* be, const char* kind, const char* mod,
   if (!mod) mod = "?";
   if (!sym) sym = "?";
 
-  // reuse an identical thunk if we already made one
-  for (int i = 0; i < g_thunk_count; ++i)
-    if (strcmp(g_thunks[i].kind, kind) == 0 &&
-        strcmp(g_thunks[i].mod, mod) == 0 &&
-        strcmp(g_thunks[i].sym, sym) == 0)
-      return g_thunks[i].code;
-
-  if (g_thunk_count >= (int)(sizeof(g_thunks) / sizeof(g_thunks[0])))
-    return nullptr;
+  std::string key;
+  key.reserve(strlen(kind) + strlen(mod) + strlen(sym) + 2);
+  key.append(kind).push_back('\x1f');
+  key.append(mod).push_back('\x1f');
+  key.append(sym);
 
   const trt_backend* backend = be ? be : trt_core_backend();
-  if (!backend || !backend->alloc || !backend->protect) return nullptr;
+  void* created_code = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_thunk_mu);
+    auto it = g_thunk_map.find(key);
+    if (it != g_thunk_map.end()) return g_thunks[it->second].code;
 
-  thunk_entry& e = g_thunks[g_thunk_count];
-  memset(&e, 0, sizeof(e));
-  snprintf(e.kind, sizeof(e.kind), "%s", kind);
-  snprintf(e.mod, sizeof(e.mod), "%s", mod);
-  snprintf(e.sym, sizeof(e.sym), "%s", sym);
+    if (!backend || !backend->alloc || !backend->protect) return nullptr;
 
-  // one page is plenty for 128 stubs; allocate 4 KiB RW, write, flip RX
-  unsigned char* page = (unsigned char*)backend->alloc(4096, 0);
-  if (!page) return nullptr;
+    const size_t index = g_thunks.size();
+    const size_t page_idx = index / k_thunks_per_page;
+    const size_t slot_idx = index % k_thunks_per_page;
 
-  const u64 index = (u64)g_thunk_count;
-  unsigned char* code = page + (size_t)index * 64;  // 64-byte stride
-  unsigned char* p = code;
-  memcpy(p, k_stub_head, sizeof(k_stub_head)); p += sizeof(k_stub_head);
-  memcpy(p, k_stub_arg_mov, sizeof(k_stub_arg_mov)); p += sizeof(k_stub_arg_mov);
-  put_u64(p, index); p += 8;
-  memcpy(p, k_stub_mov_r11, sizeof(k_stub_mov_r11)); p += sizeof(k_stub_mov_r11);
-  put_u64(p, (u64)(uintptr_t)&trt_thunk_dispatch); p += 8;
-  memcpy(p, k_stub_call_r11, sizeof(k_stub_call_r11)); p += sizeof(k_stub_call_r11);
-  memcpy(p, k_stub_tail, sizeof(k_stub_tail)); p += sizeof(k_stub_tail);
+    if (page_idx >= g_thunk_pages.size()) {
+      // Pre-populate all 64 slots on a fresh 4 KiB page while RW, then flip RX once.
+      unsigned char* page = (unsigned char*)backend->alloc(4096, 0);
+      if (!page) return nullptr;
+      const u64 base_idx = (u64)page_idx * k_thunks_per_page;
+      const u64 dispatch_addr = (u64)(uintptr_t)&trt_thunk_dispatch;
+      for (size_t s = 0; s < k_thunks_per_page; ++s) {
+        write_stub_slot(page + s * k_thunk_stride, base_idx + s, dispatch_addr);
+      }
+      backend->protect(page, 4096, TRT_PROT_R | TRT_PROT_X);
+      g_thunk_pages.push_back(page);
+    }
 
-  // W^X: RW -> RX, never RWX
-  backend->protect(page, 4096, TRT_PROT_R | TRT_PROT_X);
+    created_code = g_thunk_pages[page_idx] + slot_idx * k_thunk_stride;
+    thunk_entry e;
+    e.kind = kind;
+    e.mod = mod;
+    e.sym = sym;
+    e.code = created_code;
+    g_thunks.push_back(std::move(e));
+    g_thunk_map.emplace(std::move(key), index);
+  }
 
-  e.code = code;
-  ++g_thunk_count;
-
-  char line[256];
+  char line[512];
   snprintf(line, sizeof(line), "trt: %s %s!%s -> fail-visible thunk",
            kind, mod, sym);
   trt_core_log(line);
-  return code;
+  return created_code;
 }
 
 } // extern "C"

@@ -38,13 +38,13 @@ struct builtin_mod {
   // cap of 128 SILENTLY dropped the tail — games importing the dropped
   // tail (GetSystemTimeAsFileTime, EncodePointer, GetCommandLineW...) died
   // at bind with no named cause. OrTMM audit found it.
-  trt_named_fn fns[256];
+  trt_named_fn fns[2048];
   int fn_count;
 };
 // The table must hold every module a game might import: the defaults
 // (70+) plus the builtin bridges. Overflow is a bug, not a shrug - it is
 // logged, because a dropped registration means an unresolved import.
-builtin_mod g_modules[256];
+builtin_mod g_modules[384];
 int g_module_count = 0;
 
 // host-installed binding for SYSTEM-route modules (UWP: LoadLibraryW +
@@ -57,12 +57,14 @@ trt_system_load g_system_load = nullptr;
 struct dll_alias { const char* guest_name; const char* system_name; };
 const dll_alias k_dll_aliases[] = {
     {"vcruntime140.dll", "vcruntime140_app.dll"},
+    {"vcruntime140_1.dll", "vcruntime140_1_app.dll"},
     {"msvcp140.dll", "msvcp140_app.dll"},
     {"msvcp140_1.dll", "msvcp140_1_app.dll"},
     {"msvcp140_2.dll", "msvcp140_2_app.dll"},
     {"msvcp140_atomic_wait.dll", "msvcp140_atomic_wait_app.dll"},
     {"msvcp140_codecvt_ids.dll", "msvcp140_codecvt_ids_app.dll"},
     {"concrt140.dll", "concrt140_app.dll"},
+    {"vcomp140.dll", "vcomp140_app.dll"},
     // XInput on console = XINPUTUAP.dll (the SDK's xinput.lib imports it)
     {"xinput1_4.dll", "xinputuap.dll"},
     {"xinput1_3.dll", "xinputuap.dll"},
@@ -257,9 +259,18 @@ void trt_module_register(const char* name, trt_route route,
   memset(m, 0, sizeof(*m));
   strncpy(m->name, name, sizeof(m->name) - 1);
   m->route = route;
-  for (int i = 0; i < fn_count && i < (int)(sizeof(m->fns) / sizeof(m->fns[0])); ++i)
-    m->fns[i] = fns[i];
-  m->fn_count = fn_count;
+  const int cap = (int)(sizeof(m->fns) / sizeof(m->fns[0]));
+  int copied = 0;
+  for (; copied < fn_count && copied < cap; ++copied)
+    m->fns[copied] = fns[copied];
+  m->fn_count = copied;
+  if (copied < fn_count) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "trt: MODULE TABLE OVERFLOW - %s clipped %d/%d exports",
+             name, copied, fn_count);
+    trt_core_log(line);
+  }
 }
 
 trt_route trt_module_route(const char* name) {
@@ -378,8 +389,11 @@ const mod_default k_defaults[] = {
     // UIAutomationCore: UnityPlayer imports the Uia* accessibility surface;
     // console has no UIA — STUB binds fail-visible, calls name themselves
     {"uiautomationcore.dll", TRT_ROUTE_STUB},
-    {"uxtheme.dll", TRT_ROUTE_SYSTEM},
-    {"msimg32.dll", TRT_ROUTE_SYSTEM},
+    {"uxtheme.dll", TRT_ROUTE_BUILTIN},
+    {"msimg32.dll", TRT_ROUTE_BUILTIN},
+    {"vulkan-1.dll", TRT_ROUTE_BUILTIN},
+    {"comdlg32.dll", TRT_ROUTE_BUILTIN},
+    {"oleacc.dll", TRT_ROUTE_BUILTIN},
 
     // ---- COM / OLE / WinRT ----
     {"ole32.dll", TRT_ROUTE_BUILTIN},  // M7: COM boot (bridge_ole)
@@ -393,27 +407,28 @@ const mod_default k_defaults[] = {
 
     // ---- networking ----
     {"ws2_32.dll", TRT_ROUTE_SYSTEM},
-    {"mswsock.dll", TRT_ROUTE_SYSTEM},
+    {"mswsock.dll", TRT_ROUTE_BUILTIN},
     {"winhttp.dll", TRT_ROUTE_SYSTEM},
     {"wininet.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: WinINet not available to
                                           // UWP — honest-runtime bridge
-    {"dnsapi.dll", TRT_ROUTE_SYSTEM},
+    {"dnsapi.dll", TRT_ROUTE_BUILTIN},
     {"iphlpapi.dll", TRT_ROUTE_BUILTIN},  // STAGE 5: honest no-data bridge
-    {"netapi32.dll", TRT_ROUTE_SYSTEM},
-    {"mpr.dll", TRT_ROUTE_SYSTEM},
-    {"normaliz.dll", TRT_ROUTE_SYSTEM},
+    {"netapi32.dll", TRT_ROUTE_BUILTIN},
+    {"mpr.dll", TRT_ROUTE_BUILTIN},
+    {"dhcpcsvc.dll", TRT_ROUTE_BUILTIN},
+    {"normaliz.dll", TRT_ROUTE_BUILTIN},
 
     // ---- crypto / security / services ----
     {"bcrypt.dll", TRT_ROUTE_SYSTEM},
-    {"ncrypt.dll", TRT_ROUTE_SYSTEM},
+    {"ncrypt.dll", TRT_ROUTE_BUILTIN},
     {"crypt32.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: no cert store on console
                                           // — honest-fail bridge
-    {"cryptui.dll", TRT_ROUTE_SYSTEM},
-    {"secur32.dll", TRT_ROUTE_SYSTEM},
-    {"sechost.dll", TRT_ROUTE_SYSTEM},
-    {"sspicli.dll", TRT_ROUTE_SYSTEM},
-    {"wintrust.dll", TRT_ROUTE_SYSTEM},
-    {"credui.dll", TRT_ROUTE_SYSTEM},
+    {"cryptui.dll", TRT_ROUTE_BUILTIN},
+    {"secur32.dll", TRT_ROUTE_BUILTIN},
+    {"sechost.dll", TRT_ROUTE_BUILTIN},
+    {"sspicli.dll", TRT_ROUTE_BUILTIN},
+    {"wintrust.dll", TRT_ROUTE_BUILTIN},
+    {"credui.dll", TRT_ROUTE_BUILTIN},
 
     // ---- shell / env / misc ----
     {"shlwapi.dll", TRT_ROUTE_BUILTIN},  // M7: Path* helpers (bridge_shlwapi)
@@ -421,8 +436,8 @@ const mod_default k_defaults[] = {
     {"shfolder.dll", TRT_ROUTE_BUILTIN},  // M7: shim onto SHGetFolderPath
     {"shcore.dll", TRT_ROUTE_SYSTEM},
     {"version.dll", TRT_ROUTE_SYSTEM},
-    {"propsys.dll", TRT_ROUTE_SYSTEM},
-    {"userenv.dll", TRT_ROUTE_SYSTEM},
+    {"propsys.dll", TRT_ROUTE_BUILTIN},
+    {"userenv.dll", TRT_ROUTE_BUILTIN},
     {"psapi.dll", TRT_ROUTE_BUILTIN},     // STAGE 5: real guest module list
                                           // from the image registry
     {"hid.dll", TRT_ROUTE_SYSTEM},
@@ -430,13 +445,13 @@ const mod_default k_defaults[] = {
     {"avrt.dll", TRT_ROUTE_SYSTEM},
     {"imm32.dll", TRT_ROUTE_BUILTIN},     // STAGE 5: no IME on console —
                                           // honest no-IME bridge
-    {"usp10.dll", TRT_ROUTE_SYSTEM},
-    {"wtsapi32.dll", TRT_ROUTE_SYSTEM},
+    {"usp10.dll", TRT_ROUTE_BUILTIN},
+    {"wtsapi32.dll", TRT_ROUTE_BUILTIN},
     {"dbghelp.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: symbol records + real
                                           // text crash-report bridge
     {"dbgcore.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: dump engine (same surface)
-    {"dxcore.dll", TRT_ROUTE_SYSTEM},
-    {"directxmath.dll", TRT_ROUTE_SYSTEM},
+    {"dxcore.dll", TRT_ROUTE_BUILTIN},
+    {"directxmath.dll", TRT_ROUTE_BUILTIN},
 
     // ---- input: XInput (console = XINPUTUAP) ----
     {"xinput1_4.dll", TRT_ROUTE_SYSTEM},
@@ -450,7 +465,7 @@ const mod_default k_defaults[] = {
     {"openal32.dll", TRT_ROUTE_BUILTIN}, // M7: OpenAL 1.1 -> console sink
     {"dsound.dll", TRT_ROUTE_BUILTIN},   // M6: DirectSound -> console sink
     {"ddraw.dll", TRT_ROUTE_BUILTIN},    // M6: DirectDraw -> backend present
-    {"opengl32.dll", TRT_ROUTE_STUB},    // console has no GL
+    {"opengl32.dll", TRT_ROUTE_BUILTIN}, // OpenGL 1.x-4.x -> GLSL->HLSL -> D3D11
     {"glu32.dll", TRT_ROUTE_STUB},
     {"dinput8.dll", TRT_ROUTE_STUB},     // console input = XInput
     {"dinput.dll", TRT_ROUTE_STUB},
@@ -479,6 +494,28 @@ const mod_default k_defaults[] = {
     // this STUB entry is the fallback if the bridge never registered
     {"steam_api64.dll", TRT_ROUTE_STUB},
     {"steam_api.dll", TRT_ROUTE_STUB},
+    // Media Foundation + DXVA (overridden BUILTIN by bridge_mf)
+    {"mfplat.dll", TRT_ROUTE_BUILTIN},
+    {"mfreadwrite.dll", TRT_ROUTE_BUILTIN},
+    {"mf.dll", TRT_ROUTE_BUILTIN},
+    {"mfuuid.dll", TRT_ROUTE_BUILTIN},
+    {"evr.dll", TRT_ROUTE_BUILTIN},
+    {"dxva2.dll", TRT_ROUTE_BUILTIN},
+    // Legacy XAudio2/X3DAudio/XAPOFX (overridden BUILTIN by bridge_audio)
+    {"xaudio2_7.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_6.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_5.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_4.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_3.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_2.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_1.dll", TRT_ROUTE_BUILTIN},
+    {"xaudio2_0.dll", TRT_ROUTE_BUILTIN},
+    {"x3daudio1_7.dll", TRT_ROUTE_BUILTIN},
+    {"xapofx1_5.dll", TRT_ROUTE_BUILTIN},
+    // Power / Telemetry / WER / Session (overridden BUILTIN by bridge_sys_extras)
+    {"powrprof.dll", TRT_ROUTE_BUILTIN},
+    {"pdh.dll", TRT_ROUTE_BUILTIN},
+    {"wer.dll", TRT_ROUTE_BUILTIN},
 };
 
 } // namespace

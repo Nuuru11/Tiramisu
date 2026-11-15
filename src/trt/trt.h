@@ -83,6 +83,11 @@ typedef struct trt_image {
 // use (acquire) — images with no TLS directory still need it installed.
 void* trt_guest_teb_acquire(u32* out_index);
 void* trt_guest_teb_shared(void);
+int   trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
+                             u32* out_index);
+void  trt_guest_tls_sync_thread(void);
+void** trt_guest_tls_array(void);
+void  trt_guest_tls_bind_host_slot(void** host_tls, void** guest_tls);
 
 // Map a PE64 from a file image. Read-only view of [file, file+file_size).
 // Stages: validate -> alloc -> headers+sections -> relocs -> imports -> TLS.
@@ -150,8 +155,39 @@ void trt_bridge_boot(const trt_backend* be);
 int trt_bridge_register_kernel32(void);
 void trt_bridge_new_thread_id(u32 id);
 void trt_vfs_mount(const char* drive_prefix, const char* host_path);
+// Disc images: a read-only drive served straight out of a .iso/.bin/.img.
+// Files are extracted lazily into the cache root; the image is never written.
+struct trt_iso;
+void trt_vfs_set_iso_cache_root(const char* host_dir);
+int trt_vfs_mount_image(const char* drive_prefix, const char* host_image);
+void trt_vfs_unmount_image(const char* drive_prefix);
+struct trt_iso* trt_vfs_image_for_guest_utf16(const u16* guest_path,
+                                             char* rel_out, size_t rel_cap);
+int trt_vfs_is_image_utf16(const u16* guest_path);
+int trt_vfs_image_materialize(const u16* guest_path, char* host_out,
+                              size_t host_cap, int* is_dir_out);
+void trt_vfs_set_cwd(const char* guest_dir);
+int trt_vfs_get_cwd(char* out, size_t out_cap);
+int trt_vfs_normalize_guest_utf16(const u16* guest_path, char* out,
+                                  size_t out_cap);
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
+int trt_vfs_resolve_utf16_rw(const u16* guest_path, int for_write, char* out,
+                             size_t out_cap);
+int trt_vfs_resolve_z_pair_utf16(const u16* guest_path, char* ov_out,
+                                 size_t ov_cap, char* ro_out, size_t ro_cap,
+                                 char* rel_out, size_t rel_cap);
+int trt_vfs_is_z_deleted_rel(const char* z_rel, int is_child);
+int trt_vfs_is_z_opaque_rel(const char* z_rel);
+void trt_vfs_mark_z_deleted_utf16(const u16* guest_path, int is_deleted,
+                                  int is_dir);
+int trt_vfs_delete_file_utf16(const u16* guest_path, u32* win_err_out);
+int trt_vfs_remove_dir_utf16(const u16* guest_path, u32* win_err_out);
+int trt_vfs_ensure_parents(const char* host_path);
+int trt_vfs_mkdir_p(const char* host_dir);
+int trt_vfs_stat(const char* host_path, int* is_dir, u64* size_out);
 void trt_bridge_set_exe_path(const char* zpath);
+void trt_bridge_set_cmd_args(const char* args);
+void trt_bridge_set_cwd(const char* guest_dir);
 // STAGE 5 boot-determinism bridges (wininet/psapi/iphlpapi/imm32/crypt32/
 // dbghelp+dbgcore): honest-runtime surfaces for DLLs whose console presence
 // is unproven — bound BUILTIN so a game boots and the calls fail NAMED
@@ -165,6 +201,17 @@ int trt_bridge_register_dbghelp(void);
 int trt_utf16_to_utf8(const u16* in, char* out, size_t out_cap);
 // the bytes behind a guest file handle (the memory-mapping bridge)
 void* trt_file_bytes(void* handle, size_t* size);
+int trt_file_retain(void* handle);
+u64 trt_thread_handle_for_current(void);  // real handle for GetCurrentThread() duplicates
+int trt_retain_sync_handle(u64 handle);  // DuplicateHandle retain for 0x5Bxxxxxx handles
+void trt_fls_on_thread_exit(void);       // invoke non-null FLS callbacks on exiting thread
+void trt_queue_io_apc(void* fn, u64 err, u64 bytes, void* overlapped);
+int trt_file_release(void* handle);
+int trt_file_stat_size(void* handle, u64* size_out);
+int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
+                   size_t* read_out);
+int trt_file_pwrite(void* handle, u64 offset, const void* src, size_t bytes,
+                    size_t* written_out);
 int trt_bridge_register_user32(void);
 // host pump: called from the builtin GetMessageW while the guest blocks, so
 // CoreWindow events + XInput keep flowing after the guest owns the thread
@@ -179,9 +226,30 @@ void trt_set_pump(void (*fn)(void));
 extern void (*trt_boot_exit_trap)(int code);   // ExitProcess/TerminateProcess
 extern void (*trt_boot_raise_trap)(u32 code);  // RaiseException (no SEH walk)
 
+// TEST-HARNESS ONLY, spawn model: the offline EXE boot harness installs
+// this so CreateProcessW becomes a REAL forked child (PyInstaller's onefile
+// parent must re-spawn its own exe). The hook forks, re-boots the inherited
+// image in the child, waits, records the exit code, and answers through
+// pid_out (>=0 success). NULL (default) on every host build — there the
+// documented console behavior holds: ERROR_ACCESS_DENIED, fail named.
+extern void (*trt_boot_spawn_hook)(const char* exe_path, const char* cmdline,
+                                   int* pid_out);
+extern int trt_child_pid;         // >=0 once a modeled child exists
+extern int trt_child_running;     // 1 while the modeled child is alive
+extern u32 trt_child_exit_code;   // valid once not running
 // how many messages the builtin user32 pump has actually dispatched
 // (removed from the ring) — the boot report's "N messages dispatched"
 unsigned trt_msg_dispatched(void);
+
+// Dispatch a host hardware fault (Linux SIGSEGV/SIGBUS/SIGILL/SIGFPE/SIGTRAP
+// or Windows EXCEPTION_POINTERS*) to registered guest VectoredExceptionHandlers
+// (and SEH .pdata handlers on Linux). Returns 1 if execution should resume at the
+// updated machine context; 0 if unhandled.
+int trt_dispatch_hw_fault(int sig, void* siginfo, void* ucontext);
+int TRT_STDCALL trt_dispatch_win32_exception(void* ep);
+
+// runtime Steam AppID override (read from steam_appid.txt when launching)
+void trt_steam_set_appid(u32 app_id);
 
 #ifdef __cplusplus
 }

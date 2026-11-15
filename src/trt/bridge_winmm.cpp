@@ -138,6 +138,19 @@ u32 TRT_GUEST_ABI trt_waveOutOpen(u64* handle, u32, u64, u64, u64, u32) {
 u32 TRT_GUEST_ABI trt_waveOutUnprepareHeader(u64, void*, u32) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutPrepareHeader(u64, void*, u32) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiInGetNumDevs(void) { return 0; }
+u32 TRT_GUEST_ABI trt_midiInOpen(void** ph, u32 dev, u64 cb, u64 inst, u32 fl) {
+  (void)dev; (void)cb; (void)inst; (void)fl;
+  if (ph) *ph = nullptr;
+  return 6;  // MMSYSERR_NODRIVER
+}
+u32 TRT_GUEST_ABI trt_midiInHandleOp(void*) { return 4; /*MMSYSERR_INVALHANDLE*/ }
+u32 TRT_GUEST_ABI trt_midiInGetDevCapsA(u64, void*, u32) { return 4; }
+u32 TRT_GUEST_ABI trt_midiInGetErrorTextA(u32 err, char* buf, u32 len) {
+  (void)err;
+  if (buf && len > 0) buf[0] = 0;
+  return 8;  // MMSYSERR_BADERRNUM
+}
 
 int trt_bridge_register_winmm(void) {
   static const trt_named_fn k_fns[] = {
@@ -166,6 +179,15 @@ int trt_bridge_register_winmm(void) {
       {"waveOutUnprepareHeader", (void*)&trt_waveOutUnprepareHeader},
       {"waveOutGetDevCapsA", (void*)&trt_waveOutGetDevCapsA},
       {"midiOutGetNumDevs", (void*)&trt_midiOutGetNumDevs},
+      {"midiInGetNumDevs", (void*)&trt_midiInGetNumDevs},
+      {"midiInOpen", (void*)&trt_midiInOpen},
+      {"midiInClose", (void*)&trt_midiInHandleOp},
+      {"midiInStart", (void*)&trt_midiInHandleOp},
+      {"midiInStop", (void*)&trt_midiInHandleOp},
+      {"midiInReset", (void*)&trt_midiInHandleOp},
+      {"midiInGetDevCapsA", (void*)&trt_midiInGetDevCapsA},
+      {"midiInGetDevCapsW", (void*)&trt_midiInGetDevCapsA},
+      {"midiInGetErrorTextA", (void*)&trt_midiInGetErrorTextA},
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},
       {"mciSendStringW", (void*)&trt_mciSendStringW},

@@ -11,9 +11,12 @@
 #include "ui.h"
 #include "webxfer.h"
 #include "../trt/trt.h"
+#include "../trt/iso.h"
 #include "../trt/input.h"
 #include "../trt/images.h"
+#include "../trt/bridge_mem.h"
 #include "../trt/bridge_d3d.h"
+#include "../trt/bridge_openal.h"
 #include "../trt/bridge_reg.h"
 
 #include <winrt/base.h>
@@ -30,6 +33,7 @@
 #include <winrt/Windows.System.h>
 #include <winrt/Windows.UI.Core.h>
 #include <winrt/Windows.UI.Input.h>
+#include <winrt/Windows.UI.ViewManagement.h>
 #include <winrt/Windows.Web.Http.h>
 
 #include <d2d1_1.h>
@@ -37,9 +41,14 @@
 #include <d3d11.h>
 #include <xinput.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <csetjmp>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -56,16 +65,30 @@ namespace {
 
 std::string g_local_state;
 std::string g_games_dir;
+std::mutex g_status_mu;
 std::string g_guest_status = "idle";
 std::string g_steam_status = "press Y to link Steam (your own account)";
 std::string g_steam_qr;  // URL to render as QR (steam or transfer)
 std::atomic<bool> g_steam_busy{false};
 std::atomic<bool> g_shutdown{false};
+std::atomic<bool> g_guest_running{false};
+DWORD g_ui_tid = 0;
+std::thread g_guest_thread;
 std::string g_pending_launch;
 bool g_mouse_mode = false;
 bool g_booted = false;
 bool g_setup_done = false;      // first-run setup screen flag
 bool g_setup_active = false;    // currently showing the setup screen
+
+void set_guest_status(std::string s) {
+  std::lock_guard<std::mutex> lk(g_status_mu);
+  g_guest_status = std::move(s);
+}
+
+std::string get_guest_status() {
+  std::lock_guard<std::mutex> lk(g_status_mu);
+  return g_guest_status;
+}
 
 // ---------------- helpers ----------------
 std::string ws2u8(winrt::hstring const& h) {
@@ -119,10 +142,38 @@ void* uwp_alloc(size_t bytes, u64 preferred_base) {
   return VirtualAllocFromApp(nullptr, bytes, MEM_COMMIT | MEM_RESERVE,
                              PAGE_READWRITE);
 }
+void* uwp_reserve(size_t bytes, u64 preferred_base) {
+  (void)preferred_base;
+  return VirtualAllocFromApp(nullptr, bytes, MEM_RESERVE, PAGE_NOACCESS);
+}
+int uwp_commit(void* base, size_t bytes, unsigned prot) {
+  DWORD fl = PAGE_READONLY;
+  if ((prot & (TRT_PROT_W | TRT_PROT_X)) == (TRT_PROT_W | TRT_PROT_X))
+    fl = PAGE_EXECUTE_READWRITE;
+  else if (prot & TRT_PROT_X)
+    fl = PAGE_EXECUTE_READ;
+  else if (prot & TRT_PROT_W)
+    fl = PAGE_READWRITE;
+  return VirtualAllocFromApp(base, bytes, MEM_COMMIT, fl) ? 0 : 1;
+}
+int uwp_decommit(void* base, size_t bytes) {
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable: 6250)
+#endif
+  return VirtualFree(base, bytes, MEM_DECOMMIT) ? 0 : 1;
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
+}
 int uwp_protect(void* base, size_t bytes, unsigned prot) {
   DWORD fl = PAGE_READONLY;
-  if (prot & TRT_PROT_X) fl = PAGE_EXECUTE_READ;
-  else if (prot & TRT_PROT_W) fl = PAGE_READWRITE;
+  if ((prot & (TRT_PROT_W | TRT_PROT_X)) == (TRT_PROT_W | TRT_PROT_X))
+    fl = PAGE_EXECUTE_READWRITE;
+  else if (prot & TRT_PROT_X)
+    fl = PAGE_EXECUTE_READ;
+  else if (prot & TRT_PROT_W)
+    fl = PAGE_READWRITE;
   DWORD old = 0;
   return VirtualProtectFromApp(base, bytes, fl, &old) ? 0 : 1;
 }
@@ -138,34 +189,104 @@ int uwp_register_unwind(void* image_base, const void* pdata, u32 count) {
 
 void uwp_log(const char* line) { longan::log_line(line); }
 
+std::atomic<bool> g_uwp_raw_mouse{false};
+
+inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
+  if (vk == 0x10 /*VK_SHIFT*/) return (scan == 0x36u || ext) ? 0xA1u : 0xA0u;
+  if (vk == 0x11 /*VK_CONTROL*/) return ext ? 0xA3u : 0xA2u;
+  if (vk == 0x12 /*VK_MENU*/) return ext ? 0xA5u : 0xA4u;
+  return vk;
+}
+
+inline int host_mouse_btn_for_press(winrt::Windows::UI::Input::PointerUpdateKind k) {
+  using PUK = winrt::Windows::UI::Input::PointerUpdateKind;
+  if (k == PUK::LeftButtonPressed) return 0;
+  if (k == PUK::RightButtonPressed) return 1;
+  if (k == PUK::MiddleButtonPressed) return 2;
+  if (k == PUK::XButton1Pressed) return 3;
+  if (k == PUK::XButton2Pressed) return 4;
+  return -1;
+}
+
+inline int host_mouse_btn_for_release(winrt::Windows::UI::Input::PointerUpdateKind k) {
+  using PUK = winrt::Windows::UI::Input::PointerUpdateKind;
+  if (k == PUK::LeftButtonReleased) return 0;
+  if (k == PUK::RightButtonReleased) return 1;
+  if (k == PUK::MiddleButtonReleased) return 2;
+  if (k == PUK::XButton1Released) return 3;
+  if (k == PUK::XButton2Released) return 4;
+  return -1;
+}
+
+void poll_host_gamepads(XINPUT_STATE* pad0_out, bool* pad0_ok_out) {
+  for (DWORD idx = 0; idx < 4; ++idx) {
+    XINPUT_STATE xs{};
+    const bool ok = (XInputGetState(idx, &xs) == ERROR_SUCCESS);
+    trt_input_pad_state_n(idx, ok, xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY,
+                          xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY,
+                          xs.Gamepad.wButtons, xs.Gamepad.bLeftTrigger,
+                          xs.Gamepad.bRightTrigger);
+    if (ok) {
+      u16 l = 0, r = 0;
+      if (trt_pad_get_vibration(idx, &l, &r)) {
+        XINPUT_VIBRATION xv{l, r};
+        ::XInputSetState(idx, &xv);
+      }
+    }
+    if (idx == 0) {
+      if (pad0_out) *pad0_out = xs;
+      if (pad0_ok_out) *pad0_ok_out = ok;
+    }
+  }
+}
+
 // host pump the guest's GetMessageW calls: dispatcher + pad, nothing else
+void check_guest_stop_trap();
+
 void host_pump() {
+  // CoreWindow/Dispatcher lives strictly on g_ui_tid; background guest threads
+  // yield so the UI loop processes messages, XInput, and audio cleanly.
+  if (GetCurrentThreadId() != g_ui_tid) {
+    check_guest_stop_trap();
+    SwitchToThread();
+    Sleep(1);
+    return;
+  }
   CoreWindow::GetForCurrentThread()
       .Dispatcher()
       .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
   trt_input_frame_begin();
-  XINPUT_STATE xs{};
-  if (XInputGetState(0, &xs) == ERROR_SUCCESS)
-    trt_input_pad_state(xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY,
-                        xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY,
-                        xs.Gamepad.wButtons, xs.Gamepad.bLeftTrigger,
-                        xs.Gamepad.bRightTrigger);
+  poll_host_gamepads(nullptr, nullptr);
+  trt_openal_pump(8);
 }
 
 // ---------------- system-route binder (console real DLLs) ----------------
+std::mutex g_sys_mu;
+
 void* system_bind(const char* module, const char* symbol) {
-  static wchar_t last_mod[64] = L"";
+  if (!module || !symbol) return nullptr;
+  std::lock_guard<std::mutex> lk(g_sys_mu);
+  static wchar_t last_mod[260] = L"";
   static HMODULE h = nullptr;
-  wchar_t wmod[64];
+  wchar_t wmod[260];
   size_t n = 0;
-  while (module[n] && n < 62) { wmod[n] = (wchar_t)module[n]; ++n; }
+  while (module[n] && n < 258) { wmod[n] = (wchar_t)(unsigned char)module[n]; ++n; }
   wmod[n] = 0;
-  if (!h || wcscmp(last_mod, wmod) != 0) {
+  if (!h || _wcsicmp(last_mod, wmod) != 0) {
     h = GetModuleHandleW(wmod);
     if (!h) h = LoadLibraryW(wmod);
     wcscpy(last_mod, wmod);
   }
-  return h ? (void*)GetProcAddress(h, symbol) : nullptr;
+  if (!h) return nullptr;
+  LPCSTR sym = symbol;
+  if (symbol[0] == '#') {
+    char* endp = nullptr;
+    const unsigned long ord = strtoul(symbol + 1, &endp, 10);
+    if (endp != symbol + 1 && ord > 0 && ord <= 0xFFFFul) {
+      sym = (LPCSTR)(uintptr_t)ord;
+    }
+  }
+  return (void*)GetProcAddress(h, sym);
 }
 
 // ---------------- smoke probes ----------------
@@ -176,6 +297,40 @@ void run_probes() {
     snprintf(line, sizeof(line), "probe: memory avail=%llu MB / %llu MB",
              (unsigned long long)(ms.ullAvailPhys / (1024 * 1024)),
              (unsigned long long)(ms.ullTotalPhys / (1024 * 1024)));
+    longan::log_line(line);
+  }
+  // G3 JIT capability probes: direct RWX vs W->RX codeGeneration contract
+  void* rwx = VirtualAllocFromApp(nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+                                  PAGE_EXECUTE_READWRITE);
+  if (rwx) {
+    longan::log_line("probe: jit RWX alloc -> ALLOWED");
+    VirtualFree(rwx, 0, MEM_RELEASE);
+  } else {
+    snprintf(line, sizeof(line), "probe: jit RWX alloc -> DENIED (err=%lu)",
+             (unsigned long)GetLastError());
+    longan::log_line(line);
+  }
+  void* wx = VirtualAllocFromApp(nullptr, 4096, MEM_COMMIT | MEM_RESERVE,
+                                 PAGE_READWRITE);
+  if (wx) {
+    DWORD oldp = 0;
+    const BOOL rx_ok = VirtualProtectFromApp(wx, 4096, PAGE_EXECUTE_READ, &oldp);
+    snprintf(line, sizeof(line), "probe: jit W->RX transition -> %s (err=%lu)",
+             rx_ok ? "ALLOWED" : "DENIED",
+             (unsigned long)(rx_ok ? 0 : GetLastError()));
+    longan::log_line(line);
+    VirtualFree(wx, 0, MEM_RELEASE);
+  }
+  const wchar_t* const k_probe_dlls[] = {
+      L"d3d11.dll", L"d3dcompiler_47.dll", L"dstorage.dll",
+      L"gdi32.dll", L"shlwapi.dll",        L"ws2_32.dll",
+      L"bcrypt.dll", L"winmm.dll",
+  };
+  for (const wchar_t* dn : k_probe_dlls) {
+    HMODULE hm = GetModuleHandleW(dn);
+    if (!hm) hm = LoadLibraryW(dn);
+    snprintf(line, sizeof(line), "probe: dll %ls -> %s", dn,
+             hm ? "PRESENT" : "MISSING");
     longan::log_line(line);
   }
   HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
@@ -202,18 +357,135 @@ void run_probes() {
 // ---------------- game shelf ----------------
 struct game_entry {
   std::string name;
-  std::string exe;
-  std::string compat;  // static PE analysis, shown before launch
+  std::string dir;  // full root directory of this game (LocalState or USB)
+  std::string exe;  // selected relative path inside game_dir (or the image)
+  std::string image;  // disc image (.iso/.bin/.img) when the game ships on one
+  std::vector<std::string> exes;
+  int exe_idx = 0;
+  std::string compat;      // static PE analysis, shown before launch
+  std::string input_mode;  // auto | controller | kbm | pad2kbm
 };
 std::vector<game_entry> g_games;
 int g_selected = 0;
 
+std::string lower_ascii(std::string s) {
+  for (char& c : s) c = (char)std::tolower((unsigned char)c);
+  return s;
+}
+
+bool is_junk_exe(const std::string& fname) {
+  const std::string s = lower_ascii(fname);
+  return s.find("unitycrashhandler") != std::string::npos ||
+         s.find("crashreport") != std::string::npos ||
+         s.find("ueprereq") != std::string::npos ||
+         s.find("ue4prereq") != std::string::npos ||
+         s.find("ue5prereq") != std::string::npos ||
+         s.find("vcredist") != std::string::npos ||
+         s.find("vc_redist") != std::string::npos ||
+         s.find("dxsetup") != std::string::npos ||
+         s.find("dotnet") != std::string::npos ||
+         s.find("unins0") != std::string::npos ||
+         s.find("uninstall") != std::string::npos ||
+         s.find("easyanticheat") != std::string::npos ||
+         s.find("battleye") != std::string::npos;
+}
+
+struct exe_cand {
+  std::string rel;
+  u64 size;
+  int score;
+  int depth;
+};
+
+void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
+                      const std::string& game_name, int depth,
+                      std::vector<exe_cand>* out) {
+  if (depth > 5) return;
+  const std::string dir = rel_dir.empty() ? base_dir : (base_dir + "\\" + rel_dir);
+  WIN32_FIND_DATAA fd;
+  HANDLE h = FindFirstFileA((dir + "\\*").c_str(), &fd);
+  if (h == INVALID_HANDLE_VALUE) return;
+  const std::string g_low = lower_ascii(game_name);
+  do {
+    const std::string fn = fd.cFileName;
+    if (fn == "." || fn == ".." || fn == "__MACOSX") continue;
+    const std::string rel = rel_dir.empty() ? fn : (rel_dir + "\\" + fn);
+    if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+      const std::string fn_low = lower_ascii(fn);
+      if (fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs") {
+        continue;
+      }
+      collect_exes_rec(base_dir, rel, game_name, depth + 1, out);
+      continue;
+    }
+    const size_t dot = fn.rfind('.');
+    if (dot == std::string::npos || _stricmp(fn.c_str() + dot, ".exe") != 0) {
+      continue;
+    }
+    if (is_junk_exe(fn)) continue;
+    const u64 sz = ((u64)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+    const std::string stem_low = lower_ascii(fn.substr(0, dot));
+    int score = 0;
+    if (stem_low == g_low || stem_low == g_low + "-win64-shipping") score += 200;
+    if (stem_low.size() > 15 &&
+        stem_low.rfind("-win64-shipping") == stem_low.size() - 15) {
+      score += 120;
+    }
+    if (depth == 0) score += 60;
+    else if (depth == 1) score += 30;
+    out->push_back({rel, sz, score, depth});
+  } while (FindNextFileA(h, &fd));
+  FindClose(h);
+}
+
+// Exe candidates inside a disc image (same scoring as the folder walk).
+void collect_iso_exes_rec(trt_iso* iso, const std::string& rel_dir,
+                          const std::string& game_name, int depth,
+                          std::vector<exe_cand>* out) {
+  if (!iso || depth > 5) return;
+  struct rec {
+    std::vector<std::string> names;
+    std::vector<int> dirs;
+    std::vector<uint64_t> sizes;
+  } r;
+  trt_iso_enum(iso, rel_dir.c_str(), [](void* user, const char* name, int is_dir,
+                                        uint64_t size) {
+    rec* rr = (rec*)user;
+    rr->names.push_back(name);
+    rr->dirs.push_back(is_dir);
+    rr->sizes.push_back(size);
+  }, &r);
+  const std::string g_low = lower_ascii(game_name);
+  for (size_t i = 0; i < r.names.size(); ++i) {
+    const std::string& fn = r.names[i];
+    const std::string rel = rel_dir.empty() ? fn : (rel_dir + "\\" + fn);
+    if (r.dirs[i]) {
+      const std::string fn_low = lower_ascii(fn);
+      if (fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs" ||
+          fn_low == "directx" || fn_low == "redist")
+        continue;
+      collect_iso_exes_rec(iso, rel, game_name, depth + 1, out);
+      continue;
+    }
+    const size_t dot = fn.rfind('.');
+    if (dot == std::string::npos || _stricmp(fn.c_str() + dot, ".exe") != 0)
+      continue;
+    if (is_junk_exe(fn)) continue;
+    const std::string stem_low = lower_ascii(fn.substr(0, dot));
+    int score = 0;
+    if (stem_low == g_low || stem_low == g_low + "-win64-shipping") score += 200;
+    if (stem_low.size() > 15 &&
+        stem_low.rfind("-win64-shipping") == stem_low.size() - 15)
+      score += 120;
+    if (depth == 0) score += 60;
+    else if (depth == 1) score += 30;
+    out->push_back({rel, r.sizes[i], score, depth});
+  }
+}
+
 // Static compatibility scan of a game's exe: machine type + import table.
-// This is the "setup UI" honesty layer: the launcher tells you what will
-// happen BEFORE the launch, from the PE itself — not guesswork.
-void scan_compat(const std::string& path, char* out, unsigned cap) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { snprintf(out, cap, "compat: exe unreadable"); return; }
+// Seeks to real RVA sections so multi-MB Unreal/Unity PE64s inspect accurately.
+void scan_compat_stream(std::istream& f, char* out, unsigned cap) {
   u8 hdr[4096] = {};
   f.read((char*)hdr, sizeof(hdr));
   const size_t got = (size_t)f.gcount();
@@ -226,6 +498,8 @@ void scan_compat(const std::string& path, char* out, unsigned cap) {
     snprintf(out, cap, "compat: PE signature missing"); return;
   }
   const u16 machine = (u16)(hdr[e_lfanew + 4] | (hdr[e_lfanew + 5] << 8));
+  const u16 num_sec = (u16)(hdr[e_lfanew + 6] | (hdr[e_lfanew + 7] << 8));
+  const u16 opt_size = (u16)(hdr[e_lfanew + 20] | (hdr[e_lfanew + 21] << 8));
   const u16 opt_magic = (u16)(hdr[e_lfanew + 24] | (hdr[e_lfanew + 25] << 8));
   const char* arch;
   if (machine == 0x8664 && opt_magic == 0x20B) arch = "x64";
@@ -233,23 +507,21 @@ void scan_compat(const std::string& path, char* out, unsigned cap) {
   else if (machine == 0xAA64) arch = "ARM64 (unsupported)";
   else arch = "unknown arch";
 
-  // import directory -> module names (bounded by the 4 KB we read)
   u32 imp_rva = 0, imp_sz = 0;
-  const u16 opt_size = (u16)(hdr[e_lfanew + 20] | (hdr[e_lfanew + 21] << 8));
   const u32 opt_off = e_lfanew + 24;
-  if (opt_magic == 0x20B) {       // PE32+
+  if (opt_magic == 0x20B && opt_off + 128 <= got) {
     memcpy(&imp_rva, hdr + opt_off + 120, 4);
     memcpy(&imp_sz, hdr + opt_off + 124, 4);
-  } else if (opt_magic == 0x10B) {  // PE32
+  } else if (opt_magic == 0x10B && opt_off + 112 <= got) {
     memcpy(&imp_rva, hdr + opt_off + 104, 4);
     memcpy(&imp_sz, hdr + opt_off + 108, 4);
   }
-  char mods[256] = "";
-  if (imp_rva && opt_size >= 72 && got >= sizeof(hdr)) {
-    // section table: translate RVA -> file offset
-    const u32 sec_off = opt_off + opt_size;
-    u32 imp_file = 0;
-    for (u32 s = 0; s < 96; ++s) {
+  (void)imp_sz;
+
+  const u32 sec_off = opt_off + opt_size;
+  auto rva_to_file = [&](u32 rva) -> u64 {
+    const u32 secs = num_sec < 96 ? num_sec : 96;
+    for (u32 s = 0; s < secs; ++s) {
       const u32 so = sec_off + s * 40;
       if (so + 40 > got) break;
       u32 vaddr = 0, vsize = 0, raw = 0, rawsz = 0;
@@ -257,86 +529,255 @@ void scan_compat(const std::string& path, char* out, unsigned cap) {
       memcpy(&vaddr, hdr + so + 12, 4);
       memcpy(&rawsz, hdr + so + 16, 4);
       memcpy(&raw, hdr + so + 20, 4);
-      if (imp_rva >= vaddr && imp_rva < vaddr + vsize) {
-        imp_file = raw + (imp_rva - vaddr);
-        if (imp_file + 8 > got) imp_file = 0;
-        break;
+      const u32 span = vsize > rawsz ? vsize : rawsz;
+      if (rva >= vaddr && rva < vaddr + span && (rva - vaddr) < rawsz) {
+        return (u64)raw + (u64)(rva - vaddr);
       }
-      if (raw == 0 && rawsz == 0 && vaddr == 0 && vsize == 0) break;
     }
-    if (imp_file) {
-      size_t o = 0;
-      for (u32 d = 0; d < 96 && o + 40 < sizeof(mods); ++d) {
-        const u32 doff = imp_file + d * 20;
-        if (doff + 20 > got) break;
-        u32 name_rva = 0;
-        memcpy(&name_rva, hdr + doff + 12, 4);
-        if (!name_rva) break;
-        // translate again (string RVA)
-        u32 name_file = 0;
-        for (u32 s = 0; s < 96; ++s) {
-          const u32 so = sec_off + s * 40;
-          if (so + 40 > got) break;
-          u32 vaddr = 0, vsize = 0, raw = 0;
-          memcpy(&vsize, hdr + so + 8, 4);
-          memcpy(&vaddr, hdr + so + 12, 4);
-          memcpy(&raw, hdr + so + 20, 4);
-          if (name_rva >= vaddr && name_rva < vaddr + vsize) {
-            name_file = raw + (name_rva - vaddr);
-            break;
-          }
-        }
-        if (!name_file || name_file + 32 > got) break;
-        const char* nm = (const char*)hdr + name_file;
-        // flag the ones that decide bootability
-        const char* mark = "";
-        if (!_strnicmp(nm, "steam_api", 9)) mark = "[steam-auth]";
-        else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9 OK]";
-        else if (!_strnicmp(nm, "d3dx9", 5)) mark = "[d3dx9 OK]";
-        else if (!_strnicmp(nm, "dsound", 6)) mark = "[dsound OK]";
-        else if (!_strnicmp(nm, "ddraw", 5)) mark = "[ddraw OK]";
-        else if (!_strnicmp(nm, "d3d11", 5)) mark = "[d3d11 OK]";
-        else if (!_strnicmp(nm, "xaudio", 6)) mark = "[audio OK]";
-        else if (!_strnicmp(nm, "xinput", 6)) mark = "[pad OK]";
-        o += (size_t)snprintf(mods + o, sizeof(mods) - o, " %s%s", nm, mark);
-      }
+    return 0;
+  };
+
+  char mods[256] = "";
+  const u64 imp_file = imp_rva ? rva_to_file(imp_rva) : 0;
+  if (imp_file > 0) {
+    u8 desc[2048] = {};
+    f.clear();
+    f.seekg((std::streamoff)imp_file, std::ios::beg);
+    f.read((char*)desc, sizeof(desc));
+    const size_t dgot = (size_t)f.gcount();
+    size_t o = 0;
+    for (u32 d = 0; d * 20 + 20 <= dgot && o + 40 < sizeof(mods); ++d) {
+      u32 name_rva = 0;
+      memcpy(&name_rva, desc + d * 20 + 12, 4);
+      if (!name_rva) break;
+      const u64 nfile = rva_to_file(name_rva);
+      if (!nfile) break;
+      char nm[64] = {};
+      f.clear();
+      f.seekg((std::streamoff)nfile, std::ios::beg);
+      f.read(nm, sizeof(nm) - 1);
+      nm[sizeof(nm) - 1] = 0;
+      if (!nm[0]) continue;
+      const char* mark = "";
+      if (!_strnicmp(nm, "steam_api", 9)) mark = "[steam-auth]";
+      else if (!_strnicmp(nm, "d3d12", 5)) mark = "[d3d12 OK]";
+      else if (!_strnicmp(nm, "d3d9", 4)) mark = "[d3d9 OK]";
+      else if (!_strnicmp(nm, "d3d8", 4)) mark = "[d3d8 OK]";
+      else if (!_strnicmp(nm, "d3dx9", 5)) mark = "[d3dx9 OK]";
+      else if (!_strnicmp(nm, "dsound", 6)) mark = "[dsound OK]";
+      else if (!_strnicmp(nm, "ddraw", 5)) mark = "[ddraw OK]";
+      else if (!_strnicmp(nm, "d3d11", 5)) mark = "[d3d11 OK]";
+      else if (!_strnicmp(nm, "xaudio", 6)) mark = "[audio OK]";
+      else if (!_strnicmp(nm, "openal", 6)) mark = "[openal OK]";
+      else if (!_strnicmp(nm, "xinput", 6)) mark = "[pad OK]";
+      else if (!_strnicmp(nm, "gameinput", 9)) mark = "[gameinput OK]";
+      else if (!_strnicmp(nm, "winhttp", 7)) mark = "[winhttp OK]";
+      else if (!_strnicmp(nm, "vulkan-1", 8)) mark = "[VK->D3D OK]";
+      else if (!_strnicmp(nm, "opengl32", 8)) mark = "[GL->D3D OK]";
+      else if (!_strnicmp(nm, "unityplayer", 11)) mark = "[unity OK]";
+      o += (size_t)snprintf(mods + o, sizeof(mods) - o, " %s%s", nm, mark);
     }
   }
   snprintf(out, cap, "compat: %s;%s", arch, mods[0] ? mods : " no imports");
 }
 
-void rescan_games() {
-  g_games.clear();
+void scan_compat(const std::string& path, char* out, unsigned cap) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) { snprintf(out, cap, "compat: exe unreadable"); return; }
+  scan_compat_stream(f, out, cap);
+}
+
+// The same static scan for an exe that lives inside a disc image: read it out
+// of the image (bounded) and analyse it in memory.
+void scan_compat_iso(trt_iso* iso, const std::string& rel, char* out,
+                     unsigned cap) {
+  int is_dir = 0;
+  uint64_t size = 0;
+  if (!iso || trt_iso_stat(iso, rel.c_str(), &is_dir, &size) != 0 || is_dir) {
+    snprintf(out, cap, "compat: exe unreadable");
+    return;
+  }
+  const uint64_t cap_bytes = 96ull * 1024 * 1024;
+  const uint64_t want = size < cap_bytes ? size : cap_bytes;
+  std::string buf((size_t)want, '\0');
+  const uint32_t got = trt_iso_read(iso, rel.c_str(), 0, buf.data(), (uint32_t)want);
+  buf.resize(got);
+  std::istringstream is(buf, std::ios::binary);
+  scan_compat_stream(is, out, cap);
+}
+
+void scan_games_root(
+    const std::string& root, char drive_tag,
+    const std::vector<std::pair<std::string, std::string>>& prev_choice) {
   WIN32_FIND_DATAA fd;
-  HANDLE h = FindFirstFileA((g_games_dir + "\\*").c_str(), &fd);
+  HANDLE h = FindFirstFileA((root + "\\*").c_str(), &fd);
   if (h == INVALID_HANDLE_VALUE) return;
   do {
     const std::string n = fd.cFileName;
     if (n == "." || n == "..") continue;
-    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-    WIN32_FIND_DATAA fx;
-    HANDLE hx =
-        FindFirstFileA((g_games_dir + "\\" + n + "\\*.exe").c_str(), &fx);
-    if (hx == INVALID_HANDLE_VALUE) continue;
-    std::string best;
-    u64 best_sz = 0;
-    do {
-      const std::string e = fx.cFileName;
-      const u64 sz = ((u64)fx.nFileSizeHigh << 32) | fx.nFileSizeLow;
-      const size_t dot = e.rfind('.');
-      const std::string stem = dot == std::string::npos ? e : e.substr(0, dot);
-      if (_stricmp(stem.c_str(), n.c_str()) == 0) { best = e; break; }
-      if (sz > best_sz) { best = e; best_sz = sz; }
-    } while (FindNextFileA(hx, &fx));
-    FindClose(hx);
-    if (!best.empty()) {
+    if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+      // A disc image dropped straight into the games folder: the exe list is
+      // read out of the image and it mounts as D: on launch.
+      const size_t dot = n.rfind('.');
+      if (dot == std::string::npos) continue;
+      const std::string ext = lower_ascii(n.substr(dot));
+      if (ext != ".iso" && ext != ".bin" && ext != ".img") continue;
+      const std::string img_path = root + "\\" + n;
+      bool dup_img = false;
+      for (const auto& existing : g_games)
+        if (!_stricmp(existing.image.c_str(), img_path.c_str())) dup_img = true;
+      if (dup_img) continue;
+      trt_iso* iso = trt_iso_open(img_path.c_str());
+      if (!iso) {
+        char line[600];
+        snprintf(line, sizeof(line),
+                 "shelf: %s is not an ISO9660/UDF image (skipped, named)",
+                 img_path.c_str());
+        longan::log_line(line);
+        continue;
+      }
+      std::vector<exe_cand> icands;
+      const std::string stem = n.substr(0, dot);
+      collect_iso_exes_rec(iso, "", stem, 0, &icands);
+      if (icands.empty()) {
+        char line[600];
+        snprintf(line, sizeof(line),
+                 "shelf: %s mounted but holds no runnable exe", img_path.c_str());
+        longan::log_line(line);
+        trt_iso_close(iso);
+        continue;
+      }
+      std::sort(icands.begin(), icands.end(),
+                [](const exe_cand& a, const exe_cand& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.size != b.size) return a.size > b.size;
+        return a.rel < b.rel;
+      });
+      game_entry ge;
+      ge.name = stem;
+      ge.dir = root;
+      ge.image = img_path;
+      for (const auto& c : icands) ge.exes.push_back(c.rel);
+      ge.exe = ge.exes[0];
       char compat[280];
-      scan_compat(g_games_dir + "\\" + n + "\\" + best, compat,
-                  (unsigned)sizeof(compat));
-      g_games.push_back({n, best, compat});
+      scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
+      ge.compat = compat;
+      trt_iso_close(iso);
+      g_games.push_back(std::move(ge));
+      continue;
     }
+    const std::string gdir = root + "\\" + n;
+    std::string disp = n;
+    bool dup = false;
+    for (const auto& existing : g_games) {
+      if (!_stricmp(existing.dir.c_str(), gdir.c_str())) {
+        dup = true;
+        break;
+      }
+      if (existing.name == disp && drive_tag) {
+        disp = n + " [" + std::string(1, drive_tag) + ":]";
+      }
+    }
+    if (dup) continue;
+    std::vector<exe_cand> cands;
+    collect_exes_rec(gdir, "", n, 0, &cands);
+    // A folder that holds a disc image is a game too: the exe list comes from
+    // inside the image and the image is mounted as D: at launch.
+    std::string image_path;
+    if (cands.empty()) {
+      char img[1024] = {};
+      if (trt_iso_find_image_in_dir(gdir.c_str(), img, sizeof(img))) {
+        trt_iso* iso = trt_iso_open(img);
+        if (iso) {
+          collect_iso_exes_rec(iso, "", n, 0, &cands);
+          if (!cands.empty()) image_path = img;
+          trt_iso_close(iso);
+        }
+        if (cands.empty()) {
+          char line[600];
+          snprintf(line, sizeof(line),
+                   "shelf: %s holds a disc image but no runnable exe inside it",
+                   img);
+          longan::log_line(line);
+        }
+      }
+    }
+    if (cands.empty()) continue;
+    std::sort(cands.begin(), cands.end(), [](const exe_cand& a, const exe_cand& b) {
+      if (a.score != b.score) return a.score > b.score;
+      if (a.size != b.size) return a.size > b.size;
+      if (a.depth != b.depth) return a.depth < b.depth;
+      return a.rel < b.rel;
+    });
+    game_entry ge;
+    ge.name = disp;
+    ge.dir = gdir;
+    for (const auto& c : cands) ge.exes.push_back(c.rel);
+    ge.exe_idx = 0;
+    {
+      std::ifstream ef(gdir + "\\tiramisu_exe.txt");
+      std::string cfg_exe;
+      if (ef && std::getline(ef, cfg_exe)) {
+        while (!cfg_exe.empty() && ((unsigned char)cfg_exe.back() <= ' '))
+          cfg_exe.pop_back();
+        for (size_t k = 0; k < ge.exes.size(); ++k) {
+          if (!_stricmp(ge.exes[k].c_str(), cfg_exe.c_str())) {
+            ge.exe_idx = (int)k;
+            break;
+          }
+        }
+      }
+      std::ifstream inf(gdir + "\\tiramisu_input.txt");
+      std::string im;
+      if (inf && std::getline(inf, im)) {
+        while (!im.empty() && ((unsigned char)im.back() <= ' ')) im.pop_back();
+        ge.input_mode = lower_ascii(im);
+      }
+    }
+    for (const auto& p : prev_choice) {
+      if (p.first == (ge.image.empty() ? gdir : ge.image)) {
+        for (size_t k = 0; k < ge.exes.size(); ++k) {
+          if (ge.exes[k] == p.second) {
+            ge.exe_idx = (int)k;
+            break;
+          }
+        }
+        break;
+      }
+    }
+    ge.exe = ge.exes[ge.exe_idx];
+    ge.image = image_path;
+    char compat[280];
+    if (!ge.image.empty()) {
+      trt_iso* iso = trt_iso_open(ge.image.c_str());
+      scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
+      trt_iso_close(iso);
+    } else {
+      scan_compat(gdir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
+    }
+    ge.compat = compat;
+    g_games.push_back(std::move(ge));
   } while (FindNextFileA(h, &fd));
   FindClose(h);
+}
+
+void rescan_games() {
+  std::vector<std::pair<std::string, std::string>> prev_choice;
+  for (const auto& ge : g_games) {
+    prev_choice.push_back({!ge.image.empty() ? ge.image
+                            : (ge.dir.empty() ? ge.name : ge.dir),
+                           ge.exe});
+  }
+  g_games.clear();
+  scan_games_root(g_games_dir, 0, prev_choice);
+  for (char drv = 'D'; drv <= 'Y'; ++drv) {
+    const char root_drv[4] = {drv, ':', '\\', 0};
+    const UINT dt = GetDriveTypeA(root_drv);
+    if (dt == DRIVE_REMOVABLE || dt == DRIVE_FIXED) {
+      scan_games_root(std::string(1, drv) + ":\\Games", drv, prev_choice);
+      scan_games_root(std::string(1, drv) + ":\\TiramisuGames", drv, prev_choice);
+    }
+  }
   if (g_selected >= (int)g_games.size()) g_selected = 0;
 }
 
@@ -346,32 +787,189 @@ struct guest_run_result {
   char detail[256];
 };
 
+std::jmp_buf g_exit_jmp;
+int g_exit_code = 0;
+u32 g_raise_code = 0;
+DWORD g_guest_tid = 0;
+std::atomic<bool> g_guest_stop_req{false};
+std::atomic<u64> g_guest_stop_since{0};
+
+extern "C" {
+void trt_bridge_post_quit(int code);
+}
+
+void request_guest_stop() {
+  if (!g_guest_stop_req.exchange(true)) {
+    g_guest_stop_since.store((u64)GetTickCount64());
+    trt_msg_post(0x0010 /*WM_CLOSE*/, 0, 0);
+    trt_bridge_post_quit(0);
+    longan::log_line("host: stop requested -> posting WM_CLOSE/WM_QUIT");
+  }
+}
+
+void check_guest_stop_trap() {
+  if (g_guest_stop_req.load() && g_guest_tid &&
+      GetCurrentThreadId() == g_guest_tid) {
+    u64 elapsed = (u64)GetTickCount64() - g_guest_stop_since.load();
+    if (elapsed >= 1200ull) {
+      g_guest_stop_req.store(false);
+      longan::log_line("host: guest did not quit cleanly -> unwinding to shelf");
+      if (trt_boot_exit_trap) trt_boot_exit_trap(0);
+    }
+  }
+}
+
+void host_exit_trap(int code) {
+  if (GetCurrentThreadId() == g_guest_tid) {
+    g_exit_code = code;
+    std::longjmp(g_exit_jmp, 1);
+  }
+  ExitThread((DWORD)code);
+}
+
+static int guest_seh_filter(void* ep) {
+  return (trt_dispatch_win32_exception(ep) == -1) ? EXCEPTION_CONTINUE_EXECUTION
+                                                  : EXCEPTION_EXECUTE_HANDLER;
+}
+
+// Pure-POD SEH wrapper: allows C++ try/catch inside guest PE images to unwind
+// natively via Windows .pdata while still catching truly unhandled faults.
+int call_guest_seh(trt_image* img, u64* out_rc, DWORD* out_ex) {
+  __try {
+    *out_rc = trt_call_guest_img(
+        (void*)(img->base + img->entry_rva), img,
+        (u64)(uintptr_t)img->base, 0, 0, 0);
+    return 0;
+  } __except (guest_seh_filter(GetExceptionInformation())) {
+    *out_ex = GetExceptionCode();
+    return 1;
+  }
+}
+
+void run_guest_trapped(trt_image* img, char* detail, size_t cap) {
+  g_exit_code = 0;
+  g_raise_code = 0;
+  g_guest_tid = GetCurrentThreadId();
+  trt_boot_exit_trap = &host_exit_trap;
+  trt_boot_raise_trap = nullptr;  // let caught C++ EH unwind via OS .pdata
+  const int trapped = setjmp(g_exit_jmp);
+  if (trapped == 0) {
+    u64 rc = 0;
+    DWORD ex_code = 0;
+    if (call_guest_seh(img, &rc, &ex_code) == 0) {
+      snprintf(detail, cap, "guest returned %llu", (unsigned long long)rc);
+    } else {
+      snprintf(detail, cap, "guest unhandled exception 0x%08lx",
+               (unsigned long)ex_code);
+    }
+  } else if (trapped == 1) {
+    snprintf(detail, cap, "guest ExitProcess(%d)", g_exit_code);
+  } else {
+    snprintf(detail, cap, "guest raised exception 0x%08x", g_raise_code);
+  }
+  trt_boot_exit_trap = nullptr;
+  trt_boot_raise_trap = nullptr;
+  g_guest_tid = 0;
+}
+
 guest_run_result run_game(const std::string& name, const std::string& exe,
-                          const std::string& game_dir) {
+                          const std::string& game_dir,
+                          const std::string& image = std::string()) {
   guest_run_result r{};
   char line[256];
 
+  trt_images_reset();
   trt_backend be{&uwp_alloc,     &uwp_protect,        &uwp_release,
                  &uwp_log,       &uwp_register_unwind};
+  trt_set_vmem_hooks(&uwp_reserve, &uwp_commit, &uwp_decommit);
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
   trt_bridge_register_user32();
-  trt_module_register("gdi32.dll", TRT_ROUTE_STUB, nullptr, 0);
-  trt_module_register("winmm.dll", TRT_ROUTE_STUB, nullptr, 0);
-  // d3d9.dll is registered by trt_bridge_boot (BUILTIN, the D3D9->D3D11
-  // bridge) — do not downgrade it to STUB here.
-  // ole32/oleaut32 are BUILTIN (bridge_ole via trt_bridge_boot)
-  trt_module_register("d3d11.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
-  trt_module_register("dxgi.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
+  // BUILTIN graphics/media/GDI/D3D11/DXGI bridges remain registered from
+  // trt_bridge_boot; only bind ws2_32 and bcrypt to real SYSTEM UWP DLLs.
   trt_module_register("ws2_32.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_module_register("bcrypt.dll", TRT_ROUTE_SYSTEM, nullptr, 0);
   trt_set_system_loader(&system_bind);
   trt_set_pump(&host_pump);  // guests that pump keep CoreWindow/XInput alive
+  longan::swapchain_bind_d3d9();
 
   const std::string drive_c = g_local_state + "\\drive_c";
+  const char* c_dirs[] = {
+      "",
+      "\\Temp",
+      "\\Users",
+      "\\Users\\Player",
+      "\\Users\\Player\\AppData",
+      "\\Users\\Player\\AppData\\Local",
+      "\\Users\\Player\\AppData\\LocalLow",
+      "\\Users\\Player\\AppData\\Roaming",
+      "\\Users\\Player\\Documents",
+      "\\Users\\Player\\Documents\\My Games",
+      "\\Users\\Player\\Saved Games",
+      "\\Users\\Player\\Desktop",
+      "\\Users\\Player\\Pictures",
+      "\\Users\\Player\\Music",
+      "\\Users\\Player\\Videos",
+      "\\ProgramData",
+      "\\Windows",
+      "\\Windows\\System32",
+      "\\Windows\\Temp",
+  };
+  for (const char* sub : c_dirs) {
+    CreateDirectoryA((drive_c + sub).c_str(), nullptr);
+  }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
-  trt_bridge_set_exe_path(("Z:\\" + exe).c_str());
+  // A game that ships on a disc image: mount it as D: (read-only, lazily
+  // extracted) and run the exe out of the image, so every one of its path
+  // requests - assets, music, movies - is answered by the disc itself.
+  std::string guest_exe = "Z:\\" + exe;
+  std::string guest_cwd_root = "Z:\\";
+  bool image_mounted = false;
+  if (!image.empty()) {
+    const std::string cache_root = g_local_state + "\\iso-cache";
+    trt_vfs_set_iso_cache_root(cache_root.c_str());
+    if (trt_vfs_mount_image("d:", image.c_str())) {
+      image_mounted = true;
+      guest_exe = "D:\\" + exe;
+      guest_cwd_root = "D:\\";
+      char iline[600];
+      snprintf(iline, sizeof(iline), "trt: disc image mounted as D: %s",
+               image.c_str());
+      longan::log_line(iline);
+    } else {
+      longan::log_line("trt: disc image mount FAILED (not an ISO9660/UDF "
+                       "image) - launching from the folder instead");
+    }
+  }
+  trt_bridge_set_exe_path(guest_exe.c_str());
+  {
+    const size_t rel_sl = exe.rfind('\\');
+    const std::string guest_cwd =
+        (rel_sl == std::string::npos) ? guest_cwd_root
+                                      : (guest_cwd_root + exe.substr(0, rel_sl));
+    trt_bridge_set_cwd(guest_cwd.c_str());
+  }
+  {
+    std::ifstream af(game_dir + "\\tiramisu_args.txt");
+    if (af) {
+      std::string args, ln;
+      while (std::getline(af, ln)) {
+        if (!ln.empty() && ln.back() == '\r') ln.pop_back();
+        if (ln.empty() || ln[0] == '#') continue;
+        if (!args.empty()) args += ' ';
+        args += ln;
+      }
+      trt_bridge_set_cmd_args(args.c_str());
+    } else {
+      trt_bridge_set_cmd_args("");
+    }
+    u32 app_id = 0;
+    std::ifstream sf(game_dir + "\\steam_appid.txt");
+    if (sf) sf >> app_id;
+    trt_steam_set_appid(app_id);
+  }
+  g_guest_stop_req.store(false);
   // the registry hive lives on the guest's C: drive (next to its saves).
   // Windows wchar_t is UTF-16, which is what the bridge expects.
   static_assert(sizeof(wchar_t) == 2, "wchar_t must be UTF-16");
@@ -379,12 +977,38 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
 
   trt_resolver rs;
   trt_resolver_default(&rs);
+  std::string exe_path = game_dir + "\\" + exe;
+  if (image_mounted) {
+    // The loader reads the PE from the host, so the exe and the DLLs beside it
+    // are materialized once from the image into the cache. Every other file the
+    // game asks for is extracted on demand through D:.
+    const size_t exe_dirs = exe.rfind('\\');
+    const std::string rel_dir =
+        (exe_dirs == std::string::npos) ? std::string() : exe.substr(0, exe_dirs);
+    const std::wstring wdir = u82ws("D:\\" + rel_dir);
+    char hdir[1200] = {};
+    int ddir = 0;
+    if (trt_vfs_image_materialize((const u16*)wdir.c_str(), hdir, sizeof(hdir),
+                                  &ddir) == 0 &&
+        ddir) {
+      struct trt_iso* iso =
+          trt_vfs_image_for_guest_utf16((const u16*)wdir.c_str(), nullptr, 0);
+      if (iso) trt_iso_extract_dir(iso, rel_dir.c_str(), hdir);
+      char hexe[1400] = {};
+      const std::wstring wexe = u82ws(guest_exe);
+      if (trt_vfs_image_materialize((const u16*)wexe.c_str(), hexe,
+                                    sizeof(hexe), nullptr) == 0)
+        exe_path = hexe;
+    }
+  }
+  const size_t exe_sl = exe_path.rfind('\\');
+  const std::string exe_dir =
+      (exe_sl == std::string::npos) ? game_dir : exe_path.substr(0, exe_sl);
   // the runtime knows where the game's own DLLs live, and resolves imports
   // through the guest-image registry (a game's own DLLs beat the system's)
-  trt_runtime_init(&be, game_dir.c_str());
+  trt_runtime_init(&be, exe_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
-  const std::string exe_path = game_dir + "\\" + exe;
   std::ifstream f(exe_path, std::ios::binary);
   if (!f) {
     snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
@@ -407,15 +1031,12 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     strncpy(r.detail, "seal failed", sizeof(r.detail) - 1);
     return r;
   }
+  trt_images_register_main(img, exe.c_str());
   for (int i = 0; i < img->tls_callback_count; ++i) {
-    using tls_cb = void (*)(void*, u32, void*);
-    ((tls_cb)(img->base + img->tls_callback_rvas[i]))(img->base, 1, nullptr);
+    trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
+                       (u64)(uintptr_t)img->base, 1, 0, 0);
   }
-  using entry_t = u32 (*)(u64, u64, u64);
-  // NOTE for games: this call runs the guest's main; games pump via the
-  // builtin user32 GetMessageW which yields to the host Sleep between events.
-  ((entry_t)(img->base + img->entry_rva))(0, 0, 0);
-  strncpy(r.detail, "guest returned", sizeof(r.detail) - 1);
+  run_guest_trapped(img, r.detail, sizeof(r.detail));
   return r;
 }
 
@@ -518,7 +1139,14 @@ struct tiramisu_host
   IFrameworkView CreateView() { return *this; }
   void Initialize(CoreApplicationView const&) {}
   void Load(hstring const&) {}
-  void Uninitialize() {}
+  void Uninitialize() {
+    g_shutdown.store(true);
+    if (g_guest_thread.joinable()) {
+      if (g_guest_running.load()) g_guest_thread.detach();
+      else g_guest_thread.join();
+    }
+    longan::audio_shutdown();
+  }
 
   void SetWindow(CoreWindow const& window) {
     m_window = window;
@@ -549,16 +1177,24 @@ struct tiramisu_host
         dxgidev->Release();
       }
     }
-    longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v);
+    longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v,
+                    longan::swapchain_dxgi());
+    longan::swapchain_bind_d3d9();
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
       const auto s = a.KeyStatus();
-      trt_input_key_event2((u16)a.VirtualKey(), true, (u16)s.ScanCode,
+      const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
+                                              (u16)s.ScanCode,
+                                              s.IsExtendedKey);
+      trt_input_key_event2(vk, true, (u16)s.ScanCode,
                            s.IsExtendedKey ? 1 : 0, s.WasKeyDown ? 1 : 0);
     });
     m_ku = window.KeyUp([](CoreWindow const&, KeyEventArgs const& a) {
       const auto s = a.KeyStatus();
-      trt_input_key_event2((u16)a.VirtualKey(), false, (u16)s.ScanCode,
+      const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
+                                              (u16)s.ScanCode,
+                                              s.IsExtendedKey);
+      trt_input_key_event2(vk, false, (u16)s.ScanCode,
                            s.IsExtendedKey ? 1 : 0, 0);
     });
     m_cr = window.CharacterReceived(
@@ -567,28 +1203,20 @@ struct tiramisu_host
         });
     m_pp = window.PointerPressed([](CoreWindow const&,
                                     PointerEventArgs const& a) {
-      const auto k = a.CurrentPoint().Properties().PointerUpdateKind();
-      trt_input_mouse_button(k == winrt::Windows::UI::Input::PointerUpdateKind::RightButtonPressed
-                                 ? 1
-                                 : k == winrt::Windows::UI::Input::PointerUpdateKind::MiddleButtonPressed
-                                       ? 2
-                                       : 0,
-                             true);
+      const int btn = host_mouse_btn_for_press(
+          a.CurrentPoint().Properties().PointerUpdateKind());
+      if (btn >= 0) trt_input_mouse_button(btn, true);
     });
     m_pr = window.PointerReleased([](CoreWindow const&,
                                      PointerEventArgs const& a) {
-      const auto k = a.CurrentPoint().Properties().PointerUpdateKind();
-      trt_input_mouse_button(k == winrt::Windows::UI::Input::PointerUpdateKind::RightButtonReleased
-                                 ? 1
-                                 : k == winrt::Windows::UI::Input::PointerUpdateKind::MiddleButtonReleased
-                                       ? 2
-                                       : 0,
-                             false);
+      const int btn = host_mouse_btn_for_release(
+          a.CurrentPoint().Properties().PointerUpdateKind());
+      if (btn >= 0) trt_input_mouse_button(btn, false);
     });
     m_pm = window.PointerMoved([](CoreWindow const&,
                                   PointerEventArgs const& a) {
       const auto p = a.CurrentPoint().Position();
-      trt_input_mouse_move((int)p.X, (int)p.Y);
+      trt_input_pointer_move((int)p.X, (int)p.Y, g_uwp_raw_mouse.load());
     });
     m_pw = window.PointerWheelChanged([](CoreWindow const&,
                                          PointerEventArgs const& a) {
@@ -602,6 +1230,7 @@ struct tiramisu_host
     namespace wdi = winrt::Windows::Devices::Input;
     m_mm = wdi::MouseDevice::GetForCurrentView().MouseMoved(
         [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+          g_uwp_raw_mouse.store(true);
           const auto d = a.MouseDelta();
           trt_input_mouse_delta_raw((i32)d.X, (i32)d.Y);
         });
@@ -648,12 +1277,14 @@ struct tiramisu_host
     const std::string url = longan::webxfer_start(g_local_state, 1920);
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
+    longan::ui_set_qr(url);
+    const std::wstring url_step = L"Transfer server: " + u82ws(url);
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
-                 L"Audio ready", L"Transfer server up"},
+                 L"Audio ready", url_step},
                 L"Scanning for games…", false);
     rescan_games();
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
-                 L"Audio ready", L"Transfer server up", L"Game shelf scanned"},
+                 L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);
 
     // builtin self-test: proves the whole pipeline on hardware
@@ -661,124 +1292,308 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "selftest: rc=%s (%s)", trt_errstr(gr.map_rc),
              gr.detail);
     longan::log_line(line);
-    g_guest_status = std::string("selftest ") + trt_errstr(gr.map_rc);
+    set_guest_status(std::string("selftest ") + trt_errstr(gr.map_rc));
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
-                 L"Audio ready", L"Transfer server up", L"Game shelf scanned",
+                 L"Audio ready", url_step, L"Game shelf scanned",
                  L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
                 nullptr, true);
     g_setup_done = true;  // A press on the finished screen opens the shelf
   }
 
   void Run() {
+    g_ui_tid = GetCurrentThreadId();
     CoreWindow::GetForCurrentThread().Activate();
     if (!g_booted) { g_booted = true; boot_all(); }
 
     int mouse_vx = 960, mouse_vy = 540;
-    while (true) {
+    while (!g_shutdown.load()) {
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
       trt_input_frame_begin();
 
-      // ---- controller ----
+      // ---- controller & keyboard launcher navigation ----
       XINPUT_STATE xs{};
-      if (XInputGetState(0, &xs) == ERROR_SUCCESS) {
-        trt_input_pad_state(xs.Gamepad.sThumbLX, xs.Gamepad.sThumbLY,
-                            xs.Gamepad.sThumbRX, xs.Gamepad.sThumbRY,
-                            xs.Gamepad.wButtons, xs.Gamepad.bLeftTrigger,
-                            xs.Gamepad.bRightTrigger);
-        static bool d_up = false, d_dn = false, a_btn = false, y_btn = false,
-                    rs_btn = false;
-        const u16 b = xs.Gamepad.wButtons;
-        if ((b & XINPUT_GAMEPAD_DPAD_UP) && !d_up) {
-          d_up = true;
-          if (g_selected > 0) --g_selected;
-        } else if (!(b & XINPUT_GAMEPAD_DPAD_UP)) d_up = false;
-        if ((b & XINPUT_GAMEPAD_DPAD_DOWN) && !d_dn) {
-          d_dn = true;
-          if (g_selected + 1 < (int)g_games.size()) ++g_selected;
-        } else if (!(b & XINPUT_GAMEPAD_DPAD_DOWN)) d_dn = false;
-        if ((b & XINPUT_GAMEPAD_A) && !a_btn) {
-          a_btn = true;
-          if (g_setup_active && g_setup_done) {
-            g_setup_active = false;  // leave setup, open the shelf
-            longan::ui_set_setup({}, 0, false);
-          } else if (!g_setup_active && !g_games.empty()) {
-            g_pending_launch = g_games[g_selected].name;
+      bool pad_ok = false;
+      poll_host_gamepads(&xs, &pad_ok);
+      {
+        static bool d_up = false, d_dn = false, d_lt = false, d_rt = false,
+                    a_btn = false, y_btn = false, rs_btn = false, vkbd_btn = false;
+        static bool mm_was_active = false, mm_was_rt = false, mm_was_lt = false,
+                    mm_was_rb = false, mm_was_lb = false, mm_was_ls = false,
+                    mm_was_a = false, mm_was_b = false, mm_was_x = false,
+                    mm_was_y = false, mm_was_dl = false, mm_was_dr = false,
+                    mm_was_w = false, mm_was_s = false, mm_was_ak = false,
+                    mm_was_d = false, guest_was_running = false;
+        static int mm_wheel_tick = 0, vm_hold_ticks = 0;
+        const u16 b = pad_ok ? xs.Gamepad.wButtons : 0;
+        const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) ||
+                             trt_key_down(0x26 /*VK_UP*/) || trt_key_down('W');
+        const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) ||
+                             trt_key_down(0x28 /*VK_DOWN*/) || trt_key_down('S');
+        const bool want_lt = (b & XINPUT_GAMEPAD_DPAD_LEFT) ||
+                             trt_key_down(0x25 /*VK_LEFT*/);
+        const bool want_rt = (b & XINPUT_GAMEPAD_DPAD_RIGHT) ||
+                             trt_key_down(0x27 /*VK_RIGHT*/);
+        const bool want_go = (b & XINPUT_GAMEPAD_A) ||
+                             trt_key_down(0x0D /*VK_RETURN*/) ||
+                             trt_key_down(0x20 /*VK_SPACE*/);
+        const bool want_st = (b & XINPUT_GAMEPAD_Y) || trt_key_down('Y');
+        const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
+        if (g_guest_running.load()) {
+          if (longan::webxfer_poll_stop()) request_guest_stop();
+          if (pad_vm) {
+            if (++vm_hold_ticks == 45) request_guest_stop();
+          } else {
+            vm_hold_ticks = 0;
           }
-        } else if (!(b & XINPUT_GAMEPAD_A)) a_btn = false;
-        if ((b & XINPUT_GAMEPAD_Y) && !y_btn) {
-          y_btn = true;
-          steam_begin();
-        } else if (!(b & XINPUT_GAMEPAD_Y)) y_btn = false;
-        if ((b & XINPUT_GAMEPAD_RIGHT_THUMB) && !rs_btn) {
+        } else {
+          vm_hold_ticks = 0;
+          longan::webxfer_poll_stop();
+          if (guest_was_running) {
+            g_mouse_mode = false;
+            longan::webxfer_set_running_game("");
+          }
+        }
+        guest_was_running = g_guest_running.load();
+        const bool want_mm = (b & XINPUT_GAMEPAD_RIGHT_THUMB) ||
+                             (!g_guest_running.load() && pad_vm) ||
+                             trt_key_down(0x70 /*VK_F1*/);
+        const bool want_vkbd = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_X);
+        if (want_vkbd && !vkbd_btn) {
+          vkbd_btn = true;
+          try {
+            winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryShow();
+          } catch (...) {}
+        } else if (!want_vkbd) {
+          vkbd_btn = false;
+        }
+        if (!g_guest_running.load()) {
+          if (want_up && !d_up) {
+            d_up = true;
+            if (g_selected > 0) --g_selected;
+          } else if (!want_up) d_up = false;
+          if (want_dn && !d_dn) {
+            d_dn = true;
+            if (g_selected + 1 < (int)g_games.size()) ++g_selected;
+          } else if (!want_dn) d_dn = false;
+          if (!g_setup_active && !g_games.empty() && g_selected < (int)g_games.size()) {
+            auto& ge = g_games[g_selected];
+            const int n = (int)ge.exes.size();
+            if (want_lt && !d_lt) {
+              d_lt = true;
+              if (n > 1) {
+                ge.exe_idx = (ge.exe_idx + n - 1) % n;
+                ge.exe = ge.exes[ge.exe_idx];
+                char compat[280];
+                scan_compat(ge.dir + "\\" + ge.exe, compat,
+                            (unsigned)sizeof(compat));
+                ge.compat = compat;
+              }
+            } else if (!want_lt) d_lt = false;
+            if (want_rt && !d_rt) {
+              d_rt = true;
+              if (n > 1) {
+                ge.exe_idx = (ge.exe_idx + 1) % n;
+                ge.exe = ge.exes[ge.exe_idx];
+                char compat[280];
+                scan_compat(ge.dir + "\\" + ge.exe, compat,
+                            (unsigned)sizeof(compat));
+                ge.compat = compat;
+              }
+            } else if (!want_rt) d_rt = false;
+          } else {
+            d_lt = d_rt = false;
+          }
+          if (want_go && !a_btn) {
+            a_btn = true;
+            if (g_setup_active && g_setup_done) {
+              g_setup_active = false;  // leave setup, open the shelf
+              longan::ui_set_setup({}, 0, false);
+            } else if (!g_setup_active && !g_games.empty()) {
+              g_pending_launch = g_games[g_selected].name;
+            }
+          } else if (!want_go) a_btn = false;
+          if (want_st && !y_btn) {
+            y_btn = true;
+            steam_begin();
+          } else if (!want_st) y_btn = false;
+        } else {
+          d_up = d_dn = d_lt = d_rt = a_btn = y_btn = false;
+        }
+        if (want_mm && !rs_btn) {
           rs_btn = true;
           g_mouse_mode = !g_mouse_mode;
-        } else if (!(b & XINPUT_GAMEPAD_RIGHT_THUMB)) rs_btn = false;
+        } else if (!want_mm) rs_btn = false;
 
-        // gamepad-as-mouse (KBM games without a real mouse)
-        if (g_mouse_mode) {
+        // gamepad-as-mouse + virtual KBM (KBM games without a real mouse/KB)
+        if (pad_ok && g_mouse_mode) {
+          mm_was_active = true;
           const int dz = 8000;
           int sx = xs.Gamepad.sThumbRX;
           int sy = -xs.Gamepad.sThumbRY;
           sx = sx > dz ? sx - dz : sx < -dz ? sx + dz : 0;
           sy = sy > dz ? sy - dz : sy < -dz ? sy + dz : 0;
-          mouse_vx += (int)(sx / 32767.0f * 1400.0f / 60.0f);
-          mouse_vy += (int)(sy / 32767.0f * 1400.0f / 60.0f);
+          const int ddx = (int)(sx / 32767.0f * 1400.0f / 60.0f);
+          const int ddy = (int)(sy / 32767.0f * 1400.0f / 60.0f);
+          int dw = 1920, dh = 1080;
+          trt_display_size(&dw, &dh);
+          if (dw <= 0) dw = 1920;
+          if (dh <= 0) dh = 1080;
+          mouse_vx += ddx;
+          mouse_vy += ddy;
           if (mouse_vx < 0) mouse_vx = 0;
-          if (mouse_vx > 1919) mouse_vx = 1919;
+          if (mouse_vx >= dw) mouse_vx = dw - 1;
           if (mouse_vy < 0) mouse_vy = 0;
-          if (mouse_vy > 1079) mouse_vy = 1079;
-          trt_input_mouse_move(mouse_vx, mouse_vy);
-          // triggers = mouse buttons (byte thresholds, not button flags)
-          static bool was_rt = false, was_lt = false;
+          if (mouse_vy >= dh) mouse_vy = dh - 1;
+          trt_input_pointer_move(mouse_vx, mouse_vy, true);
+          if (ddx != 0 || ddy != 0) trt_input_mouse_delta_raw(ddx, ddy);
+
           const bool rt = xs.Gamepad.bRightTrigger >
                           XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
           const bool lt = xs.Gamepad.bLeftTrigger >
                           XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
-          if (rt != was_rt) trt_input_mouse_button(0, rt);
-          if (lt != was_lt) trt_input_mouse_button(1, lt);
-          was_rt = rt;
-          was_lt = lt;
+          const bool rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
+          if (rt != mm_was_rt) { trt_input_mouse_button(0, rt); mm_was_rt = rt; }
+          if (lt != mm_was_lt) { trt_input_mouse_button(1, lt); mm_was_lt = lt; }
+          if (rb != mm_was_rb) { trt_input_mouse_button(2, rb); mm_was_rb = rb; }
+
+          if (g_guest_running.load()) {
+            const bool k_w = xs.Gamepad.sThumbLY > 14000;
+            const bool k_s = xs.Gamepad.sThumbLY < -14000;
+            const bool k_d = xs.Gamepad.sThumbLX > 14000;
+            const bool k_a = xs.Gamepad.sThumbLX < -14000;
+            const bool k_ent = (b & XINPUT_GAMEPAD_A) != 0;
+            const bool k_esc = (b & XINPUT_GAMEPAD_B) != 0;
+            const bool k_spc = (b & XINPUT_GAMEPAD_X) != 0;
+            const bool k_e = (b & XINPUT_GAMEPAD_Y) != 0;
+            const bool k_tab = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
+            const bool k_shf = (b & XINPUT_GAMEPAD_LEFT_THUMB) != 0;
+            const bool k_r = (b & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+            const bool k_f = (b & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+            if (k_w != mm_was_w) { trt_input_key_event('W', k_w); mm_was_w = k_w; }
+            if (k_s != mm_was_s) { trt_input_key_event('S', k_s); mm_was_s = k_s; }
+            if (k_a != mm_was_ak) { trt_input_key_event('A', k_a); mm_was_ak = k_a; }
+            if (k_d != mm_was_d) { trt_input_key_event('D', k_d); mm_was_d = k_d; }
+            if (k_ent != mm_was_a) { trt_input_key_event(0x0D, k_ent); mm_was_a = k_ent; }
+            if (k_esc != mm_was_b) { trt_input_key_event(0x1B, k_esc); mm_was_b = k_esc; }
+            if (k_spc != mm_was_x) { trt_input_key_event(0x20, k_spc); mm_was_x = k_spc; }
+            if (k_e != mm_was_y) { trt_input_key_event('E', k_e); mm_was_y = k_e; }
+            if (k_tab != mm_was_lb) { trt_input_key_event(0x09, k_tab); mm_was_lb = k_tab; }
+            if (k_shf != mm_was_ls) { trt_input_key_event(0xA0, k_shf); mm_was_ls = k_shf; }
+            if (k_r != mm_was_dl) { trt_input_key_event('R', k_r); mm_was_dl = k_r; }
+            if (k_f != mm_was_dr) { trt_input_key_event('F', k_f); mm_was_dr = k_f; }
+            if (b & XINPUT_GAMEPAD_DPAD_UP) {
+              if (mm_wheel_tick <= 0) { trt_input_wheel(120); mm_wheel_tick = 8; }
+              else --mm_wheel_tick;
+            } else if (b & XINPUT_GAMEPAD_DPAD_DOWN) {
+              if (mm_wheel_tick <= 0) { trt_input_wheel(-120); mm_wheel_tick = 8; }
+              else --mm_wheel_tick;
+            } else {
+              mm_wheel_tick = 0;
+            }
+          }
+        } else if (mm_was_active) {
+          mm_was_active = false;
+          if (mm_was_rt) { trt_input_mouse_button(0, false); mm_was_rt = false; }
+          if (mm_was_lt) { trt_input_mouse_button(1, false); mm_was_lt = false; }
+          if (mm_was_rb) { trt_input_mouse_button(2, false); mm_was_rb = false; }
+          if (mm_was_w) { trt_input_key_event('W', false); mm_was_w = false; }
+          if (mm_was_s) { trt_input_key_event('S', false); mm_was_s = false; }
+          if (mm_was_ak) { trt_input_key_event('A', false); mm_was_ak = false; }
+          if (mm_was_d) { trt_input_key_event('D', false); mm_was_d = false; }
+          if (mm_was_a) { trt_input_key_event(0x0D, false); mm_was_a = false; }
+          if (mm_was_b) { trt_input_key_event(0x1B, false); mm_was_b = false; }
+          if (mm_was_x) { trt_input_key_event(0x20, false); mm_was_x = false; }
+          if (mm_was_y) { trt_input_key_event('E', false); mm_was_y = false; }
+          if (mm_was_lb) { trt_input_key_event(0x09, false); mm_was_lb = false; }
+          if (mm_was_ls) { trt_input_key_event(0xA0, false); mm_was_ls = false; }
+          if (mm_was_dl) { trt_input_key_event('R', false); mm_was_dl = false; }
+          if (mm_was_dr) { trt_input_key_event('F', false); mm_was_dr = false; }
         }
-      } else {
-        trt_input_pad_state(0, 0, 0, 0, 0, 0, 0);
       }
 
       // ---- launch handoff (web + pad) ----
-      std::string webname;
-      if (longan::webxfer_poll_launch(&webname)) g_pending_launch = webname;
-      if (!g_pending_launch.empty()) {
-        const std::string want = g_pending_launch;
-        g_pending_launch.clear();
-        for (const auto& ge : g_games)
-          if (ge.name == want) {
-            g_guest_status = "running " + ge.name + "…";
-            const auto gr = run_game(ge.name, ge.exe, g_games_dir + "\\" + ge.name);
-            char line[192];
-            snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
-                     ge.name.c_str(), trt_errstr(gr.map_rc), gr.detail);
-            longan::log_line(line);
-            g_guest_status = std::string(want) + ": " + trt_errstr(gr.map_rc);
-            break;
-          }
-      }
-
-      // ---- UI ----
-      if (!g_setup_active) {
-        if (m_frames - m_rescan_at >= 120) {
+      if (!g_guest_running.load()) {
+        if (longan::webxfer_poll_rescan() || m_frames - m_rescan_at >= 120) {
           m_rescan_at = m_frames;
           rescan_games();
         }
+        std::string webname;
+        if (longan::webxfer_poll_launch(&webname)) {
+          g_pending_launch = webname;
+          if (g_setup_active && g_setup_done) {
+            g_setup_active = false;
+            longan::ui_set_setup({}, 0, false);
+          }
+          bool found = false;
+          for (const auto& ge : g_games)
+            if (ge.name == webname) { found = true; break; }
+          if (!found) rescan_games();
+        }
+        if (!g_pending_launch.empty()) {
+          const std::string want = g_pending_launch;
+          g_pending_launch.clear();
+          for (const auto& ge : g_games) {
+            if (ge.name == want) {
+              if (g_guest_thread.joinable()) g_guest_thread.join();
+              set_guest_status("running " + ge.name + "…");
+              if (ge.input_mode == "pad2kbm" || ge.input_mode == "kbm") {
+                g_mouse_mode = true;
+              } else if (ge.input_mode == "controller") {
+                g_mouse_mode = false;
+              }
+              longan::webxfer_set_running_game(want);
+              g_guest_running.store(true);
+              const std::string exe = ge.exe;
+              const std::string gdir = ge.dir;
+              const std::string img = ge.image;
+              g_guest_thread = std::thread([want, exe, gdir, img]() {
+                const auto gr = run_game(want, exe, gdir, img);
+                char line[192];
+                snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
+                         want.c_str(), trt_errstr(gr.map_rc), gr.detail);
+                longan::log_line(line);
+                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
+                g_guest_running.store(false);
+              });
+              break;
+            }
+          }
+        }
+      }
+
+      trt_openal_pump(8);
+
+      // While a guest owns the host swapchain, do not touch D3D11/DXGI from the UI
+      // loop; keep pumping CoreWindow events, XInput, virtual mouse, and OpenAL.
+      if (g_guest_running.load()) {
+        Sleep(4);
+        continue;
+      }
+      longan::swapchain_restore_d3d11();
+
+      // ---- UI ----
+      longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
+      if (!g_setup_active) {
         std::vector<longan::ui_game> uig;
-        for (const auto& ge : g_games)
-          uig.push_back({u82ws(ge.name), u82ws(ge.exe)});
+        for (const auto& ge : g_games) {
+          std::wstring disp = u82ws(ge.exe);
+          if (!ge.image.empty()) disp = L"[disc] " + disp;
+          if (ge.exes.size() > 1) {
+            disp = L"[" + std::to_wstring(ge.exe_idx + 1) + L"/" +
+                   std::to_wstring(ge.exes.size()) + L"] " + disp;
+          }
+          uig.push_back({u82ws(ge.name), disp, u82ws(ge.input_mode)});
+        }
         longan::ui_set_games(uig, g_selected);
         std::vector<std::wstring> lines;
         lines.push_back(u82ws(longan::webxfer_status_line()));
-        lines.push_back(u82ws("guest: " + g_guest_status));
+        lines.push_back(
+            L"Phone/PC: scan QR or type LAN URL to drop a game folder or .zip");
+        lines.push_back(u82ws("guest: " + get_guest_status()));
         lines.push_back(u82ws(g_steam_status +
-                              (g_mouse_mode ? "  |  MOUSE MODE" : "")));
+                              (g_mouse_mode ? "  |  MOUSE/KBM MODE" : "")));
         char audio_line[128];
         longan::audio_status(audio_line, sizeof(audio_line));
         lines.push_back(u82ws(audio_line));
@@ -787,13 +1602,11 @@ struct tiramisu_host
           lines.push_back(u82ws(g_games[g_selected].compat));
         }
         lines.push_back(
-            L"D-pad: select   A: launch   Y: steam   RS: mouse mode");
+            L"U/D: game  L/R: exe  A: launch  Y: steam  R3/F1: mouse  Hold View+Menu: stop");
         longan::ui_set_lines(lines);
-        longan::ui_set_qr(g_steam_busy ? g_steam_qr : longan::webxfer_url());
       }
-      longan::ui_render();
-
       longan::swapchain_render_frame((m_frames % 180) / 180.0f);
+      longan::ui_render();
       longan::swapchain_present();
       ++m_frames;
     }

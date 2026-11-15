@@ -6,6 +6,7 @@
 // missing answer here is often a silent "game quits at launch".
 #include "trt.h"
 #include "thunk.h"
+#include "iso.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,22 +81,31 @@ u32 TRT_STDCALL trt_GetVersion(void) {
 // GetSystemInfo(SYSTEM_INFO*)
 void TRT_STDCALL trt_GetSystemInfo(void* si) {
   if (!si) return;
-  // SYSTEM_INFO: u16 alignment, u16 pad, u32 pageSize, u32 minApp, u32 maxApp,
-  // u32 dwMask, u32 processors, u32 processorType, u32 allocationGranularity,
-  // u16 processorLevel, u16 processorRevision
-  u16* w = (u16*)si;
-  w[0] = 8;        // alignment
-  w[1] = 0;
-  u32* d = (u32*)si;
-  d[1] = 4096;     // page size
-  d[2] = 0x1000;   // min app address
-  d[3] = 0x7FFEFFFF;
-  d[4] = 0x000003FF;  // processor mask
-  d[5] = 8;        // processors
-  d[6] = 258;      // PROCESSOR_TYPE_INTEL
-  d[7] = 0x10000;  // allocation granularity
-  w[16] = 6;       // processor level
-  w[17] = 0;       // revision
+  // Win64 SYSTEM_INFO layout (48 bytes):
+  //   +0x00 u16 wProcessorArchitecture (9 = PROCESSOR_ARCHITECTURE_AMD64)
+  //   +0x02 u16 wReserved (0)
+  //   +0x04 u32 dwPageSize (4096)
+  //   +0x08 u64 lpMinimumApplicationAddress (0x10000)
+  //   +0x10 u64 lpMaximumApplicationAddress (0x00007FFFFFFEFFFF)
+  //   +0x18 u64 dwActiveProcessorMask (0xFF = 8 logical processors)
+  //   +0x20 u32 dwNumberOfProcessors (8)
+  //   +0x24 u32 dwProcessorType (8664 = PROCESSOR_AMD_X8664)
+  //   +0x28 u32 dwAllocationGranularity (0x10000 = 64 KB)
+  //   +0x2C u16 wProcessorLevel (6)
+  //   +0x2E u16 wProcessorRevision (0)
+  memset(si, 0, 48);
+  u8* b = (u8*)si;
+  *(u16*)(b + 0x00) = 9;                        // PROCESSOR_ARCHITECTURE_AMD64
+  *(u16*)(b + 0x02) = 0;                        // wReserved
+  *(u32*)(b + 0x04) = 4096;                     // dwPageSize
+  *(u64*)(b + 0x08) = 0x0000000000010000ULL;    // lpMinimumApplicationAddress
+  *(u64*)(b + 0x10) = 0x00007FFFFFFEFFFFULL;    // lpMaximumApplicationAddress
+  *(u64*)(b + 0x18) = 0x00000000000000FFULL;    // dwActiveProcessorMask
+  *(u32*)(b + 0x20) = 8;                        // dwNumberOfProcessors
+  *(u32*)(b + 0x24) = 8664;                     // PROCESSOR_AMD_X8664
+  *(u32*)(b + 0x28) = 0x10000;                  // dwAllocationGranularity
+  *(u16*)(b + 0x2C) = 6;                        // wProcessorLevel
+  *(u16*)(b + 0x2E) = 0;                        // wProcessorRevision
 }
 
 // GetNativeSystemInfo(SYSTEM_INFO*) - same numbers, no WOW64 downgrade
@@ -117,7 +127,15 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
   if (!name) return 0;
   char n[256];
   utf16_to_utf8(name, n, sizeof(n));
-  const char* v = getenv(n);
+  // the SetEnvironmentVariableW store first (cross-call consistency: a
+  // value the guest WROTE must be readable back — PyInstaller's onefile
+  // child flow depends on _PYI_APPLICATION_HOME_DIR), then host getenv
+  const char* v = nullptr;
+  {
+    extern const char* trt_gap_env_get(const char*);
+    v = trt_gap_env_get(n);
+  }
+  if (!v) v = getenv(n);
   if (!v) return 0;
   const u32 need = (u32)strlen(v) + 1;
   if (buf && size >= need) {
@@ -132,7 +150,12 @@ u32 TRT_STDCALL trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
   if (!in) return 0;
   char src[1024], dst[2048];
   utf16_to_utf8(in, src, sizeof(src));
-  const char* base = getenv(src);
+  const char* base = nullptr;
+  {
+    extern const char* trt_gap_env_get(const char*);
+    base = trt_gap_env_get(src);
+  }
+  if (!base) base = getenv(src);
   snprintf(dst, sizeof(dst), "%s", base ? base : src);
   const u32 need = (u32)strlen(dst) + 1;
   if (out && size >= need) {
@@ -170,7 +193,7 @@ int TRT_STDCALL trt_MultiByteToWideChar(u32 codepage, u32 flags,
   (void)codepage; (void)flags;
   if (!src) return 0;
   const int len = srclen < 0 ? (int)strlen(src) : srclen;
-  if (!dst || dstlen <= 0) return len + 1;
+  if (!dst || dstlen <= 0) return (srclen < 0) ? (len + 1) : len;
   int n = 0;
   for (int i = 0; i < len; ++i) {
     const u8 c = (u8)src[i];
@@ -257,13 +280,21 @@ u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {
 }
 
 u32 TRT_STDCALL trt_GetFileAttributesW(const u16* path) {
-  char p[512];
-  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
+  int is_dir = 0;
+  // disc image: answer from the ISO records, never extract
+  if (trt_vfs_is_image_utf16(path)) {
+    char rel[1024] = "";
+    struct trt_iso* iso = trt_vfs_image_for_guest_utf16(path, rel, sizeof(rel));
+    if (!iso || trt_iso_stat(iso, rel, &is_dir, nullptr) != 0)
+      return 0xFFFFFFFFu;
+    return is_dir ? 0x10u : 0x80u;
+  }
+  char p[1024];
+  if (trt_vfs_resolve_utf16_rw(path, 0, p, sizeof(p)) != 0)
     utf16_to_utf8(path, p, sizeof(p));
-  FILE* f = fopen(p, "rb");
-  if (!f) return 0xFFFFFFFFu;  // INVALID_FILE_ATTRIBUTES
-  fclose(f);
-  return 0x80;  // FILE_ATTRIBUTE_NORMAL
+  if (trt_vfs_stat(p, &is_dir, nullptr) != 0)
+    return 0xFFFFFFFFu;  // INVALID_FILE_ATTRIBUTES
+  return is_dir ? 0x10u /*FILE_ATTRIBUTE_DIRECTORY*/ : 0x80u /*FILE_ATTRIBUTE_NORMAL*/;
 }
 
 int TRT_STDCALL trt_SetFileAttributesW(const u16* path, u32 attrs) {
@@ -271,58 +302,53 @@ int TRT_STDCALL trt_SetFileAttributesW(const u16* path, u32 attrs) {
   return 1;
 }
 
+extern void TRT_STDCALL trt_SetLastError(u32 err);
+
 int TRT_STDCALL trt_DeleteFileW(const u16* path) {
-  char p[512];
-  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
-    utf16_to_utf8(path, p, sizeof(p));
-  return remove(p) == 0 ? 1 : 0;
+  if (trt_vfs_is_image_utf16(path)) {
+    trt_SetLastError(19);  // ERROR_WRITE_PROTECT: a disc is read-only
+    return 0;
+  }
+  u32 werr = 0;
+  if (trt_vfs_delete_file_utf16(path, &werr) == 0) return 1;
+  (void)werr;
+  return 0;
 }
 
 int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa) {
   (void)sa;
-  char p[512];
-  // resolve via the VFS so relative guest paths (".\_MEIxxxx") land on the
-  // guest cwd drive instead of mkdir'ing a literal ".\_MEIxxxx" entry in
-  // the host cwd (measured: PyInstaller's extraction dir went to the wrong
-  // place and CreateFileW could not find it).
-  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0) {
+  char p[1024];
+  if (trt_vfs_resolve_utf16_rw(path, 1, p, sizeof(p)) != 0) {
     utf16_to_utf8(path, p, sizeof(p));  // fail-visible: try the raw name
   }
-  // create missing parents (Win32 C:\Temp exists on a real install; on the
-  // console the drive_c mount starts empty, so "C:\Temp\_MEIxxxx" needs the
-  // intermediate level). Each level is a real mkdir, not a fake success.
-  for (char* q = p + 1; *q; ++q) {
-    if (*q == '/') {
-      *q = 0;
-      mkdir_portable(p);
-      *q = '/';
-    }
+  if (trt_vfs_mkdir_p(p) == 0) {
+    trt_vfs_mark_z_deleted_utf16(path, 0, 1);
+    return 1;
   }
-  // Win32 semantics: nonzero = created. POSIX mkdir returns 0 on success —
-  // and EEXIST for a directory that ALREADY exists is also a Win32 success
-  // (ERROR_ALREADY_EXISTS, GetLastError names it; the call itself answers 1).
-  if (mkdir_portable(p) == 0) return 1;
-  return errno == EEXIST ? 1 : 0;
+  return 0;
 }
 
 int TRT_STDCALL trt_RemoveDirectoryW(const u16* path) {
-  char p[512];
-  if (trt_vfs_resolve_utf16(path, p, sizeof(p)) != 0)
-    utf16_to_utf8(path, p, sizeof(p));
-  // Win32 semantics: nonzero = removed, 0 = failed (POSIX rmdir is the
-  // inverse: 0 on success). Returning the raw POSIX code made every
-  // successful cleanup read as failure — OrTMM popped a spurious
-  // "Failed to remove temporary directory" MessageBox on a clean exit.
-  return rmdir_portable(p) == 0 ? 1 : 0;
+  if (trt_vfs_is_image_utf16(path)) {
+    trt_SetLastError(19);  // ERROR_WRITE_PROTECT
+    return 0;
+  }
+  u32 werr = 0;
+  if (trt_vfs_remove_dir_utf16(path, &werr) == 0) return 1;
+  (void)werr;
+  return 0;
 }
 
 int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
-  (void)fail;
-  char s[512], d[512];
-  if (trt_vfs_resolve_utf16(src, s, sizeof(s)) != 0)
+  char s[1024], d[1024], d_read[1024];
+  if (trt_vfs_resolve_utf16_rw(src, 0, s, sizeof(s)) != 0)
     utf16_to_utf8(src, s, sizeof(s));
-  if (trt_vfs_resolve_utf16(dst, d, sizeof(d)) != 0)
+  if (trt_vfs_resolve_utf16_rw(dst, 1, d, sizeof(d)) != 0)
     utf16_to_utf8(dst, d, sizeof(d));
+  if (trt_vfs_resolve_utf16_rw(dst, 0, d_read, sizeof(d_read)) != 0)
+    snprintf(d_read, sizeof(d_read), "%s", d);
+  if (fail && trt_vfs_stat(d_read, nullptr, nullptr) == 0) return 0;
+  trt_vfs_ensure_parents(d);
   FILE* in = fopen(s, "rb");
   if (!in) return 0;
   FILE* out = fopen(d, "wb");
@@ -332,6 +358,7 @@ int TRT_STDCALL trt_CopyFileW(const u16* src, const u16* dst, bool fail) {
   while ((n = fread(buf, 1, sizeof(buf), in)) > 0) fwrite(buf, 1, n, out);
   fclose(in);
   fclose(out);
+  trt_vfs_mark_z_deleted_utf16(dst, 0, 0);
   return 1;
 }
 

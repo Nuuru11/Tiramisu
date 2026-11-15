@@ -1,7 +1,8 @@
 // tiramisu/src/host/webxfer.h
-// Phone -> console game transfer: a tiny HTTP server inside the UWP app.
-// Launch the app, scan the TV QR (or type the URL), upload a game ZIP from
-// the phone, hit LAUNCH. File transfer is the primary game pipeline.
+// LAN/QR game transfer & dashboard HTTP server inside the UWP app.
+// Launch the Xbox UWP app, scan the TV QR (or type the LAN URL), drag & drop
+// any unpacked PC/Steam game folder or .zip, configure exe/appid/args/input,
+// launch/stop games, and watch live console logs.
 #ifndef TIRAMISU_WEBXFER_H
 #define TIRAMISU_WEBXFER_H
 
@@ -12,26 +13,39 @@ namespace longan {
 struct webxfer_state {
   bool running = false;
   unsigned short port = 9127;
-  std::string url;            // http://<ip>:9127
-  // launch handoff: worker thread sets name+flag; host loop consumes
+  std::string url;            // http://<ip>:<port>
+  // handoffs: worker threads set name+flag; host loop consumes
   std::string launch_name;
   bool launch_requested = false;
+  bool stop_requested = false;
+  bool rescan_requested = false;
+  std::string running_game;
   // status for the TV overlay
-  std::string last_upload;    // "name (123 MB) -> 4 exe candidates"
+  std::string last_upload;    // "name (123 MB, 42 files)"
   std::string last_error;
 };
 
-// start the listener; returns the URL for the TV/QR. Safe to call once.
+// Score a dotted-quad IPv4 for LAN reachability (higher = better; 0 = loopback/APIPA).
+int webxfer_score_ipv4(const char* dotted);
+
+// Start the listener on default port 9127; returns http://<lan-ip>:9127.
 std::string webxfer_start(const std::string& local_state, int display_w);
 
-// poll from the host loop: consumes launch requests, refreshes status
-bool webxfer_poll_launch(std::string* out_name);
+// Start listener on a specific port (0 = OS ephemeral port for tests).
+std::string webxfer_start_port(const std::string& local_state, unsigned short port);
 
-// one-line status for the TV overlay ("transfer: http://…", last upload, err)
+// Poll from the host loop: consume launch / stop / rescan requests.
+bool webxfer_poll_launch(std::string* out_name);
+bool webxfer_poll_stop();
+bool webxfer_poll_rescan();
+void webxfer_set_running_game(const std::string& name);
+
+// One-line status for the TV overlay ("transfer: http://...", last upload, err).
 std::string webxfer_status_line();
 
-// the URL shown in the QR (empty until started)
+// Current transfer URL shown in the QR (empty until started).
 std::string webxfer_url();
+unsigned short webxfer_port();
 
 void webxfer_shutdown();
 

@@ -22,5 +22,11 @@ EXPORTS
     SetLastError
     GetLastError
     VirtualProtect
+    VirtualQuery
+    FlushInstructionCache
     RtlCaptureContext
     RtlLookupFunctionEntry
+    RaiseException
+    RtlUnwindEx
+    GetSystemInfo
+    GetTickCount64

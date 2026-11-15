@@ -13,6 +13,7 @@
 // + index), opened keys get allocated handles from the same table, so the
 // guest can pass them back like real HKEYs.
 #include "bridge_reg.h"
+#include "bridge_crypt32.h"
 #include "thunk.h"
 
 #include <stdio.h>
@@ -468,6 +469,109 @@ int TRT_GUEST_ABI trt_RegDeleteValueW(u64 hkey, const u16* name) {
   return REG_SUCCESS;
 }
 
+void free_subtree(reg_key* key) {
+  if (!key || key->is_root) return;
+  while (key->child) {
+    free_subtree(key->child);
+  }
+  if (key->parent) {
+    reg_key* prev = nullptr;
+    for (reg_key* c = key->parent->child; c; prev = c, c = c->next_sibling) {
+      if (c == key) {
+        if (prev) prev->next_sibling = c->next_sibling;
+        else key->parent->child = c->next_sibling;
+        --key->parent->child_count;
+        break;
+      }
+    }
+  }
+  while (key->values) {
+    reg_value* next = key->values->next;
+    free(key->values->data);
+    free(key->values);
+    key->values = next;
+  }
+  for (u32 i = 0; i < g_handle_count; ++i) {
+    if (g_open_keys[i] == key) g_open_keys[i] = nullptr;
+  }
+  free(key);
+  g_hive_dirty = true;
+}
+
+int TRT_GUEST_ABI trt_RegDeleteKeyExW(u64 hkey, const u16* subkey, u32 sam,
+                                      u32 reserved) {
+  (void)sam; (void)reserved;
+  load_hive();
+  reg_key* root = key_for_handle(hkey);
+  if (!root || !subkey || !subkey[0]) return REG_ERROR_INVALID_HANDLE;
+  char path[256];
+  reg_to_utf8(subkey, path, sizeof(path));
+  reg_key* target = open_path(root, path, false);
+  if (!target || target->is_root) return REG_ERROR_FILE_NOT_FOUND;
+  if (target->child != nullptr) return REG_ERROR_ACCESS_DENIED;
+  free_subtree(target);
+  write_hive();
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_RegDeleteKeyW(u64 hkey, const u16* subkey) {
+  return trt_RegDeleteKeyExW(hkey, subkey, 0, 0);
+}
+
+int TRT_GUEST_ABI trt_RegDeleteTreeW(u64 hkey, const u16* subkey) {
+  load_hive();
+  reg_key* root = key_for_handle(hkey);
+  if (!root) return REG_ERROR_INVALID_HANDLE;
+  if (!subkey || !subkey[0]) {
+    if (root->is_root) return REG_ERROR_ACCESS_DENIED;
+    while (root->child) free_subtree(root->child);
+    while (root->values) delete_value(root, root->values->name);
+    write_hive();
+    return REG_SUCCESS;
+  }
+  char path[256];
+  reg_to_utf8(subkey, path, sizeof(path));
+  reg_key* target = open_path(root, path, false);
+  if (!target) return REG_ERROR_FILE_NOT_FOUND;
+  if (target->is_root) return REG_ERROR_ACCESS_DENIED;
+  free_subtree(target);
+  write_hive();
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_RegFlushKey(u64 hkey) {
+  if (!key_for_handle(hkey)) return REG_ERROR_INVALID_HANDLE;
+  if (g_hive_dirty) write_hive();
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_RegOpenCurrentUser(u32 sam, u64* phk) {
+  (void)sam;
+  if (!phk) return 87;
+  load_hive();
+  *phk = allocate_handle(&g_roots[1]);  // HKCU
+  return *phk ? REG_SUCCESS : 8;
+}
+
+int TRT_GUEST_ABI trt_RegConnectRegistryW(const u16* machine, u64 hkey, u64* phk) {
+  if (!phk) return 87;
+  if (machine && machine[0]) return 53;  // ERROR_BAD_NETPATH
+  load_hive();
+  reg_key* k = key_for_handle(hkey);
+  if (!k) return REG_ERROR_INVALID_HANDLE;
+  *phk = allocate_handle(k);
+  return *phk ? REG_SUCCESS : 8;
+}
+
+int TRT_GUEST_ABI trt_RegSaveKeyW(u64 hkey, const u16* file, void* sa) {
+  (void)hkey; (void)file; (void)sa;
+  return REG_ERROR_ACCESS_DENIED;
+}
+int TRT_GUEST_ABI trt_RegLoadKeyW(u64 hkey, const u16* subkey, const u16* file) {
+  (void)hkey; (void)subkey; (void)file;
+  return REG_ERROR_ACCESS_DENIED;
+}
+
 int TRT_GUEST_ABI trt_RegCloseKey(u64 hkey) {
   if (hkey >= REG_FIRST_HANDLE && hkey < REG_FIRST_HANDLE + REG_MAX_HANDLES) {
     const u32 idx = (u32)(hkey - REG_FIRST_HANDLE);
@@ -629,11 +733,11 @@ void* TRT_GUEST_ABI trt_OpenProcessToken(void* process, u32 desired,
     token_set_last_error(87);  // ERROR_INVALID_PARAMETER
     return 0;
   }
-  if ((desired & TRT_TOKEN_QUERY_RIGHT) == 0) {
-    // we only support QUERY; anything else is honest about it
+  if ((desired & (TRT_TOKEN_QUERY_RIGHT | 0x0020u)) == 0) {
+    // we only support QUERY / ADJUST_PRIVILEGES; anything else fails honestly
     char line[160];
     snprintf(line, sizeof(line),
-             "advapi32: OpenProcessToken desired=0x%x (no QUERY bit) -> "
+             "advapi32: OpenProcessToken desired=0x%x (no QUERY/ADJUST bit) -> "
              "ERROR_ACCESS_DENIED", desired);
     trt_core_log(line);
     token_set_last_error(5);  // ERROR_ACCESS_DENIED
@@ -847,27 +951,396 @@ int TRT_GUEST_ABI trt_ConvertSidToStringSidW(const void* sid, u16** str_out) {
   return 1;  // TRUE
 }
 
-// advapi32!SystemFunction036 (RtlGenRandom): the obfuscation runtime in
-// corpus-local/gonext/dstoragecore.dll lazy-resolves this via
-// LoadLibraryExW("advapi32") + GetProcAddress and aborts (int 0x29 ec=7) when
-// either step fails. We have no security model and no entropy source, so this
-// bridge fills the caller buffer with deterministic pseudo-random bytes and
-// logs the call fail-visible. Never fake-secure: the log line states it.
-static int trt_SystemFunction036(void* buf, unsigned long len) {
-  unsigned char* p = (unsigned char*)buf;
-  unsigned long state = 0x9e3779b97f4a7c15ull * (unsigned long)(len + 1);
-  for (unsigned long i = 0; i < len; ++i) {
-    state ^= state << 13;
-    state ^= state >> 7;
-    state ^= state << 17;
-    p[i] = (unsigned char)(state >> 24);
+// ---------------- ANSI Registry & QueryInfo wrappers -----------------------
+namespace {
+void ascii_to_u16(const char* a, u16* w, size_t cap) {
+  size_t i = 0;
+  if (a) {
+    for (; a[i] && i + 1 < cap; ++i) w[i] = (u16)(u8)a[i];
   }
-  char line[128];
-  snprintf(line, sizeof(line),
-           "advapi32: SystemFunction036(buf=%p len=%lu) -> deterministic "
-           "fill (NOT cryptographic entropy)",
-           (void*)buf, len);
-  trt_core_log(line);
+  if (cap) w[i] = 0;
+}
+
+bool bytes_look_utf16_sz(const u8* d, u32 sz) {
+  return sz >= 2 && (sz % 2) == 0 && d[1] == 0;
+}
+
+struct crypt_hash_handle {
+  bool used;
+  trt_hash_ctx ctx;
+};
+crypt_hash_handle g_crypt_hashes[32];
+} // namespace
+
+int TRT_GUEST_ABI trt_RegOpenKeyExA(u64 hkey, const char* subkey, u32 options,
+                                    u32 sam, void** out) {
+  u16 w[256];
+  if (subkey) ascii_to_u16(subkey, w, 256);
+  return trt_RegOpenKeyExW(hkey, subkey ? w : nullptr, options, sam, out);
+}
+
+int TRT_GUEST_ABI trt_RegCreateKeyW(u64 hkey, const u16* subkey, void** out) {
+  return trt_RegCreateKeyExW(hkey, subkey, 0, nullptr, 0, 0, out, nullptr);
+}
+
+int TRT_GUEST_ABI trt_RegOpenKeyW(u64 hkey, const u16* subkey, void** out) {
+  return trt_RegOpenKeyExW(hkey, subkey, 0, 0, out);
+}
+
+int TRT_GUEST_ABI trt_RegQueryValueExA(u64 hkey, const char* name, u32* reserved,
+                                       u32* type, u8* data, u32* lpcbData) {
+  (void)reserved;
+  load_hive();
+  reg_key* key = key_for_handle(hkey);
+  if (!key) return REG_ERROR_INVALID_HANDLE;
+  const char* vname = (name && name[0]) ? name : "(Default)";
+  reg_value* v = find_value(key, vname);
+  if (!v) return REG_ERROR_FILE_NOT_FOUND;
+  if (type) *type = v->type;
+  const bool conv_sz = (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) &&
+                       bytes_look_utf16_sz(v->data, v->size);
+  const u32 need = conv_sz ? (v->size / 2) : v->size;
+  const u32 avail = lpcbData ? *lpcbData : 0;
+  if (lpcbData) *lpcbData = need;
+  if (!data) return REG_SUCCESS;
+  if (avail < need) return REG_ERROR_MORE_DATA;
+  if (conv_sz) {
+    for (u32 i = 0; i < need; ++i) data[i] = v->data[i * 2];
+  } else if (v->size) {
+    memcpy(data, v->data, v->size);
+  }
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_RegSetValueExA(u64 hkey, const char* name, u32 reserved,
+                                     u32 type, const u8* data, u32 cbData) {
+  (void)reserved;
+  load_hive();
+  reg_key* key = key_for_handle(hkey);
+  if (!key) return REG_ERROR_INVALID_HANDLE;
+  const char* vname = (name && name[0]) ? name : "(Default)";
+  if ((type == TRT_REG_SZ || type == TRT_REG_EXPAND_SZ) && data && cbData > 0 && cbData <= 1024) {
+    u16 wbuf[1024];
+    for (u32 i = 0; i < cbData; ++i) wbuf[i] = (u16)data[i];
+    set_value(key, vname, type, (const u8*)wbuf, cbData * 2);
+  } else {
+    set_value(key, vname, type, data, cbData);
+  }
+  write_hive();
+  return REG_SUCCESS;
+}
+
+int TRT_GUEST_ABI trt_RegDeleteValueA(u64 hkey, const char* name) {
+  u16 w[128];
+  if (name) ascii_to_u16(name, w, 128);
+  return trt_RegDeleteValueW(hkey, name ? w : nullptr);
+}
+int TRT_GUEST_ABI trt_RegDeleteKeyExA(u64 hkey, const char* subkey, u32 sam,
+                                      u32 reserved) {
+  u16 w[256];
+  if (subkey) ascii_to_u16(subkey, w, 256);
+  return trt_RegDeleteKeyExW(hkey, subkey ? w : nullptr, sam, reserved);
+}
+int TRT_GUEST_ABI trt_RegDeleteKeyA(u64 hkey, const char* subkey) {
+  return trt_RegDeleteKeyExA(hkey, subkey, 0, 0);
+}
+int TRT_GUEST_ABI trt_RegDeleteTreeA(u64 hkey, const char* subkey) {
+  u16 w[256];
+  if (subkey) ascii_to_u16(subkey, w, 256);
+  return trt_RegDeleteTreeW(hkey, subkey ? w : nullptr);
+}
+
+int TRT_GUEST_ABI trt_RegQueryInfoKeyW(u64 hkey, u16* cls, u32* cb_cls,
+                                       u32* reserved, u32* subkeys,
+                                       u32* max_subkey_len, u32* max_cls_len,
+                                       u32* values, u32* max_val_name_len,
+                                       u32* max_val_len, void* sd, void* ft) {
+  (void)cls; (void)reserved; (void)sd; (void)ft;
+  load_hive();
+  reg_key* key = key_for_handle(hkey);
+  if (!key) return REG_ERROR_INVALID_HANDLE;
+  if (cb_cls) *cb_cls = 0;
+  if (max_cls_len) *max_cls_len = 0;
+  u32 max_sk = 0;
+  for (reg_key* c = key->child; c; c = c->next_sibling) {
+    const u32 l = (u32)strlen(c->name);
+    if (l > max_sk) max_sk = l;
+  }
+  u32 max_vn = 0, max_vl = 0;
+  for (reg_value* v = key->values; v; v = v->next) {
+    const u32 nl = (u32)strlen(v->name);
+    if (nl > max_vn) max_vn = nl;
+    if (v->size > max_vl) max_vl = v->size;
+  }
+  if (subkeys) *subkeys = key->child_count;
+  if (max_subkey_len) *max_subkey_len = max_sk;
+  if (values) *values = key->value_count;
+  if (max_val_name_len) *max_val_name_len = max_vn;
+  if (max_val_len) *max_val_len = max_vl;
+  return REG_SUCCESS;
+}
+
+// ---------------- User / HW Profile / Token Privileges ---------------------
+int TRT_GUEST_ABI trt_GetUserNameW(u16* buf, u32* cch) {
+  static const char k_user[] = "tiramisu";
+  const u32 need = (u32)sizeof(k_user);
+  if (!cch) { token_set_last_error(87); return 0; }
+  if (!buf || *cch < need) {
+    *cch = need;
+    token_set_last_error(122);  // ERROR_INSUFFICIENT_BUFFER
+    return 0;
+  }
+  for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)k_user[i];
+  *cch = need;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_GetUserNameA(char* buf, u32* cch) {
+  static const char k_user[] = "tiramisu";
+  const u32 need = (u32)sizeof(k_user);
+  if (!cch) { token_set_last_error(87); return 0; }
+  if (!buf || *cch < need) {
+    *cch = need;
+    token_set_last_error(122);
+    return 0;
+  }
+  memcpy(buf, k_user, need);
+  *cch = need;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_AdjustTokenPrivileges(void* tok, int disable_all,
+                                            const void* new_state, u32 buf_len,
+                                            void* prev_state, u32* ret_len) {
+  (void)disable_all; (void)new_state; (void)buf_len; (void)prev_state;
+  if (!token_is_valid((u32)(uintptr_t)tok)) {
+    token_set_last_error(6);
+    return 0;
+  }
+  if (ret_len) *ret_len = 0;
+  token_set_last_error(0);  // ERROR_SUCCESS
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_LookupPrivilegeValueW(const u16* sys, const u16* name,
+                                            u64* luid) {
+  (void)sys; (void)name;
+  if (!luid) { token_set_last_error(87); return 0; }
+  *luid = 20ull;  // SE_DEBUG_PRIVILEGE nominal LUID
+  return 1;
+}
+int TRT_GUEST_ABI trt_LookupPrivilegeValueA(const char* sys, const char* name,
+                                            u64* luid) {
+  (void)sys; (void)name;
+  if (!luid) { token_set_last_error(87); return 0; }
+  *luid = 20ull;
+  return 1;
+}
+u32 TRT_GUEST_ABI trt_LsaNtStatusToWinError(u32 status) {
+  if (status == 0) return 0;
+  if (status == 0xC0000022u) return 5;    // STATUS_ACCESS_DENIED
+  if (status == 0xC000000Du) return 87;   // STATUS_INVALID_PARAMETER
+  if (status == 0xC0000034u) return 2;    // STATUS_OBJECT_NAME_NOT_FOUND
+  if (status == 0xC0000017u) return 8;    // STATUS_NO_MEMORY
+  if (status == 0x80000005u) return 234;  // STATUS_BUFFER_OVERFLOW
+  return 317;                             // ERROR_MR_MID_NOT_FOUND
+}
+int TRT_GUEST_ABI trt_IsValidSid(const void* sid) {
+  const u8* s = (const u8*)sid;
+  return (s && s[0] == 1 && s[1] <= 15) ? 1 : 0;
+}
+u32 TRT_GUEST_ABI trt_GetLengthSid(const void* sid) {
+  const u8* s = (const u8*)sid;
+  if (!s) return 0;
+  return 8u + (u32)s[1] * 4u;
+}
+int TRT_GUEST_ABI trt_EqualSid(const void* s1, const void* s2) {
+  if (!trt_IsValidSid(s1) || !trt_IsValidSid(s2)) return 0;
+  const u32 l1 = trt_GetLengthSid(s1);
+  if (l1 != trt_GetLengthSid(s2)) return 0;
+  return memcmp(s1, s2, l1) == 0 ? 1 : 0;
+}
+int TRT_GUEST_ABI trt_AllocateAndInitializeSid(const u8* auth, u8 sub_cnt,
+                                               u32 sa0, u32 sa1, u32 sa2, u32 sa3,
+                                               u32 sa4, u32 sa5, u32 sa6, u32 sa7,
+                                               void** psid) {
+  if (!auth || !psid || sub_cnt > 8) { token_set_last_error(87); return 0; }
+  u8* s = (u8*)calloc(1, 8u + (size_t)sub_cnt * 4u);
+  if (!s) { token_set_last_error(8); return 0; }
+  s[0] = 1;  // SID_REVISION
+  s[1] = sub_cnt;
+  memcpy(s + 2, auth, 6);
+  const u32 vals[8] = {sa0, sa1, sa2, sa3, sa4, sa5, sa6, sa7};
+  for (u8 i = 0; i < sub_cnt; ++i) memcpy(s + 8u + i * 4u, &vals[i], 4);
+  *psid = s;
+  return 1;
+}
+void* TRT_GUEST_ABI trt_FreeSid(void* sid) {
+  free(sid);
+  return nullptr;
+}
+int TRT_GUEST_ABI trt_CheckTokenMembership(void* tok, const void* sid,
+                                           int* is_member) {
+  (void)tok;
+  if (!is_member || !trt_IsValidSid(sid)) { token_set_last_error(87); return 0; }
+  const u8* s = (const u8*)sid;
+  u32 rid0 = 0, rid1 = 0;
+  if (s[1] >= 1) memcpy(&rid0, s + 8, 4);
+  if (s[1] >= 2) memcpy(&rid1, s + 12, 4);
+  // Not elevated Administrators (S-1-5-32-544), is a normal Users member (S-1-5-32-545)
+  *is_member = (rid0 == 32u && rid1 == 545u) ? 1 : 0;
+  return 1;
+}
+
+u32* TRT_GUEST_ABI trt_GetSidSubAuthority(void* sid, u32 sub_auth) {
+  u8* s = (u8*)sid;
+  if (!s || sub_auth >= s[1]) { token_set_last_error(87); return nullptr; }
+  return (u32*)(s + 8 + sub_auth * 4);
+}
+
+u8* TRT_GUEST_ABI trt_GetSidSubAuthorityCount(void* sid) {
+  u8* s = (u8*)sid;
+  if (!s) { token_set_last_error(87); return nullptr; }
+  return s + 1;
+}
+
+int TRT_GUEST_ABI trt_GetCurrentHwProfileA(void* info) {
+  if (!info) { token_set_last_error(87); return 0; }
+  // HW_PROFILE_INFOA: dwDockInfo (u32), szHwProfileGuid[39], szHwProfileName[80]
+  memset(info, 0, 124);
+  *(u32*)info = 0x1;  // DOCKINFO_UNDOCKED
+  memcpy((u8*)info + 4, "{tiramisu-0000-0000-0000-xboxseries}", 37);
+  memcpy((u8*)info + 43, "TiramisuXbox", 13);
+  return 1;
+}
+
+// ---------------- CryptoAPI (advapi32) backed by bridge_crypt32 ----------
+int TRT_GUEST_ABI trt_CryptAcquireContextW(void** phProv, const u16* container,
+                                           const u16* provider, u32 prov_type,
+                                           u32 flags) {
+  (void)container; (void)provider; (void)prov_type; (void)flags;
+  if (!phProv) { token_set_last_error(87); return 0; }
+  *phProv = (void*)(uintptr_t)0xC4190001u;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CryptAcquireContextA(void** phProv, const char* container,
+                                           const char* provider, u32 prov_type,
+                                           u32 flags) {
+  (void)container; (void)provider; (void)prov_type; (void)flags;
+  if (!phProv) { token_set_last_error(87); return 0; }
+  *phProv = (void*)(uintptr_t)0xC4190001u;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CryptReleaseContext(void* hProv, u32 flags) {
+  (void)hProv; (void)flags;
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CryptGenRandom(void* hProv, u32 len, u8* buf) {
+  (void)hProv;
+  if (!buf && len > 0) { token_set_last_error(87); return 0; }
+  trt_csprng_fill(buf, len);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CryptCreateHash(void* hProv, u32 alg_id, void* hKey,
+                                      u32 flags, void** phHash) {
+  (void)hProv; (void)hKey; (void)flags;
+  if (!phHash) { token_set_last_error(87); return 0; }
+  u32 ha = TRT_HASH_NONE;
+  if (alg_id == 0x8003u) ha = TRT_HASH_MD5;          // CALG_MD5
+  else if (alg_id == 0x8004u) ha = TRT_HASH_SHA1;    // CALG_SHA1
+  else if (alg_id == 0x800Cu) ha = TRT_HASH_SHA256;  // CALG_SHA_256
+  if (!ha) { token_set_last_error(0x80090008u); return 0; }  // NTE_BAD_ALGID
+  for (u32 i = 0; i < 32; ++i) {
+    if (!g_crypt_hashes[i].used) {
+      g_crypt_hashes[i].used = true;
+      trt_hash_init(&g_crypt_hashes[i].ctx, ha);
+      *phHash = (void*)(uintptr_t)(0xC41A0000u | i);
+      return 1;
+    }
+  }
+  token_set_last_error(8);
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptHashData(void* hHash, const u8* data, u32 len,
+                                    u32 flags) {
+  (void)flags;
+  const u32 h = (u32)(uintptr_t)hHash;
+  if ((h >> 16) != 0xC41Au || (h & 0xFFFFu) >= 32 ||
+      !g_crypt_hashes[h & 0xFFFFu].used) {
+    token_set_last_error(6);
+    return 0;
+  }
+  trt_hash_update(&g_crypt_hashes[h & 0xFFFFu].ctx, data, len);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_CryptGetHashParam(void* hHash, u32 param, u8* data,
+                                        u32* data_len, u32 flags) {
+  (void)flags;
+  const u32 h = (u32)(uintptr_t)hHash;
+  if ((h >> 16) != 0xC41Au || (h & 0xFFFFu) >= 32 ||
+      !g_crypt_hashes[h & 0xFFFFu].used || !data_len) {
+    token_set_last_error(6);
+    return 0;
+  }
+  trt_hash_ctx copy = g_crypt_hashes[h & 0xFFFFu].ctx;
+  const u32 dlen = trt_hash_digest_len(copy.alg);
+  if (param == 4 /* HP_HASHSIZE */) {
+    if (data && *data_len >= 4) { *(u32*)data = dlen; *data_len = 4; return 1; }
+    *data_len = 4;
+    if (!data) return 1;
+    token_set_last_error(234);
+    return 0;
+  }
+  if (param == 2 /* HP_HASHVAL */) {
+    if (!data) { *data_len = dlen; return 1; }
+    if (*data_len < dlen) { *data_len = dlen; token_set_last_error(234); return 0; }
+    trt_hash_final(&copy, data);
+    *data_len = dlen;
+    return 1;
+  }
+  token_set_last_error(87);
+  return 0;
+}
+
+int TRT_GUEST_ABI trt_CryptDestroyHash(void* hHash) {
+  const u32 h = (u32)(uintptr_t)hHash;
+  if ((h >> 16) != 0xC41Au || (h & 0xFFFFu) >= 32) {
+    token_set_last_error(6);
+    return 0;
+  }
+  g_crypt_hashes[h & 0xFFFFu].used = false;
+  return 1;
+}
+
+// ETW Event* no-ops directly exported on advapi32 (besides ntdll forward)
+u32 TRT_GUEST_ABI reg_EventRegister(const void* id, void* cb, void* ctx, u64* h) {
+  (void)id; (void)cb; (void)ctx;
+  if (h) *h = 0x45545701ull;
+  return 0;
+}
+u32 TRT_GUEST_ABI reg_EventUnregister(u64) { return 0; }
+u32 TRT_GUEST_ABI reg_EventWrite(u64, const void*, u32, void*) { return 0; }
+u32 TRT_GUEST_ABI reg_EventWriteEx(u64, const void*, u64, u32, const void*,
+                                   const void*, u32, void*) { return 0; }
+u32 TRT_GUEST_ABI reg_EventWriteTransfer(u64, const void*, const void*,
+                                         const void*, u32, void*) { return 0; }
+u32 TRT_GUEST_ABI reg_EventWriteString(u64, u8, u64, const u16*) { return 0; }
+u32 TRT_GUEST_ABI reg_EventSetInformation(u64, u32, const void*, u32) { return 0; }
+u32 TRT_GUEST_ABI reg_EventActivityIdControl(u32 ctrl, void* guid) {
+  if (!guid) return 87;
+  if (ctrl == 1 || ctrl == 3 || ctrl == 4) memset(guid, 0, 16);
+  return 0;
+}
+
+// advapi32!SystemFunction036 (RtlGenRandom): Win64 guest-ABI CSPRNG fill.
+static int TRT_GUEST_ABI trt_SystemFunction036(void* buf, unsigned long len) {
+  trt_csprng_fill((u8*)buf, (u32)len);
   return 1;  // TRUE
 }
 
@@ -876,28 +1349,118 @@ void* trt_bridge_SystemFunction036(void* buf, unsigned long len) {
   return (void*)(uintptr_t)trt_SystemFunction036(buf, len);
 }
 
+u32 TRT_GUEST_ABI reg_EnumDynamicTimeZoneInformation(u32 index, void* info) {
+  if (!info) return 87;  // ERROR_INVALID_PARAMETER
+  if (index > 0) return 259;  // ERROR_NO_MORE_ITEMS
+  u8* b = (u8*)info;
+  memset(b, 0, 432);
+  static const u16 k_utc[] = {'U', 'T', 'C', 0};
+  memcpy(b + 4, k_utc, sizeof(k_utc));     // StandardName
+  memcpy(b + 88, k_utc, sizeof(k_utc));    // DaylightName
+  memcpy(b + 172, k_utc, sizeof(k_utc));   // TimeZoneKeyName
+  return 0;  // ERROR_SUCCESS
+}
+
+u32 TRT_GUEST_ABI reg_GetDynamicTimeZoneInformationEffectiveYears(
+    const void* info, u32* first_year, u32* last_year) {
+  (void)info;
+  if (!first_year || !last_year) return 87;
+  *first_year = 2020;
+  *last_year = 2030;
+  return 0;
+}
+
+u32 TRT_GUEST_ABI reg_EnumerateTraceGuidsEx(u32 info_class, const void* in_buf,
+                                            u32 in_sz, void* out_buf,
+                                            u32 out_sz, u32* req_sz) {
+  (void)info_class; (void)in_buf; (void)in_sz; (void)out_buf; (void)out_sz;
+  if (req_sz) *req_sz = 0;
+  return 0;  // ERROR_SUCCESS (zero active ETW trace sessions)
+}
+
 int trt_bridge_register_registry(void) {
   static const trt_named_fn k_advapi32_fns[] = {
       {"RegOpenKeyExW", (void*)&trt_RegOpenKeyExW},
+      {"RegOpenKeyExA", (void*)&trt_RegOpenKeyExA},
       {"RegCreateKeyExW", (void*)&trt_RegCreateKeyExW},
+      {"RegCreateKeyW", (void*)&trt_RegCreateKeyW},
+      {"RegOpenKeyW", (void*)&trt_RegOpenKeyW},
       {"RegQueryValueExW", (void*)&trt_RegQueryValueExW},
+      {"RegQueryValueExA", (void*)&trt_RegQueryValueExA},
       {"RegSetValueExW", (void*)&trt_RegSetValueExW},
+      {"RegSetValueExA", (void*)&trt_RegSetValueExA},
       {"RegDeleteValueW", (void*)&trt_RegDeleteValueW},
+      {"RegDeleteValueA", (void*)&trt_RegDeleteValueA},
+      {"RegQueryInfoKeyW", (void*)&trt_RegQueryInfoKeyW},
       {"RegCloseKey", (void*)&trt_RegCloseKey},
       {"RegEnumKeyExW", (void*)&trt_RegEnumKeyExW},
       {"RegEnumValueW", (void*)&trt_RegEnumValueW},
       {"RegGetValueW", (void*)&trt_RegGetValueW},
+      {"GetUserNameW", (void*)&trt_GetUserNameW},
+      {"GetUserNameA", (void*)&trt_GetUserNameA},
+      {"GetCurrentHwProfileA", (void*)&trt_GetCurrentHwProfileA},
       // the token/security half (the honest no-security-model surface)
       {"OpenProcessToken", (void*)&trt_OpenProcessToken},
       {"GetTokenInformation", (void*)&trt_GetTokenInformation},
+      {"AdjustTokenPrivileges", (void*)&trt_AdjustTokenPrivileges},
+      {"LookupPrivilegeValueW", (void*)&trt_LookupPrivilegeValueW},
+      {"GetSidSubAuthority", (void*)&trt_GetSidSubAuthority},
+      {"GetSidSubAuthorityCount", (void*)&trt_GetSidSubAuthorityCount},
       {"ConvertStringSecurityDescriptorToSecurityDescriptorW",
        (void*)&trt_ConvertStringSecurityDescriptorToSecurityDescriptorW},
       {"ConvertSidToStringSidW", (void*)&trt_ConvertSidToStringSidW},
-      // dstoragecore obfuscation runtime lazy-resolves this by name
+      // CryptoAPI + RtlGenRandom
+      {"CryptAcquireContextW", (void*)&trt_CryptAcquireContextW},
+      {"CryptAcquireContextA", (void*)&trt_CryptAcquireContextA},
+      {"CryptReleaseContext", (void*)&trt_CryptReleaseContext},
+      {"CryptGenRandom", (void*)&trt_CryptGenRandom},
+      {"CryptCreateHash", (void*)&trt_CryptCreateHash},
+      {"CryptHashData", (void*)&trt_CryptHashData},
+      {"CryptGetHashParam", (void*)&trt_CryptGetHashParam},
+      {"CryptDestroyHash", (void*)&trt_CryptDestroyHash},
       {"SystemFunction036", (void*)&trt_SystemFunction036},
+      // ETW & Dynamic TimeZone
+      {"EventRegister", (void*)&reg_EventRegister},
+      {"EventUnregister", (void*)&reg_EventUnregister},
+      {"EventWrite", (void*)&reg_EventWrite},
+      {"EventWriteEx", (void*)&reg_EventWriteEx},
+      {"EventWriteTransfer", (void*)&reg_EventWriteTransfer},
+      {"EventWriteString", (void*)&reg_EventWriteString},
+      {"EventSetInformation", (void*)&reg_EventSetInformation},
+      {"EventActivityIdControl", (void*)&reg_EventActivityIdControl},
+      {"EnumDynamicTimeZoneInformation",
+       (void*)&reg_EnumDynamicTimeZoneInformation},
+      {"GetDynamicTimeZoneInformationEffectiveYears",
+       (void*)&reg_GetDynamicTimeZoneInformationEffectiveYears},
+      {"EnumerateTraceGuidsEx", (void*)&reg_EnumerateTraceGuidsEx},
+      {"RegDeleteKeyExW", (void*)&trt_RegDeleteKeyExW},
+      {"RegDeleteKeyExA", (void*)&trt_RegDeleteKeyExA},
+      {"RegDeleteKeyW", (void*)&trt_RegDeleteKeyW},
+      {"RegDeleteKeyA", (void*)&trt_RegDeleteKeyA},
+      {"RegDeleteTreeW", (void*)&trt_RegDeleteTreeW},
+      {"RegDeleteTreeA", (void*)&trt_RegDeleteTreeA},
+      {"RegFlushKey", (void*)&trt_RegFlushKey},
+      {"RegOpenCurrentUser", (void*)&trt_RegOpenCurrentUser},
+      {"RegConnectRegistryW", (void*)&trt_RegConnectRegistryW},
+      {"RegSaveKeyW", (void*)&trt_RegSaveKeyW},
+      {"RegLoadKeyW", (void*)&trt_RegLoadKeyW},
+      {"LookupPrivilegeValueA", (void*)&trt_LookupPrivilegeValueA},
+      {"LsaNtStatusToWinError", (void*)&trt_LsaNtStatusToWinError},
+      {"IsValidSid", (void*)&trt_IsValidSid},
+      {"GetLengthSid", (void*)&trt_GetLengthSid},
+      {"EqualSid", (void*)&trt_EqualSid},
+      {"AllocateAndInitializeSid", (void*)&trt_AllocateAndInitializeSid},
+      {"FreeSid", (void*)&trt_FreeSid},
+      {"CheckTokenMembership", (void*)&trt_CheckTokenMembership},
   };
-  trt_module_register("advapi32.dll", TRT_ROUTE_BUILTIN, k_advapi32_fns,
-                       (int)(sizeof(k_advapi32_fns) / sizeof(k_advapi32_fns[0])));
+  const int n_adv = (int)(sizeof(k_advapi32_fns) / sizeof(k_advapi32_fns[0]));
+  trt_module_register("advapi32.dll", TRT_ROUTE_BUILTIN, k_advapi32_fns, n_adv);
+  trt_module_register("api-ms-win-core-registry-l1-1-0.dll", TRT_ROUTE_BUILTIN,
+                      k_advapi32_fns, n_adv);
+  trt_module_register("api-ms-win-core-registry-l1-1-1.dll", TRT_ROUTE_BUILTIN,
+                      k_advapi32_fns, n_adv);
+  trt_module_register("api-ms-win-core-registry-l2-1-0.dll", TRT_ROUTE_BUILTIN,
+                      k_advapi32_fns, n_adv);
   return 0;
 }
 

@@ -83,20 +83,37 @@ int stub_count_for(const char* dll) {
 void stub_reset() { g_stub_count = 0; }
 
 struct extent { void* base; size_t len; };
-extent g_extents[256];
+extent g_extents[65536];
 int g_extent_count = 0;
 
 void* linux_alloc(size_t bytes, u64 preferred_base) {
+  if (preferred_base) {
+    const uintptr_t want = (uintptr_t)preferred_base;
+    const uintptr_t want_end = want + bytes;
+    int active = 0;
+    for (int i = 0; i < g_extent_count; ++i) {
+      if (!g_extents[i].base) continue;
+      ++active;
+      const uintptr_t b = (uintptr_t)g_extents[i].base;
+      const uintptr_t e = b + g_extents[i].len;
+      if (want < e && b < want_end) return nullptr;
+    }
+    if (active >= 65536) return nullptr;
+  }
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
                  bytes, PROT_READ | PROT_WRITE,
                  preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
                                 : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;
-  if (g_extent_count < 256) {
-    g_extents[g_extent_count].base = p;
-    g_extents[g_extent_count].len = bytes;
-    ++g_extent_count;
+  int slot = -1;
+  for (int i = 0; i < g_extent_count; ++i) {
+    if (!g_extents[i].base) { slot = i; break; }
+  }
+  if (slot < 0 && g_extent_count < 65536) slot = g_extent_count++;
+  if (slot >= 0) {
+    g_extents[slot].base = p;
+    g_extents[slot].len = bytes;
   }
   return p;
 }
@@ -486,6 +503,21 @@ struct dry_result {
   char first_gap[224];
 };
 
+void append_csv(char* dst, size_t cap, const char* item) {
+  if (!dst || !item || cap == 0) return;
+  size_t len = strlen(dst);
+  if (len + 1 >= cap) return;
+  if (len > 0) {
+    dst[len++] = ',';
+    dst[len] = 0;
+  }
+  size_t ilen = strlen(item);
+  size_t room = cap - 1 - len;
+  if (ilen > room) ilen = room;
+  memcpy(dst + len, item, ilen);
+  dst[len + ilen] = 0;
+}
+
 // dry-run one import descriptor's thunks (file offsets, not RVAs)
 void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
                 u32 nsec, const char* dll_name, u64 int_off, u64 iat_off,
@@ -510,8 +542,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
         char one[160];
         snprintf(one, sizeof(one), "%s!<bad hint/name rva>", dll_name);
         if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
-        if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
-        strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+        append_csv(out->unresolved, sizeof(out->unresolved), one);
         continue;
       }
       sym_name = (const char*)(file + hn_off + 2);
@@ -519,8 +550,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
         char one[160];
         snprintf(one, sizeof(one), "%s!<unterminated symbol>", dll_name);
         if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
-        if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
-        strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+        append_csv(out->unresolved, sizeof(out->unresolved), one);
         continue;
       }
     }
@@ -562,8 +592,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
       else snprintf(one, sizeof(one), "%s!#%u", dll_name, (unsigned)ordinal);
       if (!out->first_gap[0]) snprintf(out->first_gap, sizeof(out->first_gap), "%s", one);
-      if (out->unresolved[0]) strncat(out->unresolved, ",", sizeof(out->unresolved) - 1);
-      strncat(out->unresolved, one, sizeof(out->unresolved) - strlen(out->unresolved) - 1);
+      append_csv(out->unresolved, sizeof(out->unresolved), one);
     }
   }
 }
@@ -765,8 +794,7 @@ int run_corpus(int argc, char** argv) {
               const char* sym = (const char*)(img->base + thunk + 2);
               snprintf(one, sizeof(one), "%.*s", 120, sym);
             }
-            if (unresolved[0]) strncat(unresolved, ",", sizeof(unresolved) - 1);
-            strncat(unresolved, one, sizeof(unresolved) - strlen(unresolved) - 1);
+            append_csv(unresolved, sizeof(unresolved), one);
             ++n_unresolved;
           }
         }

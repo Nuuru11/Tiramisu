@@ -27,7 +27,7 @@ __declspec(dllimport) HRESULT GSTD D3D11CreateDevice(
     UINT SDKVersion, ID3D11Device **ppDevice, D3D_FEATURE_LEVEL *pFeatureLevel,
     ID3D11DeviceContext **ppImmediateContext);
 
-__declspec(dllimport) HRESULT GSTD CreateDXGIFactory2(REFIID riid, void **ppFactory);
+extern "C" __declspec(dllimport) HRESULT GSTD CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory);
 
 static float g_color[4] = {0.1f, 0.2f, 0.3f, 1.0f};
 
@@ -46,7 +46,7 @@ unsigned int GSTD d3d_boot(unsigned long long a, unsigned long long b,
   if (!dev || !ctx) return bits;
 
   IDXGIFactory2 *factory = nullptr;
-  hr = CreateDXGIFactory2(__uuidof(IDXGIFactory2), (void **)&factory);
+  hr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2), (void **)&factory);
   bits |= (hr == S_OK && factory != nullptr) ? 0x2u : 0u;
   if (!factory) return bits;
 

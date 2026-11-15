@@ -4,13 +4,30 @@
 #include "pe_exports.h"
 #include "thunk.h"
 
+#include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
+#if defined(_WIN32)
+#  include <intrin.h>
+#endif
+
+// Escaped-guest-exception landing pad (Linux harness only): the innermost
+// active host→guest call boundary. trt_call_guest_img arms it before calling
+// in; the terminal EH path longjmps here when a guest C++ exception escapes
+// the guest images (UnityPlayer native wrapper-catch emulation).
+// Per-thread: each worker thread arms its own pad around its guest call.
+thread_local eh_escape_state g_eh_escape = {0, {}};
+// Per-thread host→guest call nesting depth (trt_call_guest_img/trt_call_guest).
+// EH resume records are tagged with it; records retire when the call that
+// created them returns (a record can only be consumed by walks running inside
+// that same guest call).
+thread_local unsigned g_guest_call_depth = 0;
 
 namespace {
 
-#define TRT_MAX_GUEST_IMAGES 64
+#define TRT_MAX_GUEST_IMAGES 256
 #define TRT_HANDLE_TAG 0x4D000000u
 
 struct guest_image {
@@ -18,14 +35,26 @@ struct guest_image {
   char path[512];     // host path it came from
   trt_image* img;
   void* handle;
+  bool is_dll;
+  bool entry_called;
+  bool thread_calls_disabled;
 };
 
 guest_image g_images[TRT_MAX_GUEST_IMAGES];
 int g_image_count = 0;
+std::mutex g_img_mu;
 
 const trt_backend* g_be = nullptr;
 trt_resolver g_rs;
 char g_search_dir[512] = "";
+char g_set_dll_dir[512] = "";
+struct extra_dll_dir {
+  char path[512];
+  bool used;
+};
+extra_dll_dir g_extra_dll_dirs[32] = {};
+char g_load_dir_stack[16][512] = {};
+int g_load_dir_depth = 0;
 int g_load_depth = 0;
 // Load-only mode (corpus dry-run): map + bind + seal guest DLLs but do NOT
 // run their TLS callbacks or DllMain — the corpus test proves the load
@@ -37,6 +66,16 @@ char lower_of(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : 
 bool ieq(const char* a, const char* b) {
   while (*a && *b) {
     if (lower_of(*a) != lower_of(*b)) return false;
+    ++a; ++b;
+  }
+  return *a == *b;
+}
+
+bool path_ieq(const char* a, const char* b) {
+  while (*a && *b) {
+    char ca = (*a == '\\') ? '/' : lower_of(*a);
+    char cb = (*b == '\\') ? '/' : lower_of(*b);
+    if (ca != cb) return false;
     ++a; ++b;
   }
   return *a == *b;
@@ -62,6 +101,74 @@ u8* read_whole_file(const char* path, size_t* size) {
   return buf;
 }
 
+bool has_dot_in_base(const char* s) {
+  const char* b = base_name(s);
+  return strchr(b, '.') != nullptr;
+}
+
+bool ends_with_dot(const char* s) {
+  size_t n = strlen(s);
+  return n > 0 && s[n - 1] == '.';
+}
+
+bool probe_file_exists(const char* path) {
+  if (!path || !path[0]) return false;
+  FILE* f = fopen(path, "rb");
+  if (!f) return false;
+  fclose(f);
+  return true;
+}
+
+bool join_dir_and_name(const char* dir, const char* rel, char* out, size_t cap) {
+  if (!dir || !dir[0] || !rel || !rel[0] || cap < 4) return false;
+  size_t dl = strlen(dir);
+  while (dl > 0 && (dir[dl - 1] == '/' || dir[dl - 1] == '\\')) --dl;
+  if (dl == 0) return false;
+  char clean_rel[512];
+  size_t rl = 0;
+  for (; rel[rl] && rl + 1 < sizeof(clean_rel); ++rl) {
+    clean_rel[rl] = (rel[rl] == '\\') ? '/' : rel[rl];
+  }
+  clean_rel[rl] = 0;
+  const int w = snprintf(out, cap, "%.*s/%s", (int)dl, dir, clean_rel);
+  return w > 0 && (size_t)w < cap;
+}
+
+bool probe_dll_in_dir(const char* dir, const char* rel_or_name,
+                      char* out, size_t cap) {
+  if (!join_dir_and_name(dir, rel_or_name, out, cap)) return false;
+  if (probe_file_exists(out)) return true;
+  if (!has_dot_in_base(rel_or_name) && !ends_with_dot(rel_or_name)) {
+    char with_ext[1030];
+    const int n = snprintf(with_ext, sizeof(with_ext), "%s.dll", out);
+    if (n > 0 && (size_t)n < cap && probe_file_exists(with_ext)) {
+      memcpy(out, with_ext, (size_t)n + 1);
+      return true;
+    }
+  }
+  return false;
+}
+
+struct LoadDirGuard {
+  bool pushed = false;
+  explicit LoadDirGuard(const char* host_path) {
+    if (!host_path || g_load_dir_depth >= 16) return;
+    const char* s1 = strrchr(host_path, '/');
+    const char* s2 = strrchr(host_path, '\\');
+    const char* sep = (s1 && s2) ? (s1 > s2 ? s1 : s2) : (s1 ? s1 : s2);
+    if (!sep || sep == host_path) return;
+    size_t len = (size_t)(sep - host_path);
+    if (len >= sizeof(g_load_dir_stack[0])) return;
+    memcpy(g_load_dir_stack[g_load_dir_depth], host_path, len);
+    g_load_dir_stack[g_load_dir_depth][len] = 0;
+    ++g_load_dir_depth;
+    pushed = true;
+  }
+  ~LoadDirGuard() {
+    if (pushed && g_load_dir_depth > 0) --g_load_dir_depth;
+  }
+};
+
 } // namespace
 
 extern "C" {
@@ -73,8 +180,66 @@ extern "C" {
 void trt_runtime_init(const trt_backend* be, const char* search_dir) {
   g_be = be;
   if (search_dir) snprintf(g_search_dir, sizeof(g_search_dir), "%s", search_dir);
+  else g_search_dir[0] = 0;
+  g_set_dll_dir[0] = 0;
+  memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
+  g_load_dir_depth = 0;
   g_rs.user = nullptr;
   g_rs.resolve = &trt_resolve_full;
+}
+
+void trt_runtime_set_dll_dir(const char* host_dir) {
+  if (!host_dir || !host_dir[0]) {
+    g_set_dll_dir[0] = 0;
+    return;
+  }
+  snprintf(g_set_dll_dir, sizeof(g_set_dll_dir), "%s", host_dir);
+}
+
+int trt_runtime_add_dll_dir(const char* host_dir) {
+  if (!host_dir || !host_dir[0]) return -1;
+  for (int i = 0; i < 32; ++i) {
+    if (!g_extra_dll_dirs[i].used) {
+      snprintf(g_extra_dll_dirs[i].path, sizeof(g_extra_dll_dirs[i].path), "%s",
+               host_dir);
+      g_extra_dll_dirs[i].used = true;
+      return i;
+    }
+  }
+  return -1;
+}
+
+int trt_runtime_remove_dll_dir(int slot) {
+  if (slot < 0 || slot >= 32 || !g_extra_dll_dirs[slot].used) return 0;
+  g_extra_dll_dirs[slot].used = false;
+  g_extra_dll_dirs[slot].path[0] = 0;
+  return 1;
+}
+
+int trt_runtime_find_dll(const char* name_or_rel, char* out, size_t cap) {
+  if (!name_or_rel || !name_or_rel[0] || !out || cap == 0) return -1;
+  // 1. Directory of the DLL(s) currently being loaded (top down): handles
+  //    plugins importing sibling plugins in Plugins/x86_64 or PySide6/.
+  for (int i = g_load_dir_depth - 1; i >= 0; --i) {
+    if (probe_dll_in_dir(g_load_dir_stack[i], name_or_rel, out, cap)) return 0;
+  }
+  // 2. Game / application root directory
+  if (g_search_dir[0] && probe_dll_in_dir(g_search_dir, name_or_rel, out, cap)) {
+    return 0;
+  }
+  // 3. SetDllDirectoryW path
+  if (g_set_dll_dir[0] &&
+      probe_dll_in_dir(g_set_dll_dir, name_or_rel, out, cap)) {
+    return 0;
+  }
+  // 4. AddDllDirectory entries
+  for (int i = 31; i >= 0; --i) {
+    if (g_extra_dll_dirs[i].used &&
+        probe_dll_in_dir(g_extra_dll_dirs[i].path, name_or_rel, out, cap)) {
+      return 0;
+    }
+  }
+  return -1;
 }
 
 const trt_backend* trt_runtime_backend(void) { return g_be; }
@@ -92,6 +257,13 @@ trt_image* trt_images_find(const char* name) {
   const char* base = base_name(name);
   for (int i = 0; i < g_image_count; ++i)
     if (ieq(g_images[i].name, base)) return g_images[i].img;
+  if (!has_dot_in_base(base) && !ends_with_dot(base)) {
+    char with_ext[128];
+    if (snprintf(with_ext, sizeof(with_ext), "%s.dll", base) < (int)sizeof(with_ext)) {
+      for (int i = 0; i < g_image_count; ++i)
+        if (ieq(g_images[i].name, with_ext)) return g_images[i].img;
+    }
+  }
   return nullptr;
 }
 
@@ -113,7 +285,9 @@ trt_image* trt_images_first(void) {
 }
 
 void trt_images_register_main(trt_image* img, const char* guest_name) {
-  if (!img || g_image_count >= TRT_MAX_GUEST_IMAGES) return;
+  if (!img) return;
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  if (g_image_count >= TRT_MAX_GUEST_IMAGES) return;
   const char* base = base_name(guest_name ? guest_name : "main.exe");
   guest_image& g = g_images[g_image_count];
   memset(&g, 0, sizeof(g));
@@ -164,43 +338,72 @@ const char* trt_images_name(void* handle) {
 
 // ---- synthetic system-module handles (STAGE 7, OrTMM) ---------------------
 // LoadLibraryW("kernel32.dll") / GetModuleHandleW("api-ms-win-core-...") on
-// modules the runtime implements but that exist as no host file. The handle
-// is a TRT_HANDLE_TAG-tagged value registered in a small side table so
-// GetProcAddress can route back to the module table and psapi can list it.
-#define TRT_MAX_SYNTH_MODULES 32
+// modules the runtime implements but that exist as no host file. Each synthetic
+// module carries a real minimal PE32+ header in readable memory so HMODULE
+// returned to guest CRT/engine PE-header walkers (such as Godot's
+// dinput8.dll import walk or Unity's MZ check) never faults.
+#define TRT_MAX_SYNTH_MODULES 128
 struct synth_module {
+  alignas(16) u8 pe_hdr[512];
   char name[64];
-  void* handle;
 };
 synth_module g_synth[TRT_MAX_SYNTH_MODULES];
 int g_synth_count = 0;
+
+static void write_u16_le(u8* p, u16 v) {
+  p[0] = (u8)(v & 0xFFu);
+  p[1] = (u8)((v >> 8) & 0xFFu);
+}
+
+static void write_u32_le(u8* p, u32 v) {
+  p[0] = (u8)(v & 0xFFu);
+  p[1] = (u8)((v >> 8) & 0xFFu);
+  p[2] = (u8)((v >> 16) & 0xFFu);
+  p[3] = (u8)((v >> 24) & 0xFFu);
+}
+
+static void init_minimal_pe_header(u8* hdr) {
+  memset(hdr, 0, 512);
+  hdr[0] = 'M'; hdr[1] = 'Z';
+  write_u32_le(hdr + 0x3c, 0x80u);       // e_lfanew -> 0x80
+  hdr[0x80] = 'P'; hdr[0x81] = 'E';
+  write_u16_le(hdr + 0x84, 0x8664u);     // IMAGE_FILE_MACHINE_AMD64
+  write_u16_le(hdr + 0x86, 0);           // NumberOfSections = 0
+  write_u16_le(hdr + 0x94, 0x00F0u);     // SizeOfOptionalHeader = 240
+  write_u16_le(hdr + 0x96, 0x2022u);     // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DLL
+  write_u16_le(hdr + 0x98, 0x020Bu);     // PE32+ Magic
+  write_u32_le(hdr + 0xD0, 0x1000u);     // SizeOfImage
+  write_u32_le(hdr + 0xD4, 0x0200u);     // SizeOfHeaders
+  write_u32_le(hdr + 0x104, 16u);        // NumberOfRvaAndSizes
+}
 
 void* trt_images_synthetic_handle(const char* module_name) {
   if (!module_name || !module_name[0]) return nullptr;
   // stable: same name -> same handle for the process lifetime
   for (int i = 0; i < g_synth_count; ++i)
-    if (ieq(g_synth[i].name, module_name)) return g_synth[i].handle;
+    if (ieq(g_synth[i].name, module_name)) return (void*)&g_synth[i].pe_hdr[0];
   if (g_synth_count >= TRT_MAX_SYNTH_MODULES) return nullptr;
   synth_module& s = g_synth[g_synth_count];
   memset(&s, 0, sizeof(s));
+  init_minimal_pe_header(s.pe_hdr);
   snprintf(s.name, sizeof(s.name), "%s", module_name);
-  s.handle = (void*)(uintptr_t)(TRT_HANDLE_TAG |
-                               (u64)(0x1000 + g_synth_count));
   ++g_synth_count;
-  return s.handle;
+  return (void*)&s.pe_hdr[0];
 }
 
 int trt_images_is_synthetic(void* handle) {
-  if (!handle) return 0;
-  const u64 v = (u64)(uintptr_t)handle;
-  if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return 0;
-  const int idx = (int)(v & 0xFFFFu) - 0x1000;
-  return idx >= 0 && idx < g_synth_count;
+  if (!handle || g_synth_count <= 0) return 0;
+  const uintptr_t p = (uintptr_t)handle;
+  const uintptr_t b = (uintptr_t)&g_synth[0];
+  const uintptr_t e = (uintptr_t)&g_synth[g_synth_count];
+  if (p < b || p >= e) return 0;
+  return ((p - b) % sizeof(synth_module)) == 0 ? 1 : 0;
 }
 
 const char* trt_images_synth_name(void* handle) {
   if (!trt_images_is_synthetic(handle)) return nullptr;
-  const int idx = (int)(((u64)(uintptr_t)handle) & 0xFFFFu) - 0x1000;
+  const int idx = (int)(((uintptr_t)handle - (uintptr_t)&g_synth[0]) /
+                        sizeof(synth_module));
   return g_synth[idx].name;
 }
 
@@ -208,19 +411,23 @@ const char* trt_images_synth_name(void* handle) {
 // resolver: guest images first, then the module table
 // ---------------------------------------------------------------------------
 
+static bool is_forced_builtin_module(const char* name) {
+  const char* base = base_name(name);
+  return ieq(base, "steam_api64.dll") ||
+         ieq(base, "steam_api.dll");
+}
+
 // Try to load a DLL the game ships with us (from the game's directory).
 static trt_image* try_load_sibling(const char* module) {
-  if (!g_be || !g_search_dir[0] || g_load_depth > 8) return nullptr;
+  if (!g_be || g_load_depth > 8) return nullptr;
+  if (is_forced_builtin_module(module)) return nullptr;
   const char* base = base_name(module);
   char host[1024];
-  snprintf(host, sizeof(host), "%s/%s", g_search_dir, base);
-  FILE* probe = fopen(host, "rb");
-  if (!probe) return nullptr;
-  fclose(probe);
+  if (trt_runtime_find_dll(base, host, sizeof(host)) != 0) return nullptr;
   char line[320];
-  snprintf(line, sizeof(line), "trt: loading guest DLL %s", base);
+  snprintf(line, sizeof(line), "trt: loading guest DLL %s", base_name(host));
   trt_core_log(line);
-  return trt_load_pe(host, base, 1);
+  return trt_load_pe(host, base_name(host), 1);
 }
 
 void* trt_resolve_full(void* user, const char* module, const char* symbol,
@@ -260,9 +467,15 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   // exe's index slot would end up pointing at the FIRST block while later
   // callbacks write later blocks. The load is the same file: skip the
   // callback/entry re-run, return the already-mapped image.
+  const char* req_base = base_name(guest_name ? guest_name : host_path);
+  char req_with_ext[128] = "";
+  if (!has_dot_in_base(req_base) && !ends_with_dot(req_base)) {
+    snprintf(req_with_ext, sizeof(req_with_ext), "%s.dll", req_base);
+  }
   for (int i = 0; i < g_image_count; ++i)
-    if (strcmp(g_images[i].path, host_path) == 0 ||
-        strcmp(g_images[i].name, base_name(guest_name ? guest_name : host_path)) == 0) {
+    if (path_ieq(g_images[i].path, host_path) ||
+        ieq(g_images[i].name, req_base) ||
+        (req_with_ext[0] && ieq(g_images[i].name, req_with_ext))) {
       char line[320];
       snprintf(line, sizeof(line), "trt: load_pe %s -> already mapped (slot %d), re-entry guard",
                g_images[i].name, i);
@@ -278,6 +491,7 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
+  LoadDirGuard load_dir_guard(host_path);
   trt_image* img = nullptr;
   ++g_load_depth;
   const int rc = trt_map_pe(g_be, &g_rs, file, size, &img);
@@ -295,15 +509,21 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
   // register BEFORE the entry runs: the DLL may load another DLL that
   // imports back into this one
   const char* base = base_name(guest_name ? guest_name : host_path);
-  if (g_image_count < TRT_MAX_GUEST_IMAGES) {
-    guest_image& g = g_images[g_image_count];
-    memset(&g, 0, sizeof(g));
-    snprintf(g.name, sizeof(g.name), "%s", base);
-    snprintf(g.path, sizeof(g.path), "%s", host_path);
-    g.img = img;
-    // STAGE 7: HMODULE == image base (see trt_images_register_main)
-    g.handle = (void*)(uintptr_t)img->base;
-    ++g_image_count;
+  int slot = -1;
+  {
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    if (g_image_count < TRT_MAX_GUEST_IMAGES) {
+      slot = g_image_count;
+      guest_image& g = g_images[slot];
+      memset(&g, 0, sizeof(g));
+      snprintf(g.name, sizeof(g.name), "%s", base);
+      snprintf(g.path, sizeof(g.path), "%s", host_path);
+      g.img = img;
+      // STAGE 7: HMODULE == image base (see trt_images_register_main)
+      g.handle = (void*)(uintptr_t)img->base;
+      g.is_dll = true;
+      ++g_image_count;
+    }
   }
 
   if (trt_seal_image(g_be, img) != TRT_OK) {
@@ -332,30 +552,136 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     snprintf(line, sizeof(line), "trt: %s entry returned 0x%llx", base,
              (unsigned long long)rc_entry);
     trt_core_log(line);
+    if (rc_entry != 0 && slot >= 0) {
+      std::lock_guard<std::mutex> lk(g_img_mu);
+      if (slot < g_image_count && g_images[slot].img == img) {
+        g_images[slot].entry_called = true;
+      }
+    }
   }
   return img;
+}
+
+int trt_images_disable_thread_calls(void* handle) {
+  if (!handle) return 0;
+  if (trt_images_is_synthetic(handle)) return 1;
+  const u64 hv = (u64)(uintptr_t)handle;
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  for (int i = 0; i < g_image_count; ++i) {
+    if (g_images[i].handle == handle ||
+        (g_images[i].img && (u64)(uintptr_t)g_images[i].img->base == hv)) {
+      g_images[i].thread_calls_disabled = true;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+void trt_images_notify_thread(int reason) {
+  if (!g_run_image_code) return;
+  if (reason != 2 && reason != 3) return;
+  struct notify_entry {
+    trt_image* img;
+    void* handle;
+    bool call_entry;
+  };
+  notify_entry snap[TRT_MAX_GUEST_IMAGES];
+  int snap_count = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_img_mu);
+    snap_count = g_image_count;
+    for (int i = 0; i < snap_count; ++i) {
+      const guest_image& g = g_images[i];
+      snap[i].img = g.img;
+      snap[i].handle = g.handle;
+      snap[i].call_entry = g.is_dll && g.entry_called &&
+                           !g.thread_calls_disabled &&
+                           g.img && g.img->entry_rva != 0;
+    }
+  }
+  if (reason == 2) {
+    for (int i = 0; i < snap_count; ++i) {
+      trt_image* img = snap[i].img;
+      if (!img) continue;
+      for (int t = 0; t < img->tls_callback_count; ++t) {
+        trt_call_guest_img(img->base + img->tls_callback_rvas[t], img,
+                           (u64)(uintptr_t)img->base, 2, 0, 0);
+      }
+      if (snap[i].call_entry) {
+        trt_call_guest_img(img->base + img->entry_rva, img,
+                           (u64)(uintptr_t)snap[i].handle, 2, 0, 0);
+      }
+    }
+  } else {
+    for (int i = snap_count - 1; i >= 0; --i) {
+      trt_image* img = snap[i].img;
+      if (!img) continue;
+      if (snap[i].call_entry) {
+        trt_call_guest_img(img->base + img->entry_rva, img,
+                           (u64)(uintptr_t)snap[i].handle, 3, 0, 0);
+      }
+      for (int t = 0; t < img->tls_callback_count; ++t) {
+        trt_call_guest_img(img->base + img->tls_callback_rvas[t], img,
+                           (u64)(uintptr_t)img->base, 3, 0, 0);
+      }
+    }
+  }
 }
 
 // Load-only mode toggle: 0 = map/bind/seal without running TLS callbacks or
 // DllMain (corpus dry-run), 1 (default) = full boot semantics.
 void trt_set_image_code_run(int enable) { g_run_image_code = enable ? 1 : 0; }
 
-void trt_images_reset(void) { g_image_count = 0; }
+void trt_images_reset(void) {
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  g_image_count = 0;
+  g_set_dll_dir[0] = 0;
+  memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
+  g_load_dir_depth = 0;
+}
 
 // ---------------------------------------------------------------------------
 // calling guest code from host code
 // ---------------------------------------------------------------------------
 
 u64 trt_call_guest(void* fn, u64 a, u64 b, u64 c, u64 d) {
-  return trt_call_guest_img(fn, nullptr, a, b, c, d);
+  ++g_guest_call_depth;
+  const u64 r = trt_call_guest_img(fn, nullptr, a, b, c, d);
+  --g_guest_call_depth;
+  return r;
 }
 
 u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
   if (!fn) return 0;
 #if defined(_WIN32)
-  // the host IS Win64: the guest ABI is the host ABI
-  using guest_fn = u64 (*)(u64, u64, u64, u64);
+  // the host IS Win64: the guest ABI is the host ABI, except gs:[0x58]
+  // (ThreadLocalStoragePointer) must point to THIS OS thread's guest .tls
+  // array with host's own _tls_index preserved inside the reserved host prefix.
   (void)img;
+  void** guest_tls = trt_guest_tls_array();
+  struct Gs58Guard {
+    u64 saved;
+    bool active;
+    static inline volatile u64* teb_tls_slot() {
+      // NT_TIB64.Self at gs:[0x30] holds the flat linear address of the TEB;
+      // writing TEB+0x58 updates gs:[0x58] without relying on __writegsqword
+      // lowering under clang-cl MSVC ABI.
+      return (volatile u64*)((u8*)(uintptr_t)__readgsqword(0x30) + 0x58);
+    }
+    explicit Gs58Guard(void** gtls) : saved(0), active(false) {
+      if (!gtls) return;
+      saved = __readgsqword(0x58);
+      if (saved != (u64)(uintptr_t)gtls) {
+        trt_guest_tls_bind_host_slot((void**)(uintptr_t)saved, gtls);
+        *teb_tls_slot() = (u64)(uintptr_t)gtls;
+        active = true;
+      }
+    }
+    ~Gs58Guard() {
+      if (active) *teb_tls_slot() = saved;
+    }
+  } gs58_guard(guest_tls);
+  using guest_fn = u64 (*)(u64, u64, u64, u64);
   return ((guest_fn)fn)(a, b, c, d);
 #else
   // Linux test harness: the host is SysV, the guest is Win64. Marshal
@@ -376,11 +702,49 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
   //    first makes every address stale (the guest then gets garbage).
   u64 args[4] = {a, b, c, d};
   u64 ret = 0;
+  ++g_guest_call_depth;
+  // Linux EH boundary: a C++ exception escaping the guest must not unwind
+  // host ELF frames (the host personality cannot walk Win64 frames and a
+  // forced-unwind would run guest destructors twice). setjmp BEFORE the call;
+  // when an escaped exception longjmps here, the call reports a synthetic
+  // error return instead of unwinding into the host. The pad must be armed
+  // with a setjmp-local copy of the jmp_buf: setjmp may leave the buffer
+  // incomplete until it returns (measured raccoin-ehfix14: arming with the
+  // buffer itself and longjmping before setjmp filled it = SIGSEGV).
+  jmp_buf eh_jb;
+  const unsigned char eh_prev_active = g_eh_escape.active;
+  jmp_buf eh_prev_jb;
+  if (eh_prev_active) memcpy(eh_prev_jb, g_eh_escape.jb, sizeof(jmp_buf));
+  if (setjmp(eh_jb) == 0) {
+    g_eh_escape.active = 1;
+    memcpy(g_eh_escape.jb, eh_jb, sizeof(jmp_buf));
+  } else {
+    // Escaped C++ exception (UnityPlayer native wrapper-catch emulation):
+    // the guest caller sees a synthetic error return instead of a host
+    // unwind. Every swallow is logged by the terminal path before jumping.
+    g_eh_escape.active = eh_prev_active;
+    if (eh_prev_active) memcpy(g_eh_escape.jb, eh_prev_jb, sizeof(jmp_buf));
+    extern void trt_eh_retire_resume_records(unsigned depth);
+    trt_eh_retire_resume_records(g_guest_call_depth);
+    --g_guest_call_depth;
+    return 0;
+  }
   // STAGE 7: if the image has a guest TEB (TLS directory), point the guest
   // gs base at it for the duration of the call and restore the host gs
   // base after (the host is libc/glibc: its gs base is the thread pointer
   // and MUST come back). r11 is caller-saved in Win64, so it also carries
   // the saved host gs base across the guest call.
+  //
+  // STAGE 7 (third, onefile-child measured): that r11 carrier was WRONG.
+  // r11 is VOLATILE in Win64: guest code legally clobbers it (OrTMM.exe
+  // __chkstk even does `xor %r11,%r11` at 0x14000c8dd), so the restore
+  // `wrgsbase %r11` wrote 0 back into gs. The guest kept running on gs
+  // base 0 until the next TEB read, `mov %gs:0x10,%r11` in the SAME
+  // __chkstk, faulted at address 0x10 inside the onefile child right
+  // after python313.dll's DllMain returned (gdb-measured live: gs == 0 at
+  // RIP 0x14000c8ec). The host gs base now travels in a stack slot at
+  // rsp+40 relative to the call rsp: 8 bytes ABOVE the 32-byte shadow
+  // space, memory that no Win64-conforming callee writes.
   //
   // STAGE 7 (second): the harness rsp is NOT guaranteed 16-aligned at this
   // asm. Win64 requires rsp % 16 == 0 AT the call instruction; a skewed
@@ -389,16 +753,8 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
   // CRT startup -> QueryPerformanceCounter -> movaps %xmm15,0xa0(%rsp)
   // SIGSEGV). Align rsp, save the original on the guest stack, restore
   // with popq %rsp (pop into rsp: the +8 is overridden by the popped value).
-  const u64 teb =
-      (img && img->guest_teb) ? (u64)(uintptr_t)img->guest_teb
-      // STAGE 7: even images without their own TLS directory get the shared
-      // process TEB when it exists — UnityPlayer reads gs:[0x10] for stack
-      // checks inside UnityMain2 even when the exe has no TLS dir.
-      // STAGE 7 (second): acquire it LAZILY — a child that maps ONE image
-      // with no TLS dir (dstorage.dll in the corpus DLL phase) previously
-      // got teb=0 and ran on the HOST gs base; the MSVC stack probe
-      // `mov r11,gs:0x10` faulted at address 0x10 (measured live).
-          : (u64)(uintptr_t)trt_guest_teb_acquire(nullptr);
+  (void)img;
+  const u64 teb = (u64)(uintptr_t)trt_guest_teb_acquire(nullptr);
   asm volatile(
       "movq %[a0], %%rcx\n"
       "movq %[a1], %%rdx\n"
@@ -414,10 +770,12 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
       "call *%[fn]\n"
       "jmp 8f\n"
       "7:\n"
-      "rdgsbase %%r11\n"          // save the host thread pointer
+      "rdgsbase %%r11\n"          // save the host thread pointer...
+      "movq %%r11, 40(%%rsp)\n"   // ...into the slot above the shadow space
       "wrgsbase %[teb]\n"         // guest gs -> the TEB
       "call *%[fn]\n"
-      "wrgsbase %%r11\n"          // host gs back (any guest clobber dies here)
+      "movq 40(%%rsp), %%r11\n"   // host gs back (stack, not a volatile reg)
+      "wrgsbase %%r11\n"
       "8:\n"
       "addq $32, %%rsp\n"
       "popq %%rsp\n"              // exact original rsp back
@@ -425,6 +783,13 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
       : [a0] "m"(args[0]), [a1] "m"(args[1]), [a2] "m"(args[2]),
         [a3] "m"(args[3]), [fn] "r"(fn), [teb] "r"(teb)
       : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
+  g_eh_escape.active = eh_prev_active;
+  if (eh_prev_active) memcpy(g_eh_escape.jb, eh_prev_jb, sizeof(jmp_buf));
+  // Retire this call's EH resume records (and any deeper-nested leftovers):
+  // walks can only consume records inside the guest call that created them.
+  extern void trt_eh_retire_resume_records(unsigned depth);
+  trt_eh_retire_resume_records(g_guest_call_depth);
+  --g_guest_call_depth;
   return ret;
 #endif
 }

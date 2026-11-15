@@ -70,17 +70,22 @@ struct d8_obj {
   u32 refcount;
   u32 handle;  // GPU object this wraps (0 = pure interface)
   u32 kind;    // 1 tex, 2 vb, 3 ib, 4 surface, 5 shader
+  u32 w, h, fmt;
 };
 d8_obj g_pool[k_max_objs];
 u32 g_pool_count = 0;
 
-d8_obj* obj_alloc(const void** vtbl, u32 handle, u32 kind) {
+d8_obj* obj_alloc(const void** vtbl, u32 handle, u32 kind,
+                  u32 w = 0, u32 h = 0, u32 fmt = 0) {
   if (g_pool_count >= k_max_objs) return nullptr;
   d8_obj* o = &g_pool[g_pool_count++];
   o->vtbl = vtbl;
   o->refcount = 1;
   o->handle = handle;
   o->kind = kind;
+  o->w = w;
+  o->h = h;
+  o->fmt = fmt;
   return o;
 }
 void obj_free(d8_obj* o) {
@@ -287,7 +292,7 @@ int TRT_GUEST_ABI dev8_CreateTexture(void*, u32 w, u32 h, u32 levels, u32 usage,
                       ? hooks().create_tex(w, h, levels ? levels : 1, usage,
                                            fmt, hooks().user)
                       : gpu_alloc(1, w, h, levels ? levels : 1, 0, usage, fmt);
-  d8_obj* o = obj_alloc(g_tex8_vtbl, hnd, 1);
+  d8_obj* o = obj_alloc(g_tex8_vtbl, hnd, 1, w, h, fmt);
   if (!o) return D3DERR_NOTIMPL_;
   *out = o;
   char line[160];
@@ -328,7 +333,7 @@ int TRT_GUEST_ABI dev8_CreateRenderTarget(void*, u32 w, u32 h, u32 fmt,
                       ? hooks().create_tex(w, h, 1, 1 /*RENDERTARGET*/, fmt,
                                            hooks().user)
                       : gpu_alloc(4, w, h, 1, 0, 1, fmt);
-  d8_obj* o = obj_alloc(g_surf8_vtbl, hnd, 4);
+  d8_obj* o = obj_alloc(g_surf8_vtbl, hnd, 4, w, h, fmt);
   if (!o) return D3DERR_NOTIMPL_;
   *out = o;
   return D3D_OK_;
@@ -343,7 +348,7 @@ int TRT_GUEST_ABI dev8_CreateImageSurface(void*, u32 w, u32 h, u32 fmt,
   const u32 hnd = hooks().create_tex
                       ? hooks().create_tex(w, h, 1, 0, fmt, hooks().user)
                       : gpu_alloc(1, w, h, 1, 0, 0, fmt);
-  d8_obj* o = obj_alloc(g_surf8_vtbl, hnd, 4);
+  d8_obj* o = obj_alloc(g_surf8_vtbl, hnd, 4, w, h, fmt);
   if (!o) return D3DERR_NOTIMPL_;
   *out = o;
   char line[96];
@@ -506,23 +511,34 @@ int TRT_GUEST_ABI dev8_DrawIndexedPrimitive(void*, u32 prim, u32 min_idx,
   return D3D_OK_;
 }
 int TRT_GUEST_ABI dev8_DrawPrimitiveUP(void*, u32 prim, u32 count,
-                                       const void*, u32) {
+                                       const void* verts, u32 stride) {
   g_last_draw = (prim << 16) | (count & 0xFFFF);
-  if (hooks().draw)
+  if (hooks().draw_up && verts && stride) {
+    hooks().draw_up(prim, verts, stride, trt_d3d9_prim_verts(prim, count),
+                    nullptr, 0, 0, count, hooks().user);
+  } else if (hooks().draw) {
     hooks().draw(prim, 0, 0, 0, 0, count * 3 + 1, 0, count, hooks().user);
+  }
   return D3D_OK_;
 }
 int TRT_GUEST_ABI dev8_DrawIndexedPrimitiveUP(void*, u32 prim, u32 min_idx,
                                               u32 num_verts, u32 count,
-                                              const void*, u32, const void*,
-                                              u32) {
+                                              const void* indices, u32 idx_fmt,
+                                              const void* verts, u32 stride) {
   g_last_draw = (prim << 16) | (count & 0xFFFF);
-  if (hooks().draw)
+  if (hooks().draw_up && verts && stride) {
+    const u32 icount = indices ? trt_d3d9_prim_verts(prim, count) : 0;
+    hooks().draw_up(prim, verts, stride, min_idx + num_verts, indices,
+                    idx_fmt == 102 ? 1u : 0u, icount, count, hooks().user);
+  } else if (hooks().draw) {
     hooks().draw(prim, 0, 0, 0, min_idx, num_verts, 0, count, hooks().user);
+  }
   return D3D_OK_;
 }
-int TRT_GUEST_ABI dev8_SetStreamSource(void*, u32 stream, void* vb, u32) {
+int TRT_GUEST_ABI dev8_SetStreamSource(void*, u32 stream, void* vb, u32 stride) {
   if (stream == 0) g_stream_vb = vb ? ((d8_obj*)vb)->handle : 0;
+  if (hooks().set_stream_stride)
+    hooks().set_stream_stride(stream, stride, hooks().user);
   return D3D_OK_;
 }
 int TRT_GUEST_ABI dev8_SetIndices(void*, void* ib, u32 base_vertex) {
@@ -566,15 +582,17 @@ int TRT_GUEST_ABI tex8_LockRect(void* self, u32 level, void* lr, const void*,
                                 u32) {
   if (!lr) return D3DERR_INVALIDCALL_;
   // D3DLOCKED_RECT { INT Pitch; void* pBits; } — x64: pBits at +8
+  d8_obj* o = (d8_obj*)self;
   i32* p = (i32*)lr;
   void* bits = nullptr;
   if (hooks().lock) {
-    bits = hooks().lock(((d8_obj*)self)->handle, level, 0, 0, hooks().user);
+    bits = hooks().lock(o->handle, level, 0, 0, hooks().user);
     if (!bits) bits = g_scratch;
   } else {
     bits = g_scratch;
   }
-  p[0] = 4096;
+  const u32 mw = (o->w && level < 32) ? ((o->w >> level) ? (o->w >> level) : 1u) : 0u;
+  p[0] = trt_d3d9_row_pitch(mw, o->fmt);
   *(void**)(p + 2) = bits;
   return D3D_OK_;
 }

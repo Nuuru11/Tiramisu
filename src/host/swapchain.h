@@ -23,6 +23,8 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
 void swapchain_render_frame(float t);   // t in [0,1) animates the backdrop
 void* swapchain_dxgi();                 // IDXGISwapChain1* for the UI layer
 void* swapchain_d3d();                  // ID3D11Device1* for the UI layer
+void swapchain_bind_d3d9();             // bind the D3D9->D3D11 drawing backend
+void swapchain_restore_d3d11();         // rebind D3D11 CoreWindow swapchain if guest used D3D12
 void swapchain_present();
 void swapchain_shutdown();
 

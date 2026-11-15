@@ -31,8 +31,11 @@ const u8 k_guid_keyboard[16] = {0x61, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF,
 // GUID_SysMouse {6F1D2B60-D5A0-11CF-BFC7-444553540000} (in-memory GUID)
 const u8 k_guid_mouse[16] = {0x60, 0x2B, 0x1D, 0x6F, 0xA0, 0xD5, 0xCF, 0x11,
                              0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00};
+// Tiramisu Virtual Xbox Controller GUID
+const u8 k_guid_gamepad[16] = {0x54, 0x49, 0x52, 0x41, 0x4D, 0x49, 0x53, 0x55,
+                               0x50, 0x41, 0x44, 0x30, 0x00, 0x00, 0x00, 0x01};
 
-enum device_kind { DEV_KEYBOARD = 1, DEV_MOUSE = 2 };
+enum device_kind { DEV_KEYBOARD = 1, DEV_MOUSE = 2, DEV_GAMEPAD = 3 };
 
 struct dinput_device {
   const void** vtbl;
@@ -55,9 +58,27 @@ struct mouse_state {
   u8 rgbButtons[8];
 };
 
+// DIJOYSTATE (80 bytes) / DIJOYSTATE2 prefix (matches standard Win32 dinput.h layout)
+struct joy_state {
+  i32 lX;
+  i32 lY;
+  i32 lZ;
+  i32 lRx;
+  i32 lRy;
+  i32 lRz;
+  i32 rglSlider[2];
+  u32 rgdwPOV[4];
+  u8 rgbButtons[128];
+  // DIJOYSTATE2 extra fields ignored unless buffer >= 272
+  i32 lVX, lVY, lVZ, lVRx, lVRy, lVRz, rglVSlider[2];
+  i32 lAX, lAY, lAZ, lARx, lARy, lARz, rglASlider[2];
+  i32 lFX, lFY, lFZ, lFRx, lFRy, lFRz, rglFSlider[2];
+};
+
 // the objects and vtables are defined further down
 extern dinput_device g_dev_keyboard;
 extern dinput_device g_dev_mouse;
+extern dinput_device g_dev_gamepad;
 extern const void* g_di8_vtbl[11];
 extern const void* g_didev_vtbl[34];
 
@@ -88,35 +109,65 @@ int TRT_GUEST_ABI di_CreateDevice(void* self, const u8* guid, void** out_device,
     *out_device = &g_dev_mouse;
   } else if (guid && memcmp(guid, k_guid_keyboard, 16) == 0) {
     *out_device = &g_dev_keyboard;
+  } else if (guid && memcmp(guid, k_guid_gamepad, 16) == 0) {
+    *out_device = &g_dev_gamepad;
   } else {
-    // an unknown GUID: hand back the mouse (the game usually asks for a
-    // keyboard or a mouse by GUID, but some ask for a "system" device)
     *out_device = &g_dev_mouse;
   }
   return DI_OK_;
 }
 
+static void fill_di_dev_inst(void* dst_raw, const u8* guid, u32 dev_type,
+                             const char* name) {
+  // DIDEVICEINSTANCEW (1080 bytes) or DIDEVICEINSTANCEA (580 bytes)
+  u8* d = (u8*)dst_raw;
+  u32 sz = *(u32*)d;
+  if (sz < 40u) return;
+  memset(d + 4, 0, sz - 4);
+  memcpy(d + 4, guid, 16);
+  memcpy(d + 20, guid, 16);
+  memcpy(d + 36, &dev_type, 4);
+  if (sz >= 1080u) {
+    u16* inst = (u16*)(d + 40);
+    u16* prod = (u16*)(d + 560);
+    for (int i = 0; name[i] && i < 259; ++i) {
+      inst[i] = (u16)(u8)name[i];
+      prod[i] = (u16)(u8)name[i];
+    }
+  } else if (sz >= 580u) {
+    char* inst = (char*)(d + 40);
+    char* prod = (char*)(d + 300);
+    for (int i = 0; name[i] && i < 259; ++i) {
+      inst[i] = name[i];
+      prod[i] = name[i];
+    }
+  }
+}
+
 int TRT_GUEST_ABI di_EnumDevices(void* self, u32 type, void* callback,
                                  void* context, u32 flags) {
-  (void)self; (void)type; (void)flags;
+  (void)self; (void)flags;
   if (!callback) return E_NOTIMPL_;
-  // the callback gets (LPDIDEVICEINSTANCEW, LPVOID)
-  using cb_t = int (*)(const void*, void*);
-  // a minimal DIDEVICEINSTANCEW: guid, ts, name, ...
-  struct {
-    u32 size;
-    u32 guid;
-    u32 product;
-    u32 reserved;
-    u16 align;
-    u16 version;
-    u8 ts[16];
-    u16 name[32];
-    u16 instance[32];
-  } dev;
-  memset(&dev, 0, sizeof(dev));
-  dev.size = sizeof(dev);
-  ((cb_t)callback)(&dev, context);
+  using cb_t = int (TRT_GUEST_ABI*)(const void*, void*);
+  u8 buf[1120];
+  auto emit = [&](const u8* guid, u32 dev_type, const char* name) -> int {
+    memset(buf, 0, sizeof(buf));
+    u32 sz = 1080u;
+    memcpy(buf, &sz, 4);
+    fill_di_dev_inst(buf, guid, dev_type, name);
+    return ((cb_t)callback)(buf, context);
+  };
+  // DI8DEVCLASS_ALL (0), DI8DEVCLASS_DEVICE (1), DI8DEVCLASS_POINTER (2),
+  // DI8DEVCLASS_KEYBOARD (3), DI8DEVCLASS_GAMECTRL (4)
+  if (type == 0 || type == 2) {
+    if (emit(k_guid_mouse, 0x00000212u, "Tiramisu Mouse") == 0) return DI_OK_;
+  }
+  if (type == 0 || type == 3) {
+    if (emit(k_guid_keyboard, 0x00000413u, "Tiramisu Keyboard") == 0) return DI_OK_;
+  }
+  if ((type == 0 || type == 4) && trt_pad_connected(0)) {
+    emit(k_guid_gamepad, 0x00010215u, "Xbox Controller (Tiramisu)");
+  }
   return DI_OK_;
 }
 
@@ -142,17 +193,65 @@ int TRT_GUEST_ABI di_ConfigureDevices(void*, void*, void*, u32, void*) {
 int TRT_GUEST_ABI dd_GetCapabilities(void* self, void* caps) {
   dinput_device* d = (dinput_device*)self;
   if (!caps) return E_NOTIMPL_;
-  memset(caps, 0, 220);
-  u8* c = (u8*)caps;
-  c[0] = 220;  // dwSize
-  // dwDevType (offset 4): keyboard = 4, mouse = 3
-  c[4] = (u8)(d->kind == DEV_KEYBOARD ? 4 : 3);
+  memset(caps, 0, 44);
+  u32* c = (u32*)caps;
+  c[0] = 44u;  // dwSize = sizeof(DIDEVCAPS)
+  c[1] = 0x00000001u;  // DIDC_ATTACHED
+  if (d->kind == DEV_KEYBOARD) {
+    c[2] = 0x00000413u;
+    c[4] = 256u;  // dwButtons
+  } else if (d->kind == DEV_MOUSE) {
+    c[2] = 0x00000212u;
+    c[3] = 3u;    // dwAxes
+    c[4] = 5u;    // dwButtons
+  } else {
+    c[2] = 0x00010215u;  // DI8DEVTYPE_GAMEPAD
+    c[3] = 6u;    // dwAxes
+    c[4] = 14u;   // dwButtons
+    c[5] = 1u;    // dwPOVs
+  }
   return DI_OK_;
 }
-int TRT_GUEST_ABI dd_EnumObjects(void*, void*, void*, u32) { return E_NOTIMPL_; }
-int TRT_GUEST_ABI dd_GetProperty(void*, const u8*, void*) { return E_NOTIMPL_; }
+int TRT_GUEST_ABI dd_EnumObjects(void* self, void* cb, void* ctx, u32 flags) {
+  (void)flags;
+  if (!cb) return E_NOTIMPL_;
+  dinput_device* d = (dinput_device*)self;
+  if (d->kind != DEV_GAMEPAD) return DI_OK_;
+  using enum_obj_cb = int (TRT_GUEST_ABI*)(const void*, void*);
+  u8 doi[580];
+  auto emit_obj = [&](u32 type_ofs, u32 flags_obj, const char* name) -> int {
+    memset(doi, 0, sizeof(doi));
+    u32 sz = 580u;  // sizeof(DIDEVICEOBJECTINSTANCEW)
+    memcpy(doi + 0, &sz, 4);
+    memcpy(doi + 20, &type_ofs, 4);  // dwOfs
+    memcpy(doi + 24, &flags_obj, 4); // dwType
+    u16* wn = (u16*)(doi + 32);
+    for (int i = 0; name[i] && i < 259; ++i) wn[i] = (u16)(u8)name[i];
+    return ((enum_obj_cb)cb)(doi, ctx);
+  };
+  emit_obj(0, 0x00000003u /*DIDFT_AXIS*/, "X Axis");
+  emit_obj(4, 0x00000103u, "Y Axis");
+  emit_obj(8, 0x00000203u, "Z Axis");
+  emit_obj(12, 0x00000303u, "Rx Axis");
+  emit_obj(16, 0x00000403u, "Ry Axis");
+  emit_obj(20, 0x00000503u, "Rz Axis");
+  emit_obj(32, 0x00000010u /*DIDFT_POV*/, "POV Hat");
+  return DI_OK_;
+}
+int TRT_GUEST_ABI dd_GetProperty(void*, const u8*, void* prop) {
+  if (prop) {
+    // DIPROPRANGE: header(16) + lMin, lMax -> standard 0..65535
+    u32 sz = *(u32*)prop;
+    if (sz == 24u) {
+      i32* r = (i32*)((u8*)prop + 16);
+      r[0] = 0;
+      r[1] = 65535;
+    }
+  }
+  return DI_OK_;
+}
 int TRT_GUEST_ABI dd_SetProperty(void*, const u8*, const void*) {
-  return E_NOTIMPL_;
+  return DI_OK_;
 }
 int TRT_GUEST_ABI dd_Acquire(void* self) {
   ((dinput_device*)self)->acquired = 1;
@@ -161,6 +260,14 @@ int TRT_GUEST_ABI dd_Acquire(void* self) {
 int TRT_GUEST_ABI dd_Unacquire(void* self) {
   ((dinput_device*)self)->acquired = 0;
   return DI_OK_;
+}
+
+static i32 norm_di_axis(i16 v, bool invert) {
+  i32 s = invert ? -(i32)v : (i32)v;
+  i32 out = s + 32768;
+  if (out < 0) out = 0;
+  if (out > 65535) out = 65535;
+  return out;
 }
 
 // GetDeviceState: the state a game actually polls
@@ -179,7 +286,43 @@ int TRT_GUEST_ABI dd_GetDeviceState(void* self, u32 size, void* buf) {
     if (trt_mouse_button(0)) st.rgbButtons[0] = 0x80;
     if (trt_mouse_button(1)) st.rgbButtons[1] = 0x80;
     if (trt_mouse_button(2)) st.rgbButtons[2] = 0x80;
+    if (trt_mouse_button(3)) st.rgbButtons[3] = 0x80;
+    if (trt_mouse_button(4)) st.rgbButtons[4] = 0x80;
     memcpy(buf, &st, sizeof(st));
+    return DI_OK_;
+  }
+  if (d->kind == DEV_GAMEPAD) {
+    if (size < 80u) return E_NOTIMPL_;  // sizeof(DIJOYSTATE) == 80
+    joy_state j{};
+    j.lX = norm_di_axis(trt_pad_thumb_n(0, 0), false);
+    j.lY = norm_di_axis(trt_pad_thumb_n(0, 1), true);
+    j.lZ = 32768 + ((i32)trt_pad_trigger_n(0, 0) - (i32)trt_pad_trigger_n(0, 1)) * 128;
+    if (j.lZ < 0) j.lZ = 0;
+    if (j.lZ > 65535) j.lZ = 65535;
+    j.lRx = norm_di_axis(trt_pad_thumb_n(0, 2), false);
+    j.lRy = norm_di_axis(trt_pad_thumb_n(0, 3), true);
+    j.lRz = (i32)trt_pad_trigger_n(0, 1) * 257;
+    const bool du = trt_pad_down_n(0, 0x0001u);
+    const bool dd = trt_pad_down_n(0, 0x0002u);
+    const bool dl = trt_pad_down_n(0, 0x0004u);
+    const bool dr = trt_pad_down_n(0, 0x0008u);
+    u32 pov = 0xFFFFFFFFu;
+    if (du && dr) pov = 4500u; else if (dr && dd) pov = 13500u;
+    else if (dd && dl) pov = 22500u; else if (dl && du) pov = 31500u;
+    else if (du) pov = 0u; else if (dr) pov = 9000u;
+    else if (dd) pov = 18000u; else if (dl) pov = 27000u;
+    j.rgdwPOV[0] = pov;
+    j.rgdwPOV[1] = j.rgdwPOV[2] = j.rgdwPOV[3] = 0xFFFFFFFFu;
+    static const u16 k_xi_btns[10] = {
+        0x1000u, 0x2000u, 0x4000u, 0x8000u, 0x0100u,
+        0x0200u, 0x0020u, 0x0010u, 0x0040u, 0x0080u};
+    for (int i = 0; i < 10; ++i) {
+      if (trt_pad_down_n(0, k_xi_btns[i])) j.rgbButtons[i] = 0x80u;
+    }
+    if (trt_pad_trigger_n(0, 0) > 64) j.rgbButtons[10] = 0x80u;
+    if (trt_pad_trigger_n(0, 1) > 64) j.rgbButtons[11] = 0x80u;
+    const size_t copy_sz = size < sizeof(j) ? (size_t)size : sizeof(j);
+    memcpy(buf, &j, copy_sz);
     return DI_OK_;
   }
   // keyboard: one byte per virtual key, 0x80 = down
@@ -202,7 +345,24 @@ int TRT_GUEST_ABI dd_SetCooperativeLevel(void* self, void* hwnd, u32 level) {
   return DI_OK_;
 }
 int TRT_GUEST_ABI dd_GetObjectInfo(void*, void*, u32, u32) { return E_NOTIMPL_; }
-int TRT_GUEST_ABI dd_GetDeviceInfo(void*, void*) { return E_NOTIMPL_; }
+int TRT_GUEST_ABI dd_GetDeviceInfo(void* self, void* info) {
+  auto* d = (dinput_device*)self;
+  if (!d || !info) return E_NOTIMPL_;
+  const u8* guid = k_guid_mouse;
+  u32 dev_type = 0x00000212u;
+  const char* name = "Tiramisu Mouse";
+  if (d->kind == DEV_KEYBOARD) {
+    guid = k_guid_keyboard;
+    dev_type = 0x00000413u;
+    name = "Tiramisu Keyboard";
+  } else if (d->kind == DEV_GAMEPAD) {
+    guid = k_guid_gamepad;
+    dev_type = 0x00010215u;
+    name = "Tiramisu Xbox Gamepad";
+  }
+  fill_di_dev_inst(info, guid, dev_type, name);
+  return DI_OK_;
+}
 int TRT_GUEST_ABI dd_RunControlPanel(void*, void*, u32) { return E_NOTIMPL_; }
 int TRT_GUEST_ABI dd_Initialize(void*, void*, u32, const u8*) { return DI_OK_; }
 int TRT_GUEST_ABI dd_CreateEffect(void*, const u8*, const void*, void** out,
@@ -216,7 +376,14 @@ int TRT_GUEST_ABI dd_GetForceFeedbackState(void*, u32* state) {
   if (state) *state = 0;  // no force feedback on the console
   return DI_OK_;
 }
-int TRT_GUEST_ABI dd_SendForceFeedbackCommand(void*, u32) { return DI_OK_; }
+int TRT_GUEST_ABI dd_SendForceFeedbackCommand(void* self, u32 cmd) {
+  auto* d = (dinput_device*)self;
+  // DISFFC_RESET (1) or DISFFC_STOPALL (2)
+  if (d && d->kind == DEV_GAMEPAD && (cmd == 1u || cmd == 2u)) {
+    trt_pad_set_vibration(0, 0, 0);
+  }
+  return DI_OK_;
+}
 int TRT_GUEST_ABI dd_EnumCreatedEffectObjects(void*, void*, void*, u32) {
   return E_NOTIMPL_;
 }
@@ -243,6 +410,7 @@ int TRT_GUEST_ABI dd_GetImageInfo(void*, void*) { return E_NOTIMPL_; }
 dinput_object g_di8_obj = {g_di8_vtbl, 1};
 dinput_device g_dev_keyboard = {g_didev_vtbl, 1, DEV_KEYBOARD, 0, 0};
 dinput_device g_dev_mouse = {g_didev_vtbl, 1, DEV_MOUSE, 0, 0};
+dinput_device g_dev_gamepad = {g_didev_vtbl, 1, DEV_GAMEPAD, 0, 0};
 
 // the objects and the vtables are defined below
 extern const void* g_di8_vtbl[11];

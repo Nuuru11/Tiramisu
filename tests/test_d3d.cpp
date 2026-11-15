@@ -37,6 +37,12 @@ int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u32 driver_ty
                                         void* swapchain_desc, void** out_swapchain,
                                         void** out_device, u32* out_level,
                                         void** out_context);
+int TRT_GUEST_ABI trt_CreateDXGIFactory2(u32 flags, void* riid, void** out_factory);
+int TRT_GUEST_ABI trt_DXGIGetDebugInterface1(u32 flags, void* riid, void** out_debug);
+int TRT_GUEST_ABI trt_D3D11On12CreateDevice(
+    void* device, u32 flags, const void* levels, u32 level_count,
+    void* const* queues, u32 num_queues, u32 node_mask,
+    void** out_device, void** out_ctx, u32* out_level);
 }
 
 // ---------------- mmap backend ----------------
@@ -424,6 +430,48 @@ int main(int argc, char** argv) {
                                          nullptr, &sc, &dev, &got_level, &ctx);
   CHECK(hr == 0 && got_level == 0x9100,
         "AndSwapChain {9_1} -> S_OK, FL 0x9100");
+
+  // ---- DXGI 3-arg CreateDXGIFactory2, 4-arg CreateSwapChain, UWP safety ----
+  void* dxgi_fac = nullptr;
+  hr = trt_CreateDXGIFactory2(0, nullptr, &dxgi_fac);
+  CHECK(hr == 0 && dxgi_fac != nullptr,
+        "CreateDXGIFactory2(0, riid, out) 3-arg returns wrapped factory");
+  if (dxgi_fac) {
+    const void** fvt = *(const void***)dxgi_fac;
+    using enum_t = int (TRT_GUEST_ABI *)(void*, u32, void**);
+    using csc_t = int (TRT_GUEST_ABI *)(void*, void*, void*, void**);
+    void* adp = nullptr;
+    const int ehr = ((enum_t)fvt[7])(dxgi_fac, 0, &adp);
+    CHECK(ehr == 0 && adp == g_fake_adapter && g_enumerated_adapter == 2,
+          "IDXGIFactory::EnumAdapters delegates via TRT_GUEST_ABI");
+
+    void* proxy_sc = nullptr;
+    const int schr = ((csc_t)fvt[10])(dxgi_fac, dev, nullptr, &proxy_sc);
+    CHECK(schr == 0 && proxy_sc != nullptr,
+          "IDXGIFactory::CreateSwapChain (4-arg) yields proxy swapchain");
+    if (proxy_sc) {
+      const void** svt = *(const void***)proxy_sc;
+      using fs_t = int (TRT_GUEST_ABI *)(void*, int, void*);
+      using rb_t = int (TRT_GUEST_ABI *)(void*, u32, u32, u32, u32, u32);
+      using pres_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
+      CHECK(((fs_t)svt[10])(proxy_sc, 1, nullptr) == 0,
+            "IDXGISwapChain::SetFullscreenState(TRUE) -> S_OK on CoreWindow");
+      CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, 87, 0) == 0,
+            "IDXGISwapChain::ResizeBuffers handles fixed CoreWindow cleanly");
+      CHECK(((pres_t)svt[8])(proxy_sc, 0, 0x200u) == 0 && g_presented == 2,
+            "IDXGISwapChain::Present strips ALLOW_TEARING and forwards");
+    }
+  }
+
+  void* dbg_if = (void*)(uintptr_t)0xdeadbeef;
+  CHECK((u32)trt_DXGIGetDebugInterface1(0, nullptr, &dbg_if) == 0x80004002u &&
+            dbg_if == nullptr,
+        "DXGIGetDebugInterface1 -> E_NOINTERFACE fail-visible");
+  void* on12_dev = (void*)(uintptr_t)0xdeadbeef;
+  CHECK((u32)trt_D3D11On12CreateDevice(nullptr, 0, nullptr, 0, nullptr, 0, 0,
+                                       &on12_dev, nullptr, nullptr) == 0x80004001u &&
+            on12_dev == nullptr,
+        "D3D11On12CreateDevice -> E_NOTIMPL fail-visible");
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;

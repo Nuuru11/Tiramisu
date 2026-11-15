@@ -2,6 +2,7 @@
 #include "input.h"
 
 #include <math.h>
+#include <mutex>
 #include <string.h>
 
 namespace {
@@ -16,28 +17,36 @@ struct input_state {
 
   // mouse
   int mx, my;                // virtual-cursor position
+  int last_abs_x, last_abs_y;
+  bool abs_init;             // independent of SetCursorPos to prevent spikes
   int dx_acc, dy_acc;        // accumulated deltas since last consume
   bool mouse_init;           // first absolute event positions, no delta
   int rdx, rdy;              // last REAL mouse deltas (MouseDevice)
-  u8  mbtn;                  // bit0 L, bit1 R, bit2 M
+  u8  mbtn;                  // bit0 L, bit1 R, bit2 M, bit3 X1, bit4 X2
   i32 wheel_acc;
 
-  // pad (XINPUT_GAMEPAD_* bits mirrored directly)
-  i16 lx, ly, rx, ry;
-  u16 pbtn;
-  u8  tl, tr;
+  // pads 0..3 (XINPUT_GAMEPAD_* bits mirrored directly)
+  struct pad_slot {
+    bool connected;
+    bool conn_known;
+    i16 lx, ly, rx, ry;
+    u16 pbtn;
+    u8  tl, tr;
+    u16 vib_left, vib_right;
+    bool vib_dirty;
+  } pads[4];
 
   // display
   int dw, dh;
 
-  // cursor visibility hook (ShowCursor)
-  bool cursor_visible;
+  // cursor visibility hook (ShowCursor: default visible => hidden=false)
+  bool cursor_hidden;
 
-  // raw input: registered devices + a small ring of RAWINPUT blobs
+  // raw input: registered devices + a ring of RAWINPUT blobs
   u8  raw_mouse_reg, raw_kbd_reg;
   u64 raw_next_handle;
   struct raw_rec { u64 handle; u8 blob[48]; u32 size; };
-  raw_rec raw_ring[16];
+  raw_rec raw_ring[64];
   int raw_ring_len;
 
   // message ring
@@ -46,9 +55,9 @@ struct input_state {
 };
 
 input_state g;
-// guest runs on the host thread; sockets on worker threads never touch this.
-// The lock guards the ring only (host UI thread may post while guest runs).
-struct guard { guard() { /* single-consumer: no lock needed on this path */ } };
+// Host CoreWindow UI thread produces input while the guest runs on a worker
+// thread; recursive_mutex keeps internal trt_msg_post / trt_raw_post safe.
+std::recursive_mutex g_input_mu;
 
 int clamp_axis(i16 v) {  // deadzone ~8k, normalize to [-1,1]
   const int dz = 8000;
@@ -62,8 +71,63 @@ int clamp_axis(i16 v) {  // deadzone ~8k, normalize to [-1,1]
 extern "C" {
 
 // raw-blob feeders (defined below; used by the host-feed section)
-void trt_raw_post_mouse(i32 dx, i32 dy, u8 mbtn, i32 wheel);
-void trt_raw_post_key(u16 vk, u16 scan, bool down);
+void trt_raw_post_mouse(i32 dx, i32 dy, u16 btn_flags, u16 btn_data);
+void trt_raw_post_key(u16 vk, u16 scan, bool down, u8 extended);
+
+static bool g_clip_active = false;
+static i32 g_clip_l = 0, g_clip_t = 0, g_clip_r = 0, g_clip_b = 0;
+
+static u64 compute_mk_wparam() {
+  u64 mk = 0;
+  if (g.mbtn & (1u << 0)) mk |= 0x0001u;  // MK_LBUTTON
+  if (g.mbtn & (1u << 1)) mk |= 0x0002u;  // MK_RBUTTON
+  if (g.down[0x10])       mk |= 0x0004u;  // MK_SHIFT
+  if (g.down[0x11])       mk |= 0x0008u;  // MK_CONTROL
+  if (g.mbtn & (1u << 2)) mk |= 0x0010u;  // MK_MBUTTON
+  if (g.mbtn & (1u << 3)) mk |= 0x0020u;  // MK_XBUTTON1
+  if (g.mbtn & (1u << 4)) mk |= 0x0040u;  // MK_XBUTTON2
+  return mk;
+}
+
+static void clamp_to_clip(int* x, int* y) {
+  if (!g_clip_active || g_clip_r <= g_clip_l || g_clip_b <= g_clip_t) return;
+  if (*x < g_clip_l) *x = g_clip_l;
+  else if (*x >= g_clip_r) *x = g_clip_r - 1;
+  if (*y < g_clip_t) *y = g_clip_t;
+  else if (*y >= g_clip_b) *y = g_clip_b - 1;
+}
+
+static void sync_modifier_vk(u16 vk, bool down, u16 scan, u8 extended) {
+  static constexpr struct { u16 gen; u16 left; u16 right; } kMods[] = {
+      {0x10 /*VK_SHIFT*/,   0xA0 /*VK_LSHIFT*/,   0xA1 /*VK_RSHIFT*/},
+      {0x11 /*VK_CONTROL*/, 0xA2 /*VK_LCONTROL*/, 0xA3 /*VK_RCONTROL*/},
+      {0x12 /*VK_MENU*/,    0xA4 /*VK_LMENU*/,    0xA5 /*VK_RMENU*/},
+  };
+  for (const auto& m : kMods) {
+    if (vk == m.left || vk == m.right) {
+      const bool any = (g.down[m.left] || g.down[m.right]);
+      if (any && !g.down[m.gen]) g.pressed[m.gen] = 1;
+      g.down[m.gen] = any ? 1 : 0;
+      return;
+    }
+    if (vk == m.gen) {
+      const bool is_right = (vk == 0x10) ? (scan == 0x36 || extended != 0)
+                                         : (extended != 0);
+      const u16 side = is_right ? m.right : m.left;
+      if (down) {
+        if (!g.down[side]) g.pressed[side] = 1;
+        g.down[side] = 1;
+      } else {
+        g.down[side] = 0;
+        if (!scan && !extended) {
+          g.down[m.left] = 0;
+          g.down[m.right] = 0;
+        }
+      }
+      return;
+    }
+  }
+}
 
 // ---------------- host feed ----------------
 void trt_input_key_event(u16 vk, bool down) {
@@ -72,92 +136,235 @@ void trt_input_key_event(u16 vk, bool down) {
 
 void trt_input_key_event2(u16 vk, bool down, u16 scan, u8 extended, u8 repeat) {
   if (vk >= TRT_MAX_VK) return;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (down && !g.down[vk]) g.pressed[vk] = 1;
   g.down[vk] = down ? 1 : 0;
   if (scan) g.scan[vk] = scan;
+  sync_modifier_vk(vk, down, scan, extended);
   if (down) g.last_vk = vk;
   // WM_KEYDOWN/UP lParam: repeat(16) scan(9)<<16 ext(1)<<24 prev(1)<<30 up(1)<<31
   const u32 lp = (u32)repeat | ((u32)scan << 16) | ((u32)(extended != 0) << 24) |
                  (down ? 0 : 0xC0000000u);
   trt_msg_post(down ? 0x0100 /*WM_KEYDOWN*/ : 0x0101 /*WM_KEYUP*/, vk,
                (i64)(u64)lp);
-  if (g.raw_kbd_reg) trt_raw_post_key(vk, scan, down);
+  if (g.raw_kbd_reg) trt_raw_post_key(vk, scan, down, extended);
 }
 
 void trt_input_char_event(u32 ch) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (g.char_count < 64) g.char_q[g.char_count++] = ch;
   trt_msg_post(0x0102 /*WM_CHAR*/, ch, 0);
 }
 
 void trt_input_mouse_delta_raw(i32 dx, i32 dy) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   // real mouse (MouseDevice.MouseMoved): feed BOTH consumers
   g.rdx = dx;
   g.rdy = dy;
   g.dx_acc += dx;  // GetCursorPos-based games + WM_MOUSEMOVE keep working
   g.dy_acc += dy;
+  const int w = g.dw ? g.dw : 1920;
+  const int h = g.dh ? g.dh : 1080;
+  g.mx += dx;
+  g.my += dy;
+  if (g_clip_active && g_clip_r > g_clip_l && g_clip_b > g_clip_t) {
+    clamp_to_clip(&g.mx, &g.my);
+  } else {
+    if (g.mx < 0) g.mx = 0; else if (g.mx >= w) g.mx = w - 1;
+    if (g.my < 0) g.my = 0; else if (g.my >= h) g.my = h - 1;
+  }
+  g.mouse_init = true;
   // synthesize WM_INPUT for engines on the Raw Input path
-  if (g.raw_mouse_reg) trt_raw_post_mouse(dx, dy, g.mbtn, g.wheel_acc);
+  if (g.raw_mouse_reg) trt_raw_post_mouse(dx, dy, 0, 0);
 }
 
-void trt_input_mouse_move(int x, int y) {
+void trt_input_set_cursor_pos(int x, int y) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  clamp_to_clip(&x, &y);
+  g.mx = x;
+  g.my = y;
+  g.mouse_init = true;
+}
+
+void trt_input_set_clip_rect(bool enable, i32 left, i32 top, i32 right, i32 bottom) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (!enable || right <= left || bottom <= top) {
+    g_clip_active = false;
+    g_clip_l = g_clip_t = g_clip_r = g_clip_b = 0;
+    return;
+  }
+  g_clip_active = true;
+  g_clip_l = left;
+  g_clip_t = top;
+  g_clip_r = right;
+  g_clip_b = bottom;
+  clamp_to_clip(&g.mx, &g.my);
+}
+
+bool trt_input_get_clip_rect(i32* left, i32* top, i32* right, i32* bottom) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (!g_clip_active) return false;
+  if (left) *left = g_clip_l;
+  if (top) *top = g_clip_t;
+  if (right) *right = g_clip_r;
+  if (bottom) *bottom = g_clip_b;
+  return true;
+}
+
+void trt_input_pointer_move(int x, int y, bool suppress_delta) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (!suppress_delta) {
+    if (!g.abs_init) {
+      g.abs_init = true;
+      g.last_abs_x = x;
+      g.last_abs_y = y;
+    } else {
+      g.dx_acc += x - g.last_abs_x;
+      g.dy_acc += y - g.last_abs_y;
+      g.last_abs_x = x;
+      g.last_abs_y = y;
+    }
+  } else {
+    g.last_abs_x = x;
+    g.last_abs_y = y;
+    g.abs_init = true;
+  }
+  // When hardware raw mouse stream owns a locked/hidden cursor, do not snap
+  // g.mx/g.my back to screen-edge PointerMoved coordinates.
+  if (suppress_delta && (g_clip_active || g.cursor_hidden)) {
+    return;
+  }
+  clamp_to_clip(&x, &y);
   if (!g.mouse_init) {
     g.mouse_init = true;
     g.mx = x;
     g.my = y;
+    if (suppress_delta) return;
+    trt_msg_post(0x0200 /*WM_MOUSEMOVE*/, compute_mk_wparam(),
+                 (i64)(((u32)y << 16) | ((u32)x & 0xFFFFu)));
     return;
   }
-  g.dx_acc += x - g.mx;
-  g.dy_acc += y - g.my;
   g.mx = x;
   g.my = y;
-  trt_msg_post(0x0200 /*WM_MOUSEMOVE*/, 0, (i64)((y << 16) | (x & 0xFFFF)));
+  trt_msg_post(0x0200 /*WM_MOUSEMOVE*/, compute_mk_wparam(),
+               (i64)(((u32)y << 16) | ((u32)x & 0xFFFFu)));
+}
+
+void trt_input_mouse_move(int x, int y) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const bool was_init = g.mouse_init;
+  trt_input_pointer_move(x, y, false);
+  (void)was_init;
 }
 
 void trt_input_mouse_button(int btn, bool down) {
-  if (btn < 0 || btn > 2) return;
-  const u8 bit = (u8)(1 << btn);
+  if (btn < 0 || btn > 4) return;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  static const u16 k_btn_vk[5] = {
+      0x01u /*VK_LBUTTON*/, 0x02u /*VK_RBUTTON*/, 0x04u /*VK_MBUTTON*/,
+      0x05u /*VK_XBUTTON1*/, 0x06u /*VK_XBUTTON2*/};
+  const u16 vk = k_btn_vk[btn];
+  if (down) {
+    if (!g.down[vk]) g.pressed[vk] = 1;
+    g.down[vk] = 1;
+  } else {
+    g.down[vk] = 0;
+  }
+  const u8 bit = (u8)(1u << btn);
   if (down) g.mbtn |= bit; else g.mbtn &= (u8)~bit;
-  const u32 msg = btn == 0 ? (down ? 0x0201 : 0x0202)
-                : btn == 1 ? (down ? 0x0204 : 0x0205)
-                           : (down ? 0x0207 : 0x0208);
-  trt_msg_post(msg, down ? 1 : 0, (i64)(((u32)g.my << 16) | ((u32)g.mx & 0xFFFF)));
+
+  const u64 mk = compute_mk_wparam();
+  const i64 lp = (i64)(((u32)g.my << 16) | ((u32)g.mx & 0xFFFFu));
+  if (btn <= 2) {
+    const u32 msg = btn == 0 ? (down ? 0x0201u : 0x0202u)
+                  : btn == 1 ? (down ? 0x0204u : 0x0205u)
+                             : (down ? 0x0207u : 0x0208u);
+    trt_msg_post(msg, mk, lp);
+  } else {
+    const u32 msg = down ? 0x020Bu /*WM_XBUTTONDOWN*/ : 0x020Cu /*WM_XBUTTONUP*/;
+    const u64 xbtn = (btn == 3) ? 1ULL : 2ULL;
+    trt_msg_post(msg, (xbtn << 16) | mk, lp);
+  }
+  if (g.raw_mouse_reg) {
+    static const u16 k_ri_down[5] = {0x0001u, 0x0004u, 0x0010u, 0x0040u, 0x0100u};
+    static const u16 k_ri_up[5]   = {0x0002u, 0x0008u, 0x0020u, 0x0080u, 0x0200u};
+    trt_raw_post_mouse(0, 0, down ? k_ri_down[btn] : k_ri_up[btn], 0);
+  }
 }
 
-void trt_input_wheel(i32 delta) { g.wheel_acc += delta; }
+void trt_input_wheel(i32 delta) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  g.wheel_acc += delta;
+  const u64 wp = ((u64)(u16)(i16)delta << 16) | compute_mk_wparam();
+  const i64 lp = (i64)(((u32)g.my << 16) | ((u32)g.mx & 0xFFFFu));
+  trt_msg_post(0x020A /*WM_MOUSEWHEEL*/, wp, lp);
+  if (g.raw_mouse_reg) {
+    trt_raw_post_mouse(0, 0, 0x0400u /*RI_MOUSE_WHEEL*/, (u16)(i16)delta);
+  }
+}
+
+void trt_input_pad_state_n(u32 index, bool connected, i16 lx, i16 ly,
+                           i16 rx, i16 ry, u16 buttons, u8 tl, u8 tr) {
+  if (index >= 4) return;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  g.pads[index].connected = connected;
+  g.pads[index].conn_known = true;
+  if (connected) {
+    g.pads[index].lx = lx; g.pads[index].ly = ly;
+    g.pads[index].rx = rx; g.pads[index].ry = ry;
+    g.pads[index].pbtn = buttons;
+    g.pads[index].tl = tl; g.pads[index].tr = tr;
+  } else {
+    g.pads[index].lx = g.pads[index].ly = 0;
+    g.pads[index].rx = g.pads[index].ry = 0;
+    g.pads[index].pbtn = 0;
+    g.pads[index].tl = g.pads[index].tr = 0;
+  }
+}
 
 void trt_input_pad_state(i16 lx, i16 ly, i16 rx, i16 ry,
                          u16 buttons, u8 tl, u8 tr) {
-  g.lx = lx; g.ly = ly; g.rx = rx; g.ry = ry;
-  g.pbtn = buttons; g.tl = tl; g.tr = tr;
+  trt_input_pad_state_n(0, true, lx, ly, rx, ry, buttons, tl, tr);
 }
 
-void trt_input_display_size(int w, int h) { g.dw = w; g.dh = h; }
+void trt_input_display_size(int w, int h) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  g.dw = w; g.dh = h;
+}
 
 void trt_input_frame_begin() {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   memset(g.pressed, 0, sizeof(g.pressed));
   g.char_count = 0;
 }
 
 // ---------------- guest read ----------------
-bool trt_key_down(u16 vk) { return vk < TRT_MAX_VK && g.down[vk] != 0; }
+bool trt_key_down(u16 vk) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return vk < TRT_MAX_VK && g.down[vk] != 0;
+}
 
 i16 trt_key_async(u16 vk) {
   if (vk >= TRT_MAX_VK) return 0;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   return (i16)((g.down[vk] ? -0x8000 : 0) | (g.pressed[vk] ? 1 : 0));
 }
 
 i16 trt_key_sync(u16 vk) {
   if (vk >= TRT_MAX_VK) return 0;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   return (i16)((g.down[vk] ? -0x8000 : 0) | (g.pressed[vk] ? 1 : 0));
 }
 
 int trt_mouse_pos(int* x, int* y) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (x) *x = g.mx;
   if (y) *y = g.my;
   return g.mbtn;
 }
 
 void trt_mouse_delta(int* dx, int* dy) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (dx) *dx = g.dx_acc;
   if (dy) *dy = g.dy_acc;
   g.dx_acc = 0;
@@ -165,56 +372,124 @@ void trt_mouse_delta(int* dx, int* dy) {
 }
 
 void trt_mouse_delta_raw(int* dx, int* dy) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (dx) *dx = g.rdx;
   if (dy) *dy = g.rdy;
 }
 
 bool trt_mouse_button(int btn) {
-  return (btn >= 0 && btn <= 2) && (g.mbtn & (1 << btn)) != 0;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return (btn >= 0 && btn <= 4) && (g.mbtn & (1u << btn)) != 0;
 }
 
 i32 trt_mouse_wheel() {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   const i32 w = g.wheel_acc;
   g.wheel_acc = 0;
   return w;
 }
 
-bool trt_pad_down(u16 bit) { return (g.pbtn & bit) != 0; }
+bool trt_pad_connected(u32 index) {
+  if (index >= 4) return false;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (index == 0 && !g.pads[0].conn_known) return true;
+  return g.pads[index].connected;
+}
+
+bool trt_pad_down_n(u32 index, u16 bit) {
+  if (index >= 4) return false;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return trt_pad_connected(index) && (g.pads[index].pbtn & bit) != 0;
+}
+
+bool trt_pad_down(u16 bit) { return trt_pad_down_n(0, bit); }
 
 float trt_pad_stick(int s) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const auto& p = g.pads[0];
   switch (s) {
-    case 0: return (float)clamp_axis(g.lx) / 100.0f;
-    case 1: return (float)clamp_axis(g.ly) / 100.0f;
-    case 2: return (float)clamp_axis(g.rx) / 100.0f;
-    case 3: return (float)clamp_axis(g.ry) / 100.0f;
+    case 0: return (float)clamp_axis(p.lx) / 100.0f;
+    case 1: return (float)clamp_axis(p.ly) / 100.0f;
+    case 2: return (float)clamp_axis(p.rx) / 100.0f;
+    case 3: return (float)clamp_axis(p.ry) / 100.0f;
   }
   return 0.0f;
 }
 
-u8 trt_pad_trigger(int t) { return t == 0 ? g.tl : g.tr; }
+i16 trt_pad_thumb_n(u32 index, int s) {
+  if (index >= 4) return 0;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const auto& p = g.pads[index];
+  switch (s) {
+    case 0: return p.lx;
+    case 1: return p.ly;
+    case 2: return p.rx;
+    case 3: return p.ry;
+  }
+  return 0;
+}
+
+i16 trt_pad_thumb(int s) { return trt_pad_thumb_n(0, s); }
+
+u8 trt_pad_trigger_n(u32 index, int t) {
+  if (index >= 4) return 0;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return t == 0 ? g.pads[index].tl : g.pads[index].tr;
+}
+
+u8 trt_pad_trigger(int t) { return trt_pad_trigger_n(0, t); }
+
+void trt_pad_set_vibration(u32 index, u16 left_motor, u16 right_motor) {
+  if (index >= 4) return;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  if (g.pads[index].vib_left != left_motor ||
+      g.pads[index].vib_right != right_motor) {
+    g.pads[index].vib_left = left_motor;
+    g.pads[index].vib_right = right_motor;
+    g.pads[index].vib_dirty = true;
+  }
+}
+
+bool trt_pad_get_vibration(u32 index, u16* left_motor, u16* right_motor) {
+  if (index >= 4) return false;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const bool dirty = g.pads[index].vib_dirty;
+  if (left_motor) *left_motor = g.pads[index].vib_left;
+  if (right_motor) *right_motor = g.pads[index].vib_right;
+  g.pads[index].vib_dirty = false;
+  return dirty;
+}
 
 int trt_display_size(int* w, int* h) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (w) *w = g.dw ? g.dw : 1920;
   if (h) *h = g.dh ? g.dh : 1080;
   return 0;
 }
 
-u16 trt_key_scan(u16 vk) { return vk < TRT_MAX_VK ? g.scan[vk] : 0; }
+u16 trt_key_scan(u16 vk) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return vk < TRT_MAX_VK ? g.scan[vk] : 0;
+}
 
-void trt_set_cursor_visible(bool v) { g.cursor_visible = v; }
+void trt_set_cursor_visible(bool v) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  g.cursor_hidden = !v;
+}
 
 // ---------------- raw input (WM_INPUT path) ----------------
 // RAWINPUT blob: RAWINPUTHEADER(24) + RAWMOUSE(24) or RAWKEYBOARD(16)
-void trt_raw_post_mouse(i32 dx, i32 dy, u8 mbtn, i32 wheel) {
-  (void)mbtn; (void)wheel;  // buttons ride the WM_ path
-  input_state::raw_rec& r =
-      g.raw_ring[g.raw_ring_len < 16 ? g.raw_ring_len++ : 15];
-  r.handle = ++g.raw_next_handle;
+void trt_raw_post_mouse(i32 dx, i32 dy, u16 btn_flags, u16 btn_data) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const u64 h = ++g.raw_next_handle;
+  input_state::raw_rec& r = g.raw_ring[(h - 1) & 63];
+  if (g.raw_ring_len < 64) ++g.raw_ring_len;
+  r.handle = h;
   r.size = 48;
   memset(r.blob, 0, sizeof(r.blob));
   const u32 type = 0;         // RIM_TYPEMOUSE
   const u32 size = 48;
-  const u64 dev = 0, wp = 0;  // hDevice, wParam RIM_INPUT
+  const u64 dev = 0x00060001ULL, wp = 0;  // hDevice, wParam RIM_INPUT
   const u16 flags = 0;        // MOUSE_MOVE_RELATIVE
   const u32 none = 0;         // ulRawButtons
   memcpy(r.blob + 0, &type, 4);
@@ -222,42 +497,59 @@ void trt_raw_post_mouse(i32 dx, i32 dy, u8 mbtn, i32 wheel) {
   memcpy(r.blob + 8, &dev, 8);
   memcpy(r.blob + 16, &wp, 8);
   memcpy(r.blob + 24, &flags, 2);
+  memcpy(r.blob + 28, &btn_flags, 2);  // usButtonFlags
+  memcpy(r.blob + 30, &btn_data, 2);   // usButtonData
   memcpy(r.blob + 32, &none, 4);
   memcpy(r.blob + 36, &dx, 4);   // lLastX
   memcpy(r.blob + 40, &dy, 4);   // lLastY
   trt_msg_post(0x00FF /*WM_INPUT*/, 0, (i64)r.handle);
 }
 
-void trt_raw_post_key(u16 vk, u16 scan, bool down) {
-  input_state::raw_rec& r =
-      g.raw_ring[g.raw_ring_len < 16 ? g.raw_ring_len++ : 15];
-  r.handle = ++g.raw_next_handle;
+void trt_raw_post_key(u16 vk, u16 scan, bool down, u8 extended) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  const u64 h = ++g.raw_next_handle;
+  input_state::raw_rec& r = g.raw_ring[(h - 1) & 63];
+  if (g.raw_ring_len < 64) ++g.raw_ring_len;
+  r.handle = h;
   r.size = 40;
   memset(r.blob, 0, sizeof(r.blob));
   const u32 type = 1;          // RIM_TYPEKEYBOARD
   const u32 size = 40;
-  const u32 msg = down ? 0x0100 : 0x0101;
+  const u64 dev = 0x00060002ULL, wp = 0;  // hDevice, wParam RIM_INPUT
+  const u16 make_code = scan ? scan : g.scan[vk < TRT_MAX_VK ? vk : 0];
+  const u16 rflags = (u16)((down ? 0u : 1u /*RI_KEY_BREAK*/) |
+                           (extended ? 2u /*RI_KEY_E0*/ : 0u));
+  const u16 reserved = 0;
+  const u16 vkey = vk;
+  const u32 msg = down ? 0x0100u : 0x0101u;
   memcpy(r.blob + 0, &type, 4);
   memcpy(r.blob + 4, &size, 4);
-  memcpy(r.blob + 24, &scan, 2);  // MakeCode
-  memcpy(r.blob + 28, &vk, 2);    // VKey
-  memcpy(r.blob + 32, &msg, 4);   // Message
+  memcpy(r.blob + 8, &dev, 8);
+  memcpy(r.blob + 16, &wp, 8);
+  memcpy(r.blob + 24, &make_code, 2);  // MakeCode
+  memcpy(r.blob + 26, &rflags, 2);     // Flags
+  memcpy(r.blob + 28, &reserved, 2);   // Reserved
+  memcpy(r.blob + 30, &vkey, 2);       // VKey
+  memcpy(r.blob + 32, &msg, 4);        // Message
   trt_msg_post(0x00FF /*WM_INPUT*/, 0, (i64)r.handle);
 }
 
 bool trt_raw_register(const void* devices, u32 count) {
   if (!devices || count == 0 || count > 8) return false;
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   // RAWINPUTDEVICE: usUsagePage(2) usUsage(2) dwFlags(4) hwndTarget(8)
   struct rid { u16 page; u16 usage; u32 flags; u64 hwnd; };
   const rid* d = (const rid*)devices;
   for (u32 i = 0; i < count; ++i) {
-    if (d[i].page == 1 && d[i].usage == 2) g.raw_mouse_reg = 1;  // mouse
-    if (d[i].page == 1 && d[i].usage == 6) g.raw_kbd_reg = 1;    // keyboard
+    const u8 reg = (d[i].flags & 0x00000001u /*RIDEV_REMOVE*/) ? 0 : 1;
+    if (d[i].page == 1 && d[i].usage == 2) g.raw_mouse_reg = reg;  // mouse
+    if (d[i].page == 1 && d[i].usage == 6) g.raw_kbd_reg = reg;    // keyboard
   }
   return true;
 }
 
 bool trt_raw_blob(u64 hraw, const u8** blob, u32* size) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   for (int i = 0; i < g.raw_ring_len; ++i)
     if (g.raw_ring[i].handle == hraw) {
       if (blob) *blob = g.raw_ring[i].blob;
@@ -272,6 +564,7 @@ unsigned long g_msg_dispatched_count = 0;  // STAGE 7 pump-dispatch counter
 unsigned trt_msg_dispatched(void);         // (definition below, in trt.h ABI)
 
 bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (g.ring_count >= TRT_MSG_RING) return false;
   const int tail = (g.ring_head + g.ring_count) % TRT_MSG_RING;
   g.ring[tail] = trt_msg{message, wparam, lparam};
@@ -280,6 +573,7 @@ bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
 }
 
 bool trt_msg_peek(trt_msg* out, bool remove) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   if (g.ring_count == 0) return false;
   if (out) *out = g.ring[g.ring_head];
   if (remove) {
@@ -290,8 +584,14 @@ bool trt_msg_peek(trt_msg* out, bool remove) {
   return true;
 }
 
-bool trt_msg_pending() { return g.ring_count > 0; }
+bool trt_msg_pending() {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return g.ring_count > 0;
+}
 
-unsigned trt_msg_dispatched(void) { return (unsigned)g_msg_dispatched_count; }
+unsigned trt_msg_dispatched(void) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return (unsigned)g_msg_dispatched_count;
+}
 
 } // extern "C"

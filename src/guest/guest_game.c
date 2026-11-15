@@ -47,14 +47,23 @@ __attribute__((dllimport)) int GSTD PeekMessageW(void* msg, void* hwnd,
                                                  u32 min, u32 max, u32 remove);
 __attribute__((dllimport)) int GSTD TranslateMessage(const void* msg);
 __attribute__((dllimport)) i64 GSTD DispatchMessageW(const void* msg);
+__attribute__((dllimport)) i64 GSTD SendMessageW(void* hwnd, u32 msg, u64 wp,
+                                                 i64 lp);
 __attribute__((dllimport)) i16 GSTD GetAsyncKeyState(int vk);
 __attribute__((dllimport)) int GSTD GetCursorPos(void* pt);
 
 static volatile u32 g_wndproc_calls = 0;
 static u32 g_last_msg = 0;
+static void* g_expected_hwnd = (void*)0;
+static u32 g_abi_ok = 0;
 
 static i64 GSTD wndproc(void* hwnd, u32 msg, u64 wp, i64 lp) {
-  (void)hwnd; (void)wp; (void)lp;
+  if (msg == 0x8007u && hwnd == g_expected_hwnd &&
+      wp == 0x1122334455667788ULL &&
+      (u64)lp == 0x99AABBCCDDEEFF01ULL) {
+    g_abi_ok = 1;
+    return (i64)0x0BADF00DDEADBEEFULL;
+  }
   g_wndproc_calls++;
   g_last_msg = msg;
   return 0;
@@ -82,6 +91,11 @@ u32 GSTD game_boot(u64 a, u64 b, u64 c) {
   const u16 atom = RegisterClassExW(&wc);
   void* hwnd = CreateWindowExW(0, cls_name, win_title, 0, 0, 0, 320, 240,
                                (void*)0, (void*)0, (void*)0, (void*)0);
+  g_expected_hwnd = hwnd;
+  const i64 sret = hwnd
+      ? SendMessageW(hwnd, 0x8007u, 0x1122334455667788ULL,
+                     (i64)0x99AABBCCDDEEFF01ULL)
+      : 0;
 
   // 2. the standard game pump (PeekMessage + Translate + Dispatch)
   MSG64 m;
@@ -137,6 +151,7 @@ u32 GSTD game_boot(u64 a, u64 b, u64 c) {
   checksum |= env_ok ? 0x400000 : 0;
   checksum |= mod_ok ? 0x800000 : 0;
   checksum |= cursor_ran ? 0x1000000 : 0;
+  checksum |= (g_abi_ok && (u64)sret == 0x0BADF00DDEADBEEFULL) ? 0x2000000 : 0;
 
   void* f = CreateFileW(
       (const u16[]){'C',':','\\','r','e','s','u','l','t','s','.','t','x','t',0},

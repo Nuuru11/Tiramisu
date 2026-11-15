@@ -10,6 +10,7 @@
 // Fail-visible rule: nothing here can "fail silently" — the worst case is
 // a FALSE from PathFileExistsW, which is the API's contract.
 #include "bridge_shlwapi.h"
+#include "bridge_ole.h"
 #include "thunk.h"
 
 #include <stdio.h>
@@ -228,6 +229,34 @@ int TRT_GUEST_ABI shw_SHDeleteKeyW(void* hkey, const u16* subkey) {
   return 1;  // ERROR_SUCCESS: the key is treated as gone
 }
 
+int TRT_GUEST_ABI shw_QISearch(void* that, const void* pqit, const void* riid,
+                               void** ppv) {
+  (void)that; (void)pqit; (void)riid;
+  if (ppv) *ppv = nullptr;
+  return (int)0x80004002u;  // E_NOINTERFACE
+}
+
+int TRT_GUEST_ABI shw_SHLoadIndirectString(const u16* src, u16* out, u32 cch,
+                                           void** reserved) {
+  (void)reserved;
+  if (!src || !out || cch == 0) return (int)0x80070057u;
+  u32 i = 0;
+  while (src[i] && i + 1 < cch) { out[i] = src[i]; ++i; }
+  out[i] = 0;
+  return src[i] ? (int)0x8007007Au : 0;
+}
+
+int TRT_GUEST_ABI shw_SHStrDupW(const u16* src, u16** dst) {
+  if (!src || !dst) return (int)0x80070057u;
+  u32 n = 0;
+  while (src[n]) ++n;
+  u16* p = (u16*)ole_CoTaskMemAlloc((u32)((n + 1) * sizeof(u16)));
+  if (!p) { *dst = nullptr; return (int)0x8007000Eu; }
+  for (u32 i = 0; i <= n; ++i) p[i] = src[i];
+  *dst = p;
+  return 0;
+}
+
 }  // namespace
 
 extern "C" {
@@ -248,6 +277,9 @@ int trt_bridge_register_shlwapi(void) {
       {"PathIsRelativeW", (void*)&shw_PathIsRelativeW},
       {"PathCanonicalizeW", (void*)&shw_PathCanonicalizeW},
       {"SHDeleteKeyW", (void*)&shw_SHDeleteKeyW},
+      {"QISearch", (void*)&shw_QISearch},
+      {"SHLoadIndirectString", (void*)&shw_SHLoadIndirectString},
+      {"SHStrDupW", (void*)&shw_SHStrDupW},
   };
   trt_module_register("shlwapi.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

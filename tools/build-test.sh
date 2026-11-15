@@ -18,6 +18,19 @@ LLVM_DLLTOOL="$LLVM_BIN/llvm-dlltool"
 [[ -x "$CLANG" ]] || { echo "ERROR: clang 19 not found" >&2; exit 1; }
 "$CLANG" --version | head -1
 
+# --- 0. Precompile src/trt/*.cpp + miniz_tinfl.c in parallel into libtrt.a ---
+objdir="$out/trt_objs"
+rm -rf "$objdir" "$out/libtrt.a"
+mkdir -p "$objdir"
+printf '%s\n' src/trt/*.cpp | xargs -P"$(nproc)" -I{} bash -c '
+  f="$1"
+  base="$(basename "$f" .cpp)"
+  clang++ -std=c++20 -O2 -Wall -fno-pie -c "$f" -o "'"$objdir"'/${base}.o"
+' _ {}
+clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
+clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
+ar rcs "$out/libtrt.a" "$objdir"/*.o
+
 # --- 1. import library for the guest (tiramisu_host.dll) ---
 rm -f "$out/tiramisu_host.lib"
 "$LLD_LINK" /lib /def:src/guest/tiramisu_host.def /out:"$out/tiramisu_host.lib" /machine:x64 /noentry
@@ -38,28 +51,15 @@ rm -f "$out/tiramisu_host.lib"
 file "$out/guest_hello.exe"
 
 # --- 3. host-side loader test on Linux ---
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_pe_loader.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_pe_loader.cpp "$out/libtrt.a" \
   -o "$out/test_pe_loader"
 
 "$out/test_pe_loader" "$out/guest_hello.exe" "$out/guest_hello_reloc.exe"
 
 # --- 4. input bridge test (user32 surface the guests consume) ---
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_input.cpp \
-  src/trt/input.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/module_table.cpp src/trt/vfs.cpp src/trt/pe_loader.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_input.cpp "$out/libtrt.a" \
   -o "$out/test_input"
 "$out/test_input"
 
@@ -73,21 +73,12 @@ rm -f "$out/user32.lib"
 "$LLD_LINK" "$out/guest_game.obj" "$out/kernel32.lib" "$out/user32.lib" \
   /NODEFAULTLIB /ENTRY:game_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_game.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_game_boot.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp \
-  src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_game_boot.cpp "$out/libtrt.a" \
   -o "$out/test_game_boot"
 "$out/test_game_boot" "$out/guest_game.exe"
 
 # --- 6. real-game load path: api-sets, delay imports, fail-visible stubs ---
-# A guest that imports contract names (api-ms-win-*), a module the console
-# does not have (advapi32) and a DELAY-loaded DLL (d3dcompiler_47).
 rm -f "$out/api-ms-win-core-synch-l1-2-0.lib"
 "$LLD_LINK" /lib /def:src/guest/api-ms-win-core-synch-l1-2-0.def \
   /out:"$out/api-ms-win-core-synch-l1-2-0.lib" /machine:x64 /noentry
@@ -108,23 +99,12 @@ rm -f "$out/delayimp.lib"
   /NODEFAULTLIB /ENTRY:real_load_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /DELAYLOAD:d3dcompiler_47.dll \
   /OUT:"$out/guest_realload.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_real_load.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_real_load.cpp "$out/libtrt.a" \
   -o "$out/test_real_load"
 "$out/test_real_load" "$out/guest_realload.exe"
 
 # --- 6b. real-game corpus load matrix (hardware-free) -----------------------
-# Only when the local corpus exists (gitignored, never in CI): builds
-# tests/test_corpus.cpp the same way and runs it over every PE under
-# corpus-local/ through tools/corpus-smoke.sh. Everywhere else the gate
-# stays green.
 if [[ -d corpus-local ]] && [[ -n "$(find corpus-local -maxdepth 2 -type f 2>/dev/null)" ]]; then
   bash tools/corpus-smoke.sh
 else
@@ -132,16 +112,17 @@ else
 fi
 
 # --- 6c. STAGE 6 run-depth: EXECUTE real DllMain code on the corpus --------
-# Same corpus-conditional as 6b: builds tests/test_corpus_run.cpp and runs
-# each corpus DLL's real entry point (Win64 ABI, fault handlers installed,
-# one attempt each). Verdicts RUN OK / RUN FAILED / SKIP(x86) — a named
-# fault is a discovery outcome and never fails the gate; a missing verdict
-# does. Without corpus-local/ the gate stays green.
 if [[ -d corpus-local ]] && [[ -n "$(find corpus-local -maxdepth 2 -type f 2>/dev/null)" ]]; then
   bash tools/corpus-run.sh
 else
   echo "SKIP corpus run-depth: corpus-local/ absent or empty"
 fi
+
+# --- 6d. disc images: ISO9660+Joliet / UDF / raw 2352 -> a mounted drive ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_iso.cpp "$out/libtrt.a" \
+  -o "$out/test_iso"
+"$out/test_iso"
 
 # --- 7. guest DLL loading: the DLLs a game ships with it ---
 cat > "$out/guestdll.def" <<'DEOF'
@@ -153,8 +134,6 @@ rm -f "$out/guestdll.lib"
 "$LLD_LINK" /lib /def:"$out/guestdll.def" /out:"$out/guestdll.lib" /machine:x64 /noentry
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
   -c src/guest/guest_dll.c -o "$out/guest_dll.obj"
-# NOTE: /def on a DLL link makes lld write an import library next to the
-# output - name it apart so it cannot clobber the one the exe links against
 "$LLD_LINK" "$out/guest_dll.obj" "$out/tiramisu_host.lib" \
   /NODEFAULTLIB /ENTRY:dll_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1B00000 /DEF:"$out/guestdll.def" \
@@ -164,21 +143,12 @@ rm -f "$out/guestdll.lib"
 "$LLD_LINK" "$out/guest_libload.obj" "$out/guestdll.lib" "$out/kernel32.lib" \
   /NODEFAULTLIB /ENTRY:libload_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_libload.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_libload.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_libload.cpp "$out/libtrt.a" \
   -o "$out/test_libload"
 "$out/test_libload" "$out/guest_libload.exe" "$out"
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
-# The guest is compiled against the REAL SDK headers (so the vtable slots are
-# the SDK's), the host's GPU is faked in the test.
 SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
 XCRT="$HOME/.cache/uwp-crossbuild/xwin/crt/include"
 if [[ -d "$SDK/um" && -d "$XCRT" ]]; then
@@ -206,16 +176,7 @@ rm -f "$out/d3d11.lib" "$out/dxgi.lib"
   /NODEFAULTLIB /ENTRY:d3d_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_d3d.exe"
 clang++ -std=c++20 -O2 -Wall -no-pie \
-  tests/test_d3d.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+  tests/test_d3d.cpp "$out/libtrt.a" \
   -o "$out/test_d3d"
 "$out/test_d3d" "$out/guest_d3d.exe"
 else
@@ -244,17 +205,8 @@ rm -f "$out/advapi32.lib"
 "$LLD_LINK" "$out/guest_reg.obj" "$out/advapi32.lib" \
   /NODEFAULTLIB /ENTRY:reg_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_reg.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_reg.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_reg.cpp "$out/libtrt.a" \
   -o "$out/test_reg"
 DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
 "$out/test_reg" "$out/guest_reg.exe" "$DRIEC"
@@ -308,26 +260,38 @@ rm -f "$out/engine.lib" "$out/engine_u.lib"
   /NODEFAULTLIB /ENTRY:engine_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_engine.exe"
 # --- 8b. STAGE 7: the SEH/unwind surface OrTMM's CRT startup edits ---
-# VirtualProtect on .pdata, RtlCaptureContext, RtlLookupFunctionEntry
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
   -fasynchronous-unwind-tables \
   -c src/guest/guest_seh.c -o "$out/guest_seh.obj"
 "$LLD_LINK" "$out/guest_seh.obj" "$out/kernel32.lib" \
   /NODEFAULTLIB /ENTRY:guest_seh_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /OUT:"$out/guest_seh.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_engine.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
-  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/vfs.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_engine.cpp "$out/libtrt.a" \
   -o "$out/test_engine"
 DRIEC="$out/drive_c"; rm -rf "$DRIEC"; mkdir -p "$DRIEC"
 "$out/test_engine" "$out/guest_engine.exe" "$DRIEC" "$out/guest_seh.exe"
+
+# --- 8c. W1: exception dispatch through a real MSVC-shaped personality ------
+# The guest carries compiler-generated .pdata + a C scope table and its own
+# __C_specific_handler clone; the host must walk .pdata, call the personality,
+# honour the HandlerAddress==1 constant-filter sentinel, and resume through
+# RtlUnwindEx with the establishing frame's RSP and nonvolatiles restored.
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -fasynchronous-unwind-tables \
+  -c src/guest/guest_eh.c -o "$out/guest_eh.obj"
+# exports for the funclet-rethrow fixtures (linked into the image's export dir)
+"$LLD_LINK" "$out/guest_eh.obj" "$out/kernel32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_eh_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x1A00000 \
+  /EXPORT:guest_eh_main \
+  /EXPORT:guest_eh_funclet_rethrow \
+  /EXPORT:guest_eh_funclet_rethrow_escape \
+  /OUT:"$out/guest_eh.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_guest_eh.cpp "$out/libtrt.a" \
+  -o "$out/test_guest_eh"
+"$out/test_guest_eh" "$out/guest_eh.exe"
 
 # --- 9. DirectInput 8: factory -> device -> acquire -> poll -> state ---
 cat > "$out/dinput.def" <<'DEOF'
@@ -346,17 +310,8 @@ rm -f "$out/dinput.lib"
   "$out/kernel32.lib" \
   /NODEFAULTLIB /ENTRY:dinput_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1B00000 /OUT:"$out/guest_dinput.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_dinput.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
-  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_dinput.cpp "$out/libtrt.a" \
   -o "$out/test_dinput"
 "$out/test_dinput" "$out/guest_dinput.exe"
 
@@ -375,17 +330,8 @@ rm -f "$out/audio.lib"
 "$LLD_LINK" "$out/guest_audio.obj" "$out/audio.lib" \
   /NODEFAULTLIB /ENTRY:audio_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1C00000 /OUT:"$out/guest_audio.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_audio.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
-  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp src/trt/bridge_dinput.cpp \
-  src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_audio.cpp "$out/libtrt.a" \
   -o "$out/test_audio"
 "$out/test_audio" "$out/guest_audio.exe"
 
@@ -408,17 +354,8 @@ rm -f "$out/steam.lib"
 "$LLD_LINK" "$out/guest_steam.obj" "$out/steam.lib" \
   /NODEFAULTLIB /ENTRY:steam_boot /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_steam.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_steam.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
-  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_steam.cpp "$out/libtrt.a" \
   -o "$out/test_steam"
 "$out/test_steam" "$out/guest_steam.exe"
 
@@ -430,17 +367,8 @@ rm -f "$out/winmm.lib"
 "$LLD_LINK" "$out/guest_winmm.obj" "$out/winmm.lib" \
   /NODEFAULTLIB /ENTRY:guest_winmm_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1A00000 /OUT:"$out/guest_winmm.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_winmm.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp src/trt/bridge_mem.cpp \
-  src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_winmm.cpp "$out/libtrt.a" \
   -o "$out/test_winmm"
 "$out/test_winmm" "$out/guest_winmm.exe"
 
@@ -452,16 +380,8 @@ rm -f "$out/d3d9.lib"
 "$LLD_LINK" "$out/guest_d3d9.obj" "$out/d3d9.lib" \
   /NODEFAULTLIB /ENTRY:guest_d3d9_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1B00000 /OUT:"$out/guest_d3d9.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_d3d9.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d9.cpp "$out/libtrt.a" \
   -o "$out/test_d3d9"
 "$out/test_d3d9" "$out/guest_d3d9.exe"
 
@@ -473,17 +393,8 @@ rm -f "$out/d3d8.lib"
 "$LLD_LINK" "$out/guest_d3d8.obj" "$out/d3d8.lib" \
   /NODEFAULTLIB /ENTRY:guest_d3d8_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1D00000 /OUT:"$out/guest_d3d8.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_d3d8.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d8.cpp "$out/libtrt.a" \
   -o "$out/test_d3d8"
 "$out/test_d3d8" "$out/guest_d3d8.exe"
 
@@ -495,17 +406,8 @@ rm -f "$out/openal32.lib"
 "$LLD_LINK" "$out/guest_openal.obj" "$out/openal32.lib" \
   /NODEFAULTLIB /ENTRY:guest_openal_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1E00000 /OUT:"$out/guest_openal.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_openal.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_openal.cpp "$out/libtrt.a" \
   -o "$out/test_openal"
 "$out/test_openal" "$out/guest_openal.exe"
 
@@ -518,17 +420,8 @@ rm -f "$out/ole32.lib" "$out/oleaut32.lib"
 "$LLD_LINK" "$out/guest_ole.obj" "$out/ole32.lib" "$out/oleaut32.lib" \
   /NODEFAULTLIB /ENTRY:guest_ole_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1F00000 /OUT:"$out/guest_ole.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_ole.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_ole.cpp "$out/libtrt.a" \
   -o "$out/test_ole"
 "$out/test_ole" "$out/guest_ole.exe"
 
@@ -540,17 +433,8 @@ rm -f "$out/shell32.lib"
 "$LLD_LINK" "$out/guest_shell.obj" "$out/shell32.lib" "$out/kernel32.lib" \
   /NODEFAULTLIB /ENTRY:guest_shell_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x2000000 /OUT:"$out/guest_shell.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_shell.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_shell.cpp "$out/libtrt.a" \
   -o "$out/test_shell"
 "$out/test_shell" "$out/guest_shell.exe"
 
@@ -562,17 +446,8 @@ rm -f "$out/shlwapi.lib"
 "$LLD_LINK" "$out/guest_shlwapi.obj" "$out/shlwapi.lib" "$out/kernel32.lib" \
   /NODEFAULTLIB /ENTRY:guest_shlwapi_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x2100000 /OUT:"$out/guest_shlwapi.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_shlwapi.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_shlwapi.cpp "$out/libtrt.a" \
   -o "$out/test_shlwapi"
 "$out/test_shlwapi" "$out/guest_shlwapi.exe"
 
@@ -584,22 +459,8 @@ rm -f "$out/comctl32.lib"
 "$LLD_LINK" "$out/guest_comctl.obj" "$out/comctl32.lib" "$out/user32.lib" \
   /NODEFAULTLIB /ENTRY:guest_comctl_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x2200000 /OUT:"$out/guest_comctl.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_comctl.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp \
-  src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp \
-  src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
-  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_comctl.cpp "$out/libtrt.a" \
   -o "$out/test_comctl"
 "$out/test_comctl" "$out/guest_comctl.exe"
 
@@ -611,22 +472,8 @@ rm -f "$out/gdi32.lib"
 "$LLD_LINK" "$out/guest_gdi.obj" "$out/gdi32.lib" "$out/user32.lib" \
   /NODEFAULTLIB /ENTRY:guest_gdi_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x2300000 /OUT:"$out/guest_gdi.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_gdi.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_d3d8.cpp \
-  src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp \
-  src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
-  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_gdi.cpp "$out/libtrt.a" \
   -o "$out/test_gdi"
 "$out/test_gdi" "$out/guest_gdi.exe"
 
@@ -638,17 +485,8 @@ rm -f "$out/dsound.lib"
 "$LLD_LINK" "$out/guest_dsound.obj" "$out/dsound.lib" \
   /NODEFAULTLIB /ENTRY:guest_dsound_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1C00000 /OUT:"$out/guest_dsound.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_dsound.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_dsound.cpp "$out/libtrt.a" \
   -o "$out/test_dsound"
 "$out/test_dsound" "$out/guest_dsound.exe"
 
@@ -660,17 +498,8 @@ rm -f "$out/ddraw.lib"
 "$LLD_LINK" "$out/guest_ddraw.obj" "$out/ddraw.lib" \
   /NODEFAULTLIB /ENTRY:guest_ddraw_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1D00000 /OUT:"$out/guest_ddraw.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_ddraw.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_ddraw.cpp "$out/libtrt.a" \
   -o "$out/test_ddraw"
 "$out/test_ddraw" "$out/guest_ddraw.exe"
 
@@ -682,17 +511,8 @@ rm -f "$out/d3dx9.lib"
 "$LLD_LINK" "$out/guest_d3dx9.obj" "$out/d3dx9.lib" \
   /NODEFAULTLIB /ENTRY:guest_d3dx9_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1E00000 /OUT:"$out/guest_d3dx9.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_d3dx9.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3dx9.cpp "$out/libtrt.a" \
   -o "$out/test_d3dx9"
 "$out/test_d3dx9" "$out/guest_d3dx9.exe"
 
@@ -706,40 +526,24 @@ rm -f "$out/msacm.lib" "$out/msvfw.lib" "$out/winspool.lib"
 "$LLD_LINK" "$out/guest_mmedia.obj" "$out/msacm.lib" "$out/msvfw.lib" "$out/winspool.lib" \
   /NODEFAULTLIB /ENTRY:guest_mmedia_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x1F00000 /OUT:"$out/guest_mmedia.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_mmedia.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/bridge_reg.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp \
-  src/trt/vfs.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
-  src/trt/input.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_mmedia.cpp "$out/libtrt.a" \
   -o "$out/test_mmedia"
 "$out/test_mmedia" "$out/guest_mmedia.exe"
 
 # --- 18. img: PNG + DDS parsers (M7) -----------------------------------------
-# no guest PE: trt_img_parse is pure host-side code the d3dx9 bridge calls
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_img.cpp \
-  src/trt/bridge_img.cpp src/host/vendor/miniz_tinfl.c \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_img.cpp "$out/libtrt.a" \
   -o "$out/test_img"
 "$out/test_img"
 
 # --- 19. d3dx: D3DX10/11 texture/info bridge (M7) -----------------------------
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_d3dx.cpp \
-  src/trt/bridge_d3dx.cpp src/trt/bridge_img.cpp src/host/vendor/miniz_tinfl.c \
-  src/trt/module_table.cpp src/trt/thunk.cpp src/trt/vfs.cpp src/trt/apiset.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3dx.cpp "$out/libtrt.a" \
   -o "$out/test_d3dx"
 "$out/test_d3dx"
 
-# --- 27. STAGE 5 boot-determinism bridges (wininet/psapi/iphlpapi/imm32/
-#         crypt32/dbghelp+dbgcore): the 7 UNCERTAIN console DLLs converted
-#         to BUILTIN honest-runtime. Guests run the import surface through
-#         the IAT; the dbghelp guest writes a REAL text crash report.
+# --- 27. STAGE 5 boot-determinism bridges ------------------------------------
 rm -f "$out/wininet.lib" "$out/psapi.lib" "$out/iphlpapi.lib" \
       "$out/imm32.lib" "$out/crypt32.lib" "$out/dbghelp.lib"
 "$LLD_LINK" /lib /def:src/guest/wininet.def /out:"$out/wininet.lib" /machine:x64 /noentry
@@ -778,23 +582,8 @@ rm -f "$out/wininet.lib" "$out/psapi.lib" "$out/iphlpapi.lib" \
 "$LLD_LINK" "$out/guest_dbghelp.obj" "$out/dbghelp.lib" \
   /NODEFAULTLIB /ENTRY:guest_dbghelp_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
   /DYNAMICBASE /BASE:0x2900000 /OUT:"$out/guest_dbghelp.exe"
-clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_stage5.cpp \
-  src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
-  src/trt/thunk.cpp src/trt/vfs.cpp src/trt/images.cpp src/trt/pe_exports.cpp \
-  src/trt/bridge_d3d.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
-  src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
-  src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
-  src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp \
-  src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp \
-  src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
-  src/trt/bridge_d3dx.cpp src/host/vendor/miniz_tinfl.c src/trt/input.cpp \
-  src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp \
-  src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp \
-  src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
-  src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp \
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_stage5.cpp "$out/libtrt.a" \
   -o "$out/test_stage5"
 S5DIR="$out/stage5-gamedir"; rm -rf "$S5DIR"; mkdir -p "$S5DIR"
 "$out/test_stage5" "$out/guest_wininet.exe" 0x3ff
@@ -803,3 +592,59 @@ S5DIR="$out/stage5-gamedir"; rm -rf "$S5DIR"; mkdir -p "$S5DIR"
 "$out/test_stage5" "$out/guest_imm32.exe" 0x03f
 "$out/test_stage5" "$out/guest_crypt32.exe" 0x07f
 "$out/test_stage5" "$out/guest_dbghelp.exe" 0x00f "$S5DIR"
+
+# --- 28. Console-pack bridge suite (OpenGL32, HID+SetupAPI, XInput, WASAPI, WinRT) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_console_pack.cpp "$out/libtrt.a" \
+  -o "$out/test_console_pack"
+"$out/test_console_pack"
+
+# --- 29. Wave 1 suite (streaming mmap, dynamic tables, VEH, async IO) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_wave1.cpp "$out/libtrt.a" \
+  -o "$out/test_wave1"
+"$out/test_wave1"
+
+# --- 30. Wave 2 suite (D3D12 / DXGI 1.6; extended with MojoShader/d3d8to9/gl4es/MF) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_wave2.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_wave2"
+"$out/test_wave2"
+
+# --- 31. OpenGL 1.x-4.3 + WGL + GLSL->HLSL translation suite ---
+rm -f "$out/opengl32.lib" "$out/gdi32.lib"
+"$LLD_LINK" /lib /def:src/guest/opengl32.def /out:"$out/opengl32.lib" /machine:x64 /noentry
+"$LLD_LINK" /lib /def:src/guest/gdi32.def /out:"$out/gdi32.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_opengl.c -o "$out/guest_opengl.obj"
+"$LLD_LINK" "$out/guest_opengl.obj" "$out/opengl32.lib" "$out/gdi32.lib" \
+  /NODEFAULTLIB /ENTRY:guest_opengl_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2A00000 /OUT:"$out/guest_opengl.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_opengl.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_opengl"
+"$out/test_opengl" "$out/guest_opengl.exe"
+
+# --- 32. Vulkan 1.0-1.3 + WSI + SPIR-V->HLSL translation suite ---
+rm -f "$out/vulkan-1.lib"
+"$LLD_LINK" /lib /def:src/guest/vulkan1.def /out:"$out/vulkan-1.lib" /machine:x64 /noentry
+"$CLANG" --target=x86_64-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_vulkan.c -o "$out/guest_vulkan.obj"
+"$LLD_LINK" "$out/guest_vulkan.obj" "$out/vulkan-1.lib" \
+  /NODEFAULTLIB /ENTRY:guest_vulkan_main /SUBSYSTEM:WINDOWS /MACHINE:X64 \
+  /DYNAMICBASE /BASE:0x2B00000 /OUT:"$out/guest_vulkan.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_vulkan.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_vulkan"
+"$out/test_vulkan" "$out/guest_vulkan.exe"
+
+# --- 33. WebXfer LAN dashboard & streaming folder/zip upload suite ---
+"$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz.c -o "$out/wx_miniz.o"
+"$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_tdef.c -o "$out/wx_miniz_tdef.o"
+"$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$out/wx_miniz_tinfl.o"
+"$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_zip.c -o "$out/wx_miniz_zip.o"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_webxfer.cpp src/host/webxfer.cpp \
+  "$out/wx_miniz.o" "$out/wx_miniz_tdef.o" "$out/wx_miniz_tinfl.o" "$out/wx_miniz_zip.o" \
+  -lpthread -o "$out/test_webxfer"
+"$out/test_webxfer"

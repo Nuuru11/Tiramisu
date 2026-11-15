@@ -76,6 +76,13 @@ u32 TRT_STDCALL trt_FlsAlloc(void*);
 void* TRT_STDCALL trt_FlsGetValue(u32);
 void* TRT_STDCALL trt_FlsGetValue2(u32);
 int TRT_STDCALL trt_FlsSetValue(u32, void*);
+u32 TRT_STDCALL trt_GetFileAttributesW(const u16*);
+int TRT_STDCALL trt_ReadFile(void*, void*, u32, u32*, void*);
+void* TRT_STDCALL trt_VirtualAlloc(void*, u64, u32, u32);
+int TRT_STDCALL trt_VirtualFree(void*, u64, u32);
+int TRT_STDCALL trt_VirtualProtect(void*, u64, u32, u32*);
+u64 TRT_STDCALL trt_VirtualQuery(const void*, void*, u64);
+int TRT_STDCALL trt_FlushInstructionCache(void*, const void*, u64);
 }
 
 
@@ -534,6 +541,526 @@ int main(int argc, char** argv) {
     wmiss[mi] = 0;
     CHECK(trt_GetFileAttributesExW(wmiss, 0, &gd.d) == 0,
           "GetFileAttributesExW(missing) -> FALSE, not a silent TRUE");
+  }
+
+  // ---- G2: directory attributes + Z: write overlay + in-place remount ----
+  {
+    auto w16 = [](u16* dst, const char* s) {
+      while (*s) *dst++ = (u16)(u8)*s++;
+      *dst = 0;
+    };
+    u16 wpath[256];
+    w16(wpath, "C:\\seedfind");
+    CHECK(trt_GetFileAttributesW(wpath) == 0x10u,
+          "GetFileAttributesW(dir) -> FILE_ATTRIBUTE_DIRECTORY (0x10)");
+
+    struct { u32 attrs, c_lo, c_hi, a_lo, a_hi, w_lo, w_hi, szhi, szlo; } ex{};
+    CHECK(trt_GetFileAttributesExW(wpath, 0, &ex) == 1 && ex.attrs == 0x10u &&
+              ex.szlo == 0 && ex.szhi == 0,
+          "GetFileAttributesExW(dir) -> attrs=0x10, size=0");
+
+    char zdir[512], zfile[600], ovfile[600], zdir2[512], zfile2[600];
+    snprintf(zdir, sizeof(zdir), "%s_z_test", argv[2]);
+    snprintf(zfile, sizeof(zfile), "%s/ro.txt", zdir);
+    snprintf(ovfile, sizeof(ovfile), "%s/_z_write/ro.txt", argv[2]);
+    snprintf(zdir2, sizeof(zdir2), "%s_z_test2", argv[2]);
+    snprintf(zfile2, sizeof(zfile2), "%s/ro2.txt", zdir2);
+    mkdir(zdir, 0755);
+    mkdir(zdir2, 0755);
+    FILE* fz = fopen(zfile, "wb");
+    if (fz) { fwrite("orig", 1, 4, fz); fclose(fz); }
+    fz = fopen(zfile2, "wb");
+    if (fz) { fwrite("two2", 1, 4, fz); fclose(fz); }
+
+    trt_vfs_mount("z:", zdir);
+
+    w16(wpath, "Z:\\ro.txt");
+    void* hr0 = trt_CreateFileW(wpath, 0x80000000u, 1u, nullptr, 3u, 0x80u, nullptr);
+    char buf[16] = {};
+    u32 nread = 0;
+    int r0ok = (hr0 != (void*)(uintptr_t)-1) &&
+               trt_ReadFile(hr0, buf, 4, &nread, nullptr) == 1;
+    if (hr0 != (void*)(uintptr_t)-1) trt_CloseHandle(hr0);
+    CHECK(r0ok && nread == 4 && memcmp(buf, "orig", 4) == 0,
+          "Z:\\ro.txt reads original content before write");
+
+    void* hw = trt_CreateFileW(wpath, 0x40000000u, 0u, nullptr, 2u, 0x80u, nullptr);
+    u32 nwr = 0;
+    int wok = (hw != (void*)(uintptr_t)-1) &&
+              trt_WriteFile(hw, "over", 4, &nwr, nullptr) == 1 && nwr == 4;
+    if (hw != (void*)(uintptr_t)-1) trt_CloseHandle(hw);
+    CHECK(wok, "Z:\\ro.txt write succeeds via _z_write overlay");
+
+    char orig_chk[8] = {}, ov_chk[8] = {};
+    FILE* fo = fopen(zfile, "rb");
+    if (fo) { fread(orig_chk, 1, 4, fo); fclose(fo); }
+    FILE* fv = fopen(ovfile, "rb");
+    if (fv) { fread(ov_chk, 1, 4, fv); fclose(fv); }
+    CHECK(memcmp(orig_chk, "orig", 4) == 0 && memcmp(ov_chk, "over", 4) == 0,
+          "Z: write leaves read-only source untouched and writes C:\\_z_write\\ro.txt");
+
+    memset(buf, 0, sizeof(buf));
+    nread = 0;
+    void* hr1 = trt_CreateFileW(wpath, 0x80000000u, 1u, nullptr, 3u, 0x80u, nullptr);
+    int r1ok = (hr1 != (void*)(uintptr_t)-1) &&
+               trt_ReadFile(hr1, buf, 4, &nread, nullptr) == 1;
+    if (hr1 != (void*)(uintptr_t)-1) trt_CloseHandle(hr1);
+    CHECK(r1ok && nread == 4 && memcmp(buf, "over", 4) == 0,
+          "re-reading Z:\\ro.txt observes overlaid bytes");
+
+    w16(wpath, "Z:\\sub\\deep");
+    CHECK(trt_CreateDirectoryW(wpath, nullptr) == 1,
+          "CreateDirectoryW(Z:\\sub\\deep) creates overlay parents");
+    CHECK(trt_GetFileAttributesW(wpath) == 0x10u,
+          "GetFileAttributesW(Z:\\sub\\deep) -> 0x10 directory");
+
+    w16(wpath, "Z:\\sub\\deep\\f.txt");
+    void* hs = trt_CreateFileW(wpath, 0x40000000u, 0u, nullptr, 2u, 0x80u, nullptr);
+    nwr = 0;
+    int sok = (hs != (void*)(uintptr_t)-1) &&
+              trt_WriteFile(hs, "hi", 2, &nwr, nullptr) == 1 && nwr == 2;
+    if (hs != (void*)(uintptr_t)-1) trt_CloseHandle(hs);
+    CHECK(sok, "writing Z:\\sub\\deep\\f.txt succeeds");
+
+    struct find_data_w2 {
+      u32 attrs;
+      u32 c_lo, c_hi, a_lo, a_hi, w_lo, w_hi;
+      u32 szhi, szlo, r1, r2;
+      u16 name[260];
+      u16 alt[14];
+    };
+    find_data_w2 fdz{};
+    u16 wpat[256];
+    w16(wpat, "Z:\\sub\\deep\\*");
+    void* fhz = trt_FindFirstFileExW(wpat, 0, &fdz, 0, nullptr, 0);
+    bool saw_f = false;
+    if (fhz != (void*)(uintptr_t)-1) {
+      for (;;) {
+        char nm[64] = {};
+        for (int i = 0; fdz.name[i] && i < 63; ++i) nm[i] = (char)fdz.name[i];
+        if (strcmp(nm, "f.txt") == 0) saw_f = true;
+        if (!trt_FindNextFileW(fhz, &fdz)) break;
+      }
+      trt_FindClose(fhz);
+    }
+    CHECK(saw_f, "FindFirstFileExW(Z:\\sub\\deep\\*) enumerates f.txt");
+
+    trt_vfs_mount("z:", zdir2);
+    w16(wpath, "Z:\\ro2.txt");
+    CHECK(trt_GetFileAttributesW(wpath) == 0x80u,
+          "trt_vfs_mount(\"z:\") updates existing mount in-place");
+  }
+
+  // ---- G3: VirtualAlloc / VirtualQuery / FlushInstructionCache / W->RX JIT ----
+  {
+    struct mbi64 {
+      u64 BaseAddress;
+      u64 AllocationBase;
+      u32 AllocationProtect;
+      u16 PartitionId;
+      u16 _pad;
+      u64 RegionSize;
+      u32 State;
+      u32 Protect;
+      u32 Type;
+      u32 _pad2;
+    };
+    static_assert(sizeof(mbi64) == 48, "mbi64 layout");
+
+    void* p = trt_VirtualAlloc(nullptr, 8192, 0x2000u /*MEM_RESERVE*/, 0x01u /*PAGE_NOACCESS*/);
+    CHECK(p != nullptr, "VirtualAlloc(MEM_RESERVE, 8192) -> non-NULL");
+
+    mbi64 mbi{};
+    CHECK(trt_VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi),
+          "VirtualQuery(reserved) -> 48");
+    CHECK(mbi.State == 0x2000u && mbi.AllocationBase == (u64)(uintptr_t)p &&
+              mbi.RegionSize >= 8192u,
+          "VirtualQuery reports MEM_RESERVE with matching AllocationBase");
+
+    void* pc = trt_VirtualAlloc(p, 4096, 0x1000u /*MEM_COMMIT*/, 0x04u /*PAGE_READWRITE*/);
+    CHECK(pc == p, "VirtualAlloc(p, MEM_COMMIT, RW) commits inside reserved range");
+
+    memset(&mbi, 0, sizeof(mbi));
+    CHECK(trt_VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+              mbi.State == 0x1000u && mbi.Protect == 0x04u,
+          "VirtualQuery reports MEM_COMMIT + PAGE_READWRITE");
+
+    // Emit Win64/x64 stub: mov eax, 42; ret
+    u8* code = (u8*)p;
+    code[0] = 0xB8;
+    code[1] = 0x2A;
+    code[2] = 0x00;
+    code[3] = 0x00;
+    code[4] = 0x00;
+    code[5] = 0xC3;
+
+    u32 oldp = 0;
+    CHECK(trt_VirtualProtect(p, 4096, 0x20u /*PAGE_EXECUTE_READ*/, &oldp) == 1,
+          "VirtualProtect(RW -> RX) succeeds for JIT code");
+    CHECK(trt_FlushInstructionCache((void*)(uintptr_t)-1, p, 4096) == 1,
+          "FlushInstructionCache -> TRUE");
+
+    memset(&mbi, 0, sizeof(mbi));
+    CHECK(trt_VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.Protect == 0x20u,
+          "VirtualQuery sees VirtualProtect -> PAGE_EXECUTE_READ (0x20)");
+    CHECK(win64_call(p, 0, 0, 0) == 42u,
+          "JIT W->RX code executes and returns 42");
+
+    trt_image* qimg = trt_images_first();
+    if (!qimg) {
+      trt_images_register_main(img, "guest_engine.exe");
+      qimg = img;
+    }
+    memset(&mbi, 0, sizeof(mbi));
+    CHECK(trt_VirtualQuery(qimg->base, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+              mbi.State == 0x1000u && mbi.Type == 0x1000000u &&
+              mbi.AllocationBase == (u64)(uintptr_t)qimg->base,
+          "VirtualQuery(PE image base) reports MEM_COMMIT + MEM_IMAGE");
+
+    CHECK(trt_VirtualFree(p, 0, 0x8000u /*MEM_RELEASE*/) == 1,
+          "VirtualFree(MEM_RELEASE) -> TRUE");
+    memset(&mbi, 0, sizeof(mbi));
+    CHECK(trt_VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi) && mbi.State == 0x10000u,
+          "VirtualQuery after VirtualFree reports MEM_FREE (0x10000)");
+  }
+
+  // ---- Lane B: GetFinalPathNameByHandleW, DuplicateHandle, WaitOnAddress,
+  //             ntdll, bcrypt, advapi32 ANSI/Crypt, VEH/Compare, steam_api64 ----
+  {
+    auto w16 = [](u16* dst, const char* s) {
+      while (*s) *dst++ = (u16)(u8)*s++;
+      *dst = 0;
+    };
+    auto u16_ends_with = [](const u16* s, const char* suffix) -> bool {
+      size_t slen = 0;
+      while (s[slen]) ++slen;
+      const size_t n = strlen(suffix);
+      if (slen < n) return false;
+      for (size_t i = 0; i < n; ++i) {
+        u16 a = s[slen - n + i];
+        u16 b = (u16)(u8)suffix[i];
+        if (a >= 'A' && a <= 'Z') a = (u16)(a + ('a' - 'A'));
+        if (b >= 'A' && b <= 'Z') b = (u16)(b + ('a' - 'A'));
+        if (a != b) return false;
+      }
+      return true;
+    };
+    auto u16_starts_with = [](const u16* s, const char* prefix) -> bool {
+      for (size_t i = 0; prefix[i]; ++i) {
+        if (s[i] != (u16)(u8)prefix[i]) return false;
+      }
+      return true;
+    };
+
+    u16 wmod[128], wpath[256];
+    w16(wmod, "kernel32.dll");
+    void* hk32 = trt_LoadLibraryW(wmod);
+    CHECK(hk32 != nullptr, "LoadLibraryW(kernel32.dll) -> synthetic handle");
+
+    typedef u32 (TRT_STDCALL *fn_gfp_t)(void*, u16*, u32, u32);
+    typedef int (TRT_STDCALL *fn_dup_t)(void*, void*, void*, void**, u32, int, u32);
+    typedef int (TRT_STDCALL *fn_woa_t)(volatile void*, void*, u64, u32);
+    typedef void (TRT_STDCALL *fn_wake_t)(void*);
+    typedef int (TRT_STDCALL *fn_cmpord_t)(const u16*, int, const u16*, int, int);
+    typedef void* (TRT_STDCALL *fn_addveh_t)(u32, void*);
+    typedef u32 (TRT_STDCALL *fn_remveh_t)(void*);
+
+    auto fn_gfp = (fn_gfp_t)trt_GetProcAddress(hk32, "GetFinalPathNameByHandleW");
+    auto fn_dup = (fn_dup_t)trt_GetProcAddress(hk32, "DuplicateHandle");
+    auto fn_woa = (fn_woa_t)trt_GetProcAddress(hk32, "WaitOnAddress");
+    auto fn_wake = (fn_wake_t)trt_GetProcAddress(hk32, "WakeByAddressSingle");
+    auto fn_cmpord = (fn_cmpord_t)trt_GetProcAddress(hk32, "CompareStringOrdinal");
+    auto fn_addveh = (fn_addveh_t)trt_GetProcAddress(hk32, "AddVectoredExceptionHandler");
+    auto fn_remveh = (fn_remveh_t)trt_GetProcAddress(hk32, "RemoveVectoredExceptionHandler");
+    CHECK(fn_gfp && fn_dup && fn_woa && fn_wake && fn_cmpord && fn_addveh && fn_remveh,
+          "GetProcAddress resolves new Lane B kernel32 exports");
+    CHECK(trt_GetProcAddress(hk32, "DoesNotExist_LaneB_999") == nullptr &&
+              trt_GetLastError() == 127u,
+          "GetProcAddress missing export -> NULL + ERROR_PROC_NOT_FOUND(127)");
+
+    // Create C:\gfp_test.txt ("hello-world", 11 bytes)
+    w16(wpath, "C:\\gfp_test.txt");
+    void* hw = trt_CreateFileW(wpath, 0x40000000u, 0, nullptr, 2u, 0x80u, nullptr);
+    u32 nw = 0;
+    CHECK(hw != (void*)(uintptr_t)-1 &&
+              trt_WriteFile(hw, "hello-world", 11, &nw, nullptr) == 1 && nw == 11,
+          "write C:\\gfp_test.txt succeeds");
+    if (hw != (void*)(uintptr_t)-1) trt_CloseHandle(hw);
+
+    void* hf = trt_CreateFileW(wpath, 0x80000000u, 1u, nullptr, 3u, 0x80u, nullptr);
+    u16 pout[256] = {};
+    const u32 dos_len = fn_gfp(hf, pout, 256, 0u);
+    CHECK(dos_len > 0 && u16_starts_with(pout, "\\\\?\\C:\\") &&
+              u16_ends_with(pout, "\\gfp_test.txt"),
+          "GetFinalPathNameByHandleW(C:\\) -> \\\\?\\C:\\...gfp_test.txt");
+
+    u16 nt_out[256] = {};
+    const u32 nt_len = fn_gfp(hf, nt_out, 256, 0x2u /*VOLUME_NAME_NT*/);
+    CHECK(nt_len > 0 && u16_starts_with(nt_out, "\\Device\\HarddiskVolume1\\") &&
+              u16_ends_with(nt_out, "\\gfp_test.txt"),
+          "GetFinalPathNameByHandleW(VOLUME_NAME_NT) -> \\Device\\HarddiskVolume1\\...");
+
+    u16 none_out[256] = {};
+    const u32 none_len = fn_gfp(hf, none_out, 256, 0x4u /*VOLUME_NAME_NONE*/);
+    CHECK(none_len > 0 && u16_starts_with(none_out, "\\gfp_test.txt"),
+          "GetFinalPathNameByHandleW(VOLUME_NAME_NONE) -> \\gfp_test.txt");
+
+    u16 tiny[4] = {};
+    trt_SetLastError(0);
+    const u32 need_len = fn_gfp(hf, tiny, 4, 0u);
+    CHECK(need_len == dos_len + 1 && trt_GetLastError() == 122u,
+          "GetFinalPathNameByHandleW small buf -> need+1 + ERROR_INSUFFICIENT_BUFFER(122)");
+
+    // DuplicateHandle refcounting keeps FILE* open across CloseHandle(orig)
+    void* hf_dup = nullptr;
+    CHECK(fn_dup((void*)(uintptr_t)-1, hf, (void*)(uintptr_t)-1, &hf_dup, 0, 0, 0) == 1 &&
+              hf_dup != nullptr,
+          "DuplicateHandle(0x777 file) -> TRUE");
+    trt_CloseHandle(hf);
+    memset(pout, 0, sizeof(pout));
+    CHECK(fn_gfp(hf_dup, pout, 256, 0u) == dos_len,
+          "DuplicateHandle refcount keeps handle valid after closing original");
+
+    // Z:\ handle path check (reuses Z: mount on zdir2 from G2 test)
+    u16 wz[64];
+    w16(wz, "Z:\\ro2.txt");
+    void* hzf = trt_CreateFileW(wz, 0x80000000u, 1u, nullptr, 3u, 0x80u, nullptr);
+    u16 zout[256] = {};
+    const u32 zlen = (hzf != (void*)(uintptr_t)-1) ? fn_gfp(hzf, zout, 256, 0u) : 0;
+    CHECK(zlen > 0 && u16_starts_with(zout, "\\\\?\\Z:\\") &&
+              u16_ends_with(zout, "ro2.txt"),
+          "GetFinalPathNameByHandleW(Z:\\ro2.txt) -> \\\\?\\Z:\\ro2.txt");
+    if (hzf != (void*)(uintptr_t)-1) trt_CloseHandle(hzf);
+
+    // WaitOnAddress + WakeByAddressSingle + ERROR_TIMEOUT(1460)
+    volatile u32 wval = 7u;
+    u32 wcmp = 7u;
+    trt_SetLastError(0);
+    CHECK(fn_woa(&wval, &wcmp, 4, 25u) == 0 && trt_GetLastError() == 1460u,
+          "WaitOnAddress timeout -> FALSE + ERROR_TIMEOUT(1460)");
+    u32 wcmp_miss = 9u;
+    CHECK(fn_woa(&wval, &wcmp_miss, 4, 100u) == 1,
+          "WaitOnAddress value-mismatch fast path -> TRUE");
+
+    struct wake_worker {
+      volatile u32* addr;
+      fn_wake_t wake;
+      static u32 TRT_STDCALL run(void* arg) {
+        wake_worker* w = (wake_worker*)arg;
+        usleep(20000);
+        __atomic_store_n(w->addr, 42u, __ATOMIC_SEQ_CST);
+        w->wake((void*)w->addr);
+        return 0;
+      }
+    };
+    wake_worker ww{&wval, fn_wake};
+    u64 wth = trt_CreateThread(nullptr, nullptr, (void*)&wake_worker::run, &ww, 0, nullptr);
+    CHECK(wth != 0, "spawn WaitOnAddress waker thread");
+    int wake_ok = 1;
+    while (__atomic_load_n(&wval, __ATOMIC_SEQ_CST) == 7u) {
+      if (!fn_woa(&wval, &wcmp, 4, 2000u)) { wake_ok = 0; break; }
+    }
+    CHECK(wake_ok == 1 && __atomic_load_n(&wval, __ATOMIC_SEQ_CST) == 42u,
+          "WaitOnAddress woken by WakeByAddressSingle observes wval==42");
+    if (wth) {
+      trt_WaitForSingleObject(wth, 5000u);
+      trt_CloseHandle((void*)(uintptr_t)wth);
+    }
+
+    // CompareStringOrdinal & VEH
+    u16 cs1[16], cs2[16];
+    w16(cs1, "AbC");
+    w16(cs2, "abc");
+    CHECK(fn_cmpord(cs1, -1, cs2, 3, 1) == 2 && fn_cmpord(cs1, -1, cs2, -1, 0) == 1,
+          "CompareStringOrdinal case-insensitive EQUAL(2) and ordinal LESS(1)");
+    void* veh = fn_addveh(1, (void*)&wake_worker::run);
+    CHECK(veh != nullptr && fn_remveh(veh) == 1 && fn_remveh(veh) == 0,
+          "AddVectoredExceptionHandler / RemoveVectoredExceptionHandler cookie");
+
+    // ntdll: RtlGetVersion + NtQueryInformationFile
+    w16(wmod, "ntdll.dll");
+    void* hnt = trt_LoadLibraryW(wmod);
+    CHECK(hnt != nullptr, "LoadLibraryW(ntdll.dll) -> synthetic handle");
+    typedef u32 (TRT_STDCALL *fn_rtlgetver_t)(void*);
+    typedef u32 (TRT_STDCALL *fn_ntqif_t)(void*, void*, void*, u32, u32);
+    auto fn_rtlver = (fn_rtlgetver_t)trt_GetProcAddress(hnt, "RtlGetVersion");
+    auto fn_ntqif = (fn_ntqif_t)trt_GetProcAddress(hnt, "NtQueryInformationFile");
+    CHECK(fn_rtlver && fn_ntqif, "ntdll exports RtlGetVersion & NtQueryInformationFile");
+    if (fn_rtlver) {
+      u8 ovi[284] = {};
+      *(u32*)ovi = 284u;
+      CHECK(fn_rtlver(ovi) == 0u && ((u32*)ovi)[1] == 10u &&
+                ((u32*)ovi)[3] >= 19041u && ovi[282] == 1u,
+            "ntdll!RtlGetVersion -> Win10 >=19041 Workstation");
+    }
+    if (fn_ntqif) {
+      u64 iosb[2] = {};
+      struct { i64 alloc; i64 eof; u32 links; u8 del; u8 dir; u16 pad; } fsi{};
+      CHECK(fn_ntqif(hf_dup, iosb, &fsi, sizeof(fsi), 5u /*FileStandardInformation*/) == 0u &&
+                fsi.eof == 11 && fsi.links == 1 && iosb[0] == 0u,
+            "ntdll!NtQueryInformationFile(FileStandardInformation) -> eof=11");
+      u8 fnbuf[520] = {};
+      memset(iosb, 0, sizeof(iosb));
+      CHECK(fn_ntqif(hf_dup, iosb, fnbuf, sizeof(fnbuf), 9u /*FileNameInformation*/) == 0u &&
+                *(u32*)fnbuf > 0u &&
+                u16_ends_with((const u16*)(fnbuf + 4), "gfp_test.txt"),
+            "ntdll!NtQueryInformationFile(FileNameInformation) -> \\gfp_test.txt");
+    }
+    trt_CloseHandle(hf_dup);
+
+    // bcrypt: BCryptGenRandom + BCryptHash(SHA256)
+    w16(wmod, "bcrypt.dll");
+    void* hbc = trt_LoadLibraryW(wmod);
+    CHECK(hbc != nullptr, "LoadLibraryW(bcrypt.dll) -> synthetic handle");
+    typedef u32 (TRT_STDCALL *fn_bc_open_t)(void**, const u16*, const u16*, u32);
+    typedef u32 (TRT_STDCALL *fn_bc_close_t)(void*, u32);
+    typedef u32 (TRT_STDCALL *fn_bc_rand_t)(void*, u8*, u32, u32);
+    typedef u32 (TRT_STDCALL *fn_bc_hash_t)(void*, u8*, u32, const u8*, u32, u8*, u32);
+    auto fn_bc_open = (fn_bc_open_t)trt_GetProcAddress(hbc, "BCryptOpenAlgorithmProvider");
+    auto fn_bc_close = (fn_bc_close_t)trt_GetProcAddress(hbc, "BCryptCloseAlgorithmProvider");
+    auto fn_bc_rand = (fn_bc_rand_t)trt_GetProcAddress(hbc, "BCryptGenRandom");
+    auto fn_bc_hash = (fn_bc_hash_t)trt_GetProcAddress(hbc, "BCryptHash");
+    CHECK(fn_bc_open && fn_bc_close && fn_bc_rand && fn_bc_hash,
+          "bcrypt exports open/close/GenRandom/Hash");
+    static const u8 k_sha256_abc[32] = {
+      0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+      0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad
+    };
+    if (fn_bc_rand) {
+      u8 rnd[32] = {};
+      u32 nz = 0;
+      const u32 st = fn_bc_rand(nullptr, rnd, sizeof(rnd), 0x2u /*USE_SYSTEM_PREFERRED_RNG*/);
+      for (u32 i = 0; i < 32; ++i) nz |= rnd[i];
+      CHECK(st == 0u && nz != 0u, "BCryptGenRandom -> STATUS_SUCCESS + non-zero entropy");
+    }
+    if (fn_bc_open && fn_bc_hash && fn_bc_close) {
+      u16 walgo[16];
+      w16(walgo, "SHA256");
+      void* halg = nullptr;
+      u8 dig[32] = {};
+      const u32 o_st = fn_bc_open(&halg, walgo, nullptr, 0);
+      const u32 h_st = (o_st == 0u) ? fn_bc_hash(halg, nullptr, 0, (const u8*)"abc", 3, dig, 32) : 1u;
+      if (halg) fn_bc_close(halg, 0);
+      CHECK(o_st == 0u && h_st == 0u && memcmp(dig, k_sha256_abc, 32) == 0,
+            "BCryptHash(SHA256, \"abc\") matches NIST SHA-256 test vector");
+    }
+
+    // advapi32: ANSI Registry + CryptoAPI SHA-256 + SystemFunction036
+    w16(wmod, "advapi32.dll");
+    void* hadv = trt_LoadLibraryW(wmod);
+    CHECK(hadv != nullptr, "LoadLibraryW(advapi32.dll) -> synthetic handle");
+    typedef int (TRT_STDCALL *fn_regopena_t)(u64, const char*, u32, u32, void**);
+    typedef int (TRT_STDCALL *fn_regcreatew_t)(u64, const u16*, void**);
+    typedef int (TRT_STDCALL *fn_regsetexa_t)(u64, const char*, u32, u32, const u8*, u32);
+    typedef int (TRT_STDCALL *fn_regqexa_t)(u64, const char*, u32*, u32*, u8*, u32*);
+    typedef int (TRT_STDCALL *fn_regclose_t)(u64);
+    typedef int (TRT_STDCALL *fn_cacq_t)(void**, const char*, const char*, u32, u32);
+    typedef int (TRT_STDCALL *fn_crel_t)(void*, u32);
+    typedef int (TRT_STDCALL *fn_chash_t)(void*, u32, void*, u32, void**);
+    typedef int (TRT_STDCALL *fn_chdata_t)(void*, const u8*, u32, u32);
+    typedef int (TRT_STDCALL *fn_chget_t)(void*, u32, u8*, u32*, u32);
+    typedef int (TRT_STDCALL *fn_chdest_t)(void*);
+    typedef int (TRT_STDCALL *fn_sys036_t)(void*, unsigned long);
+    auto fn_ropena = (fn_regopena_t)trt_GetProcAddress(hadv, "RegOpenKeyExA");
+    auto fn_rcreatew = (fn_regcreatew_t)trt_GetProcAddress(hadv, "RegCreateKeyW");
+    auto fn_rseta = (fn_regsetexa_t)trt_GetProcAddress(hadv, "RegSetValueExA");
+    auto fn_rqexa = (fn_regqexa_t)trt_GetProcAddress(hadv, "RegQueryValueExA");
+    auto fn_rclose = (fn_regclose_t)trt_GetProcAddress(hadv, "RegCloseKey");
+    auto fn_cacq = (fn_cacq_t)trt_GetProcAddress(hadv, "CryptAcquireContextA");
+    auto fn_crel = (fn_crel_t)trt_GetProcAddress(hadv, "CryptReleaseContext");
+    auto fn_chash = (fn_chash_t)trt_GetProcAddress(hadv, "CryptCreateHash");
+    auto fn_chdata = (fn_chdata_t)trt_GetProcAddress(hadv, "CryptHashData");
+    auto fn_chget = (fn_chget_t)trt_GetProcAddress(hadv, "CryptGetHashParam");
+    auto fn_chdest = (fn_chdest_t)trt_GetProcAddress(hadv, "CryptDestroyHash");
+    auto fn_sys036 = (fn_sys036_t)trt_GetProcAddress(hadv, "SystemFunction036");
+    CHECK(fn_ropena && fn_rcreatew && fn_rseta && fn_rqexa && fn_rclose &&
+              fn_cacq && fn_crel && fn_chash && fn_chdata && fn_chget &&
+              fn_chdest && fn_sys036,
+          "advapi32 exports ANSI Reg + CryptoAPI + SystemFunction036");
+    if (fn_ropena && fn_rcreatew && fn_rseta && fn_rqexa && fn_rclose) {
+      void* hmiss = nullptr;
+      CHECK(fn_ropena(0x80000001ull, "Software\\TiramisuMissingZZ", 0, 0x20019u, &hmiss) != 0,
+            "RegOpenKeyExA(missing) fails non-zero");
+      u16 wsub[64];
+      w16(wsub, "Software\\TiramisuLaneB");
+      void* hk_w = nullptr;
+      void* hk_a = nullptr;
+      CHECK(fn_rcreatew(0x80000001ull, wsub, &hk_w) == 0 && hk_w != nullptr,
+            "RegCreateKeyW creates Software\\TiramisuLaneB");
+      if (hk_w) fn_rclose((u64)(uintptr_t)hk_w);
+      CHECK(fn_ropena(0x80000001ull, "Software\\TiramisuLaneB", 0, 0xF003Fu, &hk_a) == 0 &&
+                hk_a != nullptr,
+            "RegOpenKeyExA opens Software\\TiramisuLaneB");
+      if (hk_a) {
+        const char* val = "ok123";
+        CHECK(fn_rseta((u64)(uintptr_t)hk_a, "LaneBVal", 0, 1u /*REG_SZ*/,
+                       (const u8*)val, 6u) == 0,
+              "RegSetValueExA writes REG_SZ");
+        u32 rtype = 0, rsz = 32;
+        char rbuf[32] = {};
+        CHECK(fn_rqexa((u64)(uintptr_t)hk_a, "LaneBVal", nullptr, &rtype,
+                       (u8*)rbuf, &rsz) == 0 &&
+                  rtype == 1u && strcmp(rbuf, "ok123") == 0,
+              "RegQueryValueExA reads back ok123");
+        fn_rclose((u64)(uintptr_t)hk_a);
+      }
+    }
+    if (fn_cacq && fn_chash && fn_chdata && fn_chget && fn_chdest && fn_crel) {
+      void* hprov = nullptr;
+      void* hhash = nullptr;
+      u8 cdig[32] = {};
+      u32 csz = 32;
+      int ok = fn_cacq(&hprov, nullptr, nullptr, 24u /*PROV_RSA_AES*/, 0xF0000000u) &&
+               fn_chash(hprov, 0x800Cu /*CALG_SHA_256*/, nullptr, 0, &hhash) &&
+               fn_chdata(hhash, (const u8*)"abc", 3, 0) &&
+               fn_chget(hhash, 2u /*HP_HASHVAL*/, cdig, &csz, 0);
+      if (hhash) fn_chdest(hhash);
+      if (hprov) fn_crel(hprov, 0);
+      CHECK(ok && csz == 32u && memcmp(cdig, k_sha256_abc, 32) == 0,
+            "advapi32 CryptoAPI SHA-256(\"abc\") matches NIST vector");
+    }
+    if (fn_sys036) {
+      u8 rbuf[32] = {};
+      u32 nz = 0;
+      const int s_ok = fn_sys036(rbuf, sizeof(rbuf));
+      for (u32 i = 0; i < 32; ++i) nz |= rbuf[i];
+      CHECK(s_ok == 1 && nz != 0u, "advapi32!SystemFunction036 fills entropy");
+    }
+
+    // steam_api64 forced-builtin route (even with full C:\ dir prefix) + honest BIsSubscribedApp==0
+    w16(wmod, "C:\\fake_dir\\steam_api64.dll");
+    void* hst = trt_LoadLibraryW(wmod);
+    CHECK(hst != nullptr, "LoadLibraryW(C:\\fake_dir\\steam_api64.dll) routes to BUILTIN");
+    typedef void* (TRT_STDCALL *fn_stctx_t)(void*);
+    typedef void* (TRT_STDCALL *fn_stapps_t)(void);
+    typedef u8 (TRT_STDCALL *fn_stsub_t)(void*, u32);
+    auto fn_stctx = (fn_stctx_t)trt_GetProcAddress(hst, "SteamInternal_ContextInit");
+    auto fn_stapps = (fn_stapps_t)trt_GetProcAddress(hst, "SteamAPI_SteamApps_v008");
+    auto fn_stsub = (fn_stsub_t)trt_GetProcAddress(hst, "SteamAPI_ISteamApps_BIsSubscribedApp");
+    CHECK(fn_stctx && fn_stapps && fn_stsub,
+          "steam_api64 exports SteamInternal_ContextInit + SteamApps_v008 + BIsSubscribedApp");
+    if (fn_stctx) {
+      struct steam_cb {
+        static void TRT_STDCALL init(void* ctx) {
+          *(u64*)ctx = 0x57EA3001ull;
+        }
+      };
+      struct {
+        void (TRT_STDCALL *init_fn)(void*);
+        uintptr_t counter;
+        u64 storage;
+      } blk{&steam_cb::init, 0, 0};
+      void* c1 = fn_stctx(&blk);
+      void* c2 = fn_stctx(&blk);
+      CHECK(c1 == &blk.storage && c2 == &blk.storage &&
+                blk.counter == 1 && blk.storage == 0x57EA3001ull,
+            "SteamInternal_ContextInit initializes once and caches counter==1");
+    }
+    if (fn_stapps && fn_stsub) {
+      void* apps = fn_stapps();
+      CHECK(apps != nullptr && fn_stsub(apps, 480u) == 0u,
+            "SteamAPI_ISteamApps_BIsSubscribedApp -> 0 (no DRM bypass)");
+    }
   }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");

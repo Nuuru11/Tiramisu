@@ -56,7 +56,58 @@ typedef struct d3d9_hooks {
                u32 min_index, u32 num_vertices, u32 start_index,
                u32 prim_count, void* user);
   void* user;
+
+  // optional UP-draw + stream stride extensions (zero in offline test hooks;
+  // populated by the host backend so DrawPrimitiveUP / DDraw upload render)
+  void (*set_stream_stride)(u32 stream, u32 stride, void* user);
+  void (*draw_up)(u32 prim_type, const void* verts, u32 vstride, u32 num_verts,
+                  const void* indices, u32 index_fmt32, u32 index_count,
+                  u32 prim_count, void* user);
+
+  // Wave 2B extensions (always zero-init in older test harnesses):
+  // Shaders (MojoShader HLSL + parsed MOJOSHADER_parseData*), VertexDecls,
+  // MRT/DepthStencil targets, Cube/Volume/RT/DS textures, subresource upload,
+  // scissor rect, CopyRect/ColorFill, and 32-bit vs 16-bit index format.
+  u32 (*create_shader)(u32 is_ps, u32 maj, u32 min, const char* hlsl,
+                       u32 hlsl_len, const void* parsed, void* user);
+  void (*set_shader)(u32 is_ps, u32 handle, void* user);
+  void (*set_shader_const_f)(u32 is_ps, u32 start_reg, const float* data,
+                             u32 vec4_count, void* user);
+  void (*set_shader_const_i)(u32 is_ps, u32 start_reg, const i32* data,
+                             u32 vec4_count, void* user);
+  void (*set_shader_const_b)(u32 is_ps, u32 start_reg, const i32* data,
+                             u32 bool_count, void* user);
+  u32 (*create_decl)(const void* elems_d3d9, u32 count, void* user);
+  void (*set_decl)(u32 handle, void* user);
+  u32 (*create_tex_ex)(u32 kind, u32 w, u32 h, u32 depth_or_faces,
+                       u32 mip_levels, u32 usage, u32 fmt, void* user);
+  void (*unlock_sub)(u32 handle, u32 face_or_slice, u32 level, u32 row_pitch,
+                     u32 slice_pitch, const void* bits, u32 bytes, void* user);
+  void (*set_render_target)(u32 slot, u32 handle, void* user);
+  void (*set_depth_stencil)(u32 handle, void* user);
+  void (*set_scissor)(int enabled, int left, int top, int right, int bottom,
+                      void* user);
+  void (*copy_rect)(u32 dst_handle, u32 dst_sub, int dx, int dy, u32 src_handle,
+                    u32 src_sub, int sx, int sy, int w, int h, void* user);
+  void (*fill_rect)(u32 handle, u32 sub, int x, int y, int w, int h, u32 color,
+                    void* user);
+  void (*set_index_fmt)(u32 handle, u32 is_index32, void* user);
 } d3d9_hooks;
+
+typedef struct d3d9_vert_elem {
+  u16 stream;
+  u16 offset;
+  u8 type;
+  u8 method;
+  u8 usage;
+  u8 usage_index;
+} d3d9_vert_elem;
+
+// Free-function MojoShader bytecode scanner & HLSL translator helper exposed
+// by bridge_d3d9 so d3d8/tests can inspect translated shaders directly.
+const void* trt_d3d9_mojo_parse(const u32* bytecode, u32 byte_len,
+                                u32* out_byte_len);
+void trt_d3d9_mojo_free(const void* parsed);
 
 void trt_d3d9_set_hooks(const d3d9_hooks* hooks);
 const d3d9_hooks* trt_d3d9_hooks_get(void);
@@ -70,5 +121,41 @@ u32 trt_d3d9_last_draw(void);
 #ifdef __cplusplus
 }
 #endif
+
+static inline i32 trt_d3d9_row_pitch(u32 w, u32 fmt) {
+  if (!w) return 4096;
+  switch (fmt) {
+    case 28:  // A8
+    case 50:  // L8
+      return (i32)w;
+    case 23:  // R5G6B5
+    case 24:  // X1R5G5B5
+    case 25:  // A1R5G5B5
+    case 26:  // A4R4G4B4
+    case 51:  // A8L8
+      return (i32)(w * 2);
+    case 20:  // R8G8B8
+      return (i32)(w * 3);
+    case 0x31545844u:  // DXT1
+      return (i32)(((w + 3) / 4) * 8);
+    case 0x33545844u:  // DXT3
+    case 0x35545844u:  // DXT5
+      return (i32)(((w + 3) / 4) * 16);
+    default:
+      return (i32)(w * 4);
+  }
+}
+
+static inline u32 trt_d3d9_prim_verts(u32 prim, u32 count) {
+  switch (prim) {
+    case 1: return count;          // POINTLIST
+    case 2: return count * 2;      // LINELIST
+    case 3: return count + 1;      // LINESTRIP
+    case 4: return count * 3;      // TRIANGLELIST
+    case 5: return count + 2;      // TRIANGLESTRIP
+    case 6: return count + 2;      // TRIANGLEFAN
+    default: return count * 3;
+  }
+}
 
 #endif

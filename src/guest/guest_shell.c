@@ -34,7 +34,7 @@ __attribute__((dllimport)) i32 GSTD SHGetFolderPathA(void* hwnd, u32 csidl,
 __attribute__((dllimport)) i32 GSTD SHGetKnownFolderPath(const u8* rfid,
                                                          u32 flags,
                                                          void* token,
-                                                         u16* path);
+                                                         u16** path);
 __attribute__((dllimport)) i32 GSTD SHGetMalloc(void** out);
 __attribute__((dllimport)) i32 GSTD ShellExecuteExW(void* info);
 
@@ -99,8 +99,8 @@ u32 GSTD guest_shell_main(u64 a, u64 b, u64 c) {
     rfid[3] = 0x4C; rfid[2] = 0x5C; rfid[1] = 0x32; rfid[0] = 0xFA;
     rfid[5] = 0xBB; rfid[4] = 0x47;
     rfid[7] = 0x4C; rfid[6] = 0x5C;
-    u16 sp[260];
-    if (SHGetKnownFolderPath(rfid, 0, 0, sp) == 0) {
+    u16* sp = 0;
+    if (SHGetKnownFolderPath(rfid, 0, 0, &sp) == 0 && sp) {
       u32 ok = 0;
       utf16_cmp(sp, "C:\\users\\player\\Saved Games", &ok);
       if (ok) bits |= 0x10u;

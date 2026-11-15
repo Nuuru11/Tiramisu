@@ -30,6 +30,20 @@ typedef struct trt_gpu_hooks {
   void* factory;     // IDXGIFactory2* (the console's real one)
   unsigned feature_level;
   unsigned width, height;
+  // Optional Wave 2A host hooks (null in offline tests):
+  void* factory6;        // IDXGIFactory6* (if host DXGI >= 1.6)
+  void* swapchain3;      // IDXGISwapChain3* for active D3D11 CoreWindow swapchain
+  void* d3d12_device;    // ID3D12Device*
+  void* d3d12_swapchain; // IDXGISwapChain3* bound to active D3D12 command queue
+  int (TRT_GUEST_ABI *acquire_d3d12_swapchain)(void* queue, u32 width, u32 height,
+                                               u32 fmt, u32 count,
+                                               void** out_swapchain);
+  void (*restore_d3d11_swapchain)(void);
+  int (TRT_GUEST_ABI *d3d11on12_create)(void* device, u32 flags,
+                                          const void* levels, u32 level_count,
+                                          void* const* queues, u32 num_queues,
+                                          u32 node_mask, void** out_device,
+                                          void** out_ctx, u32* out_level);
 } trt_gpu_hooks;
 
 void trt_gpu_set_hooks(const trt_gpu_hooks* hooks);

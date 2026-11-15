@@ -1,27 +1,44 @@
 // tiramisu/src/host/swapchain.cpp
-// D3D11 flip-model swapchain on a CoreWindow — the exact pipeline shape the
-// reference projects proved on console (DX11 FL 11.0 both modes on Series X|S).
-// Renders an animated gradient quad: a TV screenshot proves present works.
+// D3D11 & D3D12 flip-model swapchain management on a CoreWindow.
+// Host UI always uses D3D11 + D2D1; when a guest game requests a D3D12
+// swapchain via IDXGIFactory::CreateSwapChain*(command_queue, ...), the
+// CoreWindow swapchain is cleanly rebound to that ID3D12CommandQueue and
+// restored to D3D11 when the guest exits back to the launcher.
 #include "swapchain.h"
+#include "d3d9_backend.hpp"
+#include "gl_backend.hpp"
+#include "vk_backend.hpp"
 
 #include "../trt/bridge_d3d.h"
+#include "../trt/bridge_d3d12.h"
 #include "../trt/bridge_d3dx.h"
 
+#include <d3d11on12.h>
+#include <d3d12.h>
 #include <d3dcompiler.h>
+#include <dxgi1_6.h>
 
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 
 namespace longan {
 
 namespace {
+winrt::com_ptr<IUnknown> g_window;
 winrt::com_ptr<ID3D11Device1> g_device;
 winrt::com_ptr<ID3D11DeviceContext1> g_ctx;
 winrt::com_ptr<IDXGISwapChain1> g_swap;
+winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
 winrt::com_ptr<IDXGIFactory2> g_factory;
+winrt::com_ptr<IDXGIFactory6> g_factory6;
+winrt::com_ptr<ID3D12Device> g_d3d12_device;
+winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
+bool g_in_d3d12 = false;
 unsigned g_w = 1280, g_h = 720;
+unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
 
 const char* k_vs = R"(struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
 VSOut main(uint id : SV_VertexID) {
@@ -39,36 +56,138 @@ float4 main(VSOut i) : SV_Target {
   float3 c = lerp(a, b, i.uv.x * i.uv.y);
   return float4(c, 1);
 })";
-} // namespace
 
-swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
-  swapchain_result r{};
-  auto bounds = w.Bounds();
-  g_w = (unsigned)bounds.Width;
-  g_h = (unsigned)bounds.Height;
-  r.width = g_w;
-  r.height = g_h;
+int TRT_GUEST_ABI host_d3d12_create_device(void* adapter, u32 min_fl,
+                                           const void* riid, void** out_dev) {
+  static const IID k_dev_iid = __uuidof(ID3D12Device);
+  const HRESULT hr = ::D3D12CreateDevice(
+      (IUnknown*)adapter, (D3D_FEATURE_LEVEL)min_fl,
+      riid ? *(const IID*)riid : k_dev_iid, out_dev);
+  if (SUCCEEDED(hr) && out_dev && *out_dev && !g_d3d12_device) {
+    ((IUnknown*)(*out_dev))->QueryInterface(__uuidof(ID3D12Device),
+                                            g_d3d12_device.put_void());
+  }
+  return (int)hr;
+}
 
-  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
-  D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_0};
-  D3D_FEATURE_LEVEL achieved{};
-  winrt::com_ptr<ID3D11Device> dev;
-  winrt::com_ptr<ID3D11DeviceContext> ctx;
-  r.device_hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                  flags, levels, 1, D3D11_SDK_VERSION,
-                                  dev.put(), &achieved, ctx.put());
-  if (FAILED(r.device_hr)) return r;
-  r.feature_level = (unsigned)achieved;
-  g_device = dev.as<ID3D11Device1>();
-  g_ctx = ctx.as<ID3D11DeviceContext1>();
+int TRT_GUEST_ABI host_d3d12_get_debug(const void* riid, void** out_dbg) {
+  if (!riid) return (int)E_INVALIDARG;
+  return (int)::D3D12GetDebugInterface(*(const IID*)riid, out_dbg);
+}
 
-  winrt::com_ptr<IDXGIDevice1> dxgi_dev;
-  g_device.as(dxgi_dev);
-  winrt::com_ptr<IDXGIAdapter> adapter;
-  dxgi_dev->GetAdapter(adapter.put());
-  winrt::com_ptr<IDXGIFactory2> factory;
-  adapter->GetParent(__uuidof(IDXGIFactory2), factory.put_void());
+int TRT_GUEST_ABI host_d3d12_ser_root(const void* desc, u32 ver,
+                                      void** out_blob, void** out_err) {
+  return (int)::D3D12SerializeRootSignature(
+      (const D3D12_ROOT_SIGNATURE_DESC*)desc, (D3D_ROOT_SIGNATURE_VERSION)ver,
+      (ID3DBlob**)out_blob, (ID3DBlob**)out_err);
+}
 
+int TRT_GUEST_ABI host_d3d12_ser_vroot(const void* desc, void** out_blob,
+                                       void** out_err) {
+  return (int)::D3D12SerializeVersionedRootSignature(
+      (const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*)desc,
+      (ID3DBlob**)out_blob, (ID3DBlob**)out_err);
+}
+
+int TRT_GUEST_ABI host_d3d12_deser_root(const void* src, u64 sz,
+                                        const void* riid, void** out_des) {
+  if (!riid) return (int)E_INVALIDARG;
+  return (int)::D3D12CreateRootSignatureDeserializer(src, (SIZE_T)sz,
+                                                   *(const IID*)riid, out_des);
+}
+
+int TRT_GUEST_ABI host_d3d12_deser_vroot(const void* src, u64 sz,
+                                         const void* riid, void** out_des) {
+  if (!riid) return (int)E_INVALIDARG;
+  return (int)::D3D12CreateVersionedRootSignatureDeserializer(
+      src, (SIZE_T)sz, *(const IID*)riid, out_des);
+}
+
+int TRT_GUEST_ABI host_d3d12_get_iface(const void* rclsid, const void* riid,
+                                       void** out_iface) {
+  if (!rclsid || !riid) return (int)E_INVALIDARG;
+  return (int)::D3D12GetInterface(*(const IID*)rclsid, *(const IID*)riid,
+                                  out_iface);
+}
+
+int TRT_GUEST_ABI host_d3d12_exp(u32 n, const void* iids, void* cfg,
+                                 const u32* sizes) {
+  return (int)::D3D12EnableExperimentalFeatures(
+      n, (const IID*)iids, cfg, const_cast<UINT*>(sizes));
+}
+
+DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
+  switch (fmt) {
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:
+      return DXGI_FORMAT_B8G8R8A8_UNORM;
+  }
+}
+
+void publish_gpu_hooks() {
+  trt_gpu_hooks hooks{};
+  hooks.device = g_device.get();
+  hooks.context = g_ctx.get();
+  hooks.swapchain = g_swap.get();
+  hooks.factory = g_factory.get();
+  hooks.feature_level = g_fl;
+  hooks.width = g_w;
+  hooks.height = g_h;
+  hooks.factory6 = g_factory6.get();
+  hooks.swapchain3 = g_swap3.get();
+  hooks.d3d12_device = g_d3d12_device.get();
+  hooks.d3d12_swapchain = g_d3d12_swap.get();
+  hooks.acquire_d3d12_swapchain = [](void* queue, u32 w, u32 h, u32 fmt,
+                                     u32 count, void** out_sc) -> int TRT_GUEST_ABI {
+    if (!queue || !g_window || !g_factory) return (int)E_INVALIDARG;
+    g_rtv = nullptr;
+    g_swap3 = nullptr;
+    g_swap = nullptr;
+    g_d3d12_swap = nullptr;
+    if (g_ctx) g_ctx->Flush();
+
+    DXGI_SWAP_CHAIN_DESC1 sc{};
+    sc.Width = w ? w : g_w;
+    sc.Height = h ? h : g_h;
+    sc.Format = sanitize_flip_fmt(fmt);
+    sc.SampleDesc.Count = 1;
+    sc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sc.BufferCount = (count < 2) ? 2 : (count > 4 ? 4 : count);
+    sc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    winrt::com_ptr<IDXGISwapChain1> sc1;
+    const HRESULT hr = g_factory->CreateSwapChainForCoreWindow(
+        (IUnknown*)queue, g_window.get(), &sc, nullptr, sc1.put());
+    if (FAILED(hr)) return (int)hr;
+    g_d3d12_swap = sc1.try_as<IDXGISwapChain3>();
+    g_in_d3d12 = true;
+    if (out_sc) *out_sc = g_d3d12_swap ? (void*)g_d3d12_swap.get() : (void*)sc1.get();
+    return S_OK;
+  };
+  hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
+  hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,
+                              u32 count, void* const* queues, u32 num_queues,
+                              u32 node_mask, void** out_dev, void** out_ctx,
+                              u32* out_level) -> int TRT_GUEST_ABI {
+    return (int)::D3D11On12CreateDevice(
+        (IUnknown*)dev, flags, (const D3D_FEATURE_LEVEL*)levels, count,
+        (IUnknown* const*)queues, num_queues, node_mask,
+        (ID3D11Device**)out_dev, (ID3D11DeviceContext**)out_ctx,
+        (D3D_FEATURE_LEVEL*)out_level);
+  };
+  trt_gpu_set_hooks(&hooks);
+}
+
+HRESULT create_d3d11_corewindow_swapchain() {
+  if (!g_device || !g_factory || !g_window) return E_FAIL;
+  g_rtv = nullptr;
+  g_swap3 = nullptr;
+  g_swap = nullptr;
   DXGI_SWAP_CHAIN_DESC1 sc{};
   sc.Width = g_w;
   sc.Height = g_h;
@@ -78,35 +197,79 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   sc.BufferCount = 2;
   sc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
   sc.Flags = 0;
-  IUnknown* win = (IUnknown*)winrt::get_abi(w);
-  r.sc_hr = factory->CreateSwapChainForCoreWindow(g_device.get(), win, &sc,
-                                                  nullptr, g_swap.put());
-  if (FAILED(r.sc_hr)) return r;
-
+  const HRESULT hr = g_factory->CreateSwapChainForCoreWindow(
+      g_device.get(), g_window.get(), &sc, nullptr, g_swap.put());
+  if (FAILED(hr)) return hr;
+  g_swap3 = g_swap.try_as<IDXGISwapChain3>();
   winrt::com_ptr<ID3D11Texture2D> back;
   g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void());
-  g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+  if (back) g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+  return S_OK;
+}
+} // namespace
 
-  // publish the GPU to the runtime: a guest game's D3D11 calls must land on
-  // THIS device and THIS swapchain (it has no HWND of its own)
-  g_factory = factory;
-  trt_gpu_hooks hooks{};
-  hooks.device = g_device.get();
-  hooks.context = g_ctx.get();
-  hooks.swapchain = g_swap.get();
-  hooks.factory = factory.get();
-  hooks.feature_level = r.feature_level;
-  hooks.width = g_w;
-  hooks.height = g_h;
-  trt_gpu_set_hooks(&hooks);
-  // the guest's D3DCompile route: hand the SYSTEM d3dcompiler_47 to the
-  // d3dx bridge (CompileFromFile needs it)
+swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
+  swapchain_result r{};
+  auto bounds = w.Bounds();
+  g_w = (unsigned)bounds.Width;
+  g_h = (unsigned)bounds.Height;
+  r.width = g_w;
+  r.height = g_h;
+  winrt::copy_from_abi(g_window, winrt::get_abi(w));
+
+  UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+  D3D_FEATURE_LEVEL levels[] = {
+      D3D_FEATURE_LEVEL_11_1,
+      D3D_FEATURE_LEVEL_11_0,
+  };
+  D3D_FEATURE_LEVEL achieved{};
+  winrt::com_ptr<ID3D11Device> dev;
+  winrt::com_ptr<ID3D11DeviceContext> ctx;
+  r.device_hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                  flags, levels, 2, D3D11_SDK_VERSION,
+                                  dev.put(), &achieved, ctx.put());
+  if (FAILED(r.device_hr)) return r;
+  g_fl = (unsigned)achieved;
+  r.feature_level = g_fl;
+  g_device = dev.as<ID3D11Device1>();
+  g_ctx = ctx.as<ID3D11DeviceContext1>();
+
+  winrt::com_ptr<IDXGIDevice1> dxgi_dev;
+  g_device.as(dxgi_dev);
+  winrt::com_ptr<IDXGIAdapter> adapter;
+  dxgi_dev->GetAdapter(adapter.put());
+  adapter->GetParent(__uuidof(IDXGIFactory2), g_factory.put_void());
+  if (g_factory) g_factory6 = g_factory.try_as<IDXGIFactory6>();
+
+  r.sc_hr = create_d3d11_corewindow_swapchain();
+  if (FAILED(r.sc_hr)) return r;
+
+  trt_d3d12_hooks d12{};
+  d12.create_device = &host_d3d12_create_device;
+  d12.get_debug_interface = &host_d3d12_get_debug;
+  d12.serialize_root_sig = &host_d3d12_ser_root;
+  d12.serialize_versioned_root_sig = &host_d3d12_ser_vroot;
+  d12.create_root_deserializer = &host_d3d12_deser_root;
+  d12.create_versioned_root_deserializer = &host_d3d12_deser_vroot;
+  d12.get_interface = &host_d3d12_get_iface;
+  d12.enable_experimental = &host_d3d12_exp;
+  trt_d3d12_set_hooks(&d12);
+
+  publish_gpu_hooks();
   trt_d3dx_set_compiler((void*)&D3DCompile);
   return r;
 }
 
+void swapchain_restore_d3d11() {
+  if (!g_in_d3d12) return;
+  g_d3d12_swap = nullptr;
+  g_in_d3d12 = false;
+  create_d3d11_corewindow_swapchain();
+  publish_gpu_hooks();
+}
+
 void swapchain_render_frame(float t) {
-  if (!g_ctx || !g_rtv) return;
+  if (!g_ctx || !g_rtv || g_in_d3d12) return;
   static winrt::com_ptr<ID3D11VertexShader> vs;
   static winrt::com_ptr<ID3D11PixelShader> ps;
   static bool compiled = false;
@@ -126,7 +289,14 @@ void swapchain_render_frame(float t) {
   const float clear[4] = {0.055f + tealtint * 0.3f, 0.067f, 0.086f + tealtint, 1.0f};
   g_ctx->ClearRenderTargetView(g_rtv.get(), clear);
   if (vs && ps) {
-    g_ctx->OMSetRenderTargets(1, g_rtv.put(), nullptr);
+    ID3D11RenderTargetView* rtv = g_rtv.get();
+    D3D11_VIEWPORT vp{0.f, 0.f, (float)g_w, (float)g_h, 0.f, 1.f};
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->RSSetState(nullptr);
+    g_ctx->OMSetDepthStencilState(nullptr, 0);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu);
+    g_ctx->IASetInputLayout(nullptr);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_ctx->VSSetShader(vs.get(), nullptr, 0);
     g_ctx->PSSetShader(ps.get(), nullptr, 0);
@@ -134,18 +304,36 @@ void swapchain_render_frame(float t) {
   }
 }
 
+void swapchain_bind_d3d9() {
+  d3d9_rt::bind(g_device.get(), g_ctx.get(), g_swap.get(), g_rtv.get(),
+                g_w, g_h);
+  gl_rt::bind(g_device.get(), g_ctx.get(), g_swap.get(), g_rtv.get(),
+              g_w, g_h);
+  vk_rt::bind(g_device.get(), g_ctx.get(), g_swap.get(), g_rtv.get(),
+              g_w, g_h);
+}
+
 void swapchain_present() {
-  if (g_swap) g_swap->Present(1, 0);
+  if (g_swap && !g_in_d3d12) g_swap->Present(1, 0);
 }
 
 void* swapchain_dxgi() { return g_swap.get(); }
 void* swapchain_d3d() { return g_device.get(); }
 
 void swapchain_shutdown() {
+  d3d9_rt::shutdown();
+  gl_rt::shutdown();
+  vk_rt::shutdown();
+  g_d3d12_swap = nullptr;
+  g_d3d12_device = nullptr;
   g_rtv = nullptr;
+  g_swap3 = nullptr;
   g_swap = nullptr;
   g_ctx = nullptr;
   g_device = nullptr;
+  g_factory6 = nullptr;
+  g_factory = nullptr;
+  g_window = nullptr;
 }
 
 } // namespace longan

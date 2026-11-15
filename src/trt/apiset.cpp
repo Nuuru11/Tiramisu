@@ -33,7 +33,7 @@ struct apiset_rule {
 // generic ones they extend (e.g. winrt-registry before winrt).
 const apiset_rule k_rules[] = {
     // ---- WinRT / COM ----
-    {"api-ms-win-core-winrt-registry", "kernel32.dll"},
+    {"api-ms-win-core-winrt-registry", "advapi32.dll"},
     {"api-ms-win-core-winrt-string", "combase.dll"},
     {"api-ms-win-core-winrt-error", "combase.dll"},
     {"api-ms-win-core-winrt-notification", "combase.dll"},
@@ -58,9 +58,17 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-core-memory", "kernel32.dll"},
     {"api-ms-win-core-string", "kernel32.dll"},
     {"api-ms-win-core-sysinfo", "kernel32.dll"},
+    {"api-ms-win-core-systemtopology", "kernel32.dll"},
     {"api-ms-win-core-timezone", "kernel32.dll"},
+    {"api-ms-win-core-datetime", "kernel32.dll"},
     {"api-ms-win-core-util", "kernel32.dll"},
     {"api-ms-win-core-localization", "kernel32.dll"},
+    {"api-ms-win-core-wow64", "kernel32.dll"},
+    {"api-ms-win-core-firmware", "kernel32.dll"},
+    {"api-ms-win-core-comm", "kernel32.dll"},
+    {"api-ms-win-core-job", "kernel32.dll"},
+    {"api-ms-win-core-psapi", "kernel32.dll"},
+    {"api-ms-win-core-realtime", "kernel32.dll"},
     {"api-ms-win-core-debug", "kernel32.dll"},
     {"api-ms-win-core-multiprocess", "kernel32.dll"},
     {"api-ms-win-core-namedpipe", "kernel32.dll"},
@@ -74,6 +82,7 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-core-libraryloader", "kernel32.dll"},
     {"api-ms-win-core-xact", "kernel32.dll"},
     {"api-ms-win-core-errorcodehelper", "kernel32.dll"},
+    {"api-ms-win-appmodel-runtime", "kernel32.dll"},
     // STAGE 7 (corpus-run DLL phase regression, root-caused): dstorage.dll's
     // DllMain now RUNS (image_code_run=1) and imports GetCommandLineW via
     // api-ms-win-core-processenvironment-l1-1-0.dll — a family that was NOT
@@ -86,9 +95,49 @@ const apiset_rule k_rules[] = {
     {"api-ms-win-core-handle", "kernel32.dll"},
     {"api-ms-win-core-io", "kernel32.dll"},
     {"api-ms-win-core-processenvironment", "kernel32.dll"},
-    {"api-ms-win-core-registry", "kernel32.dll"},
+    {"api-ms-win-core-registry", "advapi32.dll"},
     {"api-ms-win-core-threadpool", "kernel32.dll"},
-    {"api-ms-win-core-version", "kernel32.dll"},
+    {"api-ms-win-core-versionprivate", "version.dll"},
+    {"api-ms-win-core-version", "version.dll"},
+    {"api-ms-win-core-path", "kernelbase.dll"},
+    {"api-ms-win-core-kernel32-legacy", "kernel32.dll"},
+    {"api-ms-win-core-kernel32-private", "kernel32.dll"},
+    {"api-ms-win-core-ioring", "kernelbase.dll"},
+    {"api-ms-win-core-file-fromapp", "kernelbase.dll"},
+    {"api-ms-win-core-windowserrorreporting", "kernel32.dll"},
+    {"api-ms-win-core-apiquery", "kernelbase.dll"},
+    {"api-ms-win-core-delayload", "kernel32.dll"},
+    {"api-ms-win-core-xstate", "kernel32.dll"},
+    {"api-ms-win-core-psm-appnotify", "kernel32.dll"},
+    {"api-ms-win-core-enclave", "kernel32.dll"},
+    {"api-ms-win-core-appcompat", "kernel32.dll"},
+    {"api-ms-win-core-namespace", "kernel32.dll"},
+    {"api-ms-win-core-atoms", "kernel32.dll"},
+    {"api-ms-win-security-lsalookup", "advapi32.dll"},
+    {"api-ms-win-security-sddl", "advapi32.dll"},
+    {"api-ms-win-security-provider", "advapi32.dll"},
+    {"api-ms-win-security-credentials", "advapi32.dll"},
+    {"api-ms-win-security-cryptoapi", "advapi32.dll"},
+    {"api-ms-win-security-audit", "advapi32.dll"},
+    {"api-ms-win-security-lsapolicy", "advapi32.dll"},
+    {"api-ms-win-power", "powrprof.dll"},
+    {"api-ms-win-shell", "shell32.dll"},
+    {"api-ms-win-shlwapi", "shlwapi.dll"},
+    // ---- ext-ms-win-* extension contracts (Unreal/Chromium/Qt/PC games) ----
+    {"ext-ms-win-ntuser", "user32.dll"},
+    {"ext-ms-win-rtcore-ntuser", "user32.dll"},
+    {"ext-ms-win-rtcore-gdi", "gdi32.dll"},
+    {"ext-ms-win-gdi", "gdi32.dll"},
+    {"ext-ms-win-kernel32", "kernel32.dll"},
+    {"ext-ms-win-core", "kernel32.dll"},
+    {"ext-ms-win-com", "ole32.dll"},
+    {"ext-ms-win-shell", "shell32.dll"},
+    {"ext-ms-win-advapi32", "advapi32.dll"},
+    {"ext-ms-win-uxtheme", "uxtheme.dll"},
+    {"ext-ms-win-dwmapi", "dwmapi.dll"},
+    {"ext-ms-win-dx", "d3d11.dll"},
+    {"ext-ms-win-session", "wtsapi32.dll"},
+    {"ext-ms-win-security", "advapi32.dll"},
     {"api-ms-win-core-winrt-robuffer", "combase.dll"},
     {"api-ms-win-eventing-provider", "ntdll.dll"},
     {"api-ms-win-shcore-scaling", "shcore.dll"},
@@ -171,8 +220,14 @@ extern "C" {
 
 int trt_apiset_is_contract(const char* name) {
   if (!name) return 0;
-  return (name[0] == 'a' && name[1] == 'p' && name[2] == 'i' && name[3] == '-' &&
-          name[4] == 'm' && name[5] == 's');
+  auto lc = [](char c) -> char {
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  };
+  const char c0 = lc(name[0]), c1 = lc(name[1]), c2 = lc(name[2]);
+  const char c3 = lc(name[3]), c4 = lc(name[4]), c5 = lc(name[5]);
+  return ((c0 == 'a' && c1 == 'p' && c2 == 'i') ||
+          (c0 == 'e' && c1 == 'x' && c2 == 't')) &&
+         c3 == '-' && c4 == 'm' && c5 == 's';
 }
 
 const char* trt_apiset_target(const char* contract_name) {

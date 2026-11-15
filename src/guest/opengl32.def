@@ -1,0 +1,24 @@
+LIBRARY opengl32
+EXPORTS
+    wglCreateContext
+    wglDeleteContext
+    wglMakeCurrent
+    wglGetCurrentContext
+    wglGetProcAddress
+    glClearColor
+    glClear
+    glViewport
+    glMatrixMode
+    glLoadIdentity
+    glOrtho
+    glBegin
+    glEnd
+    glVertex2f
+    glColor4f
+    glTexCoord2f
+    glGenTextures
+    glBindTexture
+    glTexImage2D
+    glDrawArrays
+    glGetError
+    glGetString

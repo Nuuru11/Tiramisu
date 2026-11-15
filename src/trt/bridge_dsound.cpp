@@ -32,6 +32,21 @@ int (*g_submit)(const void* pcm, u32 bytes, u32 rate, u32 channels,
                 u32 bytes_per_sample, void* user) = nullptr;
 void* g_submit_user = nullptr;
 
+void dsound_emit(u64 voice_id, const void* pcm, u32 bytes, u32 rate,
+                 u32 channels, u32 bps) {
+  if (!bytes) return;
+  if (trt_audio_submit_voice(voice_id, pcm, bytes, rate, channels, bps, 0,
+                             1.0f)) {
+    return;
+  }
+  if (!g_submit) {
+    void (*fn)(const void*, u32, u32, u32, u32, void*) = nullptr;
+    trt_audio_get_hooks(&fn, &g_submit_user);
+    g_submit = (int (*)(const void*, u32, u32, u32, u32, void*))fn;
+  }
+  if (g_submit) g_submit(pcm, bytes, rate, channels, bps, g_submit_user);
+}
+
 }  // namespace
 
 // forward: the vtables (defined at the bottom, SDK order)
@@ -280,10 +295,8 @@ int TRT_GUEST_ABI dsb_Play(void* self, u32, u32 flags, u32) {
   b->playing = 1;
   b->loop = (flags & 0x1u) ? 1 : 0;  // DSBPLAY_LOOPING
   // first submit from the current contents (short SFX written before Play)
-  if (g_submit) {
-    g_submit(b->data, b->bytes, b->rate, b->channels, b->bits / 8,
-             g_submit_user);
-  }
+  dsound_emit((u64)(uintptr_t)b | 0x4453000000000000ULL, b->data, b->bytes,
+              b->rate, b->channels, b->bits / 8);
   return DS_OK_;
 }
 int TRT_GUEST_ABI dsb_SetCurrentPosition(void*, u32) { return DS_OK_; }
@@ -321,10 +334,9 @@ int TRT_GUEST_ABI dsb_Unlock(void* self, void* ptr1, u32 bytes1, void* ptr2,
   (void)ptr1; (void)ptr2;
   // The engine wrote into the buffer store; marshal to the console sink.
   const u32 total = bytes1 + bytes2;
-  if (g_submit && total) {
-    g_submit(b->data, total > b->bytes ? b->bytes : total, b->rate,
-             b->channels, b->bits / 8, g_submit_user);
-  }
+  dsound_emit((u64)(uintptr_t)b | 0x4453000000000000ULL, b->data,
+              total > b->bytes ? b->bytes : total, b->rate, b->channels,
+              b->bits / 8);
   return DS_OK_;
 }
 int TRT_GUEST_ABI dsb_Restore(void*) { return DS_OK_; }
@@ -437,7 +449,6 @@ const void* g_dsb_vtbl[22] = {
 };
 
 int trt_bridge_register_dsound(void) {
-  trt_dsound_bind_sink(nullptr, nullptr);  // bound by the host at boot
   static const trt_named_fn k_fns[] = {
       {"DirectSoundCreate", (void*)&trt_DirectSoundCreate},
       {"DirectSoundCreate8", (void*)&trt_DirectSoundCreate8},

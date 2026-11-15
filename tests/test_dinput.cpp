@@ -3,6 +3,7 @@
 // creates the factory, the mouse and keyboard devices, acquires them, and
 // polls states fed by the harness through the real input ring.
 #include "../src/trt/trt.h"
+#include "../src/trt/input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,6 +141,75 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x40u, "keyboard state carried the fed key");
   CHECK(ret & 0x80u, "keyboard released after key-up");
   CHECK(ret & 0x100u, "Release counted down");
+
+  // DirectInput 8 Gamepad enumeration & live DIJOYSTATE
+  {
+    using DI8Create_t = int(TRT_GUEST_ABI*)(void*, u32, const u8*, void**, void*);
+    auto pDI8C = (DI8Create_t)trt_resolve_module(nullptr, "dinput8.dll", "DirectInput8Create", 0);
+    void* di8 = nullptr;
+    const int chr = pDI8C ? pDI8C(nullptr, 0x0800u, nullptr, &di8, nullptr) : -1;
+    struct enum_ctx {
+      int count;
+      bool has_pad;
+      u8 pad_guid[16];
+    } ectx{0, false, {}};
+    auto enum_cb = +[](const void* inst, void* user) TRT_GUEST_ABI -> int {
+      auto* ctx = (enum_ctx*)user;
+      ++ctx->count;
+      u32 dev_type = 0;
+      memcpy(&dev_type, (const u8*)inst + 36, 4);
+      if ((dev_type & 0xFFu) == 0x15u) {
+        ctx->has_pad = true;
+        memcpy(ctx->pad_guid, (const u8*)inst + 4, 16);
+      }
+      return 1;  // DIENUM_CONTINUE
+    };
+    void* pad_dev = nullptr;
+    struct joy80 {
+      i32 lX, lY, lZ, lRx, lRy, lRz;
+      i32 rglSlider[2];
+      u32 rgdwPOV[4];
+      u8 rgbButtons[32];
+    } js{};
+    u8 dev_info[1080] = {};
+    *(u32*)dev_info = sizeof(dev_info);
+    u8 caps[44] = {};
+    *(u32*)caps = sizeof(caps);
+
+    trt_input_pad_state_n(0, true, 32767, 0, -32768, 0,
+                          0x1001u /*A + DPadUp*/, 200u, 0u);
+    trt_pad_set_vibration(0, 12345u, 23456u);
+
+    int gds_hr = -1, gdi_hr = -1, gcap_hr = -1;
+    if (chr == 0 && di8) {
+      void** ivt = *(void***)di8;
+      ((int(TRT_GUEST_ABI*)(void*, u32, void*, void*, u32))ivt[4])(
+          di8, 0 /*DI8DEVCLASS_ALL*/, (void*)enum_cb, &ectx, 0);
+      if (ectx.has_pad) {
+        ((int(TRT_GUEST_ABI*)(void*, const u8*, void**, void*))ivt[3])(
+            di8, ectx.pad_guid, &pad_dev, nullptr);
+      }
+      if (pad_dev) {
+        void** dvt = *(void***)pad_dev;
+        gcap_hr = ((int(TRT_GUEST_ABI*)(void*, void*))dvt[3])(pad_dev, caps);
+        gdi_hr = ((int(TRT_GUEST_ABI*)(void*, void*))dvt[15])(pad_dev, dev_info);
+        ((int(TRT_GUEST_ABI*)(void*, void*, u32))dvt[13])(pad_dev, nullptr, 0);
+        ((int(TRT_GUEST_ABI*)(void*))dvt[7])(pad_dev);
+        gds_hr = ((int(TRT_GUEST_ABI*)(void*, u32, void*))dvt[9])(pad_dev, sizeof(js), &js);
+        // DISFFC_STOPALL (2) clears controller vibration
+        ((int(TRT_GUEST_ABI*)(void*, u32))dvt[22])(pad_dev, 2u);
+        ((u32(TRT_GUEST_ABI*)(void*))dvt[2])(pad_dev);
+      }
+      ((u32(TRT_GUEST_ABI*)(void*))ivt[2])(di8);
+    }
+    u16 vl = 99, vr = 99;
+    trt_pad_get_vibration(0, &vl, &vr);
+    CHECK(ectx.count >= 3 && ectx.has_pad && pad_dev != nullptr &&
+              gcap_hr == 0 && gdi_hr == 0 && gds_hr == 0 &&
+              js.lX > 60000 && js.rgdwPOV[0] == 0u &&
+              (js.rgbButtons[0] & 0x80u) != 0 && vl == 0 && vr == 0,
+          "DirectInput8 EnumDevices/CreateDevice/GetDeviceInfo/DIJOYSTATE/STOPALL gamepad flow");
+  }
 
   printf("\nRESULT: %s\n", failures ? "FAILURES" : "ALL PASS");
   return failures ? 1 : 0;

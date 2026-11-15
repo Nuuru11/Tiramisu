@@ -177,6 +177,21 @@ int knownfolder_path(const u8* g, char* out, u32 cap) {
       {0x62AB5D82u, 0xFDC1, 0x4DC3, "C:\\ProgramData"},
       // FOLDERID_SavedGames {4C5C32FA-BB47-4C5C-B1A7-17439CE19972}
       {0x4C5C32FAu, 0xBB47, 0x4C5C, "C:\\users\\player\\Saved Games"},
+      // FOLDERID_LocalAppDataLow {A520A1A4-1780-4FF6-BD18-167343C5AF16}
+      // (Unity Application.persistentDataPath)
+      {0xA520A1A4u, 0x1780, 0x4FF6, "C:\\users\\player\\AppData\\LocalLow"},
+      // FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
+      {0xB4BFCC3Au, 0xDB2C, 0x424C, "C:\\users\\player\\Desktop"},
+      // FOLDERID_Pictures {33E28130-4E1E-4676-835A-98395C3BC3BB}
+      {0x33E28130u, 0x4E1E, 0x4676, "C:\\users\\player\\Pictures"},
+      // FOLDERID_Music {4BD8D571-6D19-48D3-BE97-422220080E43}
+      {0x4BD8D571u, 0x6D19, 0x48D3, "C:\\users\\player\\Music"},
+      // FOLDERID_Videos {18989B1D-99B5-455B-841C-AB7C74E4DDFC}
+      {0x18989B1Du, 0x99B5, 0x455B, "C:\\users\\player\\Videos"},
+      // FOLDERID_Downloads {374DE290-123F-4565-9164-39C4925E467B}
+      {0x374DE290u, 0x123F, 0x4565, "C:\\users\\player\\Downloads"},
+      // FOLDERID_Public {DFDF76A2-C82A-4D63-906A-5644AC457385}
+      {0xDFDF76A2u, 0xC82A, 0x4D63, "C:\\users\\Public"},
   };
   for (u32 i = 0; i < sizeof(table) / sizeof(table[0]); ++i) {
     if (id->a == table[i].a && id->b == table[i].b && id->c == table[i].c) {
@@ -188,9 +203,11 @@ int knownfolder_path(const u8* g, char* out, u32 cap) {
 }
 
 int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
-                                             void* token, u16* path_out) {
+                                             void* token, u16** path_out) {
   (void)flags; (void)token;
-  if (!rfid || !path_out) return E_INVALIDARG_;
+  if (!path_out) return E_INVALIDARG_;
+  *path_out = nullptr;
+  if (!rfid) return E_INVALIDARG_;
   char p8[k_max_path];
   if (knownfolder_path(rfid, p8, sizeof(p8)) != 0) {
     char guid[40];
@@ -206,7 +223,11 @@ int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
     return E_FAIL_;
   }
   ensure_dir(p8);
-  utf8_to_utf16(p8, path_out, k_max_path);
+  const u32 len = (u32)strlen(p8);
+  u16* buf = (u16*)malloc(((size_t)len + 1) * sizeof(u16));
+  if (!buf) return (int)0x8007000Eu;  // E_OUTOFMEMORY
+  utf8_to_utf16(p8, buf, len + 1);
+  *path_out = buf;
   char line[160];
   snprintf(line, sizeof(line), "shell: SHGetKnownFolderPath -> %s", p8);
   log_line(line);
@@ -352,6 +373,48 @@ int TRT_GUEST_ABI shell_SHFileOperationW(void* op) {
   return 0xDE7A;
 }
 
+void TRT_GUEST_ABI shell_DragAcceptFiles(void* hwnd, int accept) {
+  (void)hwnd; (void)accept;
+}
+
+u32 TRT_GUEST_ABI shell_DragQueryFileW(void* hdrop, u32 idx, u16* buf, u32 cch) {
+  (void)hdrop; (void)idx;
+  if (buf && cch > 0) buf[0] = 0;
+  return 0;
+}
+
+int TRT_GUEST_ABI shell_SHCreateItemFromParsingName(const u16* path, void* pbc,
+                                                   const void* riid,
+                                                   void** ppv) {
+  (void)path; (void)pbc; (void)riid;
+  if (ppv) *ppv = nullptr;
+  return (int)0x80004001u;  // E_NOTIMPL (fail-visible)
+}
+
+int TRT_GUEST_ABI shell_SHGetPropertyStoreForWindow(void* hwnd,
+                                                    const void* riid,
+                                                    void** ppv) {
+  (void)hwnd; (void)riid;
+  if (ppv) *ppv = nullptr;
+  return (int)0x80004001u;
+}
+
+int TRT_GUEST_ABI shell_SetCurrentProcessExplicitAppUserModelID(const u16* id) {
+  (void)id;
+  return 0;  // S_OK (AppContainer AppUserModelID is host-assigned)
+}
+
+int TRT_GUEST_ABI shell_Shell_NotifyIconGetRect(const void* nid, void* rect) {
+  (void)nid;
+  if (rect) memset(rect, 0, 16);
+  return (int)0x80004005u;  // E_FAIL: no tray icon surface on Xbox
+}
+
+int TRT_GUEST_ABI shell_Shell_NotifyIconW(u32 msg, void* nid) {
+  (void)msg; (void)nid;
+  return 0;  // FALSE: no system tray on console UWP
+}
+
 }  // namespace
 
 extern "C" {
@@ -367,6 +430,14 @@ int trt_bridge_register_shell(void) {
       {"SHCreateDirectoryExW", (void*)&shell_SHCreateDirectoryExW},
       {"CommandLineToArgvW", (void*)&shell_CommandLineToArgvW},
       {"SHFileOperationW", (void*)&shell_SHFileOperationW},
+      {"DragAcceptFiles", (void*)&shell_DragAcceptFiles},
+      {"DragQueryFileW", (void*)&shell_DragQueryFileW},
+      {"SHCreateItemFromParsingName", (void*)&shell_SHCreateItemFromParsingName},
+      {"SHGetPropertyStoreForWindow", (void*)&shell_SHGetPropertyStoreForWindow},
+      {"SetCurrentProcessExplicitAppUserModelID",
+       (void*)&shell_SetCurrentProcessExplicitAppUserModelID},
+      {"Shell_NotifyIconGetRect", (void*)&shell_Shell_NotifyIconGetRect},
+      {"Shell_NotifyIconW", (void*)&shell_Shell_NotifyIconW},
   };
   trt_module_register("shell32.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

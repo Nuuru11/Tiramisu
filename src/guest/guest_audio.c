@@ -67,9 +67,9 @@ u32 GSTD audio_boot(u64 a, u64 b, u64 c) {
   tail[1] = 16;    // bits per sample
 
   void* voice = 0;
-  if (((i32 GSTD (*)(void*, const void*, void**, u32, float, void*,
+  if (((i32 GSTD (*)(void*, void**, const void*, u32, float, void*,
                      const void*, u32))vmethod(engine, 5))(
-          engine, wave, &voice, 0, 1.0f, 0, 0, 0) == 0 &&
+          engine, &voice, wave, 0, 1.0f, 0, 0, 0) == 0 &&
       voice)
     bits |= 0x8u;
 

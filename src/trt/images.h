@@ -24,6 +24,12 @@ const trt_backend* trt_runtime_backend(void);
 trt_resolver* trt_runtime_resolver(void);
 // Where the game's own DLLs live on the host filesystem.
 const char* trt_runtime_search_dir(void);
+// Dynamic DLL search directories (SetDllDirectoryW / AddDllDirectory / loader
+// subdir recursion). Host filesystem paths; nullptr clears SetDllDirectory.
+void trt_runtime_set_dll_dir(const char* host_dir);
+int  trt_runtime_add_dll_dir(const char* host_dir);
+int  trt_runtime_remove_dll_dir(int slot);
+int  trt_runtime_find_dll(const char* name_or_rel, char* out, size_t cap);
 // The resolver itself (for callers that need to resolve a symbol).
 void* trt_resolve_full(void* user, const char* module, const char* symbol,
                        u16 ordinal);
@@ -69,6 +75,28 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d);
 // Load-only mode toggle: 0 = map/bind/seal without running TLS callbacks or
 // DllMain (corpus dry-run), 1 (default) = full boot semantics.
 void trt_set_image_code_run(int enable);
+
+// Escaped-guest-exception landing pad (Linux harness): armed by the innermost
+// active host→guest call boundary; the terminal EH path longjmps here when a
+// guest C++ exception escapes the guest images (UnityPlayer native
+// wrapper-catch emulation — the boundary reports a synthetic error return).
+// Per-thread: each worker thread arms its own pad around its guest call.
+#include <setjmp.h>
+struct eh_escape_state {
+  unsigned char active;
+  jmp_buf jb;
+};
+extern thread_local eh_escape_state g_eh_escape;
+
+// Per-thread host→guest call nesting depth. Incremented by trt_call_guest /
+// trt_call_guest_img on entry, decremented on return. EH machinery tags
+// per-call state with this depth and retires it when the matching call ends.
+extern thread_local unsigned g_guest_call_depth;
+
+// Disable/invoke DLL_THREAD_ATTACH (2) and DLL_THREAD_DETACH (3) notifications
+// for loaded guest images and TLS callbacks.
+int  trt_images_disable_thread_calls(void* handle);
+void trt_images_notify_thread(int reason);
 
 // Drop every registered guest image (between corpus PEs: a stale image from
 // a previous game directory must never satisfy the next game's imports).

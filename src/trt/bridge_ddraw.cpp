@@ -377,12 +377,73 @@ int TRT_GUEST_ABI dds_EnumOverlayZOrders(void*, u32, void*, u32, void*) {
   return DD_OK_;
 }
 int TRT_GUEST_ABI dds_Flip(void* self, void*, u32) {
-  // DirectDraw's flip = the display update. Present through the d3d9
-  // hooks (the host backend binds them to the real swapchain).
+  // DirectDraw's flip = the display update. Upload primary surface pixels into
+  // a host BGRA8 texture when the host backend is attached, draw a full-screen
+  // textured quad, then present through the d3d9 hooks.
   dd_obj* d = (dd_obj*)self;
+  dd_obj* src = (d && d->is_primary && d->pixels)
+                    ? d
+                    : (g_primary && g_primary->pixels ? g_primary : d);
   const d3d9_hooks* hk = trt_d3d9_hooks_get();
+  if (hk && hk->create_tex && hk->lock && hk->unlock && hk->draw_up && src &&
+      src->pixels && src->w && src->h) {
+    static u32 s_dd_tex = 0, s_dd_w = 0, s_dd_h = 0;
+    static const void* s_dd_user = nullptr;
+    if (!s_dd_tex || s_dd_w != src->w || s_dd_h != src->h ||
+        s_dd_user != hk->user) {
+      if (s_dd_tex && hk->release && s_dd_user == hk->user)
+        hk->release(s_dd_tex, hk->user);
+      s_dd_tex = hk->create_tex(src->w, src->h, 1, 0, 21 /*A8R8G8B8*/, hk->user);
+      s_dd_w = src->w;
+      s_dd_h = src->h;
+      s_dd_user = hk->user;
+    }
+    if (s_dd_tex) {
+      void* bits = hk->lock(s_dd_tex, 0, 0, 0, hk->user);
+      if (bits) {
+        for (u32 y = 0; y < src->h; ++y) {
+          u32* dst_row = (u32*)bits + (size_t)y * src->w;
+          const u8* srow = src->pixels + (size_t)y * src->pitch;
+          if (src->bpp == 4) {
+            const u32* sp = (const u32*)srow;
+            for (u32 x = 0; x < src->w; ++x) dst_row[x] = sp[x] | 0xFF000000u;
+          } else if (src->bpp == 2) {
+            const u16* sp = (const u16*)srow;
+            for (u32 x = 0; x < src->w; ++x) {
+              const u16 v = sp[x];
+              const u32 r = ((v >> 11) & 0x1F) * 255u / 31u;
+              const u32 g = ((v >> 5) & 0x3F) * 255u / 63u;
+              const u32 b = (v & 0x1F) * 255u / 31u;
+              dst_row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            }
+          } else {
+            for (u32 x = 0; x < src->w; ++x) {
+              const u32 v = srow[x];
+              dst_row[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
+            }
+          }
+        }
+        hk->unlock(s_dd_tex, hk->user);
+      }
+      struct dd_vtx { float x, y, z, rhw; u32 col; float u, v; };
+      const float W = (float)(hk->width ? hk->width : src->w);
+      const float H = (float)(hk->height ? hk->height : src->h);
+      const dd_vtx q[6] = {
+          {0.f, 0.f, 0.f, 1.f, 0xFFFFFFFFu, 0.f, 0.f},
+          {W,   0.f, 0.f, 1.f, 0xFFFFFFFFu, 1.f, 0.f},
+          {0.f, H,   0.f, 1.f, 0xFFFFFFFFu, 0.f, 1.f},
+          {W,   0.f, 0.f, 1.f, 0xFFFFFFFFu, 1.f, 0.f},
+          {W,   H,   0.f, 1.f, 0xFFFFFFFFu, 1.f, 1.f},
+          {0.f, H,   0.f, 1.f, 0xFFFFFFFFu, 0.f, 1.f},
+      };
+      if (hk->set_rs) { hk->set_rs(7, 0, hk->user); hk->set_rs(27, 0, hk->user); }
+      if (hk->set_fvf) hk->set_fvf(0x144u, hk->user);
+      if (hk->set_texture) hk->set_texture(0, s_dd_tex, hk->user);
+      hk->draw_up(4 /*TRIANGLELIST*/, q, (u32)sizeof(dd_vtx), 6, nullptr, 0, 0,
+                  2, hk->user);
+    }
+  }
   if (hk && hk->present) hk->present(hk->user);
-  (void)d;
   return DD_OK_;
 }
 int TRT_GUEST_ABI dds_GetAttachedSurface(void*, void*, void** out) {

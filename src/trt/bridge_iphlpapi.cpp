@@ -184,6 +184,17 @@ u32 TRT_GUEST_ABI iphlp_GetIfEntry(void* row) {
   return k_err_no_data;
 }
 
+u32 TRT_GUEST_ABI iphlp_GetBestInterfaceEx(const void* dest_addr, u32* best_if) {
+  if (!dest_addr || !best_if) return k_err_invalid_parameter;
+  *best_if = 0;
+  return 50;  // ERROR_NOT_SUPPORTED (fail-visible: offline network bridge)
+}
+
+u32 TRT_GUEST_ABI iphlp_if_nametoindex(const char* ifname) {
+  (void)ifname;
+  return 0;  // 0 = interface not found
+}
+
 int trt_bridge_register_iphlpapi(void) {
   static const trt_named_fn k_fns[] = {
       {"GetAdaptersInfo", (void*)&iphlp_GetAdaptersInfo},
@@ -194,6 +205,8 @@ int trt_bridge_register_iphlpapi(void) {
       {"IcmpCreateFile", (void*)&iphlp_IcmpCreateFile},
       {"IcmpCloseHandle", (void*)&iphlp_IcmpCloseHandle},
       {"IcmpSendEcho", (void*)&iphlp_IcmpSendEcho},
+      {"GetBestInterfaceEx", (void*)&iphlp_GetBestInterfaceEx},
+      {"if_nametoindex", (void*)&iphlp_if_nametoindex},
   };
   trt_module_register("iphlpapi.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

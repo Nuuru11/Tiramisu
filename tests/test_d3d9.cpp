@@ -4,6 +4,7 @@
 // and the host hooks observe every GPU action.
 #include "../src/trt/trt.h"
 #include "../src/trt/bridge_d3d9.h"
+#include "../src/trt/bridge_d3d9_meta.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -236,6 +237,38 @@ int main(int argc, char** argv) {
   CHECK(g_last_draw_prim == 4 /*TRIANGLELIST*/, "hook: prim type TRIANGLELIST");
   CHECK(g_vp_w == 1280.0f && g_vp_h == 720.0f,
         "hook: viewport = present params 1280x720");
+
+  // Wave 2B MojoShader cbuffer reflection & packing check (vs_2_0 using c2)
+  {
+    static const u32 k_vs_c2[] = {
+        0xFFFE0200u,                         // vs_2_0
+        0x0200001Fu, 0x80000000u, 0x900F0000u, // dcl_position v0
+        0x03000002u, 0xC00F0000u, 0x90E40000u, 0xA0E40002u, // add oPos, v0, c2
+        0x0000FFFFu                          // end
+    };
+    u32 b_len = 0;
+    const void* pd = trt_d3d9_mojo_parse(k_vs_c2, sizeof(k_vs_c2), &b_len);
+    CHECK(pd != nullptr && b_len == sizeof(k_vs_c2),
+          "Wave2B: mojo_parse parses vs_2_0 with c2 uniform");
+    d3d9_mojo_layout lay{};
+    u32 smask = 0;
+    const u32 cb_sz = trt_d3d9_mojo_cb_info(pd, &smask);
+    CHECK(trt_d3d9_mojo_extract(pd, &lay) == 1 && lay.f4_count == 1 &&
+              cb_sz == 16 && lay.entry_count == 1 &&
+              lay.entries[0].reg_index == 2 && lay.entries[0].cb_slot == 0,
+          "Wave2B: mojo_extract maps c2 -> b0 slot 0 (16B)");
+    float cf[512 * 4] = {};
+    cf[2 * 4 + 0] = 11.0f;
+    cf[2 * 4 + 1] = 22.0f;
+    cf[2 * 4 + 2] = 33.0f;
+    cf[2 * 4 + 3] = 44.0f;
+    float packed[4] = {};
+    CHECK(trt_d3d9_mojo_pack_cb(pd, cf, nullptr, nullptr, packed, sizeof(packed)) == 1 &&
+              packed[0] == 11.0f && packed[1] == 22.0f &&
+              packed[2] == 33.0f && packed[3] == 44.0f,
+          "Wave2B: mojo_pack_cb packs c2 into b0 buffer cleanly");
+    trt_d3d9_mojo_free(pd);
+  }
 
   free(file);
   if (failures == 0) {

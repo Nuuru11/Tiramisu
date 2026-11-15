@@ -42,9 +42,11 @@
 #include "../src/trt/trt.h"
 #include "../src/trt/images.h"
 #include "../src/trt/pe.h"
+#include "../src/trt/pe_exports.h"
 #include "../src/trt/input.h"
 #include "../src/trt/thunk.h"
 #include "../src/trt/bridge_reg.h"
+#include "../src/trt/bridge_ws2.h"
 
 // bridge_sys.cpp: Win8+ temp-path (shared answer with GetTempPathW).
 // Declared inside extern "C" so the guest-ABI symbol name matches.
@@ -136,13 +138,17 @@ extern "C" void trt_log_ring(const char* line) {
 // fault handler: the named crash report. Installed BEFORE entry execution.
 // ---------------------------------------------------------------------------
 static void fault_report(int sig, siginfo_t* si, void* uctx_v) {
+  if (trt_dispatch_hw_fault(sig, si, uctx_v)) return;
   ucontext_t* uc = (ucontext_t*)uctx_v;
   unsigned long long rip = 0;
 #if defined(__x86_64__)
   rip = (unsigned long long)uc->uc_mcontext.gregs[REG_RIP];
 #endif
   const unsigned long long fault = (unsigned long long)(uintptr_t)si->si_addr;
-  const char* signame = sig == SIGSEGV ? "SIGSEGV" : (sig == SIGILL ? "SIGILL" : "SIGBUS");
+  const char* signame = sig == SIGSEGV ? "SIGSEGV"
+                      : sig == SIGILL  ? "SIGILL"
+                      : sig == SIGTRAP ? "SIGTRAP"
+                                       : "SIGBUS";
 
   char buf[TRT_RING_LINE];
   wout("\n==== TIRAMISU CRASH REPORT (discovery artifact) ====\n");
@@ -178,14 +184,44 @@ static void install_fault_handlers(void) {
   struct sigaction sa;
   memset(&sa, 0, sizeof(sa));
   sa.sa_sigaction = fault_report;
-  sa.sa_flags = SA_SIGINFO | SA_RESETHAND;  // one report; a double fault dies
+  sa.sa_flags = SA_SIGINFO;  // recursive depth guarded in trt_dispatch_hw_fault
   sigemptyset(&sa.sa_mask);
   sigaction(SIGSEGV, &sa, nullptr);
   sigaction(SIGILL, &sa, nullptr);
   sigaction(SIGBUS, &sa, nullptr);
+  sigaction(SIGFPE, &sa, nullptr);
+  sigaction(SIGTRAP, &sa, nullptr);
 }
 
-static void hang_kill(int) { _exit(43); }  // 43 = watchdog, distinct from 42
+static void hang_kill(int, siginfo_t*, void* uctx_v) {
+  ucontext_t* uc = (ucontext_t*)uctx_v;
+  unsigned long long rip = 0, rsp = 0;
+#if defined(__x86_64__)
+  if (uc) {
+    rip = (unsigned long long)uc->uc_mcontext.gregs[REG_RIP];
+    rsp = (unsigned long long)uc->uc_mcontext.gregs[REG_RSP];
+  }
+#endif
+  char buf[512];
+  int off = snprintf(buf, sizeof(buf),
+                     "\n==== WATCHDOG SIGALRM: rip=0x%llx rsp=0x%llx frames=[",
+                     rip, rsp);
+  if (rsp > 0x10000) {
+    const unsigned long long* sp = (const unsigned long long*)(uintptr_t)rsp;
+    int shown = 0;
+    for (int i = 0; i < 128 && shown < 10 && off < 460; ++i) {
+      const unsigned long long v = sp[i];
+      if ((v >= 0x400000ULL && v < 0x600000ULL) ||
+          (v >= 0x180000000ULL && v < 0x183000000ULL)) {
+        off += snprintf(buf + off, sizeof(buf) - (size_t)off, "0x%llx ", v);
+        ++shown;
+      }
+    }
+  }
+  snprintf(buf + off, sizeof(buf) - (size_t)off, "] ====\n");
+  wout(buf);
+  _exit(43);
+}  // 43 = watchdog, distinct from 42
 
 // 45 = SKIP verdict (32-bit x86 guest: the M7 x86 engine is not on this path)
 static void print_x86_skip(const char* path) {
@@ -200,7 +236,7 @@ static void print_x86_skip(const char* path) {
 namespace {
 
 struct extent { void* base; size_t len; };
-extent g_extents[256];
+extent g_extents[65536];
 int g_extent_count = 0;
 
 void* linux_alloc(size_t bytes, u64 preferred_base) {
@@ -215,7 +251,10 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
   if (preferred_base) {
     const uintptr_t want = (uintptr_t)preferred_base;
     const uintptr_t want_end = want + bytes;
+    int active = 0;
     for (int i = 0; i < g_extent_count; ++i) {
+      if (!g_extents[i].base) continue;
+      ++active;
       const uintptr_t b = (uintptr_t)g_extents[i].base;
       const uintptr_t e = b + g_extents[i].len;
       if (want < e && b < want_end) {
@@ -228,6 +267,7 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
         return nullptr;
       }
     }
+    if (active >= 65536) return nullptr;
   }
   void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
                  bytes, PROT_READ | PROT_WRITE,
@@ -235,10 +275,14 @@ void* linux_alloc(size_t bytes, u64 preferred_base) {
                                 : (MAP_PRIVATE | MAP_ANONYMOUS),
                  -1, 0);
   if (p == MAP_FAILED) return nullptr;
-  if (g_extent_count < 256) {
-    g_extents[g_extent_count].base = p;
-    g_extents[g_extent_count].len = bytes;
-    ++g_extent_count;
+  int slot = -1;
+  for (int i = 0; i < g_extent_count; ++i) {
+    if (!g_extents[i].base) { slot = i; break; }
+  }
+  if (slot < 0 && g_extent_count < 65536) slot = g_extent_count++;
+  if (slot >= 0) {
+    g_extents[slot].base = p;
+    g_extents[slot].len = bytes;
   }
   return p;
 }
@@ -335,6 +379,330 @@ bool whitelist_has(const char* module) {
 // answer is NOT 0 for a kernel that on real Windows ANSWERS: it is the
 // truthful structure the guest reads. Everything still unimplemented
 // keeps the honest 0 / fail-visible answer.
+#include "../src/trt/bridge_d3d.h"
+
+static int g_mock_d3d11 = 0;
+
+namespace mock_gpu {
+
+struct com_obj { const void** vtbl; };
+
+static u64 TRT_GUEST_ABI ret_zero(void) { return 0; }
+static int TRT_GUEST_ABI addref_one(void*) { return 1; }
+static int TRT_GUEST_ABI ret_e_notimpl(void*) { return (int)0x80004001u; }
+static int TRT_GUEST_ABI ret_dxgi_not_found(void*) { return (int)0x887A0002u; }
+static int TRT_GUEST_ABI qi_self(void* self, const void*, void** ppv) {
+  if (!ppv) return (int)0x80004003u;
+  *ppv = self;
+  return 0;
+}
+
+extern com_obj g_dev, g_ctx, g_dxgi_dev, g_adapter, g_output, g_factory, g_sc, g_res;
+
+static int guid_match(const void* g, u32 d1, u16 d2, u16 d3) {
+  if (!g) return 0;
+  const u32* p32 = (const u32*)g;
+  const u16* p16 = (const u16*)g;
+  return p32[0] == d1 && p16[2] == d2 && p16[3] == d3;
+}
+
+static int TRT_GUEST_ABI dev_qi(void* self, const void* riid, void** ppv) {
+  if (!ppv) return (int)0x80004003u;
+  // IUnknown / ID3D11Device / ID3D11Device1..5
+  const u32* p32 = (const u32*)riid;
+  if ((p32 && p32[0] == 0u && p32[1] == 0u && p32[2] == 0x000000C0u &&
+       p32[3] == 0x46000000u) ||
+      guid_match(riid, 0xdb6f6ddbu, 0xac77, 0x4e88) ||
+      guid_match(riid, 0xa04bfb29u, 0x08ef, 0x43d6) ||
+      guid_match(riid, 0x9d06dffau, 0xb057, 0x4a71) ||
+      guid_match(riid, 0x8ffde202u, 0xa0e7, 0x45df)) {
+    *ppv = self;
+    return 0;
+  }
+  // IDXGIDevice / IDXGIDevice1 / IDXGIDevice2 / IDXGIDevice3
+  if (guid_match(riid, 0x54ec77fau, 0x1377, 0x44e6) ||
+      guid_match(riid, 0x77db970fu, 0x6276, 0x48ba) ||
+      guid_match(riid, 0x05008617u, 0xfbfd, 0x4051) ||
+      guid_match(riid, 0x6007896cu, 0x3244, 0x4afdu)) {
+    *ppv = &g_dxgi_dev;
+    return 0;
+  }
+  *ppv = nullptr;
+  return (int)0x80004002u;  // E_NOINTERFACE
+}
+
+static int TRT_GUEST_ABI out2_res(void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI out3_res(void*, void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI out4_res(void*, void*, void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI out5_res(void*, void*, void*, void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI out6_res(void*, void*, void*, void*, void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI create_deferred_ctx(void*, u32, void** out) {
+  if (out) *out = &g_ctx;
+  return 0;
+}
+static int TRT_GUEST_ABI check_fmt_support(void*, u32, u32* out) {
+  if (out) *out = 0xFFFFFFFFu;
+  return 0;
+}
+static int TRT_GUEST_ABI check_msaa(void*, u32, u32, u32* out) {
+  if (out) *out = 1;
+  return 0;
+}
+static void TRT_GUEST_ABI check_counter_info(void*, u32* out) {
+  if (out) memset(out, 0, 12);
+}
+static int TRT_GUEST_ABI check_feat_support(void*, u32, void* data, u32 sz) {
+  if (data && sz) memset(data, 0, sz);
+  return 0;
+}
+static u32 TRT_GUEST_ABI dev_get_fl(void*) { return 0xB000u; }
+static void TRT_GUEST_ABI dev_get_ctx(void*, void** out) {
+  if (out) *out = &g_ctx;
+}
+
+static u8 g_map_scratch[4 * 1024 * 1024];
+struct mapped_sub { void* pData; u32 RowPitch; u32 DepthPitch; };
+static int TRT_GUEST_ABI ctx_map(void*, void*, u32, u32, u32, mapped_sub* m) {
+  if (m) {
+    m->pData = g_map_scratch;
+    m->RowPitch = 4096;
+    m->DepthPitch = 4096;
+  }
+  return 0;
+}
+static int TRT_GUEST_ABI ctx_get_data(void*, void*, void* data, u32 sz, u32) {
+  if (data && sz) memset(data, 0, sz);
+  return 0;
+}
+static void TRT_GUEST_ABI child_get_dev(void*, void** out) {
+  if (out) *out = &g_dev;
+}
+
+static int TRT_GUEST_ABI dxgi_dev_get_adapter(void*, void** out) {
+  if (out) *out = &g_adapter;
+  return 0;
+}
+static int TRT_GUEST_ABI dxgi_dev_get_parent(void*, const void*, void** out) {
+  if (out) *out = &g_adapter;
+  return 0;
+}
+static int TRT_GUEST_ABI adapter_get_parent(void*, const void*, void** out) {
+  if (out) *out = &g_factory;
+  return 0;
+}
+static int TRT_GUEST_ABI adapter_enum_outputs(void*, u32 idx, void** out) {
+  if (idx == 0 && out) { *out = &g_output; return 0; }
+  if (out) *out = nullptr;
+  return (int)0x887A0002u;
+}
+static int TRT_GUEST_ABI adapter_get_desc(void*, u8* d) {
+  if (!d) return (int)0x80070057u;
+  memset(d, 0, 312);
+  const char* s = "Tiramisu Mock GPU";
+  for (int i = 0; s[i]; ++i) { d[i * 2] = (u8)s[i]; d[i * 2 + 1] = 0; }
+  *(u32*)(d + 256) = 0x1002u;           // VendorId
+  *(u32*)(d + 260) = 0x13FEu;           // DeviceId
+  *(u64*)(d + 272) = 4ULL << 30;        // DedicatedVideoMemory
+  *(u64*)(d + 288) = 4ULL << 30;        // SharedSystemMemory
+  return 0;
+}
+static int TRT_GUEST_ABI output_get_desc(void*, u8* d) {
+  if (!d) return (int)0x80070057u;
+  memset(d, 0, 96);
+  const char* s = "\\\\.\\DISPLAY1";
+  for (int i = 0; s[i]; ++i) { d[i * 2] = (u8)s[i]; d[i * 2 + 1] = 0; }
+  *(u32*)(d + 64) = 0; *(u32*)(d + 68) = 0;
+  *(u32*)(d + 72) = 1280; *(u32*)(d + 76) = 720;
+  *(u32*)(d + 80) = 1;                  // AttachedToDesktop
+  *(u32*)(d + 84) = 1;                  // DXGI_MODE_ROTATION_IDENTITY
+  *(u64*)(d + 88) = 0x10001ULL;         // Monitor
+  return 0;
+}
+static int TRT_GUEST_ABI output_get_modes(void*, u32 fmt, u32, u32* num, u32* modes) {
+  if (!num) return (int)0x80070057u;
+  if (!modes) { *num = 1; return 0; }
+  if (*num == 0) return (int)0x887A0001u;
+  memset(modes, 0, 28);
+  modes[0] = 1280; modes[1] = 720;
+  modes[2] = 60; modes[3] = 1;
+  modes[4] = fmt ? fmt : 28u;
+  *num = 1;
+  return 0;
+}
+static int TRT_GUEST_ABI factory_enum_adapters(void*, u32 idx, void** out) {
+  if (idx == 0 && out) { *out = &g_adapter; return 0; }
+  if (out) *out = nullptr;
+  return (int)0x887A0002u;
+}
+static int TRT_GUEST_ABI factory_create_sc(void*, void*, void*, void** out) {
+  if (out) *out = &g_sc;
+  return 0;
+}
+static int TRT_GUEST_ABI factory_create_sc_hwnd(void*, void*, void*, void*, void*, void*, void** out) {
+  if (out) *out = &g_sc;
+  return 0;
+}
+static int TRT_GUEST_ABI sc_get_buf(void*, u32, const void*, void** out) {
+  if (out) *out = &g_res;
+  return 0;
+}
+static int TRT_GUEST_ABI sc_get_containing_output(void*, void** out) {
+  if (out) *out = &g_output;
+  return 0;
+}
+static int TRT_GUEST_ABI sc_get_desc(void*, u32* d) {
+  if (!d) return (int)0x80070057u;
+  memset(d, 0, 72);
+  d[0] = 1280; d[1] = 720; d[2] = 60; d[3] = 1; d[4] = 28;
+  d[7] = 1; d[9] = 0x20; d[10] = 2; d[12] = 1;
+  return 0;
+}
+static void TRT_GUEST_ABI res_get_desc(void*, u32* d) {
+  if (!d) return;
+  memset(d, 0, 44);
+  d[0] = 1280; d[1] = 720; d[2] = 1; d[3] = 1; d[4] = 28; d[5] = 1; d[8] = 0x20;
+}
+static void TRT_GUEST_ABI res_get_type(void*, u32* t) { if (t) *t = 3; }
+
+static const void* g_dev_vtbl[50];
+static const void* g_ctx_vtbl[144];
+static const void* g_dxgi_dev_vtbl[20];
+static const void* g_adapter_vtbl[20];
+static const void* g_output_vtbl[20];
+static const void* g_factory_vtbl[32];
+static const void* g_sc_vtbl[32];
+static const void* g_res_vtbl[24];
+
+com_obj g_dev      = {g_dev_vtbl};
+com_obj g_ctx      = {g_ctx_vtbl};
+com_obj g_dxgi_dev = {g_dxgi_dev_vtbl};
+com_obj g_adapter  = {g_adapter_vtbl};
+com_obj g_output   = {g_output_vtbl};
+com_obj g_factory  = {g_factory_vtbl};
+com_obj g_sc       = {g_sc_vtbl};
+com_obj g_res      = {g_res_vtbl};
+
+static void fill_vtbl(const void** v, int n, const void* def) {
+  for (int i = 0; i < n; ++i) v[i] = def;
+  v[0] = (const void*)&qi_self;
+  v[1] = (const void*)&addref_one;
+  v[2] = (const void*)&addref_one;
+}
+
+static void init(void) {
+  static int inited = 0;
+  if (inited) return;
+  inited = 1;
+  fill_vtbl(g_dev_vtbl, 50, (const void*)&ret_zero);
+  g_dev_vtbl[0]  = (const void*)&dev_qi;
+  g_dev_vtbl[3]  = (const void*)&out4_res;   // CreateBuffer
+  g_dev_vtbl[4]  = (const void*)&out4_res;   // CreateTexture1D
+  g_dev_vtbl[5]  = (const void*)&out4_res;   // CreateTexture2D
+  g_dev_vtbl[6]  = (const void*)&out4_res;   // CreateTexture3D
+  g_dev_vtbl[7]  = (const void*)&out4_res;   // CreateShaderResourceView
+  g_dev_vtbl[8]  = (const void*)&out4_res;   // CreateUnorderedAccessView
+  g_dev_vtbl[9]  = (const void*)&out4_res;   // CreateRenderTargetView
+  g_dev_vtbl[10] = (const void*)&out4_res;   // CreateDepthStencilView
+  g_dev_vtbl[11] = (const void*)&out6_res;   // CreateInputLayout
+  g_dev_vtbl[12] = (const void*)&out5_res;   // CreateVertexShader
+  g_dev_vtbl[13] = (const void*)&out5_res;   // CreateGeometryShader
+  g_dev_vtbl[15] = (const void*)&out5_res;   // CreatePixelShader
+  g_dev_vtbl[16] = (const void*)&out5_res;   // CreateHullShader
+  g_dev_vtbl[17] = (const void*)&out5_res;   // CreateDomainShader
+  g_dev_vtbl[18] = (const void*)&out5_res;   // CreateComputeShader
+  g_dev_vtbl[19] = (const void*)&out2_res;   // CreateClassLinkage
+  g_dev_vtbl[20] = (const void*)&out3_res;   // CreateBlendState
+  g_dev_vtbl[21] = (const void*)&out3_res;   // CreateDepthStencilState
+  g_dev_vtbl[22] = (const void*)&out3_res;   // CreateRasterizerState
+  g_dev_vtbl[23] = (const void*)&out3_res;   // CreateSamplerState
+  g_dev_vtbl[24] = (const void*)&out3_res;   // CreateQuery
+  g_dev_vtbl[25] = (const void*)&out3_res;   // CreatePredicate
+  g_dev_vtbl[26] = (const void*)&out3_res;   // CreateCounter
+  g_dev_vtbl[27] = (const void*)&create_deferred_ctx;
+  g_dev_vtbl[28] = (const void*)&out4_res;   // OpenSharedResource
+  g_dev_vtbl[29] = (const void*)&check_fmt_support;
+  g_dev_vtbl[30] = (const void*)&check_msaa;
+  g_dev_vtbl[31] = (const void*)&check_counter_info;
+  g_dev_vtbl[32] = (const void*)&ret_e_notimpl;
+  g_dev_vtbl[33] = (const void*)&check_feat_support;
+  g_dev_vtbl[34] = (const void*)&ret_dxgi_not_found;
+  g_dev_vtbl[37] = (const void*)&dev_get_fl;
+  g_dev_vtbl[40] = (const void*)&dev_get_ctx;
+
+  fill_vtbl(g_ctx_vtbl, 144, (const void*)&ret_zero);
+  g_ctx_vtbl[3]  = (const void*)&child_get_dev;
+  g_ctx_vtbl[14] = (const void*)&ctx_map;
+  g_ctx_vtbl[29] = (const void*)&ctx_get_data;
+
+  fill_vtbl(g_dxgi_dev_vtbl, 20, (const void*)&ret_zero);
+  g_dxgi_dev_vtbl[5] = (const void*)&ret_dxgi_not_found;
+  g_dxgi_dev_vtbl[6] = (const void*)&dxgi_dev_get_parent;
+  g_dxgi_dev_vtbl[7] = (const void*)&dxgi_dev_get_adapter;
+
+  fill_vtbl(g_adapter_vtbl, 20, (const void*)&ret_zero);
+  g_adapter_vtbl[5]  = (const void*)&ret_dxgi_not_found;
+  g_adapter_vtbl[6]  = (const void*)&adapter_get_parent;
+  g_adapter_vtbl[7]  = (const void*)&adapter_enum_outputs;
+  g_adapter_vtbl[8]  = (const void*)&adapter_get_desc;
+  g_adapter_vtbl[10] = (const void*)&adapter_get_desc;
+
+  fill_vtbl(g_output_vtbl, 20, (const void*)&ret_zero);
+  g_output_vtbl[6] = (const void*)&adapter_get_parent;
+  g_output_vtbl[7] = (const void*)&output_get_desc;
+  g_output_vtbl[8] = (const void*)&output_get_modes;
+
+  fill_vtbl(g_factory_vtbl, 32, (const void*)&ret_zero);
+  g_factory_vtbl[5]  = (const void*)&ret_dxgi_not_found;
+  g_factory_vtbl[7]  = (const void*)&factory_enum_adapters;
+  g_factory_vtbl[10] = (const void*)&factory_create_sc;
+  g_factory_vtbl[12] = (const void*)&factory_enum_adapters;
+  g_factory_vtbl[15] = (const void*)&factory_create_sc_hwnd;
+
+  fill_vtbl(g_sc_vtbl, 32, (const void*)&ret_zero);
+  g_sc_vtbl[5]  = (const void*)&ret_dxgi_not_found;
+  g_sc_vtbl[6]  = (const void*)&adapter_get_parent;
+  g_sc_vtbl[7]  = (const void*)&child_get_dev;
+  g_sc_vtbl[9]  = (const void*)&sc_get_buf;
+  g_sc_vtbl[12] = (const void*)&sc_get_desc;
+  g_sc_vtbl[15] = (const void*)&sc_get_containing_output;
+  g_sc_vtbl[18] = (const void*)&sc_get_desc;
+  g_sc_vtbl[23] = (const void*)&ret_dxgi_not_found;
+
+  fill_vtbl(g_res_vtbl, 24, (const void*)&ret_zero);
+  g_res_vtbl[3]  = (const void*)&child_get_dev;
+  g_res_vtbl[7]  = (const void*)&res_get_type;
+  g_res_vtbl[10] = (const void*)&res_get_desc;
+
+  trt_gpu_hooks hooks{};
+  hooks.device = &g_dev;
+  hooks.context = &g_ctx;
+  hooks.swapchain = &g_sc;
+  hooks.factory = &g_factory;
+  hooks.feature_level = 0xB000u;
+  hooks.width = 1280;
+  hooks.height = 720;
+  trt_gpu_set_hooks(&hooks);
+}
+
+}  // namespace mock_gpu
+
+u64 TRT_GUEST_ABI console_hresult_nointerface(void) { return 0x80004002ULL; }
+
 u64 TRT_GUEST_ABI console_system_fn(void) {
   // STAGE 7: name every blanket-0 bind the boot actually hits — these are
   // the next surfaces to implement (each line is a discovery artifact).
@@ -405,6 +773,17 @@ const console_named k_console_named_fns[] = {
     // Win8+ temp-path the UCRT imports; blanket-0 made the UCRT temp-name
     // loop spin to the backstop. Same guest-style answer as GetTempPathW.
     {"kernel32.dll", "GetTempPath2W", (void*)&trt_GetTempPathW},
+    {"d3d12.dll", "D3D12GetInterface", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "D3D12CreateDevice", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "D3D12GetDebugInterface", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "D3D12SerializeRootSignature", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "D3D12SerializeVersionedRootSignature", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#101", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#102", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#103", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#104", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#105", (void*)&console_hresult_nointerface},
+    {"d3d12.dll", "#106", (void*)&console_hresult_nointerface},
 };
 const int k_console_named_count =
     (int)(sizeof(k_console_named_fns) / sizeof(k_console_named_fns[0]));
@@ -413,6 +792,10 @@ void* console_system_load(const char* module, const char* symbol) {
   if (!module) return nullptr;
   if (!whitelist_has(module)) return nullptr;
   if (symbol) {
+    if (strncmp(symbol, "Unity", 5) == 0) return nullptr;
+    if (wl_ieq(module, "ws2_32.dll")) {
+      if (void* w = trt_ws2_resolve(symbol)) return w;
+    }
     // STAGE 7: named surface first — the guest reads real answers here
     for (int i = 0; i < k_console_named_count; ++i) {
       if (wl_ieq(k_console_named_fns[i].module, module) &&
@@ -436,7 +819,12 @@ int child_run(const char* path) {
   setvbuf(stdout, NULL, _IONBF, 0);
 
   install_fault_handlers();
-  signal(SIGALRM, hang_kill);
+  {
+    struct sigaction sa_alrm = {};
+    sa_alrm.sa_sigaction = hang_kill;
+    sa_alrm.sa_flags = SA_SIGINFO;
+    sigaction(SIGALRM, &sa_alrm, nullptr);
+  }
   alarm(180);  // ONE attempt, bounded: a hung DllMain is a named outcome too
 
   const char* slash = strrchr(path, '/');
@@ -526,11 +914,19 @@ int main(int argc, char** argv) {
   if (g_ring == MAP_FAILED) { fprintf(stderr, "ring mmap failed\n"); return 2; }
   memset(g_ring, 0, sizeof(*g_ring));
 
-  // STAGE 7: --exe selects the EXE-entry boot phase
+  // STAGE 7: --exe selects the EXE-entry boot phase; --mock-d3d11 installs mock COM GPU hooks (opt-in)
   int first = 1;
   int exe_mode = 0;
-  if (strcmp(argv[1], "--exe") == 0) { exe_mode = 1; first = 2; }
-  if (argc <= first) { printf("usage: test_corpus_run [--exe] <pe> ...\n"); return 2; }
+  while (first < argc && (strcmp(argv[first], "--exe") == 0 ||
+                          strcmp(argv[first], "--mock-d3d11") == 0)) {
+    if (strcmp(argv[first], "--exe") == 0) exe_mode = 1;
+    else g_mock_d3d11 = 1;
+    ++first;
+  }
+  if (argc <= first) {
+    printf("usage: test_corpus_run [--exe] [--mock-d3d11] <pe> ...\n");
+    return 2;
+  }
 
   // EXE phase: one forked boot per EXE, same isolation contract
   if (exe_mode) {
@@ -687,6 +1083,7 @@ struct boot_state {
   volatile int unitymain2;
   volatile int window_created;
   volatile int d3d11_device;
+  volatile int is_child;     // 1 = forked CreateProcessW child (onefile MAIN)
 };
 
 boot_state g_boot;
@@ -720,9 +1117,17 @@ void* watchdog_fn(void*) {
 
 // depth-ladder detection: called from trt_log_ring (same thread as the guest)
 void observe(const char* line) {
-  if (strstr(line, "UnityMain2")) g_boot.unitymain2 = 1;
+  // NOTE: UnityMain2 is NOT detected here. It is called guest->guest (no
+  // bridge line ever mentions the call) and matching "UnityMain2" anywhere
+  // false-positives on the IMPORT-BIND line ("trt: bind
+  // UnityPlayer.dll!UnityMain2"). The real probe patches the guest's IAT
+  // slot (patch_unitymain2_probe below) and sets g_unitymain2_hit directly.
   if (strstr(line, "CreateWindowExW")) g_boot.window_created = 1;
-  if (strstr(line, "D3D11CreateDevice")) g_boot.d3d11_device = 1;
+  if ((strstr(line, "D3D11CreateDevice") && !strstr(line, "no host device") &&
+       !strstr(line, "-> 0x887")) ||
+      strstr(line, "d3d: FL contract")) {
+    g_boot.d3d11_device = 1;
+  }
   if (strstr(line, "GetMessageW") || strstr(line, "PeekMessageW"))
     g_boot.pump_started = 1;
   if (strstr(line, "WM_QUIT")) g_boot.quit_seen = 1;
@@ -730,12 +1135,301 @@ void observe(const char* line) {
 
 const char* marker(int v) { return v ? "REACHED" : "-"; }
 
+// ---- UnityMain2 call probe --------------------------------------------------
+// The guest calls UnityPlayer!UnityMain2 guest->guest: no bridge runs, so no
+// log line names the call. To prove the call REALLY happened (not just the
+// import bind), patch the guest's IAT slot for that import with a host-side
+// shim (ms_abi — Win64 callable) that sets a flag and tail-jumps to the real
+// function with the argument registers intact. Executed bytes prove the
+// call; a bind line alone never could. The flag/pointer live at file scope
+// with C linkage: the naked asm shim references them unmangled.
+extern "C" {
+volatile int g_unitymain2_hit = 0;
+void* g_unitymain2_real = nullptr;         // set by the patcher before entry
+}
+extern "C" void trt_unitymain2_probe_shim(void);  // asm shim below
+
+// NAKED asm shim — the IAT slot points here. It must be byte-for-byte
+// ABI-invisible: no prologue, no stack writes, nothing but a flag store and
+// a tail-jump. A normal C shim has a prologue (push rbp/regs), so when it
+// tail-jumps, the top of stack is a saved register instead of the guest's
+// RETURN ADDRESS — UnityMain2 would run with a corrupted return path
+// (measured: ehfix18 SIGSEGV at UnityPlayer+0x8004e2). rax/r10/r11 are
+// volatile in Win64, so the guest cannot observe the clobbers; rcx/rdx/r8/r9
+// (the argument registers) and rbp/rsp are untouched.
+__asm__(/* guest-callable (Win64); assembled locally too */
+    ".text\n"
+    ".globl trt_unitymain2_probe_shim\n"
+    "trt_unitymain2_probe_shim:\n"
+    "  movl $1, g_unitymain2_hit(%rip)\n"
+    "  movq g_unitymain2_real(%rip), %r10\n"
+    "  jmp *%r10\n");
+
+namespace {
+
+// local readers (pe_loader's are file-local)
+inline u32 probe_rd32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
+inline u64 probe_rd64(const u8* p) { u64 v; memcpy(&v, p, 8); return v; }
+
+} // namespace
+
+// Find the mapped UnityPlayer image's UnityMain2 export and the EXE's IAT
+// slot that references it; overwrite the slot with the shim address.
+// A named log on every failure path (fail-visible). The IAT lives in
+// non-exec data: already RW on the Linux gate (everything maps RW until
+// seal flips EXEC sections); no protect dance needed.
+static void patch_unitymain2_probe(trt_image* exe, trt_image* up) {
+  if (!exe || !up) return;
+  // 1. the real export address (Win64 ABI callable). be/rs are unused for
+  //    non-forwarded exports (pe_exports only consults rs for forwarders).
+  void* real_fn = trt_pe_find_export(nullptr, nullptr, up, "UnityMain2", 0);
+  if (!real_fn) {
+    trt_core_log("trt: UnityMain2 probe: export not found in UnityPlayer (probe off)");
+    return;
+  }
+  g_unitymain2_real = real_fn;
+  // 2. walk the EXE's import directory for the UnityPlayer.dll IAT slot
+  const trt_dos_header* dos = (const trt_dos_header*)exe->base;
+  const trt_nt_headers64* nt =
+      (const trt_nt_headers64*)(exe->base + dos->e_lfanew);
+  const trt_data_directory* imp =
+      &nt->optional_header.directories[TRT_PE_DIR_IMPORT];
+  if (!imp->virtual_address || !imp->size) {
+    trt_core_log("trt: UnityMain2 probe: EXE has no import directory (probe off)");
+    return;
+  }
+  u64 slot = 0;
+  for (const u8* d = exe->base + imp->virtual_address;; d += 20) {
+    // IMAGE_IMPORT_DESCRIPTOR: OriginalFirstThunk(0) TimeDateStamp(4)
+    // ForwarderChain(8) Name(12) FirstThunk(16)
+    const u32 oft_rva = probe_rd32(d);
+    const u32 name_rva = probe_rd32(d + 12);
+    const u32 first_thunk = probe_rd32(d + 16);
+    if (!name_rva) break;  // terminator
+    if (name_rva >= exe->size_of_image) break;
+    const char* mod = (const char*)(exe->base + name_rva);
+    if (first_thunk && first_thunk < exe->size_of_image &&
+        strcasecmp(mod, "UnityPlayer.dll") == 0) {
+      const u32 thunk_rva = oft_rva ? oft_rva : first_thunk;
+      for (const u8* t = exe->base + thunk_rva; ; t += 8) {
+        const u64 thunk = probe_rd64(t);
+        if (!thunk) break;
+        if (thunk >> 63) break;  // ordinal import: not our target
+        const u32 hint_rva = (u32)(thunk & 0xFFFFFFFF);
+        if (hint_rva && hint_rva + 2 < exe->size_of_image &&
+            strcmp((const char*)(exe->base + hint_rva + 2), "UnityMain2") == 0) {
+          // the WRITABLE slot is the IAT (FirstThunk), not the lookup table
+          slot = (u64)(uintptr_t)(exe->base + first_thunk + (t - (exe->base + thunk_rva)));
+          break;
+        }
+      }
+    }
+    if (slot) break;
+  }
+  if (!slot) {
+    trt_core_log("trt: UnityMain2 probe: IAT slot not found in the EXE (probe off)");
+    return;
+  }
+  // 3. point the IAT slot at the naked asm shim (ABI-invisible: flag store +
+  //    tail-jump, no stack writes — the guest's return address stays on top)
+  const void* shim = (const void*)(uintptr_t)&trt_unitymain2_probe_shim;
+  memcpy((void*)(uintptr_t)slot, &shim, 8);
+  char line[128];
+  snprintf(line, sizeof(line),
+           "trt: UnityMain2 probe armed (IAT slot %llx -> probe shim)",
+           (unsigned long long)slot);
+  trt_core_log(line);
+}
+
+// ---- the boot-execution core, shared by child_boot and the modeled child --
+// img/name come from the caller; all bridge state (mounts, env store, cwd,
+// heap, message ring) is INHERITED as-is. Returns the guest exit code.
+struct boot_img_ref { void* base; unsigned long long entry_rva; };
+static boot_img_ref g_boot_img;      // captured for the spawn hook's child
+static char g_boot_name[128];
+
+static int boot_run_entry(void* img_v, const char* name) {
+  trt_image* img = (trt_image*)img_v;
+  memset(&g_boot, 0, sizeof(g_boot));
+  install_fault_handlers();
+  {
+    struct sigaction sa_alrm = {};
+    sa_alrm.sa_sigaction = hang_kill;
+    sa_alrm.sa_flags = SA_SIGINFO;
+    sigaction(SIGALRM, &sa_alrm, nullptr);
+  }
+  alarm(120);  // hard backstop reset for this process
+
+  trt_boot_exit_trap = &exit_trap;
+  trt_boot_raise_trap = &raise_trap;
+  if (g_mock_d3d11) mock_gpu::init();
+  pthread_t wd;
+  pthread_create(&wd, nullptr, &watchdog_fn, nullptr);
+
+  int rc = 0;
+  if (setjmp(g_boot.back) == 0) {
+    void* entry = img->base + img->entry_rva;
+    printf("  boot: executing EXE entry at image+0x%llx as WinMain(hinst=%p,0,0,0)%s\n",
+           (unsigned long long)img->entry_rva, (void*)(uintptr_t)img->base,
+           g_boot.is_child ? "  [ONEFILE CHILD]" : "");
+    // prove the UnityMain2 call by patching the EXE's IAT slot (see above)
+    if (!g_boot.is_child) {
+      for (int i = 0, n = trt_images_count(); i < n; ++i) {
+        const char* nm = trt_images_nth_name(i);
+        if (nm && strstr(nm, "UnityPlayer")) {
+          patch_unitymain2_probe(img, trt_images_nth(i));
+          break;
+        }
+      }
+    }
+    g_boot.crt_ok = 1;  // reaching the call means the CRT surface passed init
+    trt_call_guest_img(entry, img, (u64)(uintptr_t)img->base, 0, 0, 0);
+    // WinMain returned without ExitProcess: a legitimate end state
+    trt_core_log("trt: BOOT WinMain returned (no ExitProcess) — pump phase follows");
+    g_boot.winmain_entered = 1;
+    // drive the pump from the host side: GetMessageW would block forever
+    // in this model, so give the watchdog a moment, then report honestly
+    for (int i = 0; i < 30 && !g_boot.quit_seen; ++i) {
+      struct timespec ts{0, 100 * 1000000};
+      nanosleep(&ts, nullptr);
+    }
+  } else {
+    g_boot.winmain_entered = 1;  // the trap fired from inside WinMain's subtree
+  }
+
+  pthread_join(wd, nullptr);
+  trt_boot_exit_trap = nullptr;
+  trt_boot_raise_trap = nullptr;
+
+  // ---- the NAMED DEPTH LADDER report ----
+  printf("\n==== TIRAMISU BOOT DEPTH LADDER: %s%s ====\n", name,
+         g_boot.is_child ? " (onefile child)" : "");
+  printf("  CRT-STARTUP OK        : REACHED (CRT init called; trap-eligible)\n");
+  printf("  WINMAIN ENTERED       : %s\n", marker(g_boot.winmain_entered));
+  printf("  UNITYMAIN2 CALLED     : %s\n",
+         g_unitymain2_hit ? "REACHED (IAT-probed)" : "-");
+  printf("  WINDOW CREATED        : %s\n", marker(g_boot.window_created));
+  printf("  D3D11 DEVICE ACQUIRED : %s\n", marker(g_boot.d3d11_device));
+  printf("  PUMP ENTERED          : %s\n", marker(g_boot.pump_started));
+  printf("  PUMP QUIT             : %s\n", marker(g_boot.quit_seen));
+  printf("  messages dispatched   : %u\n", trt_msg_dispatched());
+
+  if (g_boot.trapped == 1) {
+    printf("\nBOOT EXITED %s: ExitProcess(rc=%d) at last bridge: %s\n", name,
+           g_boot.exit_code, last_bridge_line());
+    printf("last trt log lines:\n");
+    ring_dump_last(40);
+  } else if (g_boot.trapped == 2) {
+    printf("\nBOOT FAILED %s: guest RaiseException(0x%08x) — no SEH walk "
+           "(last bridge: %s)\n", name, g_boot.raise_code, last_bridge_line());
+    printf("last trt log lines:\n");
+    ring_dump_last(40);
+  } else if (g_boot.quit_seen) {
+    printf("\nBOOT PUMPED %s: %u messages dispatched, WM_QUIT received%s\n",
+           name, trt_msg_dispatched(),
+           g_boot.watchdog_fired ? " (watchdog-forced)" : " (guest-quit)");
+    if (g_boot.watchdog_fired)
+      printf("last trt log lines:\n"), ring_dump_last(40);
+  } else {
+    printf("\nBOOT STALLED %s: no ExitProcess, no WM_QUIT (last bridge: %s)\n",
+           name, last_bridge_line());
+    printf("last trt log lines:\n");
+    ring_dump_last(40);
+  }
+  printf("==== end boot report ====\n");
+  fflush(stdout);
+  return g_boot.exit_code;
+}
+
+// ---- the modeled child process (CreateProcessW spawn hook) ----------------
+// PyInstaller's onefile parent MUST re-spawn its own exe as a child
+// (pyi_utils_create_child); the console denies child processes, so the
+// harness models the OS: fork a real child that re-boots the INHERITED
+// image (bridge state — mounts, env store, heap, message ring — arrives
+// copy-on-write, exactly what a Windows child would inherit).
+static trt_image* g_spawn_img = nullptr;   // captured in child_boot
+static char g_boot_path[1100];             // corpus path (for the child's reload)
+static int spawn_child_exit = 0;
+
+// runs in the FORKED CHILD: re-boot the inherited image end-to-end
+static int spawn_child_main(void) {
+  g_boot.is_child = 1;
+  g_image_base = 0;  // crash-report classifier: re-capture in this process
+  // a real Windows child starts FRESH: new image load (the fork inherited
+  // the parent's mutated mapping — re-running CRT init on it faults).
+  // Mounts, env store and cwd are inherited as-is, which is exactly what a
+  // Windows child sees (same drives, same environment block).
+  trt_images_reset();
+  trt_image* img = trt_load_pe(g_boot_path, g_boot_name, 0);
+  if (!img) {
+    printf("  [onefile child] BOOT FAILED %s: map/seal (named loader gap)\n",
+           g_boot_name);
+    fflush(stdout);
+    return 44;
+  }
+  g_spawn_img = img;
+  g_image_base = (unsigned long long)(uintptr_t)img->base;
+  const int rc = boot_run_entry((void*)img, g_boot_name);
+  printf("  [onefile child] exit rc=%d\n", rc);
+  fflush(stdout);
+  return rc;
+}
+
+static void boot_spawn_hook(const char* exe_path, const char* cmdline,
+                            int* pid_out) {
+  (void)exe_path; (void)cmdline;
+  if (pid_out) *pid_out = -1;
+  trt_core_log("kernel32: spawn hook: forking onefile child (inherited image)");
+
+  // the child reads _PYI_* through GetEnvironmentVariableW -> the bridge
+  // env store (inherited); process_level resolves to MAIN, so it takes the
+  // onefile-child path and does NOT recurse
+  pid_t pid = fork();
+  if (pid < 0) {
+    trt_core_log("kernel32: spawn hook fork FAILED (named; errno visible)");
+    return;
+  }
+  if (pid == 0) {
+    _exit(spawn_child_main());
+  }
+  // ---- parent (the guest, still inside CreateProcessW): wait inline ----
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (WIFEXITED(st)) {
+    spawn_child_exit = WEXITSTATUS(st);
+    char line[160];
+    snprintf(line, sizeof(line),
+             "kernel32: spawn hook: onefile child pid=%d exited rc=%d",
+             pid, spawn_child_exit);
+    trt_core_log(line);
+  } else if (WIFSIGNALED(st)) {
+    spawn_child_exit = 128 + WTERMSIG(st);
+    char line[160];
+    snprintf(line, sizeof(line),
+             "kernel32: spawn hook: onefile child pid=%d died on signal %d",
+             pid, WTERMSIG(st));
+    trt_core_log(line);
+  } else {
+    spawn_child_exit = -1;
+    trt_core_log("kernel32: spawn hook: onefile child unknown wait state");
+  }
+  // record for GetExitCodeProcess (the child is dead: not running)
+  trt_child_running = 0;
+  trt_child_exit_code = (u32)(unsigned)spawn_child_exit;
+  if (pid_out) *pid_out = (int)pid;
+}
+
 int child_boot(const char* path) {
   setvbuf(stdout, NULL, _IONBF, 0);
   memset(&g_boot, 0, sizeof(g_boot));
 
   install_fault_handlers();
-  signal(SIGALRM, hang_kill);
+  {
+    struct sigaction sa_alrm = {};
+    sa_alrm.sa_sigaction = hang_kill;
+    sa_alrm.sa_flags = SA_SIGINFO;
+    sigaction(SIGALRM, &sa_alrm, nullptr);
+  }
   alarm(120);  // hard backstop: 2 minutes per EXE, then exit 42 via handler
 
   const char* slash = strrchr(path, '/');
@@ -783,6 +1477,7 @@ int child_boot(const char* path) {
   char zpath[1100];
   snprintf(zpath, sizeof(zpath), "Z:\\%s", name);
   trt_bridge_set_exe_path(zpath);
+  trt_bridge_set_cwd("Z:\\");
 
   // machine gate (same discipline as the DLL phase)
   FILE* f = fopen(path, "rb");
@@ -817,71 +1512,17 @@ int child_boot(const char* path) {
     return 44;
   }
 
-  // traps + watchdog
-  trt_boot_exit_trap = &exit_trap;
-  trt_boot_raise_trap = &raise_trap;
-  pthread_t wd;
-  pthread_create(&wd, nullptr, &watchdog_fn, nullptr);
+  // traps + watchdog (now inside boot_run_entry, shared with the modeled
+  // onefile child)
+  trt_boot_spawn_hook = &boot_spawn_hook;  // CreateProcessW -> real fork
+  g_spawn_img = img;
+  snprintf(g_boot_name, sizeof(g_boot_name), "%s", name);
+  snprintf(g_boot_path, sizeof(g_boot_path), "%s", path);
 
   // ---- the boot ----
-  if (setjmp(g_boot.back) == 0) {
-    void* entry = img->base + img->entry_rva;
-    printf("  boot: executing EXE entry at image+0x%llx as WinMain(hinst=%p,0,0,0)\n",
-           (unsigned long long)img->entry_rva, (void*)(uintptr_t)img->base);
-    g_boot.crt_ok = 1;  // reaching the call means the CRT surface passed init
-    trt_call_guest_img(entry, img, (u64)(uintptr_t)img->base, 0, 0, 0);
-    // WinMain returned without ExitProcess: a legitimate end state
-    trt_core_log("trt: BOOT WinMain returned (no ExitProcess) — pump phase follows");
-    g_boot.winmain_entered = 1;
-    // drive the pump from the host side: GetMessageW would block forever
-    // in this model, so give the watchdog a moment, then report honestly
-    for (int i = 0; i < 30 && !g_boot.quit_seen; ++i) {
-      struct timespec ts{0, 100 * 1000000};
-      nanosleep(&ts, nullptr);
-    }
-  } else {
-    g_boot.winmain_entered = 1;  // the trap fired from inside WinMain's subtree
-  }
-
-  pthread_join(wd, nullptr);
-  trt_boot_exit_trap = nullptr;
-  trt_boot_raise_trap = nullptr;
-
-  // ---- the NAMED DEPTH LADDER report ----
-  printf("\n==== TIRAMISU BOOT DEPTH LADDER: %s ====\n", name);
-  printf("  CRT-STARTUP OK        : REACHED (CRT init called; trap-eligible)\n");
-  printf("  WINMAIN ENTERED       : %s\n", marker(g_boot.winmain_entered));
-  printf("  UNITYMAIN2 CALLED     : %s\n", marker(g_boot.unitymain2));
-  printf("  WINDOW CREATED        : %s\n", marker(g_boot.window_created));
-  printf("  D3D11 DEVICE ACQUIRED : %s\n", marker(g_boot.d3d11_device));
-  printf("  PUMP ENTERED          : %s\n", marker(g_boot.pump_started));
-  printf("  PUMP QUIT             : %s\n", marker(g_boot.quit_seen));
-  printf("  messages dispatched   : %u\n", trt_msg_dispatched());
-
-  if (g_boot.trapped == 1) {
-    printf("\nBOOT EXITED %s: ExitProcess(rc=%d) at last bridge: %s\n", name,
-           g_boot.exit_code, last_bridge_line());
-    printf("last trt log lines:\n");
-    ring_dump_last(40);
-  } else if (g_boot.trapped == 2) {
-    printf("\nBOOT FAILED %s: guest RaiseException(0x%08x) — no SEH walk "
-           "(last bridge: %s)\n", name, g_boot.raise_code, last_bridge_line());
-    printf("last trt log lines:\n");
-    ring_dump_last(40);
-  } else if (g_boot.quit_seen) {
-    printf("\nBOOT PUMPED %s: %u messages dispatched, WM_QUIT received%s\n",
-           name, trt_msg_dispatched(),
-           g_boot.watchdog_fired ? " (watchdog-forced)" : " (guest-quit)");
-    if (g_boot.watchdog_fired)
-      printf("last trt log lines:\n"), ring_dump_last(40);
-  } else {
-    printf("\nBOOT STALLED %s: no ExitProcess, no WM_QUIT (last bridge: %s)\n",
-           name, last_bridge_line());
-    printf("last trt log lines:\n");
-    ring_dump_last(40);
-  }
-  printf("==== end boot report ====\n");
-  fflush(stdout);
+  const int boot_rc = boot_run_entry((void*)img, name);
+  (void)boot_rc;  // the ladder report above already named the outcome; the
+                  // corpus verdict counts a named ExitProcess as a booted EXE
   return 0;
 }
 

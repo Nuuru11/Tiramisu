@@ -17,6 +17,7 @@ extern "C" {
 
 // Register openal32.dll as BUILTIN.
 int trt_bridge_register_openal(void);
+u32 TRT_GUEST_ABI trt_openal_pump(u32 max_per_source);
 
 #ifdef __cplusplus
 }

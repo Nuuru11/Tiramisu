@@ -8,3 +8,4 @@ EXPORTS
     SetTextColor
     SetBkColor
     CreateSolidBrush
+    SwapBuffers
