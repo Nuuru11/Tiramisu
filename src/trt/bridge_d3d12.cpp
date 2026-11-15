@@ -138,6 +138,41 @@ std::unordered_set<void*> g_queues;
 std::atomic<u64> g_next_va{0x120000000ULL};
 std::atomic<u64> g_next_desc{0x240000000ULL};
 
+// ---- Sprint-2 live-object registries (descriptor heaps / resources / rootsigs)
+// A CPU descriptor handle only resolves to (heap, index) if the heap is live;
+// a view only validates against a resource the bridge actually created; a PSO
+// root-signature pointer must reference a root signature CreateRootSignature
+// returned. Everything else fails VISIBLY with a named log line.
+std::mutex g_live_mu;
+std::unordered_set<void*> g_live_heaps;
+std::unordered_set<void*> g_live_resources;
+std::unordered_set<void*> g_live_rootsigs;
+
+// log-once gate for recording-level success lines / soft warnings (the
+// fail-visible E_INVALIDARG lines log EVERY time — garbage is rare and each
+// occurrence is diagnostic gold; success lines log once so per-frame calls
+// cannot flood the log).
+static std::atomic<u32> g_d3d12_once_seen{0};
+static void d3d12_log_once(u32 bit, const char* line) {
+  const u32 mask = 1u << bit;
+  const u32 seen = g_d3d12_once_seen.load(std::memory_order_relaxed);
+  if (!(seen & mask) &&
+      !(g_d3d12_once_seen.fetch_or(mask, std::memory_order_relaxed) & mask)) {
+    trt_core_log(line);
+  }
+}
+
+// Forward decls: the fail-visible logger + liveness/resolve helpers are
+// defined in the view/copy block below, but the command-list and resource
+// sections above need them too.
+struct d3d12_desc_heap;
+static bool is_live_resource(const void* p);
+static bool is_live_root_sig(const void* p);
+static d3d12_desc_heap* resolve_gpu_handle(u64 h, u32* out_idx,
+                                           const char* api, char* reason,
+                                           size_t reason_sz);
+static void view_fail(const char* api, const char* reason);
+
 // ---- ABI POD layouts matching xwin d3d12.h on x86_64 -----------------------
 struct d3d12_luid_t {
   u32 low;
@@ -203,6 +238,178 @@ struct d3d12_placed_footprint_t {
   u32 depth;
   u32 row_pitch;
 };
+
+// ---- Sprint-2: byte-exact mirrors of the guest-visible descriptor/PSO structs
+// (sizes+offsets compiler-verified against the xwin SDK d3d12.h under the
+// Win64 ABI; see the wave-5 ABI probe). Every guest-callable parse reads
+// through these layouts — a wrong offset reads garbage, so each is pinned.
+struct d3d12_cbv_desc_t {          // D3D12_CONSTANT_BUFFER_VIEW_DESC
+  u64 buffer_location;             // D3D12_GPU_VIRTUAL_ADDRESS
+  u32 size_in_bytes;
+};
+static_assert(sizeof(d3d12_cbv_desc_t) == 16, "CBV desc must be 16 bytes");
+
+struct d3d12_srv_desc_t {          // D3D12_SHADER_RESOURCE_VIEW_DESC (40)
+  u32 format;                      // DXGI_FORMAT
+  u32 view_dimension;              // D3D12_SRV_DIMENSION
+  u32 shader4_component_mapping;
+  u32 pad;
+  u8 payload[24];                  // union (largest arm 24: TEX2D_ARRAY/BUFFER)
+};
+static_assert(sizeof(d3d12_srv_desc_t) == 40, "SRV desc must be 40 bytes");
+
+struct d3d12_uav_desc_t {          // D3D12_UNORDERED_ACCESS_VIEW_DESC (40)
+  u32 format;
+  u32 view_dimension;              // D3D12_UAV_DIMENSION
+  u8 payload[32];                  // union (largest arm 32: D3D12_BUFFER_UAV)
+};
+static_assert(sizeof(d3d12_uav_desc_t) == 40, "UAV desc must be 40 bytes");
+
+struct d3d12_rtv_desc_t {          // D3D12_RENDER_TARGET_VIEW_DESC (24)
+  u32 format;
+  u32 view_dimension;              // D3D12_RTV_DIMENSION
+  u8 payload[16];                  // union (largest arm 16: TEX2D_ARRAY_RTV)
+};
+static_assert(sizeof(d3d12_rtv_desc_t) == 24, "RTV desc must be 24 bytes");
+
+struct d3d12_dsv_desc_t {          // D3D12_DEPTH_STENCIL_VIEW_DESC (24)
+  u32 format;
+  u32 view_dimension;              // D3D12_DSV_DIMENSION
+  u32 flags;                       // D3D12_DSV_FLAGS
+  u8 payload[12];                  // union at offset 12, align-4 (max arm 12)
+};
+static_assert(sizeof(d3d12_dsv_desc_t) == 24, "DSV desc must be 24 bytes");
+
+struct d3d12_sampler_desc_t {      // D3D12_SAMPLER_DESC (52)
+  u32 filter;                      // D3D12_FILTER (max valid 0x1d5)
+  u32 address_u, address_v, address_w;
+  float mip_lod_bias;
+  u32 max_anisotropy;
+  u32 comparison_func;             // D3D12_COMPARISON_FUNC (1..8)
+  float border_color[4];
+  float min_lod;
+  float max_lod;
+};
+static_assert(sizeof(d3d12_sampler_desc_t) == 52, "SAMPLER desc must be 52 bytes");
+
+struct d3d12_shader_bytecode_t {   // D3D12_SHADER_BYTECODE (16)
+  const void* p_shader_bytecode;
+  u64 bytecode_length;
+};
+static_assert(sizeof(d3d12_shader_bytecode_t) == 16, "shader bytecode 16");
+
+struct d3d12_stream_output_desc_t {  // D3D12_STREAM_OUTPUT_DESC (32)
+  const void* p_so_declaration;      // @0
+  u32 num_entries;                   // @8
+  u32 pad0;                          // @12
+  const void* p_buffer_strides;      // @16
+  u32 num_strides;                   // @24
+  u32 rasterized_stream;             // @28
+};
+static_assert(sizeof(d3d12_stream_output_desc_t) == 32, "stream output desc 32");
+
+struct d3d12_gpsd_t {              // D3D12_GRAPHICS_PIPELINE_STATE_DESC (656)
+  void* p_root_signature;          // @0
+  d3d12_shader_bytecode_t vs;      // @8
+  d3d12_shader_bytecode_t ps;      // @24
+  d3d12_shader_bytecode_t ds;      // @40
+  d3d12_shader_bytecode_t hs;      // @56
+  d3d12_shader_bytecode_t gs;      // @72
+  d3d12_stream_output_desc_t stream_output;  // @88
+  u8 blend_state[328];             // @120 D3D12_BLEND_DESC
+  u32 sample_mask;                 // @448
+  u8 rasterizer_state[44];         // @452 D3D12_RASTERIZER_DESC
+  u8 depth_stencil_state[56];      // @496 D3D12_DEPTH_STENCIL_DESC
+  const void* p_input_elements;    // @552
+  u32 input_element_count;         // @560
+  u32 input_pad;                   // @564
+  u32 ib_strip_cut_value;          // @568
+  u32 primitive_topology_type;     // @572
+  u32 num_render_targets;          // @576
+  u32 rtv_formats[8];              // @580
+  u32 dsv_format;                  // @612
+  u32 sample_count;                // @616
+  u32 sample_quality;              // @620
+  u32 node_mask;                   // @624
+  u32 pad0;                        // @628
+  const void* cached_blob;         // @632
+  u64 cached_blob_size;            // @640
+  u32 flags;                       // @648
+  u32 pad1;                        // @652
+};
+static_assert(sizeof(d3d12_gpsd_t) == 656, "GRAPHICS PSO desc must be 656 bytes");
+
+struct d3d12_cpsd_t {              // D3D12_COMPUTE_PIPELINE_STATE_DESC (56)
+  void* p_root_signature;          // @0
+  d3d12_shader_bytecode_t cs;      // @8
+  u32 node_mask;                   // @24
+  u32 pad0;                        // @28
+  const void* cached_blob;         // @32
+  u64 cached_blob_size;            // @40
+  u32 flags;                       // @48
+  u32 pad1;                        // @52
+};
+static_assert(sizeof(d3d12_cpsd_t) == 56, "COMPUTE PSO desc must be 56 bytes");
+
+struct d3d12_stream_desc_t {       // D3D12_PIPELINE_STATE_STREAM_DESC (16)
+  u64 size_in_bytes;               // @0
+  void* p_subobject_stream;        // @8
+};
+static_assert(sizeof(d3d12_stream_desc_t) == 16, "stream desc 16");
+
+struct d3d12_subobject_hdr_t {     // D3D12_PIPELINE_STATE_STREAM_SUBOBJECT header
+  u32 type;                        // D3D12_PIPELINE_STATE_SUBOBJECT_TYPE @0
+  u32 pad;                         // @4 (x64 alignment: SIZE_T size at 8)
+  u64 size;                        // payload size in bytes @8
+};
+static_assert(sizeof(d3d12_subobject_hdr_t) == 16, "subobject header 16");
+
+// D3D12_PIPELINE_STATE_SUBOBJECT_TYPE values (SDK-verbatim).
+enum : u32 {
+  k_subo_root_signature = 0,
+  k_subo_vs = 1,
+  k_subo_ps = 2,
+  k_subo_ds = 3,
+  k_subo_hs = 4,
+  k_subo_gs = 5,
+  k_subo_cs = 6,
+  k_subo_stream_output = 7,
+  k_subo_blend = 8,
+  k_subo_sample_mask = 9,
+  k_subo_rasterizer = 10,
+  k_subo_depth_stencil = 11,
+  k_subo_input_layout = 12,
+  k_subo_ib_strip_cut = 13,
+  k_subo_primitive_topology = 14,
+  k_subo_render_target_formats = 15,
+  k_subo_depth_stencil_format = 16,
+  k_subo_sample_desc = 17,
+  k_subo_node_mask = 18,
+  k_subo_cached_pso = 19,
+  k_subo_flags = 20,
+  k_subo_depth_stencil1 = 21,
+  k_subo_view_instancing = 22,
+  k_subo_as = 24,
+  k_subo_ms = 25,
+  k_subo_depth_stencil2 = 26,
+  k_subo_rasterizer1 = 27,
+  k_subo_rasterizer2 = 28,
+  k_subo_max_valid = 29,
+};
+
+struct d3d12_box_t {               // D3D12_BOX (24)
+  u32 left, top, front;
+  u32 right, bottom, back;
+};
+static_assert(sizeof(d3d12_box_t) == 24, "D3D12_BOX must be 24 bytes");
+
+struct d3d12_tex_copy_loc_t {      // D3D12_TEXTURE_COPY_LOCATION (48)
+  void* p_resource;                // @0
+  u32 type;                        // D3D12_TEXTURE_COPY_TYPE @8
+  u32 pad;                         // @12
+  u8 payload[32];                  // union @16 (PLACED_SUBRESOURCE_FOOTPRINT)
+};
+static_assert(sizeof(d3d12_tex_copy_loc_t) == 48, "tex copy location 48");
 
 // Forward declare offline COM object types so AddRef/Release/Destroy compose
 struct d3d12_blob;
@@ -400,13 +607,56 @@ static_assert(sizeof(g_fence_vtbl) / sizeof(g_fence_vtbl[0]) == 12,
               "ID3D12Fence/Fence1 vtbl must stay 12 slots (Win64 ABI)");
 
 // ---- ID3D12DescriptorHeap --------------------------------------------------
+// One parsed descriptor record per heap slot. `kind` is the view type written
+// into the slot (0xFF = never written); the rest is the parsed view/sampler
+// state so CopyDescriptors can move records between heaps and the recorded
+// command-list ops can reference what a root table actually points at.
+struct d3d12_view_record {
+  u32 kind;               // 0=CBV 1=SRV 2=UAV 3=RTV 4=DSV 5=SAMPLER 0xff=empty
+  u32 view_dim;           // ViewDimension (SRV/UAV/RTV/DSV), 0 for CBV/sampler
+  u32 format;             // DXGI_FORMAT (0 = derived from the resource)
+  u32 flags;              // DSV flags / BUFFER_SRV|UAV flags
+  u32 mip;                // MostDetailedMip / MipSlice
+  u32 mip_levels;         // MipLevels
+  u32 first_slice;        // FirstArraySlice / First2DArrayFace
+  u32 num_slices;         // ArraySize / NumCubes
+  u32 plane;              // PlaneSlice
+  u32 size_bytes;         // CBV SizeInBytes / BUFFER NumElements
+  u32 stride;             // BUFFER StructureByteStride
+  u32 sampler_filter;     // SAMPLER: D3D12_FILTER
+  u32 sampler_cmp;        // SAMPLER: D3D12_COMPARISON_FUNC
+  u64 gpu_va;             // CBV BufferLocation / RTAS Location / FirstElement
+  void* resource;         // referenced resource (null for CBV/sampler/null-desc)
+  void* counter_resource; // UAV counter resource
+  u32 addr_u, addr_v, addr_w;  // SAMPLER address modes
+  u32 max_anisotropy;          // SAMPLER
+  float mip_lod_bias;          // SAMPLER
+  float border_color[4];       // SAMPLER
+  float min_lod, max_lod;      // SAMPLER
+};
+
+constexpr u32 k_desc_kind_empty = 0xffffffffu;
+// Hard cap on stored records per heap (a 1M-descriptor heap costs ~72 MB of
+// records; beyond the cap handles are bounds-checked but fail VISIBLY).
+constexpr u32 k_desc_records_cap = 1u << 20;
+
 struct d3d12_desc_heap : com_base {
   d3d12_heap_desc_info_t desc{};
   u64 cpu_base = 0;
   u64 gpu_base = 0;
+  u32 inc = 64;           // per-descriptor handle increment (32 CSU/SAMPLER, 64 RTV/DSV)
+  u64 span = 0;           // cpu VA span reserved at create (num * 64)
+  std::vector<d3d12_view_record> records;
 };
 
-void heap_desc_destroy(com_base* b) { delete (d3d12_desc_heap*)b; }
+void heap_desc_destroy(com_base* b) {
+  auto* h = (d3d12_desc_heap*)b;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_heaps.erase(h);
+  }
+  delete h;
+}
 
 d3d12_heap_desc_info_t* TRT_GUEST_ABI descheap_get_desc(void* self, d3d12_heap_desc_info_t* ret) {
   if (ret) *ret = ((d3d12_desc_heap*)self)->desc;
@@ -426,7 +676,7 @@ u64* TRT_GUEST_ABI descheap_gpu_start(void* self, u64* ret) {
 // BUG-6 QI chain: IUnknown + Object + DeviceChild + Pageable + DescriptorHeap
 int TRT_GUEST_ABI descheap_qi(void* self, const void* riid, void** ppv) {
   static const qi_iid k_descheap = TIRAMISU_IID(ID3D12DescriptorHeap,
-      0x8efb471du, 0x616c, 0x4f49, 0x90, 0xf7, 0x12, 0xb7, 0xb7, 0x63, 0xfa, 0x51);
+      0x8efb471du, 0x616c, 0x4f49, 0x90, 0xf7, 0x12, 0x7b, 0xb7, 0x63, 0xfa, 0x51);
   static const qi_iid* const chain[] = {
       &k_iid_object, &k_iid_device_child, &k_iid_pageable, &k_descheap, nullptr};
   return d3d12_qi_chain(self, riid, ppv, chain, "ID3D12DescriptorHeap");
@@ -455,7 +705,14 @@ struct d3d12_resource : com_base {
   std::vector<u8> backing;
 };
 
-void resource_destroy(com_base* b) { delete (d3d12_resource*)b; }
+void resource_destroy(com_base* b) {
+  auto* r = (d3d12_resource*)b;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_resources.erase(r);
+  }
+  delete r;
+}
 
 size_t estimate_res_bytes(const d3d12_resource_desc_t& d) {
   u64 w = d.width ? d.width : 1;
@@ -487,22 +744,179 @@ u64 TRT_GUEST_ABI res_gpu_va(void* self) {
   return ((d3d12_resource*)self)->gpu_va;
 }
 
-int TRT_GUEST_ABI res_write_sub(void* self, u32, const void*, const void* src, u32 row_pitch, u32) {
+// Box-aware subresource copies for WriteToSubresource (slot 12) and
+// ReadFromSubresource (slot 13). box == null -> one row of min(pitch, cap)
+// bytes at offset 0; box != null -> rows [top,bottom) x slices [front,back),
+// row_bytes = right-left, linearized into the backing store as
+// (slice * rows + row) * row_bytes. Every mismatch fails VISIBLY with
+// E_INVALIDARG and a named log line; an empty box is an S_OK no-op.
+int TRT_GUEST_ABI res_write_sub(void* self, u32, const void* box,
+                                const void* src, u32 src_row_pitch,
+                                u32 src_depth_pitch) {
   auto* r = (d3d12_resource*)self;
-  if (r->backing.empty()) r->backing.resize(estimate_res_bytes(r->desc));
-  if (src && row_pitch && !r->backing.empty()) {
-    const size_t cp = row_pitch < r->backing.size() ? row_pitch : r->backing.size();
-    memcpy(r->backing.data(), src, cp);
+  const char* api = "WriteToSubresource";
+  if (!src) {
+    view_fail(api, "pSrcData is null");
+    return k_e_invalidarg;
   }
+  if (r->backing.empty()) r->backing.resize(estimate_res_bytes(r->desc));
+  const size_t cap = r->backing.size();
+  u8* dstp = r->backing.data();
+  if (!box) {
+    if (src_row_pitch == 0) {
+      view_fail(api, "SrcRowPitch is 0");
+      return k_e_invalidarg;
+    }
+    memcpy(dstp, src, src_row_pitch < cap ? src_row_pitch : cap);
+  } else {
+    const d3d12_box_t* b = (const d3d12_box_t*)box;
+    if (b->right < b->left || b->bottom < b->top || b->back < b->front) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "D3D12_BOX is not monotonic (right %u < left %u, bottom %u < "
+               "top %u or back %u < front %u)",
+               b->right, b->left, b->bottom, b->top, b->back, b->front);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    const u64 row_bytes = (u64)(b->right - b->left);
+    const u64 rows = (u64)(b->bottom - b->top);
+    const u64 slices = (u64)(b->back - b->front);
+    if (row_bytes == 0 || rows == 0 || slices == 0) return k_s_ok;  // empty box
+    // D3D12_BOX semantics: for a BUFFER, left/right are BYTE offsets in the
+    // subresource; for a texture they are texel offsets (the bridge's backing
+    // store is 4 bytes per texel, matching estimate_res_bytes).
+    const bool is_buffer = (r->desc.dimension == 1);
+    const u32 texel = is_buffer ? 1u : 4u;
+    const u64 row_bytes_b = row_bytes * texel;
+    if (src_row_pitch < row_bytes_b) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "SrcRowPitch %u is smaller than the box row width %llu",
+               src_row_pitch, (unsigned long long)row_bytes_b);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    if (slices > 1 && (u64)src_depth_pitch < src_row_pitch * rows) {
+      char reason[160];
+      snprintf(reason, sizeof(reason),
+               "SrcDepthPitch %u is smaller than SrcRowPitch %u x %llu rows",
+               src_depth_pitch, src_row_pitch, (unsigned long long)rows);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    // Destination offset of row (z, y) within the backing store: box.left
+    // bytes into the row for a buffer, box.left texels for a texture; box
+    // top/front select the row/slice the box starts at.
+    const u64 row_stride =
+        is_buffer ? row_bytes_b : (u64)(r->desc.width ? r->desc.width : 1) * 4u;
+    const u64 slice_stride =
+        is_buffer ? row_bytes_b * rows
+                  : row_stride * (u64)(r->desc.height ? r->desc.height : 1);
+    for (u64 z = 0; z < slices; ++z) {
+      for (u64 y = 0; y < rows; ++y) {
+        const u64 off = (u64)b->left * texel + (u64)b->top * row_stride +
+                        (u64)b->front * slice_stride + y * row_stride +
+                        z * slice_stride;
+        if (off + row_bytes_b > (u64)cap) {
+          char reason[160];
+          snprintf(reason, sizeof(reason),
+                   "box copy of %llu bytes at offset %llu exceeds the "
+                   "%zu-byte subresource storage",
+                   (unsigned long long)row_bytes_b, (unsigned long long)off,
+                   cap);
+          view_fail(api, reason);
+          return k_e_invalidarg;
+        }
+        memcpy(dstp + off,
+               (const u8*)src + z * (u64)src_depth_pitch + y * (u64)src_row_pitch,
+               row_bytes_b);
+      }
+    }
+  }
+  d3d12_log_once(27, "d3d12: WriteToSubresource copied into the resource backing store");
   return k_s_ok;
 }
 
-int TRT_GUEST_ABI res_read_sub(void* self, void* dst, u32 row_pitch, u32, u32, const void*) {
+int TRT_GUEST_ABI res_read_sub(void* self, void* dst, u32 dst_row_pitch,
+                               u32 dst_depth_pitch, u32, const void* box) {
   auto* r = (d3d12_resource*)self;
-  if (dst && row_pitch && !r->backing.empty()) {
-    const size_t cp = row_pitch < r->backing.size() ? row_pitch : r->backing.size();
-    memcpy(dst, r->backing.data(), cp);
+  const char* api = "ReadFromSubresource";
+  if (!dst) {
+    view_fail(api, "pDstData is null");
+    return k_e_invalidarg;
   }
+  if (r->backing.empty()) r->backing.resize(estimate_res_bytes(r->desc));
+  const size_t cap = r->backing.size();
+  const u8* srcp = r->backing.data();
+  if (!box) {
+    if (dst_row_pitch == 0) {
+      view_fail(api, "DstRowPitch is 0");
+      return k_e_invalidarg;
+    }
+    memcpy(dst, srcp, dst_row_pitch < cap ? dst_row_pitch : cap);
+  } else {
+    const d3d12_box_t* b = (const d3d12_box_t*)box;
+    if (b->right < b->left || b->bottom < b->top || b->back < b->front) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "D3D12_BOX is not monotonic (right %u < left %u, bottom %u < "
+               "top %u or back %u < front %u)",
+               b->right, b->left, b->bottom, b->top, b->back, b->front);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    const u64 row_bytes = (u64)(b->right - b->left);
+    const u64 rows = (u64)(b->bottom - b->top);
+    const u64 slices = (u64)(b->back - b->front);
+    if (row_bytes == 0 || rows == 0 || slices == 0) return k_s_ok;  // empty box
+    // D3D12_BOX semantics, mirroring WriteToSubresource: buffer left/right
+    // are BYTE offsets, texture left/right are texel offsets (4-byte texels).
+    const bool is_buffer = (r->desc.dimension == 1);
+    const u32 texel = is_buffer ? 1u : 4u;
+    const u64 row_bytes_b = row_bytes * texel;
+    if (dst_row_pitch < row_bytes_b) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "DstRowPitch %u is smaller than the box row width %llu",
+               dst_row_pitch, (unsigned long long)row_bytes_b);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    if (slices > 1 && (u64)dst_depth_pitch < dst_row_pitch * rows) {
+      char reason[160];
+      snprintf(reason, sizeof(reason),
+               "DstDepthPitch %u is smaller than DstRowPitch %u x %llu rows",
+               dst_depth_pitch, dst_row_pitch, (unsigned long long)rows);
+      view_fail(api, reason);
+      return k_e_invalidarg;
+    }
+    const u64 row_stride =
+        is_buffer ? row_bytes_b : (u64)(r->desc.width ? r->desc.width : 1) * 4u;
+    const u64 slice_stride =
+        is_buffer ? row_bytes_b * rows
+                  : row_stride * (u64)(r->desc.height ? r->desc.height : 1);
+    for (u64 z = 0; z < slices; ++z) {
+      for (u64 y = 0; y < rows; ++y) {
+        const u64 off = (u64)b->left * texel + (u64)b->top * row_stride +
+                        (u64)b->front * slice_stride + y * row_stride +
+                        z * slice_stride;
+        if (off + row_bytes_b > (u64)cap) {
+          char reason[160];
+          snprintf(reason, sizeof(reason),
+                   "box copy of %llu bytes at offset %llu exceeds the "
+                   "%zu-byte subresource storage",
+                   (unsigned long long)row_bytes_b, (unsigned long long)off,
+                   cap);
+          view_fail(api, reason);
+          return k_e_invalidarg;
+        }
+        memcpy((u8*)dst + z * (u64)dst_depth_pitch + y * (u64)dst_row_pitch,
+               srcp + off, row_bytes_b);
+      }
+    }
+  }
+  d3d12_log_once(28, "d3d12: ReadFromSubresource copied out of the resource backing store");
   return k_s_ok;
 }
 
@@ -545,12 +959,32 @@ static_assert(sizeof(g_resource_vtbl) / sizeof(g_resource_vtbl[0]) == 15,
               "ID3D12Resource vtbl must stay 15 slots (Win64 ABI)");
 
 // ---- ID3D12RootSignature / PipelineState / QueryHeap / CommandSignature ----
+// One host-side shape for the pure-DeviceChild objects. `is_root_sig` marks
+// the objects CreateRootSignature returned (the registry the PSO parsers
+// validate pRootSignature against); the PSO fields carry the shader bytecode
+// the (graphics/compute/stream) desc parsers extracted.
 struct d3d12_simple_child : com_base {
   d3d12_heap_desc_t heap_desc{};
   std::vector<u8> cached_pso;
+  bool is_root_sig = false;
+  bool is_compute = false;
+  void* root_sig = nullptr;
+  void* vs_blob = nullptr;
+  u64 vs_size = 0;
+  void* ps_blob = nullptr;
+  u64 ps_size = 0;
+  void* cs_blob = nullptr;
+  u64 cs_size = 0;
 };
 
-void simple_child_destroy(com_base* b) { delete (d3d12_simple_child*)b; }
+void simple_child_destroy(com_base* b) {
+  auto* c = (d3d12_simple_child*)b;
+  if (c->is_root_sig) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_rootsigs.erase(c);
+  }
+  delete c;
+}
 
 d3d12_heap_desc_t* TRT_GUEST_ABI heap_get_desc(void* self, d3d12_heap_desc_t* ret) {
   if (ret) *ret = ((d3d12_simple_child*)self)->heap_desc;
@@ -652,6 +1086,24 @@ struct d3d12_cmd_list : com_base {
   u32 dispatches = 0;
   u32 clears = 0;
   u32 barriers = 0;
+  u32 copies = 0;
+  u32 resolves = 0;
+  // SetDescriptorHeaps: the heaps currently bound to the list (replaced on
+  // every call, like the real API).
+  std::vector<void*> bound_heaps;
+  // Root-slot bindings recorded per call (slot, GPU handle/VA, graphics?).
+  struct root_table {
+    u32 slot;
+    u64 gpu;
+    bool graphics;
+  };
+  std::vector<root_table> root_tables;
+  struct root_cbv {
+    u32 slot;
+    u64 va;
+    bool graphics;
+  };
+  std::vector<root_cbv> root_cbvs;
 };
 void cmdlist_destroy(com_base* b) { delete (d3d12_cmd_list*)b; }
 
@@ -667,6 +1119,10 @@ int TRT_GUEST_ABI cmd_reset(void* self, void* alloc, void*) {
   auto* cl = (d3d12_cmd_list*)self;
   cl->closed = false;
   cl->draws = cl->dispatches = cl->clears = cl->barriers = 0;
+  cl->copies = cl->resolves = 0;
+  cl->bound_heaps.clear();
+  cl->root_tables.clear();
+  cl->root_cbvs.clear();
   return k_s_ok;
 }
 void TRT_GUEST_ABI cmd_clear_state(void*, void*) {}
@@ -688,6 +1144,271 @@ void TRT_GUEST_ABI cmd_barrier(void* self, u32 n, const void*) { ((d3d12_cmd_lis
 void TRT_GUEST_ABI cmd_clear_rtv(void* self, u64, const void*, u32, const void*) { ++((d3d12_cmd_list*)self)->clears; }
 void TRT_GUEST_ABI cmd_clear_dsv(void* self, u64, u32, float, u8, u32, const void*) { ++((d3d12_cmd_list*)self)->clears; }
 void TRT_GUEST_ABI cmd_noop(void*) {}
+
+// ---- command-list copies + descriptor/root slots (0-based vtbl slots) ------
+// Every op validates its arguments against the live-object registries and
+// either records real state or fails VISIBLY (E_INVALIDARG + named log line);
+// successes log once so per-frame calls cannot flood the log.
+
+void TRT_GUEST_ABI cmd_copy_buffer_region(void* self, void* dst, u64 dst_off,
+                                          void* src, u64 src_off, u64 num) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!dst || !src) {
+    view_fail("cl CopyBufferRegion",
+              !dst ? "pDstBuffer is null" : "pSrcBuffer is null");
+    return;
+  }
+  if (!is_live_resource(dst) || !is_live_resource(src)) {
+    char reason[128];
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)(!is_live_resource(dst) ? dst : src));
+    view_fail("cl CopyBufferRegion", reason);
+    return;
+  }
+  ++cl->copies;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: cl CopyBufferRegion recorded (dst 0x%llx+%llu <- src "
+           "0x%llx+%llu, %llu bytes)",
+           (unsigned long long)(uintptr_t)dst, (unsigned long long)dst_off,
+           (unsigned long long)(uintptr_t)src, (unsigned long long)src_off,
+           (unsigned long long)num);
+  d3d12_log_once(0, line);
+}
+
+void TRT_GUEST_ABI cmd_copy_texture_region(void* self,
+                                           const d3d12_tex_copy_loc_t* dst,
+                                           u32 dst_x, u32 dst_y, u32 dst_z,
+                                           const d3d12_tex_copy_loc_t* src,
+                                           const d3d12_box_t* src_box) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!dst || !src) {
+    view_fail("cl CopyTextureRegion",
+              !dst ? "pDst is null" : "pSrc is null");
+    return;
+  }
+  if (!dst->p_resource || !src->p_resource) {
+    view_fail("cl CopyTextureRegion",
+              !dst->p_resource ? "pDst->pResource is null"
+                               : "pSrc->pResource is null");
+    return;
+  }
+  if (!is_live_resource(dst->p_resource) || !is_live_resource(src->p_resource)) {
+    char reason[128];
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)(!is_live_resource(dst->p_resource)
+                                                 ? dst->p_resource
+                                                 : src->p_resource));
+    view_fail("cl CopyTextureRegion", reason);
+    return;
+  }
+  if (dst->type > 1 || src->type > 1) {
+    char reason[96];
+    snprintf(reason, sizeof(reason),
+             "TextureCopyType %u/%u outside 0..1 (SUBRESOURCE, "
+             "PLACED_FOOTPRINT)",
+             dst->type, src->type);
+    view_fail("cl CopyTextureRegion", reason);
+    return;
+  }
+  if (src_box &&
+      (src_box->right < src_box->left || src_box->bottom < src_box->top ||
+       src_box->back < src_box->front)) {
+    view_fail("cl CopyTextureRegion",
+              "D3D12_BOX is not monotonic (right<left, bottom<top or "
+              "back<front)");
+    return;
+  }
+  ++cl->copies;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: cl CopyTextureRegion recorded (dst 0x%llx @%u,%u,%u <- src "
+           "0x%llx box %s)",
+           (unsigned long long)(uintptr_t)dst->p_resource, dst_x, dst_y, dst_z,
+           (unsigned long long)(uintptr_t)src->p_resource,
+           src_box ? "set" : "null");
+  d3d12_log_once(1, line);
+}
+
+void TRT_GUEST_ABI cmd_copy_resource(void* self, void* dst, void* src) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!dst || !src) {
+    view_fail("cl CopyResource", !dst ? "pDstResource is null"
+                                      : "pSrcResource is null");
+    return;
+  }
+  if (!is_live_resource(dst) || !is_live_resource(src)) {
+    char reason[128];
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)(!is_live_resource(dst) ? dst : src));
+    view_fail("cl CopyResource", reason);
+    return;
+  }
+  ++cl->copies;
+  char line[128];
+  snprintf(line, sizeof(line),
+           "d3d12: cl CopyResource recorded (dst 0x%llx <- src 0x%llx)",
+           (unsigned long long)(uintptr_t)dst,
+           (unsigned long long)(uintptr_t)src);
+  d3d12_log_once(2, line);
+}
+
+void TRT_GUEST_ABI cmd_copy_tiles(void* self, void* tiled,
+                                  const void* start_coord,
+                                  const void* region_size, void* buffer,
+                                  u64 buf_off, u32 flags) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!tiled || !buffer) {
+    view_fail("cl CopyTiles",
+              !tiled ? "pTiledResource is null" : "pBuffer is null");
+    return;
+  }
+  if (!is_live_resource(tiled) || !is_live_resource(buffer)) {
+    char reason[128];
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)(!is_live_resource(tiled) ? tiled
+                                                                      : buffer));
+    view_fail("cl CopyTiles", reason);
+    return;
+  }
+  ++cl->copies;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: cl CopyTiles recorded (tiled 0x%llx <- buffer 0x%llx+%llu "
+           "flags 0x%x)",
+           (unsigned long long)(uintptr_t)tiled,
+           (unsigned long long)(uintptr_t)buffer, (unsigned long long)buf_off,
+           flags);
+  d3d12_log_once(3, line);
+}
+
+void TRT_GUEST_ABI cmd_resolve_subresource(void* self, void* dst, u32 dst_sub,
+                                           void* src, u32 src_sub, u32 format) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!dst || !src) {
+    view_fail("cl ResolveSubresource", !dst ? "pDstResource is null"
+                                            : "pSrcResource is null");
+    return;
+  }
+  if (!is_live_resource(dst) || !is_live_resource(src)) {
+    char reason[128];
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)(!is_live_resource(dst) ? dst : src));
+    view_fail("cl ResolveSubresource", reason);
+    return;
+  }
+  if (format == 0) {
+    view_fail("cl ResolveSubresource",
+              "Format is DXGI_FORMAT_UNKNOWN (resolve needs a typed format)");
+    return;
+  }
+  ++cl->resolves;
+  char line[128];
+  snprintf(line, sizeof(line),
+           "d3d12: cl ResolveSubresource recorded (dst 0x%llx sub %u <- src "
+           "0x%llx sub %u format %u)",
+           (unsigned long long)(uintptr_t)dst, dst_sub,
+           (unsigned long long)(uintptr_t)src, src_sub, format);
+  d3d12_log_once(4, line);
+}
+
+void TRT_GUEST_ABI cmd_set_desc_heaps(void* self, u32 num,
+                                      void* const* heaps) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (num == 0 || !heaps) {
+    view_fail("cl SetDescriptorHeaps",
+              num == 0 ? "NumDescriptorHeaps is 0"
+                       : "ppDescriptorHeaps is null");
+    return;
+  }
+  for (u32 i = 0; i < num; ++i) {
+    if (!heaps[i]) {
+      char reason[96];
+      snprintf(reason, sizeof(reason), "ppDescriptorHeaps[%u] is null", i);
+      view_fail("cl SetDescriptorHeaps", reason);
+      return;
+    }
+    bool live = false;
+    {
+      std::lock_guard<std::mutex> lk(g_live_mu);
+      live = g_live_heaps.count(heaps[i]) != 0;
+    }
+    if (!live) {
+      char reason[128];
+      snprintf(reason, sizeof(reason),
+               "descriptor heap 0x%llx was not created by this device",
+               (unsigned long long)(uintptr_t)heaps[i]);
+      view_fail("cl SetDescriptorHeaps", reason);
+      return;
+    }
+  }
+  cl->bound_heaps.assign(heaps, heaps + num);
+  char line[128];
+  snprintf(line, sizeof(line),
+           "d3d12: cl SetDescriptorHeaps recorded (%u heap%s bound)",
+           num, num == 1 ? "" : "s");
+  d3d12_log_once(5, line);
+}
+
+// Root-descriptor-table / root-CBV bindings. The GPU handle (or VA) is
+// soft-resolved against the live heaps: an unresolvable handle is a WARN-ONCE
+// (the real runtime only faults at draw time), not a hard failure.
+static void cmd_bind_root_table(d3d12_cmd_list* cl, u32 slot, u64 gpu,
+                                bool graphics) {
+  cl->root_tables.push_back({slot, gpu, graphics});
+  char reason[192];
+  u32 idx = 0;
+  if (!resolve_gpu_handle(gpu, &idx, "RootDescriptorTable", reason,
+                          sizeof(reason))) {
+    char line[288];
+    snprintf(line, sizeof(line),
+             "d3d12: cl %s RootDescriptorTable GPU handle 0x%llx does not "
+             "resolve to a live heap slot (%s) - accepted, recorded as-is",
+             graphics ? "Graphics" : "Compute", (unsigned long long)gpu, reason);
+    d3d12_log_once(12, line);
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "d3d12: cl %s RootDescriptorTable recorded (slot %u gpu 0x%llx)",
+           graphics ? "Graphics" : "Compute", slot, (unsigned long long)gpu);
+  d3d12_log_once(6, line);
+}
+
+static void cmd_bind_root_cbv(d3d12_cmd_list* cl, u32 slot, u64 va,
+                              bool graphics) {
+  cl->root_cbvs.push_back({slot, va, graphics});
+  if (va == 0) {
+    d3d12_log_once(13,
+                   "d3d12: cl RootConstantBufferView GPU VA is 0 - accepted, "
+                   "recorded as-is");
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "d3d12: cl %s RootConstantBufferView recorded (slot %u va 0x%llx)",
+           graphics ? "Graphics" : "Compute", slot, (unsigned long long)va);
+  d3d12_log_once(7, line);
+}
+
+void TRT_GUEST_ABI cmd_set_compute_root_table(void* self, u32 slot, u64 gpu) {
+  cmd_bind_root_table((d3d12_cmd_list*)self, slot, gpu, false);
+}
+
+void TRT_GUEST_ABI cmd_set_graphics_root_table(void* self, u32 slot, u64 gpu) {
+  cmd_bind_root_table((d3d12_cmd_list*)self, slot, gpu, true);
+}
+
+void TRT_GUEST_ABI cmd_set_compute_root_cbv(void* self, u32 slot, u64 va) {
+  cmd_bind_root_cbv((d3d12_cmd_list*)self, slot, va, false);
+}
+
+void TRT_GUEST_ABI cmd_set_graphics_root_cbv(void* self, u32 slot, u64 va) {
+  cmd_bind_root_cbv((d3d12_cmd_list*)self, slot, va, true);
+}
 
 // ---- ID3D12GraphicsCommandList1..9 versioned slots (60-83) ----------------
 // ABI-correct arities verified against the xwin SDK d3d12.h vtbl declarations.
@@ -764,11 +1485,11 @@ const void* g_cmdlist_vtbl[84] = {
     (const void*)&cmd_draw_inst,       // 12 DrawInstanced
     (const void*)&cmd_draw_idx,        // 13 DrawIndexedInstanced
     (const void*)&cmd_dispatch,        // 14 Dispatch
-    (const void*)&cmd_noop,            // 15 CopyBufferRegion
-    (const void*)&cmd_noop,            // 16 CopyTextureRegion
-    (const void*)&cmd_noop,            // 17 CopyResource
-    (const void*)&cmd_noop,            // 18 CopyTiles
-    (const void*)&cmd_noop,            // 19 ResolveSubresource
+    (const void*)&cmd_copy_buffer_region,  // 15 CopyBufferRegion
+    (const void*)&cmd_copy_texture_region, // 16 CopyTextureRegion
+    (const void*)&cmd_copy_resource,       // 17 CopyResource
+    (const void*)&cmd_copy_tiles,          // 18 CopyTiles
+    (const void*)&cmd_resolve_subresource, // 19 ResolveSubresource
     (const void*)&cmd_noop,            // 20 IASetPrimitiveTopology
     (const void*)&cmd_noop,            // 21 RSSetViewports
     (const void*)&cmd_noop,            // 22 RSSetScissorRects
@@ -777,17 +1498,17 @@ const void* g_cmdlist_vtbl[84] = {
     (const void*)&cmd_noop,            // 25 SetPipelineState
     (const void*)&cmd_barrier,         // 26 ResourceBarrier
     (const void*)&cmd_noop,            // 27 ExecuteBundle
-    (const void*)&cmd_noop,            // 28 SetDescriptorHeaps
+    (const void*)&cmd_set_desc_heaps,   // 28 SetDescriptorHeaps
     (const void*)&cmd_noop,            // 29 SetComputeRootSignature
     (const void*)&cmd_noop,            // 30 SetGraphicsRootSignature
-    (const void*)&cmd_noop,            // 31 SetComputeRootDescriptorTable
-    (const void*)&cmd_noop,            // 32 SetGraphicsRootDescriptorTable
+    (const void*)&cmd_set_compute_root_table,   // 31 SetComputeRootDescriptorTable
+    (const void*)&cmd_set_graphics_root_table,  // 32 SetGraphicsRootDescriptorTable
     (const void*)&cmd_noop,            // 33 SetComputeRoot32BitConstant
     (const void*)&cmd_noop,            // 34 SetGraphicsRoot32BitConstant
     (const void*)&cmd_noop,            // 35 SetComputeRoot32BitConstants
     (const void*)&cmd_noop,            // 36 SetGraphicsRoot32BitConstants
-    (const void*)&cmd_noop,            // 37 SetComputeRootConstantBufferView
-    (const void*)&cmd_noop,            // 38 SetGraphicsRootConstantBufferView
+    (const void*)&cmd_set_compute_root_cbv,     // 37 SetComputeRootConstantBufferView
+    (const void*)&cmd_set_graphics_root_cbv,    // 38 SetGraphicsRootConstantBufferView
     (const void*)&cmd_noop,            // 39 SetComputeRootShaderResourceView
     (const void*)&cmd_noop,            // 40 SetGraphicsRootShaderResourceView
     (const void*)&cmd_noop,            // 41 SetComputeRootUnorderedAccessView
@@ -1054,14 +1775,291 @@ int TRT_GUEST_ABI dev_create_alloc(void* self, u32 type, const void*, void** out
   return k_s_ok;
 }
 
-int TRT_GUEST_ABI dev_create_pso(void* self, const void*, const void*, void** out_pso) {
-  if (!out_pso) return k_e_invalidarg;
-  auto* p = new d3d12_simple_child();
+// ---- PSO creation (device slots 10 / 11 / 47) ------------------------------
+// Real parsing + validation of the pipeline-state descriptions. Validation is
+// deliberately LENIENT where a stale guest mirror reads zeros at the real
+// offsets (guest_triangle.c passes a 600-byte mirror of the 656-byte
+// D3D12_GRAPHICS_PIPELINE_STATE_DESC, so PrimitiveTopologyType and
+// NumRenderTargets read as 0 here and cached-blob/flags read past the mirror
+// — those are warn-once/accepted, never hard failures).
+
+// Root-signature liveness: null is accepted (real D3D12 derives one from the
+// shaders); a non-null pointer that is not a CreateRootSignature product
+// fails VISIBLY.
+static bool root_sig_ok(void* rs, char* reason, size_t reason_sz) {
+  if (!rs || is_live_root_sig(rs)) return true;
+  snprintf(reason, reason_sz,
+           "pRootSignature 0x%llx was not returned by CreateRootSignature",
+           (unsigned long long)(uintptr_t)rs);
+  return false;
+}
+
+// Shader bytecode pointer/length must be paired (both null or both set).
+static bool shader_pair_ok(const d3d12_shader_bytecode_t& s, const char* name,
+                           char* reason, size_t reason_sz) {
+  if ((s.p_shader_bytecode != nullptr) == (s.bytecode_length != 0)) return true;
+  snprintf(reason, reason_sz,
+           "%s bytecode pointer/length are not paired (ptr 0x%llx len %llu)",
+           name, (unsigned long long)(uintptr_t)s.p_shader_bytecode,
+           (unsigned long long)s.bytecode_length);
+  return false;
+}
+
+// Warn-once when a shader blob does not start with the DXBC container magic.
+static void warn_dxbc(const d3d12_shader_bytecode_t& s, const char* name) {
+  if (s.p_shader_bytecode && s.bytecode_length >= 4 &&
+      memcmp(s.p_shader_bytecode, "DXBC", 4) != 0) {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "d3d12: %s bytecode does not start with 'DXBC' (accepted, "
+             "recorded as-is)",
+             name);
+    d3d12_log_once(8, line);
+  }
+}
+
+static int pso_finish(void* self, d3d12_simple_child* p, void** out_pso,
+                      const char* api, u32 ok_bit) {
   p->vtbl = g_pso_vtbl;
   p->device = (d3d12_device*)self;
   p->destroy_fn = &simple_child_destroy;
   *out_pso = p;
+  char line[96];
+  snprintf(line, sizeof(line), "d3d12: %s recorded", api);
+  d3d12_log_once(ok_bit, line);
   return k_s_ok;
+}
+
+int TRT_GUEST_ABI dev_create_pso_gfx(void* self, const d3d12_gpsd_t* desc,
+                                     const void*, void** out_pso) {
+  char reason[192];
+  if (!out_pso) {
+    view_fail("CreateGraphicsPipelineState", "ppPipelineState is null");
+    return k_e_invalidarg;
+  }
+  if (!desc) {
+    view_fail("CreateGraphicsPipelineState", "pPipelineStateDesc is null");
+    return k_e_invalidarg;
+  }
+  if (!root_sig_ok(desc->p_root_signature, reason, sizeof(reason))) {
+    view_fail("CreateGraphicsPipelineState", reason);
+    return k_e_invalidarg;
+  }
+  if (!desc->vs.p_shader_bytecode && !desc->vs.bytecode_length) {
+    view_fail("CreateGraphicsPipelineState",
+              "VS bytecode is null (a graphics PSO needs a vertex shader)");
+    return k_e_invalidarg;
+  }
+  const d3d12_shader_bytecode_t* shaders[5] = {
+      &desc->vs, &desc->ps, &desc->ds, &desc->hs, &desc->gs};
+  const char* names[5] = {"VS", "PS", "DS", "HS", "GS"};
+  for (int i = 0; i < 5; ++i) {
+    if (!shader_pair_ok(*shaders[i], names[i], reason, sizeof(reason))) {
+      view_fail("CreateGraphicsPipelineState", reason);
+      return k_e_invalidarg;
+    }
+    warn_dxbc(*shaders[i], names[i]);
+  }
+  if (desc->input_element_count > 0 && !desc->p_input_elements) {
+    char r2[128];
+    snprintf(r2, sizeof(r2),
+             "InputLayout NumElements %u with a null pInputElementDescs",
+             desc->input_element_count);
+    view_fail("CreateGraphicsPipelineState", r2);
+    return k_e_invalidarg;
+  }
+  if (desc->num_render_targets > 8) {
+    char r2[96];
+    snprintf(r2, sizeof(r2), "NumRenderTargets %u exceeds 8",
+             desc->num_render_targets);
+    view_fail("CreateGraphicsPipelineState", r2);
+    return k_e_invalidarg;
+  }
+  if (desc->primitive_topology_type > 4) {
+    char r2[96];
+    snprintf(r2, sizeof(r2),
+             "PrimitiveTopologyType %u outside 0..4",
+             desc->primitive_topology_type);
+    view_fail("CreateGraphicsPipelineState", r2);
+    return k_e_invalidarg;
+  }
+  if (desc->primitive_topology_type == 0) {
+    // A stale 600-byte guest mirror reads 0 at the real @572 offset.
+    d3d12_log_once(
+        10,
+        "d3d12: CreateGraphicsPipelineState PrimitiveTopologyType is 0 "
+        "(accepted; a stale guest PSO mirror reads zeros at the real "
+        "offsets)");
+  }
+  auto* p = new d3d12_simple_child();
+  p->root_sig = desc->p_root_signature;
+  p->vs_blob = const_cast<void*>(desc->vs.p_shader_bytecode);
+  p->vs_size = desc->vs.bytecode_length;
+  p->ps_blob = const_cast<void*>(desc->ps.p_shader_bytecode);
+  p->ps_size = desc->ps.bytecode_length;
+  return pso_finish(self, p, out_pso, "CreateGraphicsPipelineState", 24);
+}
+
+int TRT_GUEST_ABI dev_create_pso_compute(void* self, const d3d12_cpsd_t* desc,
+                                         const void*, void** out_pso) {
+  char reason[192];
+  if (!out_pso) {
+    view_fail("CreateComputePipelineState", "ppPipelineState is null");
+    return k_e_invalidarg;
+  }
+  if (!desc) {
+    view_fail("CreateComputePipelineState", "pPipelineStateDesc is null");
+    return k_e_invalidarg;
+  }
+  if (!root_sig_ok(desc->p_root_signature, reason, sizeof(reason))) {
+    view_fail("CreateComputePipelineState", reason);
+    return k_e_invalidarg;
+  }
+  if (!desc->cs.p_shader_bytecode && !desc->cs.bytecode_length) {
+    view_fail("CreateComputePipelineState",
+              "CS bytecode is null (a compute PSO needs a compute shader)");
+    return k_e_invalidarg;
+  }
+  if (!shader_pair_ok(desc->cs, "CS", reason, sizeof(reason))) {
+    view_fail("CreateComputePipelineState", reason);
+    return k_e_invalidarg;
+  }
+  warn_dxbc(desc->cs, "CS");
+  if ((desc->cached_blob != nullptr) != (desc->cached_blob_size != 0)) {
+    view_fail("CreateComputePipelineState",
+              "CachedPSO pointer/size are not paired");
+    return k_e_invalidarg;
+  }
+  auto* p = new d3d12_simple_child();
+  p->is_compute = true;
+  p->root_sig = desc->p_root_signature;
+  p->cs_blob = const_cast<void*>(desc->cs.p_shader_bytecode);
+  p->cs_size = desc->cs.bytecode_length;
+  return pso_finish(self, p, out_pso, "CreateComputePipelineState", 25);
+}
+
+// Walks the D3D12_PIPELINE_STATE_STREAM subobject stream: 16-byte headers
+// {type@0, pad@4, size@8} followed by the 8-aligned payload. Garbage fails
+// VISIBLY at the exact subobject.
+int TRT_GUEST_ABI dev_create_pso_stream(void* self,
+                                        const d3d12_stream_desc_t* desc,
+                                        const void*, void** out_pso) {
+  char reason[192];
+  if (!out_pso) {
+    view_fail("CreatePipelineState(stream)", "ppPipelineState is null");
+    return k_e_invalidarg;
+  }
+  if (!desc) {
+    view_fail("CreatePipelineState(stream)", "pPipelineStateDesc is null");
+    return k_e_invalidarg;
+  }
+  if (!desc->p_subobject_stream || desc->size_in_bytes < 16) {
+    view_fail("CreatePipelineState(stream)",
+              "subobject stream is null or smaller than one 16-byte header");
+    return k_e_invalidarg;
+  }
+  const u8* base = (const u8*)desc->p_subobject_stream;
+  const u64 total = desc->size_in_bytes;
+  u64 off = 0;
+  bool have_vs = false, have_cs = false;
+  void* rs_ptr = nullptr;
+  const d3d12_shader_bytecode_t* vs = nullptr;
+  const d3d12_shader_bytecode_t* ps = nullptr;
+  const d3d12_shader_bytecode_t* cs = nullptr;
+  while (off + 16 <= total) {
+    const d3d12_subobject_hdr_t* hdr =
+        (const d3d12_subobject_hdr_t*)(base + off);
+    if (hdr->type >= k_subo_max_valid) {
+      char r2[128];
+      snprintf(r2, sizeof(r2),
+               "subobject type %u outside 0..28 at stream offset %llu",
+               hdr->type, (unsigned long long)off);
+      view_fail("CreatePipelineState(stream)", r2);
+      return k_e_invalidarg;
+    }
+    const u64 payload = off + 16;
+    if (hdr->size > total - payload) {
+      char r2[160];
+      snprintf(r2, sizeof(r2),
+               "subobject type %u payload of %llu bytes overruns the "
+               "%llu-byte stream at offset %llu",
+               hdr->type, (unsigned long long)hdr->size,
+               (unsigned long long)total, (unsigned long long)off);
+      view_fail("CreatePipelineState(stream)", r2);
+      return k_e_invalidarg;
+    }
+    const void* data = base + payload;
+    switch (hdr->type) {
+      case k_subo_root_signature:
+        if (hdr->size >= 8) rs_ptr = *(void* const*)data;
+        break;
+      case k_subo_vs:
+        if (hdr->size < 16) {
+          char r2[96];
+          snprintf(r2, sizeof(r2),
+                   "VS subobject payload is %llu bytes (needs 16)",
+                   (unsigned long long)hdr->size);
+          view_fail("CreatePipelineState(stream)", r2);
+          return k_e_invalidarg;
+        }
+        vs = (const d3d12_shader_bytecode_t*)data;
+        have_vs = true;
+        break;
+      case k_subo_ps:
+        if (hdr->size >= 16) ps = (const d3d12_shader_bytecode_t*)data;
+        break;
+      case k_subo_cs:
+        if (hdr->size < 16) {
+          char r2[96];
+          snprintf(r2, sizeof(r2),
+                   "CS subobject payload is %llu bytes (needs 16)",
+                   (unsigned long long)hdr->size);
+          view_fail("CreatePipelineState(stream)", r2);
+          return k_e_invalidarg;
+        }
+        cs = (const d3d12_shader_bytecode_t*)data;
+        have_cs = true;
+        break;
+      default:
+        break;
+    }
+    off = payload + ((hdr->size + 7u) & ~7u);
+  }
+  if (!have_vs && !have_cs) {
+    view_fail("CreatePipelineState(stream)",
+              "stream contains neither a VS nor a CS subobject");
+    return k_e_invalidarg;
+  }
+  if (!root_sig_ok(rs_ptr, reason, sizeof(reason))) {
+    view_fail("CreatePipelineState(stream)", reason);
+    return k_e_invalidarg;
+  }
+  const d3d12_shader_bytecode_t* check[3] = {vs, ps, cs};
+  const char* names[3] = {"VS", "PS", "CS"};
+  for (int i = 0; i < 3; ++i) {
+    if (check[i] && !shader_pair_ok(*check[i], names[i], reason,
+                                    sizeof(reason))) {
+      view_fail("CreatePipelineState(stream)", reason);
+      return k_e_invalidarg;
+    }
+    if (check[i]) warn_dxbc(*check[i], names[i]);
+  }
+  auto* p = new d3d12_simple_child();
+  p->is_compute = have_cs && !have_vs;
+  p->root_sig = rs_ptr;
+  if (vs) {
+    p->vs_blob = const_cast<void*>(vs->p_shader_bytecode);
+    p->vs_size = vs->bytecode_length;
+  }
+  if (ps) {
+    p->ps_blob = const_cast<void*>(ps->p_shader_bytecode);
+    p->ps_size = ps->bytecode_length;
+  }
+  if (cs) {
+    p->cs_blob = const_cast<void*>(cs->p_shader_bytecode);
+    p->cs_size = cs->bytecode_length;
+  }
+  return pso_finish(self, p, out_pso, "CreatePipelineState(stream)", 26);
 }
 
 int TRT_GUEST_ABI dev_create_cmdlist(void* self, u32, u32 type, void* alloc,
@@ -1129,14 +2127,47 @@ int TRT_GUEST_ABI dev_check_feature(void* self, u32 feature, void* data, u32 sz)
 int TRT_GUEST_ABI dev_create_descheap(void* self, const d3d12_heap_desc_info_t* desc,
                                       const void*, void** out_h) {
   if (!desc || !out_h) return k_e_invalidarg;
+  if (desc->num_descriptors == 0) {
+    trt_core_log(
+        "d3d12: CreateDescriptorHeap -> E_INVALIDARG (NumDescriptors == 0)");
+    return k_e_invalidarg;
+  }
+  if (desc->type > 3) {  // D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV..DSV
+    char line[128];
+    snprintf(line, sizeof(line),
+             "d3d12: CreateDescriptorHeap -> E_INVALIDARG (heap type %u "
+             "outside 0..3)",
+             desc->type);
+    trt_core_log(line);
+    return k_e_invalidarg;
+  }
   auto* h = new d3d12_desc_heap();
   h->vtbl = g_descheap_vtbl;
   h->device = (d3d12_device*)self;
   h->destroy_fn = &heap_desc_destroy;
   h->desc = *desc;
-  const u64 span = (u64)(desc->num_descriptors ? desc->num_descriptors : 1) * 64ULL;
+  h->inc = (desc->type == 0 || desc->type == 1) ? 32u : 64u;
+  const u64 span = (u64)desc->num_descriptors * 64ULL;
+  h->span = span;
   h->cpu_base = g_next_desc.fetch_add(span + 64ULL);
   if (desc->flags & 1u) h->gpu_base = h->cpu_base | 0x400000000000ULL;
+  const u32 stored =
+      desc->num_descriptors < k_desc_records_cap ? desc->num_descriptors
+                                                 : k_desc_records_cap;
+  if (desc->num_descriptors > k_desc_records_cap) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "d3d12: CreateDescriptorHeap type %u num %u exceeds record "
+             "storage cap %u - slots beyond the cap fail visibly",
+             desc->type, desc->num_descriptors, k_desc_records_cap);
+    d3d12_log_once(14, line);
+  }
+  h->records.resize(stored);
+  for (auto& r : h->records) r.kind = k_desc_kind_empty;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_heaps.insert(h);
+  }
   *out_h = h;
   return k_s_ok;
 }
@@ -1145,18 +2176,588 @@ u32 TRT_GUEST_ABI dev_desc_inc(void*, u32 type) {
   return (type == 0 || type == 1) ? 32u : 64u;
 }
 
+// ---- descriptor handle resolution + view/copy implementation ----------------
+// handle = cpu_base + index*increment_size. The increment (32 for CSU/SAMPLER,
+// 64 for RTV/DSV) — NOT the 64-byte VA span — is what decodes the index; the
+// span is only reserved address space.
+static bool is_live_resource(const void* p) {
+  if (!p) return false;
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  return g_live_resources.count(const_cast<void*>(p)) != 0;
+}
+
+static bool is_live_root_sig(const void* p) {
+  if (!p) return false;
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  return g_live_rootsigs.count(const_cast<void*>(p)) != 0;
+}
+
+// Resolves a CPU descriptor handle to (heap, index). Returns nullptr (with a
+// human reason in `reason`) when the handle is not on a slot boundary of any
+// live heap, is past the heap end, or is beyond record storage.
+static d3d12_desc_heap* resolve_cpu_handle(u64 h, u32* out_idx, const char* api,
+                                           char* reason, size_t reason_sz) {
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  for (void* p : g_live_heaps) {
+    auto* heap = (d3d12_desc_heap*)p;
+    if (h < heap->cpu_base || h >= heap->cpu_base + heap->span) continue;
+    const u64 off = h - heap->cpu_base;
+    const u64 idx = off / heap->inc;
+    if (off % heap->inc != 0) {
+      snprintf(reason, reason_sz,
+               "handle 0x%llx is offset %llu into heap type %u - not on a "
+               "%u-byte slot boundary",
+               (unsigned long long)h, (unsigned long long)off, heap->desc.type,
+               heap->inc);
+      (void)api;
+      return nullptr;
+    }
+    if (idx >= heap->desc.num_descriptors) {
+      snprintf(reason, reason_sz,
+               "handle 0x%llx resolves to slot %llu of a %u-descriptor "
+               "type-%u heap - past the heap end",
+               (unsigned long long)h, (unsigned long long)idx,
+               heap->desc.num_descriptors, heap->desc.type);
+      return nullptr;
+    }
+    if (idx >= heap->records.size()) {
+      snprintf(reason, reason_sz,
+               "handle 0x%llx resolves to slot %llu - beyond descriptor "
+               "record storage (cap %u)",
+               (unsigned long long)h, (unsigned long long)idx,
+               k_desc_records_cap);
+      return nullptr;
+    }
+    if (out_idx) *out_idx = (u32)idx;
+    return heap;
+  }
+  snprintf(reason, reason_sz,
+           "handle 0x%llx not in any live descriptor heap",
+           (unsigned long long)h);
+  return nullptr;
+}
+
+// GPU handles are the CPU base | 0x400000000000 in this runtime; strip the
+// synthetic bit and resolve as CPU.
+static d3d12_desc_heap* resolve_gpu_handle(u64 h, u32* out_idx,
+                                           const char* api, char* reason,
+                                           size_t reason_sz) {
+  return resolve_cpu_handle(h & ~0x400000000000ULL, out_idx, api, reason,
+                            reason_sz);
+}
+
+static void view_fail(const char* api, const char* reason) {
+  char line[256];
+  snprintf(line, sizeof(line), "d3d12: %s -> E_INVALIDARG (%s)", api, reason);
+  trt_core_log(line);
+}
+
+void TRT_GUEST_ABI dev_create_cbv(void* self, const d3d12_cbv_desc_t* desc,
+                                  u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!desc) {
+    view_fail("CreateConstantBufferView", "pDesc is null");
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateConstantBufferView",
+                                  reason, sizeof(reason));
+  if (!heap) {
+    view_fail("CreateConstantBufferView", reason);
+    return;
+  }
+  if (desc->buffer_location == 0) {
+    view_fail("CreateConstantBufferView",
+              "D3D12_CONSTANT_BUFFER_VIEW_DESC.BufferLocation is 0 (a CBV "
+              "needs a nonzero GPU virtual address)");
+    return;
+  }
+  if (desc->size_in_bytes == 0) {
+    view_fail("CreateConstantBufferView", "SizeInBytes is 0");
+    return;
+  }
+  if (desc->size_in_bytes & 0xffu) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "d3d12: CreateConstantBufferView SizeInBytes %u is not a "
+             "256-byte multiple (accepted, recorded as-is)",
+             desc->size_in_bytes);
+    d3d12_log_once(9, line);
+  }
+  d3d12_view_record& r = heap->records[idx];
+  r = d3d12_view_record{};
+  r.kind = 0;  // CBV
+  r.gpu_va = desc->buffer_location;
+  r.size_bytes = desc->size_in_bytes;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateConstantBufferView recorded (heap type %u slot %u "
+           "va 0x%llx size %u)",
+           heap->desc.type, idx, (unsigned long long)desc->buffer_location,
+           desc->size_in_bytes);
+  d3d12_log_once(15, line);
+}
+
+// Parses the SRV/UAV union payload per ViewDimension into the record. The
+// payload layouts are the SDK union arms (see the ABI probe asserts).
+static bool parse_srv_payload(const d3d12_srv_desc_t* d, d3d12_view_record* r,
+                              const char* api) {
+  const u32* p = (const u32*)d->payload;
+  r->mip = p[0];
+  r->mip_levels = p[1];
+  r->first_slice = p[2];
+  r->num_slices = p[3];
+  r->plane = p[4];
+  switch (d->view_dimension) {
+    case 1:  // BUFFER: {u64 FirstElement; u32 NumElements; u32 StructureByteStride; u32 Flags;}
+      r->gpu_va = *(const u64*)d->payload;
+      r->size_bytes = p[2];
+      r->stride = p[3];
+      r->flags = p[4];
+      break;
+    case 2: case 3: case 8: case 9:  // TEX1D/1DARRAY/3D/CUBE: mip/mips/clamp
+      break;
+    case 5:  // TEX2DARRAY: mip, mips, first, count, plane, clamp
+      r->plane = p[4];
+      break;
+    case 4: case 6: case 7: case 10:  // TEX2D/MS/MSARRAY/CUBEARRAY
+      break;
+    case 11:  // RAYTRACING_ACCELERATION_STRUCTURE: {u64 Location;}
+      r->gpu_va = *(const u64*)d->payload;
+      break;
+    default:
+      view_fail(api, "SRV ViewDimension outside 1..11");
+      return false;
+  }
+  return true;
+}
+
+void TRT_GUEST_ABI dev_create_srv(void* self, void* res,
+                                  const d3d12_srv_desc_t* desc, u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!desc) return;  // null desc + null resource = null-descriptor init slot
+  if (!res) {
+    view_fail("CreateShaderResourceView",
+              "pResource is null with a non-null pDesc (a null-descriptor "
+              "init requires BOTH pResource and pDesc to be null)");
+    return;
+  }
+  if (!is_live_resource(res)) {
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)res);
+    view_fail("CreateShaderResourceView", reason);
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateShaderResourceView",
+                                  reason, sizeof(reason));
+  if (!heap) {
+    view_fail("CreateShaderResourceView", reason);
+    return;
+  }
+  d3d12_view_record r{};
+  r.kind = 1;  // SRV
+  r.format = desc->format;
+  r.view_dim = desc->view_dimension;
+  if (!parse_srv_payload(desc, &r, "CreateShaderResourceView")) return;
+  r.resource = res;
+  heap->records[idx] = r;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateShaderResourceView recorded (heap type %u slot %u "
+           "dim %u res 0x%llx)",
+           heap->desc.type, idx, desc->view_dimension,
+           (unsigned long long)(uintptr_t)res);
+  d3d12_log_once(16, line);
+}
+
+void TRT_GUEST_ABI dev_create_uav(void* self, void* res, void* counter_res,
+                                  const d3d12_uav_desc_t* desc, u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!desc) return;  // null-descriptor init slot
+  if (!res) {
+    view_fail("CreateUnorderedAccessView",
+              "pResource is null with a non-null pDesc (a null-descriptor "
+              "init requires BOTH pResource and pDesc to be null)");
+    return;
+  }
+  if (!is_live_resource(res)) {
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)res);
+    view_fail("CreateUnorderedAccessView", reason);
+    return;
+  }
+  if (counter_res && !is_live_resource(counter_res)) {
+    snprintf(reason, sizeof(reason),
+             "counter resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)counter_res);
+    view_fail("CreateUnorderedAccessView", reason);
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateUnorderedAccessView",
+                                  reason, sizeof(reason));
+  if (!heap) {
+    view_fail("CreateUnorderedAccessView", reason);
+    return;
+  }
+  if (desc->view_dimension == 0 || desc->view_dimension > 8) {
+    view_fail("CreateUnorderedAccessView",
+              "UAV ViewDimension outside 1..8");
+    return;
+  }
+  d3d12_view_record r{};
+  r.kind = 2;  // UAV
+  r.format = desc->format;
+  r.view_dim = desc->view_dimension;
+  const u32* p = (const u32*)desc->payload;
+  r.mip = p[0];
+  r.first_slice = p[2];
+  r.num_slices = p[3];
+  r.plane = p[4];
+  if (desc->view_dimension == 1) {  // BUFFER
+    r.gpu_va = *(const u64*)desc->payload;
+    r.size_bytes = p[2];
+    r.stride = p[3];
+    r.flags = p[6];
+  }
+  r.resource = res;
+  r.counter_resource = counter_res;
+  heap->records[idx] = r;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateUnorderedAccessView recorded (heap type %u slot %u "
+           "dim %u res 0x%llx)",
+           heap->desc.type, idx, desc->view_dimension,
+           (unsigned long long)(uintptr_t)res);
+  d3d12_log_once(17, line);
+}
+
+void TRT_GUEST_ABI dev_create_rtv(void* self, void* res,
+                                  const d3d12_rtv_desc_t* desc, u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!res) {
+    view_fail("CreateRenderTargetView",
+              "pResource is null (RTV requires a resource)");
+    return;
+  }
+  if (!is_live_resource(res)) {
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)res);
+    view_fail("CreateRenderTargetView", reason);
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateRenderTargetView",
+                                  reason, sizeof(reason));
+  if (!heap) {
+    view_fail("CreateRenderTargetView", reason);
+    return;
+  }
+  d3d12_view_record r{};
+  r.kind = 3;  // RTV
+  r.resource = res;
+  if (desc) {
+    r.format = desc->format;
+    r.view_dim = desc->view_dimension;
+    if (desc->view_dimension == 0 || desc->view_dimension > 8) {
+      view_fail("CreateRenderTargetView", "RTV ViewDimension outside 1..8");
+      return;
+    }
+    const u32* p = (const u32*)desc->payload;
+    r.mip = p[0];
+    r.first_slice = p[1];
+    r.num_slices = p[2];
+    r.plane = p[3];
+    if (desc->view_dimension == 1) {  // BUFFER_RTV {u64 FirstElement; u32 NumElements;}
+      r.gpu_va = *(const u64*)desc->payload;
+      r.size_bytes = p[2];
+    }
+  } else {
+    // pDesc == null is legal: derive the view from the resource itself.
+    auto* rr = (d3d12_resource*)res;
+    r.format = rr->desc.format;
+    r.view_dim = rr->desc.dimension == 2 ? 2u    // TEX1D
+                 : rr->desc.dimension == 3 ? 4u  // TEX2D
+                 : rr->desc.dimension == 4 ? 8u  // TEX3D
+                                           : 4u;
+  }
+  heap->records[idx] = r;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateRenderTargetView recorded (heap type %u slot %u "
+           "dim %u res 0x%llx)",
+           heap->desc.type, idx, r.view_dim,
+           (unsigned long long)(uintptr_t)res);
+  d3d12_log_once(18, line);
+}
+
+void TRT_GUEST_ABI dev_create_dsv(void* self, void* res,
+                                  const d3d12_dsv_desc_t* desc, u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!res) {
+    view_fail("CreateDepthStencilView",
+              "pResource is null (DSV requires a resource)");
+    return;
+  }
+  if (!is_live_resource(res)) {
+    snprintf(reason, sizeof(reason),
+             "resource 0x%llx was not created by this device",
+             (unsigned long long)(uintptr_t)res);
+    view_fail("CreateDepthStencilView", reason);
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateDepthStencilView",
+                                  reason, sizeof(reason));
+  if (!heap) {
+    view_fail("CreateDepthStencilView", reason);
+    return;
+  }
+  d3d12_view_record r{};
+  r.kind = 4;  // DSV
+  r.resource = res;
+  if (desc) {
+    r.format = desc->format;
+    r.view_dim = desc->view_dimension;
+    r.flags = desc->flags;
+    if (desc->view_dimension == 0 || desc->view_dimension > 6) {
+      view_fail("CreateDepthStencilView", "DSV ViewDimension outside 1..6");
+      return;
+    }
+    const u32* p = (const u32*)desc->payload;
+    r.mip = p[0];
+    r.first_slice = p[1];
+    r.num_slices = p[2];
+  } else {
+    auto* rr = (d3d12_resource*)res;
+    r.format = rr->desc.format;
+    r.view_dim = rr->desc.dimension == 2 ? 1u    // TEX1D
+                 : rr->desc.dimension == 3 ? 3u  // TEX2D
+                                           : 3u;
+  }
+  heap->records[idx] = r;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateDepthStencilView recorded (heap type %u slot %u "
+           "dim %u res 0x%llx)",
+           heap->desc.type, idx, r.view_dim,
+           (unsigned long long)(uintptr_t)res);
+  d3d12_log_once(19, line);
+}
+
+void TRT_GUEST_ABI dev_create_sampler(void* self,
+                                      const d3d12_sampler_desc_t* desc,
+                                      u64 handle) {
+  (void)self;
+  char reason[192];
+  u32 idx = 0;
+  if (!desc) {
+    view_fail("CreateSampler", "pDesc is null");
+    return;
+  }
+  auto* heap = resolve_cpu_handle(handle, &idx, "CreateSampler", reason,
+                                  sizeof(reason));
+  if (!heap) {
+    view_fail("CreateSampler", reason);
+    return;
+  }
+  if (desc->filter > 0x1d5u) {  // D3D12_FILTER_MAXIMUM_ANISOTROPIC
+    view_fail("CreateSampler", "Filter is not a valid D3D12_FILTER");
+    return;
+  }
+  if (desc->max_anisotropy > 16u) {
+    view_fail("CreateSampler", "MaxAnisotropy > 16");
+    return;
+  }
+  if (desc->comparison_func > 8u) {
+    view_fail("CreateSampler", "ComparisonFunc outside D3D12_COMPARISON_FUNC");
+    return;
+  }
+  if (desc->address_u < 1u || desc->address_u > 5u ||
+      desc->address_v < 1u || desc->address_v > 5u ||
+      desc->address_w < 1u || desc->address_w > 5u) {
+    view_fail("CreateSampler",
+              "AddressU/V/W outside D3D12_TEXTURE_ADDRESS_MODE");
+    return;
+  }
+  d3d12_view_record r{};
+  r.kind = 5;  // SAMPLER
+  r.sampler_filter = desc->filter;
+  r.sampler_cmp = desc->comparison_func;
+  r.max_anisotropy = desc->max_anisotropy;
+  r.addr_u = desc->address_u;
+  r.addr_v = desc->address_v;
+  r.addr_w = desc->address_w;
+  r.mip_lod_bias = desc->mip_lod_bias;
+  r.min_lod = desc->min_lod;
+  r.max_lod = desc->max_lod;
+  for (int i = 0; i < 4; ++i) r.border_color[i] = desc->border_color[i];
+  heap->records[idx] = r;
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateSampler recorded (heap type %u slot %u filter 0x%x)",
+           heap->desc.type, idx, desc->filter);
+  d3d12_log_once(20, line);
+}
+
+void TRT_GUEST_ABI dev_copy_descriptors(void* self, u32 num_dst,
+                                        const u64* dst_starts,
+                                        const u32* dst_sizes, u32 num_src,
+                                        const u64* src_starts,
+                                        const u32* src_sizes, u32 heap_type) {
+  (void)self;
+  char reason[192];
+  if (num_dst == 0 || !dst_starts) {
+    view_fail("CopyDescriptors", "NumDestDescriptorRanges is 0 or the dest "
+                                 "range array is null");
+    return;
+  }
+  if (num_src == 0 || !src_starts) {
+    view_fail("CopyDescriptors", "NumSrcDescriptorRanges is 0 or the src "
+                                 "range array is null");
+    return;
+  }
+  // Expand both sides to flat (heap, slot) lists with per-element handles
+  // computed from each range's OWN heap increment.
+  std::vector<std::pair<d3d12_desc_heap*, u32>> dst, src;
+  u64 dst_total = 0, src_total = 0;
+  for (u32 i = 0; i < num_dst; ++i) {
+    const u32 count = dst_sizes ? dst_sizes[i] : 1u;
+    u64 h = dst_starts[i];
+    for (u32 j = 0; j < count; ++j) {
+      u32 idx = 0;
+      d3d12_desc_heap* heap =
+          resolve_cpu_handle(h, &idx, "CopyDescriptors", reason, sizeof(reason));
+      if (!heap) {
+        view_fail("CopyDescriptors (dest)", reason);
+        return;
+      }
+      dst.push_back({heap, idx});
+      h += heap->inc;
+      ++dst_total;
+    }
+  }
+  for (u32 i = 0; i < num_src; ++i) {
+    const u32 count = src_sizes ? src_sizes[i] : 1u;
+    u64 h = src_starts[i];
+    for (u32 j = 0; j < count; ++j) {
+      u32 idx = 0;
+      d3d12_desc_heap* heap =
+          resolve_cpu_handle(h, &idx, "CopyDescriptors", reason, sizeof(reason));
+      if (!heap) {
+        view_fail("CopyDescriptors (src)", reason);
+        return;
+      }
+      src.push_back({heap, idx});
+      h += heap->inc;
+      ++src_total;
+    }
+  }
+  if (dst_total != src_total) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "d3d12: CopyDescriptors -> E_INVALIDARG (dest total %llu != src "
+             "total %llu descriptors)",
+             (unsigned long long)dst_total, (unsigned long long)src_total);
+    trt_core_log(line);
+    return;
+  }
+  for (size_t i = 0; i < dst.size(); ++i) {
+    dst[i].first->records[dst[i].second] = src[i].first->records[src[i].second];
+  }
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CopyDescriptors recorded (%llu descriptors, heap type %u)",
+           (unsigned long long)dst_total, heap_type);
+  d3d12_log_once(21, line);
+}
+
+void TRT_GUEST_ABI dev_copy_descriptors_simple(void* self, u32 num, u64 dst,
+                                               u64 src, u32 heap_type) {
+  (void)self;
+  char reason[192];
+  u32 dst_idx = 0, src_idx = 0;
+  d3d12_desc_heap* dst_heap =
+      resolve_cpu_handle(dst, &dst_idx, "CopyDescriptorsSimple", reason,
+                         sizeof(reason));
+  if (!dst_heap) {
+    view_fail("CopyDescriptorsSimple (dest)", reason);
+    return;
+  }
+  d3d12_desc_heap* src_heap =
+      resolve_cpu_handle(src, &src_idx, "CopyDescriptorsSimple", reason,
+                         sizeof(reason));
+  if (!src_heap) {
+    view_fail("CopyDescriptorsSimple (src)", reason);
+    return;
+  }
+  if (num == 0) {
+    view_fail("CopyDescriptorsSimple", "NumDescriptors is 0");
+    return;
+  }
+  if ((u64)dst_idx + num > dst_heap->records.size() ||
+      (u64)src_idx + num > src_heap->records.size()) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "d3d12: CopyDescriptorsSimple -> E_INVALIDARG (range of %u "
+             "descriptors from slot %u/%u runs past stored records)",
+             num, dst_idx, src_idx);
+    trt_core_log(line);
+    return;
+  }
+  for (u32 i = 0; i < num; ++i) {
+    dst_heap->records[dst_idx + i] = src_heap->records[src_idx + i];
+  }
+  char line[160];
+  snprintf(line, sizeof(line),
+           "d3d12: CopyDescriptorsSimple recorded (%u descriptors, heap type "
+           "%u)",
+           num, heap_type);
+  d3d12_log_once(22, line);
+}
+
+// Device slot 42 = GetResourceTiling: void return, kept as a logged no-op
+// (tiled-resource tiling queries are not part of this sprint).
+void TRT_GUEST_ABI dev_view_noop(void*) {}
+
 int TRT_GUEST_ABI dev_create_rootsig(void* self, u32, const void* blob, u64 len,
                                      const void*, void** out_rs) {
-  if (!blob || !len || !out_rs) return k_e_invalidarg;
+  if (!out_rs) {
+    view_fail("CreateRootSignature", "ppvRootSignature is null");
+    return k_e_invalidarg;
+  }
+  if (!blob || !len) {
+    view_fail("CreateRootSignature",
+              !blob ? "pBlobWithRootSignature is null"
+                    : "blobLengthInBytes is 0");
+    return k_e_invalidarg;
+  }
   auto* rs = new d3d12_simple_child();
   rs->vtbl = g_child8_vtbl;
   rs->device = (d3d12_device*)self;
   rs->destroy_fn = &simple_child_destroy;
+  rs->is_root_sig = true;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_rootsigs.insert(rs);
+  }
   *out_rs = rs;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "d3d12: CreateRootSignature recorded (blob %llu bytes)",
+           (unsigned long long)len);
+  d3d12_log_once(23, line);
   return k_s_ok;
 }
-
-void TRT_GUEST_ABI dev_view_noop(void*) {}
 
 d3d12_alloc_info_t* TRT_GUEST_ABI dev_alloc_info(void*, d3d12_alloc_info_t* ret,
                                                  u32, u32 count,
@@ -1199,6 +2800,10 @@ int TRT_GUEST_ABI dev_create_resource(void* self, const d3d12_heap_props_t* prop
   r->heap_flags = heap_flags;
   const u64 sz = estimate_res_bytes(*desc);
   r->gpu_va = g_next_va.fetch_add(((sz + 65535ULL) & ~65535ULL) + 65536ULL);
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_resources.insert(r);
+  }
   *out_res = r;
   return k_s_ok;
 }
@@ -1319,21 +2924,21 @@ const void* g_device_vtbl[57] = {
     (const void*)&dev_node_count,       // 7 GetNodeCount
     (const void*)&dev_create_queue,     // 8 CreateCommandQueue
     (const void*)&dev_create_alloc,     // 9 CreateCommandAllocator
-    (const void*)&dev_create_pso,       // 10 CreateGraphicsPipelineState
-    (const void*)&dev_create_pso,       // 11 CreateComputePipelineState
+    (const void*)&dev_create_pso_gfx,   // 10 CreateGraphicsPipelineState
+    (const void*)&dev_create_pso_compute,  // 11 CreateComputePipelineState
     (const void*)&dev_create_cmdlist,   // 12 CreateCommandList
     (const void*)&dev_check_feature,    // 13 CheckFeatureSupport
     (const void*)&dev_create_descheap,  // 14 CreateDescriptorHeap
     (const void*)&dev_desc_inc,         // 15 GetDescriptorHandleIncrementSize
     (const void*)&dev_create_rootsig,   // 16 CreateRootSignature
-    (const void*)&dev_view_noop,        // 17 CreateConstantBufferView
-    (const void*)&dev_view_noop,        // 18 CreateShaderResourceView
-    (const void*)&dev_view_noop,        // 19 CreateUnorderedAccessView
-    (const void*)&dev_view_noop,        // 20 CreateRenderTargetView
-    (const void*)&dev_view_noop,        // 21 CreateDepthStencilView
-    (const void*)&dev_view_noop,        // 22 CreateSampler
-    (const void*)&dev_view_noop,        // 23 CopyDescriptors
-    (const void*)&dev_view_noop,        // 24 CopyDescriptorsSimple
+    (const void*)&dev_create_cbv,       // 17 CreateConstantBufferView
+    (const void*)&dev_create_srv,       // 18 CreateShaderResourceView
+    (const void*)&dev_create_uav,       // 19 CreateUnorderedAccessView
+    (const void*)&dev_create_rtv,       // 20 CreateRenderTargetView
+    (const void*)&dev_create_dsv,       // 21 CreateDepthStencilView
+    (const void*)&dev_create_sampler,   // 22 CreateSampler
+    (const void*)&dev_copy_descriptors, // 23 CopyDescriptors
+    (const void*)&dev_copy_descriptors_simple,  // 24 CopyDescriptorsSimple
     (const void*)&dev_alloc_info,       // 25 GetResourceAllocationInfo
     (const void*)&dev_custom_heap,      // 26 GetCustomHeapProperties
     (const void*)&dev_create_resource,  // 27 CreateCommittedResource
@@ -1356,7 +2961,7 @@ const void* g_device_vtbl[57] = {
     (const void*)&dev_unimpl,           // 44 CreatePipelineLibrary
     (const void*)&dev_ok,               // 45 SetEventOnMultipleFenceCompletion
     (const void*)&dev_ok,               // 46 SetResidencyPriority
-    (const void*)&dev_create_pso,       // 47 CreatePipelineState
+    (const void*)&dev_create_pso_stream,  // 47 CreatePipelineState
     (const void*)&dev_unimpl,           // 48 OpenExistingHeapFromAddress
     (const void*)&dev_unimpl,           // 49 OpenExistingHeapFromFileMapping
     (const void*)&dev_ok,               // 50 EnqueueMakeResident
@@ -1433,6 +3038,41 @@ int trt_d3d12_queue_recorded_count(void* obj) {
   return (int)q->recorded_lists.size();
 }
 
+// Descriptor-wave test accessors: host-side introspection of the descriptor
+// heap record store and the command list's binding/copy state (same
+// precedent as trt_d3d12_queue_recorded_count). Not guest-callable.
+u32 trt_d3d12_heap_record_count(void* obj) {
+  if (!obj) return 0;
+  return (u32)((d3d12_desc_heap*)obj)->records.size();
+}
+
+int trt_d3d12_heap_record_kind(void* obj, u32 idx) {
+  if (!obj) return -1;
+  auto* h = (d3d12_desc_heap*)obj;
+  if (idx >= h->records.size()) return -1;
+  return (int)h->records[idx].kind;
+}
+
+u32 trt_d3d12_cmdlist_bound_heap_count(void* obj) {
+  if (!obj) return 0;
+  return (u32)((d3d12_cmd_list*)obj)->bound_heaps.size();
+}
+
+u32 trt_d3d12_cmdlist_root_table_count(void* obj) {
+  if (!obj) return 0;
+  return (u32)((d3d12_cmd_list*)obj)->root_tables.size();
+}
+
+u32 trt_d3d12_cmdlist_root_cbv_count(void* obj) {
+  if (!obj) return 0;
+  return (u32)((d3d12_cmd_list*)obj)->root_cbvs.size();
+}
+
+u32 trt_d3d12_cmdlist_copy_count(void* obj) {
+  if (!obj) return 0;
+  return ((d3d12_cmd_list*)obj)->copies;
+}
+
 int trt_d3d12_is_queue(void* obj) {
   if (!obj) return 0;
   {
@@ -1472,6 +3112,10 @@ int trt_d3d12_offline_backbuffer(u32 buffer_idx, u32 width, u32 height,
   r->desc.sample_count = 1;
   r->desc.flags = 1;  // D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET
   r->gpu_va = g_next_va.fetch_add(0x400000ULL);
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_resources.insert(r);
+  }
   *out_res = r;
   return k_s_ok;
 }

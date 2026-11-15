@@ -4533,6 +4533,50 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep) {
   return result;
 }
 
+// ---- Sprint 3 item 46: the last-chance unhandled-exception filter ---------
+// SetUnhandledExceptionFilter stores the guest filter; the terminal fatal path
+// (trt_raise_exception_sysv after the SEH walk finds no handler) invokes it
+// once with a Win64 EXCEPTION_POINTERS before terminating, and the
+// UnhandledExceptionFilter export consults it exactly as real Win32 does
+// (return the filter's verdict; EXCEPTION_CONTINUE_SEARCH with none stored).
+namespace {
+std::atomic<void*> g_unhandled_filter{nullptr};
+
+const char* eh_filter_verdict_name(i32 v) {
+  if (v == 1 /*EXCEPTION_EXECUTE_HANDLER*/) return "handled";
+  if (v == -1 /*EXCEPTION_CONTINUE_EXECUTION*/)
+    return "unhandled(continue-exec)";  // undefined per MSDN; treated as death
+  return "unhandled";
+}
+}  // namespace
+
+// Sprint 3 item 46: the terminal unhandled-exception path gives the stored
+// SetUnhandledExceptionFilter one look at the record before the runtime
+// terminates. Win32 semantics: the filter runs, then the process dies either
+// way (EXCEPTION_EXECUTE_HANDLER or CONTINUE_SEARCH both end in termination;
+// CONTINUE_EXECUTION from a last-chance filter is undefined per MSDN — logged
+// as unhandled and terminated). The named verdict line is the contract.
+static void eh_run_unhandled_filter(const trt_ex_record& ex, const void* ctx) {
+  char line[192];
+  void* filter = g_unhandled_filter.load();
+  if (!filter) {
+    snprintf(line, sizeof(line),
+             "[trt] eh: unhandled exception 0x%08x @ %p -> filter no-filter",
+             ex.code, (void*)(uintptr_t)ex.address);
+    boot_log(line);
+    return;
+  }
+  trt_ex_pointers ep{};
+  ep.exception_record = (u64)(uintptr_t)&ex;
+  ep.context_record = (u64)(uintptr_t)ctx;
+  const i32 verdict = (i32)trt_call_guest(filter, (u64)(uintptr_t)&ep, 0, 0, 0);
+  snprintf(line, sizeof(line),
+           "[trt] eh: unhandled exception 0x%08x @ %p -> filter %s",
+           ex.code, (void*)(uintptr_t)ex.address,
+           eh_filter_verdict_name(verdict));
+  boot_log(line);
+}
+
 extern "C" __attribute__((used)) void trt_raise_exception_sysv(
     u32 code, u32 flags, u32 count, const u64* args, const u8* caller_ctx_in) {
   char line[192];
@@ -4638,6 +4682,10 @@ extern "C" __attribute__((used)) void trt_raise_exception_sysv(
     boot_log(line);
     longjmp(g_eh_escape.jb, 1);
   }
+  // Sprint 3 item 46: the guest's last-chance filter gets its one look at the
+  // record BEFORE the runtime terminates (SetUnhandledExceptionFilter
+  // semantics: the filter runs, then the process dies either way).
+  eh_run_unhandled_filter(ex, ctx);
   if (trt_boot_raise_trap) trt_boot_raise_trap(code);
   boot_log("kernel32: RaiseException unhandled -> terminating");
   _exit(42);
@@ -4837,17 +4885,30 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
 #endif
 
 void* TRT_STDCALL trt_SetUnhandledExceptionFilter(void* filter) {
-  (void)filter;
-  boot_log("kernel32: SetUnhandledExceptionFilter registered (records only; "
-           "the offline runtime does not walk guest SEH)");
-  return nullptr;  // the previous filter: none
+  const void* prev = g_unhandled_filter.exchange(filter);
+  char line[160];
+  snprintf(line, sizeof(line),
+           "kernel32: SetUnhandledExceptionFilter(filter=%p) -> stored "
+           "(previous=%p); the fatal path will consult it",
+           filter, prev);
+  boot_log(line);
+  return (void*)prev;  // real Win32 returns the previous filter
 }
 
 void* TRT_STDCALL trt_UnhandledExceptionFilter(void* info) {
-  (void)info;
-  boot_log("kernel32: UnhandledExceptionFilter -> EXCEPTION_CONTINUE_SEARCH "
-           "(no console filter for guest exceptions)");
-  return (void*)(uintptr_t)0;  // EXCEPTION_CONTINUE_SEARCH
+  void* filter = g_unhandled_filter.load();
+  if (!filter) {
+    boot_log("kernel32: UnhandledExceptionFilter -> EXCEPTION_CONTINUE_SEARCH "
+             "(no filter registered)");
+    return (void*)(uintptr_t)0;  // EXCEPTION_CONTINUE_SEARCH
+  }
+  const i32 verdict = (i32)trt_call_guest(filter, (u64)(uintptr_t)info, 0, 0, 0);
+  char line[160];
+  snprintf(line, sizeof(line),
+           "kernel32: UnhandledExceptionFilter -> filter %s (verdict %d)",
+           eh_filter_verdict_name(verdict), (int)verdict);
+  boot_log(line);
+  return (void*)(uintptr_t)(i64)verdict;
 }
 
 int TRT_STDCALL trt_IsDebuggerPresent(void) { return 0; }
