@@ -15,6 +15,21 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <sys/syscall.h>  // gettid for the CreateThread provenance log
+#include <unistd.h>
+
+// WaitOnAddress fail-visible accounting, defined in bridge_kernel32.cpp.
+extern std::atomic<u64> g_wa_waits;
+extern std::atomic<u64> g_wa_wake_single;
+extern std::atomic<u64> g_wa_wake_all;
+extern std::atomic<u64> g_wa_wake_single_miss;
+extern std::atomic<u64> g_wa_wake_all_miss;
+extern std::atomic<u64> g_wa_timed_out;
+
+// Debugger sampling hook (definition in bridge_kernel32.cpp): no-op; gdb
+// breaks here to stop the process at the moment the CS-stall probe names a
+// wedged owner.
+extern "C" void trt_cs_stall_probe_pause(void);
 #include <mutex>
 #include <string>
 #include <thread>
@@ -601,6 +616,17 @@ void* thread_trampoline(void* raw) {
   }
   if (!my_tid) my_tid = current_tid();
 
+  // Host-tid provenance, logged by the CHILD (gettid here is the new
+  // thread): maps guest tids to /proc and gdb LWP ids so a live sampler can
+  // name which guest thread is burning CPU. Pairs with the CS-stall probe.
+  {
+    char hline[96];
+    snprintf(hline, sizeof(hline),
+             "thread: guest-tid=%u mapped to host_tid=%d", my_tid,
+             (int)syscall(SYS_gettid));
+    trt_core_log(hline);
+  }
+
   trt_guest_tls_sync_thread();
   trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
   u64 ret = 0;
@@ -726,6 +752,14 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
 #if !defined(_WIN32)
     init_thread_pipes(o);
 #endif
+  }
+  {
+    // thread provenance: pairs with the CS-stall probe's owner_tid so a
+    // wedge can be traced back to the routine that created the owner.
+    char tline[96];
+    snprintf(tline, sizeof(tline), "thread: CreateThread tid=%u routine=%p",
+             child_tid, routine);
+    trt_core_log(tline);
   }
   ts->object = obj;
 
@@ -1693,7 +1727,76 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
     if (trt_TryEnterCriticalSection(cs)) return 1;
     std::this_thread::yield();
   }
-  while (!trt_TryEnterCriticalSection(cs)) trt_Sleep(1);
+  // Fail-visible stall probe: a CS held for >3s names its owner once. A
+  // forever-stall here means a guest thread died (or was never scheduled)
+  // while owning the section — without this line the boot looks like a
+  // silent watchdog kill and the owner is unmeasurable.
+  // wait/wake counters live in bridge_kernel32.cpp (WaitOnAddress impl);
+  // file-scope definitions there, extern declarations here.
+
+  long waits = 0;
+  bool stall_named = false;
+  while (!trt_TryEnterCriticalSection(cs)) {
+    trt_Sleep(1);
+    if (++waits >= 3000 && !stall_named) {
+      stall_named = true;
+      u32 owner_alive = 2;  // 2 = no thread object known for this tid
+      void* start = nullptr;
+      u64 arg = 0;
+      {
+        std::lock_guard<std::mutex> lk(g_obj_mu);
+        for (const sync_object& o : g_objects) {
+          if (o.kind == OBJ_THREAD && o.tid == c->owner) {
+            owner_alive = o.alive.load(std::memory_order_acquire) ? 1 : 0;
+            start = o.start_routine;
+            arg = o.start_arg;
+            break;
+          }
+        }
+      }
+    {
+      std::lock_guard<std::mutex> lk(g_obj_mu);
+      for (const sync_object& o : g_objects) {
+        if (o.kind == OBJ_THREAD && o.tid == c->owner) {
+          owner_alive = o.alive.load(std::memory_order_acquire) ? 1 : 0;
+          start = o.start_routine;
+          arg = o.start_arg;
+          break;
+        }
+      }
+    }
+    char line[200];
+    snprintf(line, sizeof(line),
+             "sync: EnterCriticalSection cs=%p STALL >3s owner_tid=%u "
+             "owner_thread_alive=%u owner_routine=%p owner_arg=%p "
+             "recursion=%u self_tid=%u\n",
+             cs, c->owner, owner_alive, start, (void*)(uintptr_t)arg,
+             c->recursion, current_tid());
+    // raw stderr, NOT trt_core_log: the ring itself can be the wedged
+    // critical section — logging through it here would deadlock the probe.
+    ssize_t wrc = ::write(2, line, strlen(line));
+    (void)wrc;
+    // wait/wake accounting: a spinning thread that never resumes is the
+    // classic lost-wake signature. waits >> wakes or wake-misses > 0 name it.
+    char wl[200];
+    snprintf(wl, sizeof(wl),
+             "sync: wait-addr accounting waits=%llu wake_single=%llu "
+             "(miss=%llu) wake_all=%llu (miss=%llu) timed_out=%llu\n",
+             (unsigned long long)g_wa_waits.load(std::memory_order_relaxed),
+             (unsigned long long)g_wa_wake_single.load(std::memory_order_relaxed),
+             (unsigned long long)g_wa_wake_single_miss.load(std::memory_order_relaxed),
+             (unsigned long long)g_wa_wake_all.load(std::memory_order_relaxed),
+             (unsigned long long)g_wa_wake_all_miss.load(std::memory_order_relaxed),
+             (unsigned long long)g_wa_timed_out.load(std::memory_order_relaxed));
+    wrc = ::write(2, wl, strlen(wl));
+    (void)wrc;
+    // Debugger sampling hook: break trt_cs_stall_probe_pause in gdb to stop
+    // the whole process at the exact moment a stall is named, then
+    // `thread apply all bt`. No-op otherwise (one call, negligible cost).
+    // Definition (and the extern "C" declaration) in bridge_kernel32.cpp.
+    trt_cs_stall_probe_pause();
+    }
+  }
   return 1;
 }
 

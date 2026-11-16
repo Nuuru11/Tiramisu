@@ -1408,10 +1408,19 @@ int trt_bridge_register_d3d(void) {
   // desktop-only there too, but UnityPlayer boots with the query. v0:
   // a named no-op answer (attribute unknown -> E_INVALIDARG-shaped), the
   // API's own failure value, never silent.
+  //
+  // ABI WARNING (measured live, Ultra Pool): every fn here is CALLED BY THE
+  // GUEST with Win64 convention. A plain SysV lambda reads its args from
+  // rdi/rsi (garbage — Win64 passed them in rcx/rdx; the log showed
+  // attr=4306832 instead of 0x21) AND clobbers rdi/rsi/r10/r11 on return —
+  // nonvolatile registers in Win64. The caller's object pointer became
+  // stack garbage and the next frame dereferenced a non-canonical address
+  // (SIGSEGV si_code=SI_KERNEL). All bridge-side guest-called fns must be
+  // TRT_GUEST_ABI (ms_abi) — the macro exists for exactly this.
   static const trt_named_fn k_dwm_fns[] = {
       {"DwmGetWindowAttribute",
-       (void*)+[](void* hwnd, u32 attr, void* out, u32 cap) -> i32 {
-         (void)hwnd; (void)attr; (void)out; (void)cap;
+       (void*)+[](u64 hwnd, u32 attr, void* out, u32 cap) TRT_GUEST_ABI -> i32 {
+         (void)hwnd; (void)out; (void)cap;
          char line[128];
          snprintf(line, sizeof(line),
                   "dwm: DwmGetWindowAttribute(attr=%u) -> E_INVALIDARG "
@@ -1420,8 +1429,8 @@ int trt_bridge_register_d3d(void) {
          return (int)0x80070057;
        }},
       {"DwmSetWindowAttribute",
-       (void*)+[](void* hwnd, u32 attr, const void* val, u32 cap) -> i32 {
-         (void)hwnd; (void)attr; (void)val; (void)cap;
+       (void*)+[](u64 hwnd, u32 attr, const void* val, u32 cap) TRT_GUEST_ABI -> i32 {
+         (void)hwnd; (void)val; (void)cap;
          char line[128];
          snprintf(line, sizeof(line),
                   "dwm: DwmSetWindowAttribute(attr=%u) -> E_INVALIDARG "
@@ -1430,29 +1439,29 @@ int trt_bridge_register_d3d(void) {
          return (int)0x80070057;
        }},
       {"DwmEnableBlurBehindWindow",
-       (void*)+[](void* hwnd, const void* bb) -> i32 {
+       (void*)+[](u64 hwnd, const void* bb) TRT_GUEST_ABI -> i32 {
          (void)hwnd; (void)bb;
          trt_core_log("dwm: DwmEnableBlurBehindWindow -> E_NOTIMPL "
                       "(no DWM blur surface on console UWP; fail-visible)");
          return (int)0x80004001;  // E_NOTIMPL
        }},
       {"DwmFlush",
-       (void*)+[](void) -> i32 {
+       (void*)+[](void) TRT_GUEST_ABI -> i32 {
          return 0;  // S_OK (composition frame paced via DXGI Present)
        }},
       {"DwmIsCompositionEnabled",
-       (void*)+[](int* enabled) -> i32 {
+       (void*)+[](int* enabled) TRT_GUEST_ABI -> i32 {
          if (!enabled) return (int)0x80070057;
          *enabled = 1;
          return 0;
        }},
       {"DwmExtendFrameIntoClientArea",
-       (void*)+[](void* hwnd, const void* margins) -> i32 {
+       (void*)+[](u64 hwnd, const void* margins) TRT_GUEST_ABI -> i32 {
          (void)hwnd; (void)margins;
          return 0;
        }},
       {"DwmDefWindowProc",
-       (void*)+[](void* hwnd, u32 msg, u64 wparam, i64 lparam, i64* res) -> int {
+       (void*)+[](u64 hwnd, u32 msg, u64 wparam, i64 lparam, i64* res) TRT_GUEST_ABI -> int {
          (void)hwnd; (void)msg; (void)wparam; (void)lparam;
          if (res) *res = 0;
          return 0;

@@ -139,6 +139,7 @@ struct wasapi_client {
   u32 buffer_frames = 4800;
   u32 period_ms = 10;
   u32 in_flight_frames = 0;
+  u64 last_submit_ns = 0;  // steady-clock timestamp of last ReleaseBuffer
   bool just_submitted = false;
   bool started = false;
   u64 total_frames_written = 0;
@@ -184,11 +185,10 @@ void start_wasapi_pump(wasapi_client* c) {
         std::lock_guard<std::mutex> lk(c->state_mu);
         if (!c->started) break;
         step_ms = c->period_ms ? c->period_ms : 10u;
-        const u32 step_frames = (c->rate * step_ms) / 1000u;
-        c->in_flight_frames = (c->in_flight_frames > step_frames)
-                                  ? (c->in_flight_frames - step_frames)
-                                  : 0u;
-        if (c->in_flight_frames == 0) c->just_submitted = false;
+        // NOTE: padding decay lives in client_GetCurrentPadding (timestamp-
+        // based, consumed on read). The pump only signals the period event;
+        // decrementing in_flight_frames here as well double-consumed the
+        // queue and collapsed padding to 0 between submits.
         ev = c->event_handle;
       }
       if (ev) trt_SetEvent(ev);
@@ -318,6 +318,10 @@ i32 TRT_GUEST_ABI render_ReleaseBuffer(void* self, u32 num_frames_written,
     c->total_frames_written += num_frames_written;
     const u32 sum = c->in_flight_frames + num_frames_written;
     c->in_flight_frames = sum <= c->buffer_frames ? sum : c->buffer_frames;
+    c->last_submit_ns =
+        (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count();
     c->just_submitted = true;
   }
   void* ev = nullptr;
@@ -500,13 +504,27 @@ i32 TRT_GUEST_ABI client_GetStreamLatency(void* self, i64* out_lat) {
 i32 TRT_GUEST_ABI client_GetCurrentPadding(void* self, u32* out_padding) {
   if (!out_padding) return k_e_invalidarg;
   wasapi_client* c = (wasapi_client*)self;
-  if (c->just_submitted) {
-    *out_padding = c->in_flight_frames;
-    c->just_submitted = false;
-    c->in_flight_frames = 0;
-  } else {
-    *out_padding = 0;
+  // Real-time consumption model: padding is the frames currently queued in
+  // the (virtual) device, decaying at the render rate — exactly what the
+  // real device does. Godot's WASAPI thread paces itself SOLELY on this
+  // value (4.3 audio_driver_wasapi.cpp: write only when
+  // buffer_size - padding > 0, sleep 1ms only when it wrote nothing), so a
+  // padding that collapses to 0 on read made the guest write full-buffers
+  // back-to-back forever: the 97%-CPU mix storm that held the CS and wedged
+  // the boot. Reading padding must not consume state (real WASAPI is not
+  // destructive here either); the pump thread's decay + a timestamp-based
+  // floor keep it honest between reads.
+  std::lock_guard<std::mutex> lk(c->state_mu);
+  u32 padding = c->in_flight_frames;
+  if (padding > 0 && c->last_submit_ns != 0) {
+    const u64 now_ns = (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const u64 since_ns = now_ns > c->last_submit_ns ? now_ns - c->last_submit_ns : 0;
+    const u64 consumed = ((u64)c->rate * since_ns) / 1000000000ULL;
+    padding = (u64)padding > consumed ? (u32)((u64)padding - consumed) : 0u;
   }
+  *out_padding = padding;
   return k_s_ok;
 }
 

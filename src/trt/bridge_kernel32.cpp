@@ -1008,6 +1008,12 @@ u32 TRT_STDCALL trt_IsProcessorFeaturePresent(u32 feature) {
   }
 }
 
+// Debugger sampling hook: no-op; gdb breaks here to stop the process at the
+// moment the CS-stall probe names a wedged owner (see bridge_thread.cpp).
+extern "C" __attribute__((noinline, used)) void trt_cs_stall_probe_pause(void) {
+  __asm__ volatile("" ::: "memory");
+}
+
 void TRT_STDCALL trt_Sleep(u32 ms) {
 #ifdef _WIN32
   ::Sleep(ms);  // we are inside a Windows process already
@@ -1046,6 +1052,14 @@ struct wait_addr_state {
   wait_addr_waiter* head = nullptr;
 };
 static wait_addr_state g_wait_addr[64];
+// Fail-visible wait/wake accounting: a lost or misdirected wake is invisible
+// from a post-mortem (the waiter just never resumes). Counters answer
+// "did the wake ever fire" without a debugger attached to a wedged thread.
+// Defined in bridge_kernel32.cpp (WaitOnAddress/WakeByAddress impls); read
+// from the CS-stall probe here — that probe bypasses the log ring, and a
+// lost wake is exactly the kind of wedge the ring can't report.
+std::atomic<u64> g_wa_waits{0}, g_wa_wake_single{0}, g_wa_wake_all{0},
+    g_wa_wake_single_miss{0}, g_wa_wake_all_miss{0}, g_wa_timed_out{0};
 static wait_addr_state* wait_addr_slot(volatile void* addr) {
   const uintptr_t v = (uintptr_t)addr;
   return &g_wait_addr[((v >> 4) ^ (v >> 12)) & 63];
@@ -1085,6 +1099,7 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
     err_ref_for_current_thread() = 87;
     return 0;
   }
+  g_wa_waits.fetch_add(1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_seq_cst);
   if (!wait_addr_same(addr, cmp, size)) return 1;
   if (ms == 0) {
@@ -1137,7 +1152,10 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
     pp = &(*pp)->next;
   }
   lk.unlock();
-  if (!ok) err_ref_for_current_thread() = 1460;
+  if (!ok) {
+    err_ref_for_current_thread() = 1460;
+    g_wa_timed_out.fetch_add(1, std::memory_order_relaxed);
+  }
   return ok;
 }
 
@@ -1153,13 +1171,17 @@ void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr) {
   std::atomic_thread_fence(std::memory_order_seq_cst);
   wait_addr_state* st = wait_addr_slot(addr);
   std::lock_guard<std::mutex> lk(st->mu);
+  bool hit = false;
   for (wait_addr_waiter* w = st->head; w; w = w->next) {
     if (w->addr == addr && !w->signalled) {
       w->signalled = true;
       w->cv.notify_one();
+      hit = true;
       break;
     }
   }
+  g_wa_wake_single.fetch_add(1, std::memory_order_relaxed);
+  if (!hit) g_wa_wake_single_miss.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TRT_STDCALL trt_WakeByAddressAll(volatile void* addr) {
@@ -1174,12 +1196,16 @@ void TRT_STDCALL trt_WakeByAddressAll(volatile void* addr) {
   std::atomic_thread_fence(std::memory_order_seq_cst);
   wait_addr_state* st = wait_addr_slot(addr);
   std::lock_guard<std::mutex> lk(st->mu);
+  bool hit = false;
   for (wait_addr_waiter* w = st->head; w; w = w->next) {
     if (w->addr == addr && !w->signalled) {
       w->signalled = true;
       w->cv.notify_one();
+      hit = true;
     }
   }
+  g_wa_wake_all.fetch_add(1, std::memory_order_relaxed);
+  if (!hit) g_wa_wake_all_miss.fetch_add(1, std::memory_order_relaxed);
 }
 
 // ---- boot ----
@@ -1576,10 +1602,25 @@ int TRT_STDCALL trt_ReadFile(void* h, void* buf, u32 bytes, u32* read,
   return 1;
 }
 
+// Raw guest stdout/stderr bytes -> the log ring (defined with the console
+// surface below); WriteFile routes the Win32 stdio pseudo-handles here.
+void console_log_bytes(const char* buf, u32 bytes);
+
 int TRT_STDCALL trt_WriteFile(void* h, const void* buf, u32 bytes, u32* written,
                               void* overlapped) {
   extern int TRT_STDCALL trt_SetEvent(u64 handle);
   extern void trt_iocp_notify_io(u64 file_handle, u32 bytes, void* overlapped);
+  // Synthetic stdio: the Win32 standard pseudo-handles route to the log ring
+  // so the guest's own stdout/stderr (Godot's error log) is a discovery
+  // surface. Raw bytes only — no console-mode surface exists behind these.
+  const intptr_t hv = (intptr_t)h;
+  if (hv == -10 || hv == -11 || hv == -12) {
+    if (buf && bytes) {
+      console_log_bytes((const char*)buf, bytes);
+    }
+    if (written) *written = bytes;
+    return 1;
+  }
   size_t n = 0;
   if (!buf || !file_xfer_impl(h, (void*)buf, bytes, 1, overlapped, &n, nullptr)) {
     if (written) *written = 0;
@@ -2210,6 +2251,37 @@ namespace {
 
 void console_log(const char* s) { trt_core_log(s); }
 
+// Raw guest stdout/stderr bytes -> the log ring, split on newlines so each
+// guest print becomes one ring line (guest prints are not NUL-terminated).
+// Definition sits with the console surface below; WriteFile routes the
+// Win32 stdio pseudo-handles here.
+void console_log_bytes(const char* buf, u32 bytes) {
+  static _Thread_local char t_pending[512];
+  static _Thread_local u32 t_pending_n = 0;
+  u32 i = 0;
+  while (i < bytes) {
+    const char ch = buf[i++];
+    if (ch == '\n') {
+      t_pending[t_pending_n] = '\0';
+      if (t_pending_n) console_log(t_pending);
+      t_pending_n = 0;
+      continue;
+    }
+    if (t_pending_n + 1 < sizeof(t_pending)) {
+      t_pending[t_pending_n++] = ch;
+    } else {
+      t_pending[t_pending_n] = '\0';
+      console_log(t_pending);
+      t_pending_n = 0;
+      t_pending[t_pending_n++] = ch;
+    }
+  }
+}
+
+// Raw guest stdout/stderr bytes -> the log ring, split on newlines so each
+// guest print becomes one ring line (guest prints are not NUL-terminated).
+void console_log_bytes(const char* buf, u32 bytes);
+
 void console_no_console(const char* api, u32 err) {
   char line[128];
   snprintf(line, sizeof(line),
@@ -2302,7 +2374,16 @@ bool is_crash_helper_exe(const std::string& base) {
 } // namespace
 
 void* TRT_GUEST_ABI trt_GetStdHandle(u32 handle_id) {
-  (void)handle_id;  // STD_INPUT/OUTPUT/ERROR all equally absent
+  // Synthetic stdio: real Win32 pseudo-handles (STD_INPUT=-10, OUTPUT=-11,
+  // ERROR=-12) routed by WriteFile/ReadFile to the runtime log ring. On the
+  // console there is no AppContainer console (measured: a TRUE AttachConsole
+  // made Godot flood GetStdHandle forever), but a game's own stdout is a
+  // discovery surface — Godot's error log names its internal state. Handled
+  // in trt_WriteFile; anything else (GetConsoleMode etc.) still reports
+  // no-console honestly.
+  if (handle_id == 0xFFFFFFF6u) return (void*)(i64)-10;
+  if (handle_id == 0xFFFFFFF5u) return (void*)(i64)-11;
+  if (handle_id == 0xFFFFFFF4u) return (void*)(i64)-12;
   console_no_console("GetStdHandle", 6 /*ERROR_INVALID_HANDLE*/);
   return nullptr;
 }
@@ -4404,7 +4485,7 @@ static int dispatch_exception_ctx(trt_ex_record* ex, u8* ctx,
         boot_log(t);
       }
 
-      if (disp == 0 /*ExceptionContinueExecution*/ && allow_continue) {
+      if (disp == 1 /*ExceptionContinueExecution*/ && allow_continue) {
         // the personality may have rewritten the exception context in place
         return 1;
       }
@@ -4498,6 +4579,59 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
   const int handled = dispatch_exception_ctx(&ex, ctx, true, true);
   --t_hw_fault_depth;
   if (handled) {
+    // fail-visible EH bounce counter: a livelock here (the same (rip,fault)
+    // pair "handled" forever) shows up as bounce floods instead of a
+    // silent hang that only a watchdog names.
+    static thread_local u64 s_eh_bounces = 0;
+    if (++s_eh_bounces % 1000 == 0) {
+      char bl[128];
+      snprintf(bl, sizeof(bl),
+               "ehfix: hw-fault bounce #%llu rip=%llx fault=%llx\n",
+               (unsigned long long)s_eh_bounces,
+               (unsigned long long)rip, (unsigned long long)si->si_addr);
+      ssize_t wrc = ::write(2, bl, strlen(bl));
+      (void)wrc;
+    }
+    if (s_eh_bounces == 1) {
+      char bl[640];
+      // Stack provenance: where does THIS thread's stack actually live, and
+      // is the fault inside it or past its end? Answers main-stack vs fiber
+      // vs pthread-stack without guessing from /proc maps of another proc.
+      void* sbase = nullptr;
+      size_t ssz = 0;
+#if !defined(_WIN32)
+      pthread_attr_t pa;
+      if (pthread_getattr_np(pthread_self(), &pa) == 0) {
+        pthread_attr_getstack(&pa, &sbase, &ssz);
+        pthread_attr_destroy(&pa);
+      }
+#endif
+      snprintf(bl, sizeof(bl),
+               "ehfix: FIRST BOUNCE GPRs rip=%llx rsp=%llx rax=%llx rbx=%llx "
+               "rcx=%llx rdx=%llx rdi=%llx rsi=%llx rbp=%llx r8=%llx r9=%llx | "
+               "thread stack=%p..%p (%zu KB) fault_in_stack=%d fault_dist_from_end=%llx\n",
+               (unsigned long long)rip,
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RSP],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RAX],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RBX],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RCX],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RDX],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RDI],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RSI],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_RBP],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_R8],
+               (unsigned long long)uc->uc_mcontext.gregs[REG_R9],
+               sbase, sbase ? (void*)((char*)sbase + ssz) : nullptr,
+               ssz / 1024,
+               (sbase && ssz) ? ((const char*)si->si_addr >= (const char*)sbase &&
+                                 (const char*)si->si_addr < (const char*)sbase + ssz)
+                              : -1,
+               (sbase && ssz) ? (unsigned long long)((const char*)si->si_addr -
+                                                     (const char*)sbase + ssz)
+                              : 0ULL);
+      ssize_t wrc = ::write(2, bl, strlen(bl));
+      (void)wrc;
+    }
     for (u8 r = 0; r < 16; ++r) {
       uc->uc_mcontext.gregs[k_uc_regs[r]] = (greg_t)ctx_gpr(ctx, r);
     }
@@ -4536,6 +4670,19 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep) {
 extern "C" __attribute__((used)) void trt_raise_exception_sysv(
     u32 code, u32 flags, u32 count, const u64* args, const u8* caller_ctx_in) {
   char line[192];
+  // MS_VC_EXCEPTION (0x406D1388): the legacy SetThreadName trick. Real
+  // Windows ignores this exception when no debugger is attached (documented:
+  // "without a debugger, the exception is ignored") — Unity raises it
+  // unconditionally for every worker thread (measured: RACCOIN exit 42,
+  // code=0x406d1388 flags=0 count=3). Swallow it the way the OS does and
+  // resume at RaiseException's caller.
+  if (code == 0x406d1388u) {
+    snprintf(line, sizeof(line),
+             "kernel32: RaiseException(0x406d1388) thread-name exception "
+             "swallowed (no debugger attached)");
+    boot_log(line);
+    return;
+  }
   snprintf(line, sizeof(line),
            "kernel32: RaiseException(code=0x%08x flags=%u count=%u arg0=0x%llx)",
            code, flags, count,
@@ -4834,7 +4981,71 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
   _exit(42);
 #endif
 }
-#endif
+#endif  // !defined(_WIN32) && defined(__x86_64__)
+
+// ---- __C_specific_handler (host-side personality, real Win64 contract) ----
+// Statically-linked MSVC CRTs import this from kernel32 (measured live:
+// Ultra Pool game.exe IAT slot -> KERNEL32.dll!__C_specific_handler; the
+// blanket-0 SYSTEM bind turned every hardware fault into "resume at fault"
+// = an 8.9M-refault EH livelock). This mirrors the tested guest clone in
+// src/guest/guest_eh.c: scope table {Count, Records[]} in HandlerData,
+// HandlerAddress==1 = constant filter, verdict 1 = EXECUTE_HANDLER (unwind
+// through RtlUnwindEx, never return), verdict -1 = CONTINUE_EXECUTION,
+// no match = ExceptionContinueSearch. Dispositions use the REAL Win64
+// constants (ContinueSearch=0, ContinueExecution=1, CollidedUnwind=3).
+struct csh_scope_rec {
+  u32 begin;
+  u32 end;
+  u32 handler;
+  u32 jump;
+};
+struct csh_scope_table {
+  u32 count;
+  csh_scope_rec rec[8];
+};
+
+u32 TRT_STDCALL trt_C_specific_handler(u64 rec_p, u64 frame,
+                                       u64 ctx_p, u64 dc_p) {
+  auto* rec = (trt_ex_record*)(uintptr_t)rec_p;
+  auto* ctx = (u8*)(uintptr_t)ctx_p;
+  auto* dc = (trt_dispatcher_ctx*)(uintptr_t)dc_p;
+  if (!dc || !dc->handler_data) return 0;  // ExceptionContinueSearch
+  const u64 image = dc->image_base;
+  const u64 pc = dc->control_pc - image;  // control PC as an RVA
+  auto* st = (const csh_scope_table*)(uintptr_t)dc->handler_data;
+  for (u32 i = 0; i < st->count && i < 8; ++i) {
+    const csh_scope_rec& s = st->rec[i];
+    if (!s.begin || !s.end) continue;
+    if (pc < s.begin || pc >= s.end) continue;
+    if (!s.jump) continue;  // __finally: phase-2 territory
+    int verdict = 0;
+    if (s.handler == 1) {
+      verdict = 1;  // __except(1): constant filter, never called
+    } else if (s.handler) {
+      // Call the guest filter (ms_abi function pointers stored in the PE's
+      // .xdata) through the shared guest-call boundary.
+      trt_ex_pointers ep = {(u64)(uintptr_t)rec, (u64)(uintptr_t)ctx};
+      const i32 v = (i32)(u32)trt_call_guest(
+          (void*)(uintptr_t)(image + s.handler),
+          (u64)(uintptr_t)&ep, frame, 0, 0);
+      verdict = (int)v;
+    } else {
+      continue;
+    }
+    if (verdict == 1) {  // EXCEPTION_EXECUTE_HANDLER
+      // Unwind from the throw-site context to the establishing frame, then
+      // resume inside the __except block. RtlUnwindEx owns the resume; the
+      // personality never returns in this case.
+      u64 history_buf[16] = {};
+      trt_RtlUnwindEx(frame, image + s.jump, rec, rec->code, ctx, history_buf);
+      return 0;  // not reached on the SysV path: RtlUnwindEx resumes
+    }
+    if (verdict == -1) return 1;  // EXCEPTION_CONTINUE_EXECUTION
+  }
+  return 0;  // ExceptionContinueSearch: keep walking outward
+}
+
+// (end __C_specific_handler host personality)
 
 void* TRT_STDCALL trt_SetUnhandledExceptionFilter(void* filter) {
   (void)filter;
@@ -4961,9 +5172,22 @@ struct cv_slot {
   bool init;
 #endif
 };
-constexpr int k_max_cvs = 64;
+constexpr int k_max_cvs = 512;
 cv_slot g_cv_slots[k_max_cvs];
 std::atomic_flag g_cv_table_lock = ATOMIC_FLAG_INIT;
+// Fail-visible CV accounting: a wake that finds no registered waiter is a
+// no-op by Win32 contract, but a wake that lands while the waiter is still
+// BETWEEN lock-release and wait-registration is a LOST WAKEUP (measured live:
+// Godot's tid=11 parked forever in SleepConditionVariableSRW while holding a
+// CS, wedging the whole boot). Counters + the g_cv_wake_mu-serialized wait
+// below make the window impossible instead of invisible.
+std::atomic<u64> g_cv_waits{0}, g_cv_wake_single{0}, g_cv_wake_all{0},
+    g_cv_wake_no_waiter{0}, g_cv_timeouts{0};
+// Serializes "release the user lock -> register as waiter" against Wake*,
+// closing the lost-wakeup window. Global (not per-slot): wake frequency is
+// low and correctness beats contention here.
+static std::mutex g_cv_wake_mu;
+static std::atomic<bool> g_cv_exhaustion_named{false};
 
 cv_slot* cv_get(void* key) {
   if (!key) return nullptr;
@@ -4987,6 +5211,13 @@ cv_slot* cv_get(void* key) {
         found = &g_cv_slots[i];
         break;
       }
+    }
+    if (!found && !g_cv_exhaustion_named.exchange(true)) {
+      char line[128];
+      snprintf(line, sizeof(line),
+               "sync: condition-variable table exhausted (%d slots); "
+               "further CVs fail with err=8 (fail-visible)", k_max_cvs);
+      trt_core_log(line);
     }
   }
   g_cv_table_lock.clear(std::memory_order_release);
@@ -5047,20 +5278,39 @@ void TRT_STDCALL trt_InitializeConditionVariable(void* cv) {
 static int cv_wait_internal(void* cv, u32 ms) {
   cv_slot* s = cv_get(cv);
   if (!s) {
+    g_cv_wake_mu.unlock();
     err_ref_for_current_thread() = 8;
     return 0;
   }
+  // Caller (trt_SleepConditionVariableSRW/CS) holds g_cv_wake_mu across the
+  // USER-LOCK RELEASE so that "released the SRW/CS" and "registered as a
+  // waiter" are atomic against WakeConditionVariable/WakeAllConditionVariable
+  // (which take g_cv_wake_mu before signaling). This is the Win32
+  // release-and-wait atomicity contract; without it a producer that acquires
+  // the just-released lock, updates the predicate and wakes BEFORE the
+  // consumer registers produces a LOST WAKEUP — measured live as Godot's
+  // tid=11 parked forever in SleepConditionVariableSRW(recursion=1 CS hold)
+  // wedging the entire boot past the 10s watchdog.
+  g_cv_waits.fetch_add(1, std::memory_order_relaxed);
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
+  // SleepConditionVariableCS releases s->cs atomically with wait
+  // registration, so dropping g_cv_wake_mu here leaves no window: a waker
+  // still cannot signal before we are asleep (it blocks on s->cs).
+  g_cv_wake_mu.unlock();
   const BOOL ok = ::SleepConditionVariableCS(&s->cv, &s->cs, ms);
   ::LeaveCriticalSection(&s->cs);
   if (!ok) {
+    g_cv_timeouts.fetch_add(1, std::memory_order_relaxed);
     err_ref_for_current_thread() = 1460;  // ERROR_TIMEOUT
     return 0;
   }
   return 1;
 #else
   pthread_mutex_lock(&s->mu);
+  // From here the waiter is "registered": pthread_cond_wait releases s->mu
+  // atomically with blocking, and any waker must pass s->mu first.
+  g_cv_wake_mu.unlock();
   int rc = 0;
   if (ms == 0xFFFFFFFFu) {
     rc = pthread_cond_wait(&s->cv, &s->mu);
@@ -5074,6 +5324,7 @@ static int cv_wait_internal(void* cv, u32 ms) {
   }
   pthread_mutex_unlock(&s->mu);
   if (rc == ETIMEDOUT) {
+    g_cv_timeouts.fetch_add(1, std::memory_order_relaxed);
     err_ref_for_current_thread() = 1460;  // ERROR_TIMEOUT
     return 0;
   }
@@ -5084,9 +5335,22 @@ static int cv_wait_internal(void* cv, u32 ms) {
 int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
                                               u32 flags) {
   const bool shared = (flags & 0x1u) != 0;
+  // Serialize "release user lock -> register as waiter" against Wake* (see
+  // cv_wait_internal). g_cv_wake_mu is consumed by cv_wait_internal.
+  g_cv_wake_mu.lock();
   if (srw) {
     if (shared) trt_ReleaseSRWLockShared(srw);
     else trt_ReleaseSRWLockExclusive(srw);
+  }
+  if (ms == 0xFFFFFFFFu) {
+    // Fail-visible infinite-wait trace: an infinite Sleep on a CV while
+    // holding another lock is the exact lost-wakeup wedge shape; pairing
+    // these lines with the CS-stall probe names both ends of the contract.
+    char iw[128];
+    snprintf(iw, sizeof(iw),
+             "sync: CV-infinite-wait cv=%p srw=%p flags=%u self_tid=%u", cv,
+             srw, flags, trt_GetCurrentThreadId());
+    trt_core_log(iw);
   }
   const int r = cv_wait_internal(cv, ms);
   if (srw) {
@@ -5099,6 +5363,7 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
 int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
   extern int TRT_STDCALL trt_LeaveCriticalSection(void* cs);
   extern int TRT_STDCALL trt_EnterCriticalSection(void* cs);
+  g_cv_wake_mu.lock();
   if (cs) trt_LeaveCriticalSection(cs);
   const int r = cv_wait_internal(cv, ms);
   if (cs) trt_EnterCriticalSection(cs);
@@ -5108,24 +5373,52 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
 void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
+  g_cv_wake_all.fetch_add(1, std::memory_order_relaxed);
+  // Take g_cv_wake_mu so a wake can never land in the window between the
+  // waiter's user-lock release and its wait registration (lost wakeup).
+  std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
   ::WakeAllConditionVariable(&s->cv);
 #else
   pthread_mutex_lock(&s->mu);
   pthread_cond_broadcast(&s->cv);
   pthread_mutex_unlock(&s->mu);
+  // Fail-visible: a wake for a CV nobody waits on right now is legal Win32,
+  // but a wake DURING an active infinite wait is the wake that must land.
+  if (g_cv_waits.load(std::memory_order_relaxed) >
+      g_cv_timeouts.load(std::memory_order_relaxed)) {
+    char wl[128];
+    snprintf(wl, sizeof(wl),
+             "sync: CV-wakeall cv=%p (waiters active: %llu waits vs %llu "
+             "timeouts)",
+             cv, (unsigned long long)g_cv_waits.load(std::memory_order_relaxed),
+             (unsigned long long)g_cv_timeouts.load(std::memory_order_relaxed));
+    trt_core_log(wl);
+  }
 #endif
 }
 
 void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
+  g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
   ::WakeConditionVariable(&s->cv);
 #else
   pthread_mutex_lock(&s->mu);
   pthread_cond_signal(&s->cv);
   pthread_mutex_unlock(&s->mu);
+  if (g_cv_waits.load(std::memory_order_relaxed) >
+      g_cv_timeouts.load(std::memory_order_relaxed)) {
+    char wl[128];
+    snprintf(wl, sizeof(wl),
+             "sync: CV-wake cv=%p (waiters active: %llu waits vs %llu "
+             "timeouts)",
+             cv, (unsigned long long)g_cv_waits.load(std::memory_order_relaxed),
+             (unsigned long long)g_cv_timeouts.load(std::memory_order_relaxed));
+    trt_core_log(wl);
+  }
 #endif
 }
 
@@ -6151,9 +6444,16 @@ void* TRT_STDCALL trt_GetConsoleWindow(void) { return nullptr; }
 
 int TRT_STDCALL trt_AttachConsole(u32 pid) {
   (void)pid;  // ATTACH_PARENT_PROCESS (0xFFFFFFFF) and any pid: same record
-  trt_core_log("kernel32: AttachConsole -> TRUE (headless console record; "
-               "no host stdio pipe)");
-  return 1;
+  // Honest failure: an AppContainer has no parent console to attach to (real
+  // Windows: AttachConsole fails here too). Returning TRUE was a measured
+  // livelock — Ultra Pool believed a console existed and flooded
+  // GetStdHandle(NULL) forever from its audio/log thread, wedging the main
+  // thread on the CS that thread held. FALSE + ERROR_INVALID_HANDLE lets the
+  // guest's no-console path proceed exactly as on desktop Windows.
+  trt_core_log("kernel32: AttachConsole -> FALSE (no parent console in "
+               "AppContainer; guest falls back to no-console path)");
+  err_ref_for_current_thread() = 6;  // ERROR_INVALID_HANDLE
+  return 0;
 }
 
 // AppModel surface (imported via api-ms-win-appmodel-runtime-l1-1-*.dll by
@@ -6323,6 +6623,8 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"RtlUnwind", (void*)&trt_RtlUnwind},
   {"RtlUnwindEx", (void*)&trt_RtlUnwindEx},
   {"RaiseException", (void*)&trt_RaiseException},
+  {"__C_specific_handler", (void*)&trt_C_specific_handler},
+  {"__C_specific_handler_impl", (void*)&trt_C_specific_handler},
   {"SetUnhandledExceptionFilter", (void*)&trt_SetUnhandledExceptionFilter},
   {"UnhandledExceptionFilter", (void*)&trt_UnhandledExceptionFilter},
   {"IsDebuggerPresent", (void*)&trt_IsDebuggerPresent},

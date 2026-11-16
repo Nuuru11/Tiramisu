@@ -4,6 +4,13 @@
 #include "spirv_hlsl.h"
 #include "thunk.h"
 
+// Real Vulkan ABI for the physical-device properties/limits structs: hand-
+// rolled mirrors drifted once (a zeroed limits block reported
+// maxFragmentInputComponents=0 -> Godot computed "maximum varyings = 0" ->
+// EVERY shader compile failed -> endless scene-import retry storm). The
+// header layout is stable and pointer-free; the static_asserts below pin it.
+#include <vulkan/vulkan_core.h>
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -58,20 +65,19 @@ struct vk_ext_props {
 struct vk_layer_props {
   char layerName[256]; u32 specVersion; u32 implementationVersion; char description[256];
 };
-struct vk_phys_dev_limits {
-  u32 raw[128];
-};
-struct vk_phys_dev_props {
-  u32 apiVersion; u32 driverVersion; u32 vendorID; u32 deviceID; u32 deviceType;
-  char deviceName[256]; u8 pipelineCacheUUID[16];
-  u32 maxImageDimension1D; u32 maxImageDimension2D; u32 maxImageDimension3D;
-  u32 maxImageDimensionCube; u32 maxImageArrayLayers; u32 maxTexelBufferElements;
-  u32 maxUniformBufferRange; u32 maxStorageBufferRange; u32 maxPushConstantsSize;
-  u32 raw_rest[120];
-};
-struct vk_phys_dev_props2 { u32 sType; void* pNext; vk_phys_dev_props properties; };
-struct vk_phys_dev_features { u32 features[55]; };
-struct vk_phys_dev_features2 { u32 sType; void* pNext; vk_phys_dev_features features; };
+// The properties/limits structs now come straight from <vulkan/vulkan_core.h>
+// (see the include above). Static asserts pin the ABI the ICD was measured on.
+static_assert(sizeof(VkPhysicalDeviceLimits) == 504,
+              "VkPhysicalDeviceLimits ABI drift");
+static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
+              "VkPhysicalDeviceProperties.limits offset drift");
+// Local aliases keep the existing call sites unchanged.
+using vk_phys_dev_props = VkPhysicalDeviceProperties;
+using vk_phys_dev_props2 = VkPhysicalDeviceProperties2;
+using vk_phys_dev_limits = VkPhysicalDeviceLimits;
+using vk_phys_dev_features = VkPhysicalDeviceFeatures;
+using vk_phys_dev_features2 = VkPhysicalDeviceFeatures2;
+// props2/features use the real header types (aliased above).
 struct vk_qf_props { u32 queueFlags; u32 queueCount; u32 timestampValidBits; vk_extent3d minImageTransferGranularity; };
 struct vk_qf_props2 { u32 sType; void* pNext; vk_qf_props queueFamilyProperties; };
 struct vk_mem_type { u32 propertyFlags; u32 heapIndex; };
@@ -834,31 +840,185 @@ i32 TRT_GUEST_ABI trt_vkEnumeratePhysicalDevices(void* inst_v, u32* pCount, void
   return VK_INCOMPLETE_V;
 }
 
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties(void*, vk_phys_dev_props* p) {
+// Desktop-class limits (AMD Navi 21 class, consistent with the vendorID/
+// deviceID above). Values are the SPIR-V->HLSL->D3D11 bridge's honest
+// capability floor: everything here is either truly supported by the D3D11
+// path or enforced by the shader translator. Zeroed limits previously made
+// Godot compute "maximum varyings = 0" and fail EVERY shader compile.
+static void fill_phys_dev_limits(VkPhysicalDeviceLimits* L) {
+  *L = {};
+  L->maxImageDimension1D = 16384;
+  L->maxImageDimension2D = 16384;
+  L->maxImageDimension3D = 2048;
+  L->maxImageDimensionCube = 16384;
+  L->maxImageArrayLayers = 2048;
+  L->maxTexelBufferElements = 0x8000000ull < (1ull << 32) ? 134217728u : 134217728u;
+  L->maxUniformBufferRange = 65536;
+  L->maxStorageBufferRange = 134217728;
+  L->maxPushConstantsSize = 256;
+  L->maxMemoryAllocationCount = 4294967295u;  // D3D11: no hard allocation cap
+  L->maxSamplerAllocationCount = 2048;
+  L->bufferImageGranularity = 4096;
+  L->sparseAddressSpaceSize = 0;  // sparse not bridged (fail-visible elsewhere)
+  L->maxBoundDescriptorSets = 8;
+  L->maxPerStageDescriptorSamplers = 16;
+  L->maxPerStageDescriptorUniformBuffers = 15;   // D3D11.1 b-constraint
+  L->maxPerStageDescriptorStorageBuffers = 8;
+  L->maxPerStageDescriptorSampledImages = 128;
+  L->maxPerStageDescriptorStorageImages = 8;
+  L->maxPerStageDescriptorInputAttachments = 8;
+  L->maxPerStageResources = 128;
+  L->maxDescriptorSetSamplers = 48;
+  L->maxDescriptorSetUniformBuffers = 90;
+  L->maxDescriptorSetUniformBuffersDynamic = 15;
+  L->maxDescriptorSetStorageBuffers = 72;
+  L->maxDescriptorSetStorageBuffersDynamic = 24;
+  L->maxDescriptorSetSampledImages = 768;
+  L->maxDescriptorSetStorageImages = 72;
+  L->maxDescriptorSetInputAttachments = 72;
+  L->maxVertexInputAttributes = 32;
+  L->maxVertexInputBindings = 32;
+  L->maxVertexInputAttributeOffset = 2047;   // D3D11: 4GB-1 really, keep sane
+  L->maxVertexInputBindingStride = 2048;     // D3D11: 4096 for 11.1; conservative
+  L->maxVertexOutputComponents = 128;        // D3D11: 32x4-vs-out
+  L->maxTessellationGenerationLevel = 64;
+  L->maxTessellationPatchSize = 32;
+  L->maxTessellationControlPerVertexInputComponents = 128;
+  L->maxTessellationControlPerVertexOutputComponents = 128;
+  L->maxTessellationControlPerPatchOutputComponents = 120;
+  L->maxTessellationControlTotalOutputComponents = 4096;
+  L->maxTessellationEvaluationInputComponents = 128;
+  L->maxTessellationEvaluationOutputComponents = 128;
+  L->maxGeometryShaderInvocations = 32;
+  L->maxGeometryInputComponents = 64;
+  L->maxGeometryOutputComponents = 128;
+  L->maxGeometryOutputVertices = 1024;
+  L->maxGeometryTotalOutputComponents = 1024;
+  // The load-bearing one: Godot computes its varying budget from this.
+  L->maxFragmentInputComponents = 128;       // D3D11: 32x4-ps-in
+  L->maxFragmentOutputAttachments = 8;
+  L->maxFragmentDualSrcAttachments = 1;
+  L->maxFragmentCombinedOutputResources = 8;
+  L->maxComputeSharedMemorySize = 32768;
+  L->maxComputeWorkGroupCount[0] = 65535;
+  L->maxComputeWorkGroupCount[1] = 65535;
+  L->maxComputeWorkGroupCount[2] = 65535;
+  L->maxComputeWorkGroupInvocations = 1024;
+  L->maxComputeWorkGroupSize[0] = 1024;
+  L->maxComputeWorkGroupSize[1] = 1024;
+  L->maxComputeWorkGroupSize[2] = 64;
+  L->subPixelPrecisionBits = 8;
+  L->subTexelPrecisionBits = 8;
+  L->mipmapPrecisionBits = 8;
+  L->maxDrawIndexedIndexValue = 4294967294u;  // D3D11: 32-bit indices
+  L->maxDrawIndirectCount = 65535;
+  L->maxSamplerLodBias = 16.0f;
+  L->maxSamplerAnisotropy = 16.0f;
+  L->maxViewports = 16;
+  L->maxViewportDimensions[0] = 16384;
+  L->maxViewportDimensions[1] = 16384;
+  L->viewportBoundsRange[0] = -32768.0f;
+  L->viewportBoundsRange[1] = 32767.0f;
+  L->viewportSubPixelBits = 8;
+  L->minMemoryMapAlignment = 4096;
+  L->minTexelBufferOffsetAlignment = 256;
+  L->minUniformBufferOffsetAlignment = 16;   // D3D11 constant-buffer 16B
+  L->minStorageBufferOffsetAlignment = 16;
+  L->minTexelOffset = -32;
+  L->maxTexelOffset = 31;
+  L->minTexelGatherOffset = -32;
+  L->maxTexelGatherOffset = 31;
+  L->minInterpolationOffset = -0.5f;
+  L->maxInterpolationOffset = 0.5f;
+  L->subPixelInterpolationOffsetBits = 8;
+  L->maxFramebufferWidth = 16384;
+  L->maxFramebufferHeight = 16384;
+  L->maxFramebufferLayers = 2048;
+  L->framebufferColorSampleCounts = 0x7F;    // 1|2|4|8|16|32|64
+  L->framebufferDepthSampleCounts = 0x7F;
+  L->framebufferStencilSampleCounts = 0x7F;
+  L->framebufferNoAttachmentsSampleCounts = 0x7F;
+  L->maxColorAttachments = 8;
+  L->sampledImageColorSampleCounts = 0x7F;
+  L->sampledImageIntegerSampleCounts = 0x7F;
+  L->sampledImageDepthSampleCounts = 0x7F;
+  L->sampledImageStencilSampleCounts = 0x7F;
+  L->storageImageSampleCounts = 0x3F;
+  L->maxSampleMaskWords = 1;
+  L->timestampComputeAndGraphics = VK_TRUE;
+  L->timestampPeriod = 1.0f;                 // 1 ns (D3D11 Query timestamp)
+  L->maxClipDistances = 8;
+  L->maxCullDistances = 8;
+  L->maxCombinedClipAndCullDistances = 8;
+  L->discreteQueuePriorities = 2;
+  L->pointSizeRange[0] = 0.0f;
+  L->pointSizeRange[1] = 8191.0f;
+  L->lineWidthRange[0] = 1.0f;
+  L->lineWidthRange[1] = 8.0f;
+  L->pointSizeGranularity = 0.0625f;
+  L->lineWidthGranularity = 0.0625f;
+  L->strictLines = VK_FALSE;
+  L->standardSampleLocations = VK_TRUE;
+  L->optimalBufferCopyOffsetAlignment = 1;
+  L->optimalBufferCopyRowPitchAlignment = 1;
+  L->nonCoherentAtomSize = 256;
+}
+
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties(void*, VkPhysicalDeviceProperties* p) {
   if (!p) return;
   memset(p, 0, sizeof(*p));
   p->apiVersion = VK_MAKE_VER(1, 3, 255);
   p->driverVersion = 1;
   p->vendorID = 0x1002u;
   p->deviceID = 0x73DFu;
-  p->deviceType = 1; // INTEGRATED_GPU
+  p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
   snprintf(p->deviceName, sizeof(p->deviceName), "Tiramisu Vulkan->D3D11");
-  p->maxImageDimension1D = 16384;
-  p->maxImageDimension2D = 16384;
-  p->maxImageDimension3D = 2048;
-  p->maxImageDimensionCube = 16384;
-  p->maxImageArrayLayers = 2048;
-  p->maxUniformBufferRange = 65536;
-  p->maxStorageBufferRange = 134217728;
-  p->maxPushConstantsSize = 256;
+  fill_phys_dev_limits(&p->limits);
+  p->sparseProperties.residencyStandard2DBlockShape = VK_FALSE;
+  // sparse not bridged: all sparse properties honestly false (zeroed)
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties2(void* pd, vk_phys_dev_props2* p2) {
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties2(void* pd, VkPhysicalDeviceProperties2* p2) {
   if (p2) trt_vkGetPhysicalDeviceProperties(pd, &p2->properties);
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, vk_phys_dev_features* f) {
-  if (f) for (int i = 0; i < 55; ++i) f->features[i] = 1;
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, VkPhysicalDeviceFeatures* f) {
+  if (f) {
+    *f = {};
+    // Features actually honored by the SPIR-V->HLSL->D3D11 bridge; the rest
+    // stay false rather than promising what the bridge can't deliver.
+    // Godot's _check_device_features hard-gates on imageCubeArray +
+    // independentBlend (rendering_device_driver_vulkan.cpp:_check_device_features
+    // — measured live: alert "does not support the following features" ->
+    // Vulkan init aborted -> forced GL fallback). Both are real D3D11
+    // capabilities the bridge carries.
+    f->robustBufferAccess = VK_TRUE;
+    f->fullDrawIndexUint32 = VK_TRUE;
+    f->independentBlend = VK_TRUE;
+    f->imageCubeArray = VK_TRUE;
+    f->dualSrcBlend = VK_TRUE;
+    f->sampleRateShading = VK_TRUE;
+    f->fragmentStoresAndAtomics = VK_TRUE;
+    f->vertexPipelineStoresAndAtomics = VK_TRUE;
+    f->shaderClipDistance = VK_TRUE;
+    f->shaderCullDistance = VK_TRUE;
+    f->shaderImageGatherExtended = VK_TRUE;
+    f->shaderStorageImageExtendedFormats = VK_TRUE;
+    f->depthClamp = VK_TRUE;
+    f->depthBiasClamp = VK_TRUE;
+    f->fillModeNonSolid = VK_TRUE;
+    f->multiViewport = VK_TRUE;
+    f->samplerAnisotropy = VK_TRUE;
+    f->textureCompressionBC = VK_TRUE;
+    f->tessellationShader = VK_TRUE;
+    f->geometryShader = VK_TRUE;
+    f->shaderTessellationAndGeometryPointSize = VK_TRUE;
+    f->occlusionQueryPrecise = VK_TRUE;
+    f->pipelineStatisticsQuery = VK_TRUE;
+    f->shaderFloat64 = VK_FALSE;  // D3D11: 64-bit shader floats are optional
+    f->shaderInt64 = VK_FALSE;
+    f->sparseBinding = VK_FALSE;  // sparse not bridged
+  }
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures2(void* pd, vk_phys_dev_features2* f2) {
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures2(void* pd, VkPhysicalDeviceFeatures2* f2) {
   if (f2) trt_vkGetPhysicalDeviceFeatures(pd, &f2->features);
 }
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFormatProperties(void*, u32, vk_fmt_props* p) {

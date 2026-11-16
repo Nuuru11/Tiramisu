@@ -191,14 +191,21 @@ u32 GSTD engine_boot(u64 a, u64 b, u64 c) {
   bits |= (GetLastError() == 5 /*ACCESS_DENIED*/) ? 0x4000u : 0u;
   bits |= (pi[0] == 0 && pi[8] == 0) ? 0x8000u : 0u;  // no fake handles
 
-  // 8b. the console surface: GetStdHandle -> NULL + named last error
+  // 8b. the console surface: GetStdHandle serves synthetic stdio — real
+  // Win32 pseudo-handles (STD_OUTPUT = -11) routed by WriteFile to the log
+  // ring (measured: Godot's own stdout is the fastest discovery surface);
+  // a non-std id still answers NULL + ERROR_INVALID_HANDLE honestly.
   __attribute__((dllimport)) void* GSTD SetStdHandle(u32 which, void* h);
   __attribute__((dllimport)) i32 GSTD WriteConsoleW(void* con, const void* buf,
                                                      u32 n, u32* put, void* r);
   (void)WriteConsoleW;
   SetLastError(0);
   const void* stdh = GetStdHandle(0xFFFFFFF5u /*STD_OUTPUT_HANDLE*/);
-  bits |= (stdh == 0 && GetLastError() == 6 /*INVALID_HANDLE*/) ? 0x10000u : 0u;
+  bits |= (stdh == (const void*)(long long)-11 /*pseudo-handle*/) ? 0x10000u
+                                                                   : 0u;  SetLastError(0);
+  const void* badh = GetStdHandle(0u /*not a std id*/);
+  bits |= (badh == 0 && GetLastError() == 6 /*INVALID_HANDLE*/) ? 0x4000000u
+                                                                 : 0u;
   bits |= (SetStdHandle(0xFFFFFFF5u, 0) == 0) ? 0x20000u : 0u;
 
   // 8c. console mode/read/write all say "no console" honestly

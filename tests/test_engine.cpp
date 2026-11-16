@@ -285,7 +285,8 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x2000u, "CreateProcessW -> FALSE (console blocks children)");
   CHECK(ret & 0x4000u, "CreateProcessW names ERROR_ACCESS_DENIED");
   CHECK(ret & 0x8000u, "CreateProcessW fills no fake PROCESS_INFORMATION");
-  CHECK(ret & 0x10000u, "GetStdHandle -> NULL + ERROR_INVALID_HANDLE");
+  CHECK(ret & 0x10000u, "GetStdHandle -> synthetic stdio pseudo-handle (-11)");
+  CHECK(ret & 0x4000000u, "GetStdHandle(non-std) -> NULL + ERROR_INVALID_HANDLE");
   CHECK(ret & 0x20000u, "SetStdHandle -> FALSE");
   CHECK(ret & 0x40000u, "GetConsoleMode -> FALSE (no console)");
   CHECK(ret & 0x80000u, "SetConsoleCtrlHandler -> FALSE");

@@ -1066,6 +1066,7 @@ extern void (*trt_boot_exit_trap)(int code);   // defined in bridge_kernel32.cpp
 extern void (*trt_boot_raise_trap)(u32 code);  // defined in bridge_kernel32.cpp
 unsigned trt_msg_dispatched(void);
 void trt_bridge_post_quit(int code);
+void* trt_GetActiveWindow(void);  // bridge_user32.cpp: guest's top window
 }
 
 namespace exe_boot {
@@ -1109,7 +1110,15 @@ void* watchdog_fn(void*) {
     if (g_boot.quit_seen || g_boot.trapped) return nullptr;
   }
   g_boot.watchdog_fired = 1;
-  trt_core_log("trt: boot-watchdog fired (10s without WM_QUIT) -> posting quit");
+  trt_core_log("trt: boot-watchdog fired (10s without WM_QUIT) -> posting WM_CLOSE");
+  // Godot's Windows quit path is WM_CLOSE -> guest WndProc ->
+  // WINDOW_EVENT_CLOSE_REQUEST -> SceneTree quit (measured against
+  // godot 4.3 display_server_windows.cpp / window.cpp / scene_tree.cpp:
+  // process_events uses PeekMessageW+DispatchMessageW and NEVER reads
+  // WM_QUIT). Post WM_CLOSE to the guest's top window so the guest's own
+  // quit logic runs; WM_QUIT stays as the queue fallback.
+  void* hwnd = trt_GetActiveWindow();
+  trt_msg_post(0x0010 /*WM_CLOSE*/, 0, (long long)(uintptr_t)hwnd);
   trt_msg_post(0x0012 /*WM_QUIT*/, 0, 0);
   trt_bridge_post_quit(0);
   return nullptr;

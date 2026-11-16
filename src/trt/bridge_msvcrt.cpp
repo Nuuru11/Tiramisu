@@ -479,7 +479,28 @@ void TRT_GUEST_ABI crt_longjmp(void* env, i32 val) {
 #endif
 
 // ---------- memory allocation ---------------------------------------------
-void* TRT_GUEST_ABI crt_malloc(u64 sz) { return malloc((size_t)sz); }
+// Fail-visible huge-allocation probe: a straight pass-through malloc only
+// returns NULL on absurd sizes, and the mixer retry-storm at
+// CowData::_copy_on_write (measured: tid=11 hot loop, error path strings
+// "core/os/memory.cpp"/"alloc_static") is exactly a NULL from here. Log the
+// size when it exceeds any plausible game allocation so the guest-side
+// garbage-size source becomes measurable.
+void* TRT_GUEST_ABI crt_malloc(u64 sz) {
+  if (sz > 268435456u /*256 MB*/) {
+    static unsigned huge_named = 0;  // racy counter; only used for log caps
+    const unsigned n = huge_named;
+    if (n < 8) {
+      char hl[96];
+      snprintf(hl, sizeof(hl),
+               "msvcrt: malloc(sz=%llu) -> NULL (huge; call #%u)",
+               (unsigned long long)sz, n + 1);
+      trt_core_log(hl);
+      huge_named = n + 1;
+    }
+    return nullptr;
+  }
+  return malloc((size_t)sz);
+}
 void* TRT_GUEST_ABI crt_calloc(u64 n, u64 sz) { return calloc((size_t)n, (size_t)sz); }
 void* TRT_GUEST_ABI crt_realloc(void* p, u64 sz) { return realloc(p, (size_t)sz); }
 void  TRT_GUEST_ABI crt_free(void* p) { free(p); }

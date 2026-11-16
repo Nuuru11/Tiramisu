@@ -138,6 +138,24 @@ u32 TRT_GUEST_ABI trt_waveOutOpen(u64* handle, u32, u64, u64, u64, u32) {
 u32 TRT_GUEST_ABI trt_waveOutUnprepareHeader(u64, void*, u32) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutPrepareHeader(u64, void*, u32) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64, void*, u32) { return 4; }
+// waveOutMessage: device-specific driver message. With no legacy wave
+// devices there is no driver to receive it — MMSYSERR_BADDEVICEID (4),
+// the API's own named failure, same as the rest of the waveOut surface.
+u32 TRT_GUEST_ABI trt_waveOutMessage(u64, u32, u64, u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutBreakLoop(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutRestart(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutPause(u64) { return 4; }
+// waveInMessage / waveOutMessage twins; GetErrorText* answer "no such
+// error for an invalid device" with the API's own bad-device code.
+u32 TRT_GUEST_ABI trt_waveInMessage(u64, u32, u64, u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutGetErrorTextW(u32 err, u16* buf, u32 len) {
+  (void)err; (void)buf; (void)len;
+  return 4;  // MMSYSERR_BADDEVICEID
+}
+u32 TRT_GUEST_ABI trt_waveInGetErrorTextW(u32 err, u16* buf, u32 len) {
+  (void)err; (void)buf; (void)len;
+  return 4;
+}
 u32 TRT_GUEST_ABI trt_midiInGetNumDevs(void) { return 0; }
 u32 TRT_GUEST_ABI trt_midiInOpen(void** ph, u32 dev, u64 cb, u64 inst, u32 fl) {
   (void)dev; (void)cb; (void)inst; (void)fl;
@@ -178,6 +196,15 @@ int trt_bridge_register_winmm(void) {
       {"waveOutPrepareHeader", (void*)&trt_waveOutPrepareHeader},
       {"waveOutUnprepareHeader", (void*)&trt_waveOutUnprepareHeader},
       {"waveOutGetDevCapsA", (void*)&trt_waveOutGetDevCapsA},
+      {"waveOutMessage", (void*)&trt_waveOutMessage},
+      {"waveOutBreakLoop", (void*)&trt_waveOutBreakLoop},
+      {"waveOutRestart", (void*)&trt_waveOutRestart},
+      {"waveOutPause", (void*)&trt_waveOutPause},
+      {"waveInMessage", (void*)&trt_waveInMessage},
+      {"waveOutGetErrorTextW", (void*)&trt_waveOutGetErrorTextW},
+      {"waveOutGetErrorTextA", (void*)&trt_waveOutGetErrorTextW},
+      {"waveInGetErrorTextW", (void*)&trt_waveInGetErrorTextW},
+      {"waveInGetErrorTextA", (void*)&trt_waveInGetErrorTextW},
       {"midiOutGetNumDevs", (void*)&trt_midiOutGetNumDevs},
       {"midiInGetNumDevs", (void*)&trt_midiInGetNumDevs},
       {"midiInOpen", (void*)&trt_midiInOpen},
