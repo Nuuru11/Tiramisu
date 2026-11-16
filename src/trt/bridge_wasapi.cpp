@@ -5,6 +5,9 @@
 #include "bridge_ole.h"
 #include "thunk.h"
 #include "trt.h"
+// Settings knob (audio_buffer_ms); weak link keeps offline tests green when
+// src/host/settings.cpp is not in the test binary.
+extern "C" int trt_settings_audio_buffer_ms() __attribute__((weak));
 
 #include <atomic>
 #include <chrono>
@@ -469,7 +472,12 @@ i32 TRT_GUEST_ABI client_Initialize(void* self, u32 share_mode,
         ((u64)hns_buffer_duration * (u64)c->rate) / 10000000ULL;
     c->buffer_frames = frames >= 1024 ? (u32)frames : 4800u;
   } else {
-    c->buffer_frames = c->rate / 10;  // 100 ms default
+    // Settings knob: audio_buffer_ms (default 100). Games that never pass
+    // hnsBufferDuration get the user's tuning instead of a hard-coded 100ms.
+    const int ms = trt_settings_audio_buffer_ms ? trt_settings_audio_buffer_ms() : 0;
+    const u64 frames =
+        (u64)c->rate * (u64)(ms > 0 ? ms : 100) / 1000ull;
+    c->buffer_frames = frames >= 1024 ? (u32)frames : 4800u;
   }
   const size_t bytes = (size_t)c->buffer_frames * (size_t)c->block_align;
   free(c->mix_buf);

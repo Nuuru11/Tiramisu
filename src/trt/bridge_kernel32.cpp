@@ -1530,7 +1530,17 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
   } else {
     os = fopen(host, write ? "r+b" : "rb");
   }
-  if (!os && write) os = fopen(host, "r+b");
+  if (!os && write) {
+    // Parent directories may not exist yet. Real Windows CreateFileW with
+    // CREATE_ALWAYS also fails when the parent dir is absent — but Unity's
+    // CrashReporter writes insights-crash-report.json without ever calling
+    // CreateDirectoryW (it expects the app's own dir tree to already exist,
+    // which the desktop install created and our VFS did not). Create parents
+    // once and retry, exactly like a fresh Windows install dir.
+    trt_vfs_ensure_parents(host);
+    os = fopen(host, "r+b");
+    if (!os && (disp == 1 || disp == 2 || disp == 5)) os = fopen(host, "w+b");
+  }
   if (!os) {
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
@@ -3905,6 +3915,37 @@ void* TRT_STDCALL trt_RtlCaptureContext(void* ctx) {
 }
 #endif
 
+// ---- guest memory safety for the unwinder --------------------------------
+// The unwinder walks GUEST-provided unwind metadata and GUEST stack memory.
+// A corrupted .pdata or a stale RSP (measured: UnityPlayer SIGSEGV inside
+// trt_RtlVirtualUnwind during its MapViewOfFile crash path) must produce a
+// clean "unwind failed" verdict, never a host crash. Safe read = range check
+// against registered guest images + Tiramisu bridge mappings.
+namespace {
+bool ptr_in_guest_image(const void* p) {
+  if (!p) return false;
+  const uintptr_t v = (uintptr_t)p;
+  for (int i = 0; i < trt_images_count(); ++i) {
+    trt_image* img = trt_images_nth(i);
+    if (!img || !img->base) continue;
+    const uintptr_t b = (uintptr_t)img->base;
+    if (v >= b && v < b + img->size_of_image) return true;
+  }
+  // .pdata and mapped-file views live outside images; accept a wide host
+  // range. Anything below 4 KiB or in the first/last 64 KiB of the address
+  // space is a null/wild dereference by construction.
+  if (v < 0x10000ull || v > 0x7ffffffe0000ull) return false;
+  return true;
+}
+// Header read with validation: `ui` must sit inside a guest image and the
+// slot walk stays within the same image.
+const u8* safe_unwind_info(const u8* ui, const u8* image_end) {
+  if (!ui || !ptr_in_guest_image(ui)) return nullptr;
+  if (image_end && ui + 4 > image_end) return nullptr;
+  return ui;
+}
+}  // namespace
+
 u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
                                      u64 ctrl_pc, void* fn_entry, void* ctx_in,
                                      void** handler_data, u64* establisher,
@@ -3931,9 +3972,17 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
     ctx_set_gpr(ctx, 4, sp + 8);
     return 0;
   }
+  // fn_entry points into the guest image's .pdata; a garbage entry (stale
+  // dispatcher context, corrupted frame) must not be dereferenced.
+  if (!ptr_in_guest_image(fn)) {
+    if (handler_data) *handler_data = nullptr;
+    if (establisher) *establisher = 0;
+    return 0;
+  }
 
   bool machframe_popped = false;
   bool is_chained = false;
+  bool unwind_failed = false;  // corrupted metadata -> clean failure verdict
   u64 last_establisher = ctx_gpr(ctx, 4);
   const u8* final_ui = nullptr;
   u8 final_flags = 0;
@@ -3944,6 +3993,31 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
       fn = (const trt_runtime_fn*)(uintptr_t)(image_base + (fn->unwind & ~1u));
     }
     const u8* ui = (const u8*)(uintptr_t)(image_base + fn->unwind);
+    // Validate the unwind-info pointer BEFORE any dereference. UnityPlayer's
+    // crash path handed us metadata outside any mapped image.
+    {
+      // image_end from the registered image whose base matches image_base
+      const u8* image_end = nullptr;
+      for (int i = 0; i < trt_images_count(); ++i) {
+        trt_image* img = trt_images_nth(i);
+        if (img && img->base && (u64)(uintptr_t)img->base == image_base) {
+          image_end = img->base + img->size_of_image;
+          break;
+        }
+      }
+      if (!safe_unwind_info(ui, image_end)) {
+        char bl[160];
+        snprintf(bl, sizeof(bl),
+                 "ehfix: unwind metadata rejected (ui=%llx base=%llx) -> "
+                 "unwind failed cleanly\n",
+                 (unsigned long long)(uintptr_t)ui,
+                 (unsigned long long)image_base);
+        ssize_t wrc = ::write(2, bl, strlen(bl));
+        (void)wrc;
+        unwind_failed = true;
+        break;
+      }
+    }
     const u8 flags = ui[0] >> 3;
     const u8 prolog = ui[1];
     const u8 count = ui[2];
@@ -4071,6 +4145,15 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
     is_chained = true;
   }
 
+  if (unwind_failed) {
+    // Corrupt/unmapped unwind metadata: return "no handler, can't unwind".
+    // The dispatcher turns this into unhandled-exception handling (which the
+    // runtime already routes to the guest's UEF / crash report) instead of
+    // faulting the host inside the unwinder.
+    if (handler_data) *handler_data = nullptr;
+    if (establisher) *establisher = 0;
+    return 0;
+  }
   if (!machframe_popped) {
     const u64 sp = ctx_gpr(ctx, 4);
     ctx_set_rip(ctx, *(const u64*)(uintptr_t)sp);
@@ -4585,9 +4668,23 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
   if (handled) {
     // fail-visible EH bounce counter: a livelock here (the same (rip,fault)
     // pair "handled" forever) shows up as bounce floods instead of a
-    // silent hang that only a watchdog names.
+    // silent hang that only a watchdog names. Cap: after 100k bounces on one
+    // thread the guest is provably livelocked (measured: OrTMM spun 14.5M
+    // identical bounces) — abort with a named verdict instead of spinning.
     static thread_local u64 s_eh_bounces = 0;
-    if (++s_eh_bounces % 1000 == 0) {
+    ++s_eh_bounces;
+    if (s_eh_bounces == 100000ull) {
+      char bl[256];
+      snprintf(bl, sizeof(bl),
+               "ehfix: BOUNCE-LIVELOCK cap hit (100k identical EH bounces, "
+               "rip=%llx) -> guest terminated with named verdict\n",
+               (unsigned long long)rip);
+      ssize_t wrc = ::write(2, bl, strlen(bl));
+      (void)wrc;
+      boot_log("ehfix: guest livelocked in EH bounce loop -> abort (named)");
+      abort();
+    }
+    if (s_eh_bounces % 100000 == 0) {
       char bl[128];
       snprintf(bl, sizeof(bl),
                "ehfix: hw-fault bounce #%llu rip=%llx fault=%llx\n",

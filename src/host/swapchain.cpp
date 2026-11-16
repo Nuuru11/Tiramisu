@@ -18,6 +18,8 @@
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
+#include "settings.h"
+#include <chrono>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -211,8 +213,17 @@ HRESULT create_d3d11_corewindow_swapchain() {
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
   swapchain_result r{};
   auto bounds = w.Bounds();
+  // Settings knob: resolution_scale (%) renders below native size and lets
+  // DXGI scale up — the main GPU headroom lever on Series S-class targets.
+  const int scale = trt_settings_resolution_scale();
   g_w = (unsigned)bounds.Width;
   g_h = (unsigned)bounds.Height;
+  if (scale > 0 && scale != 100) {
+    g_w = (unsigned)((u64)g_w * (u64)scale / 100ull);
+    g_h = (unsigned)((u64)g_h * (u64)scale / 100ull);
+    if (g_w < 320) g_w = 320;
+    if (g_h < 180) g_h = 180;
+  }
   r.width = g_w;
   r.height = g_h;
   winrt::copy_from_abi(g_window, winrt::get_abi(w));
@@ -314,7 +325,26 @@ void swapchain_bind_d3d9() {
 }
 
 void swapchain_present() {
-  if (g_swap && !g_in_d3d12) g_swap->Present(1, 0);
+  if (!g_swap || g_in_d3d12) return;
+  // Settings knobs (community wave): vsync off -> Present(0), frame-rate cap
+  // -> minimum frame time enforced on the UI thread's present cadence.
+  const bool vsync = trt_settings_vsync();
+  const int cap = trt_settings_frame_rate_cap();
+  static std::chrono::steady_clock::time_point last_present{};
+  auto now = std::chrono::steady_clock::now();
+  if (cap > 0) {
+    const auto min_dt = std::chrono::milliseconds(1000 / cap);
+    auto since = now - last_present;
+    if (since < min_dt) {
+      const auto wait = min_dt - since;
+      Sleep((unsigned)std::chrono::duration_cast<std::chrono::milliseconds>(
+                wait)
+                .count());
+      now = std::chrono::steady_clock::now();
+    }
+  }
+  last_present = now;
+  g_swap->Present(vsync ? 1 : 0, 0);
 }
 
 void* swapchain_dxgi() { return g_swap.get(); }

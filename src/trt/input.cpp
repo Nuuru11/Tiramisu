@@ -59,16 +59,22 @@ input_state g;
 // thread; recursive_mutex keeps internal trt_msg_post / trt_raw_post safe.
 std::recursive_mutex g_input_mu;
 
-int clamp_axis(i16 v) {  // deadzone ~8k, normalize to [-1,1]
-  const int dz = 8000;
+} // namespace
+
+extern "C" {
+// Settings knob (input_deadzone, 0..32767); weak symbol keeps offline tests
+// green when src/host/settings.cpp is not in the test binary. Missing
+// definition resolves to 0 -> clamp_axis falls back to the default 8000.
+int trt_settings_input_deadzone(void) __attribute__((weak));
+
+int clamp_axis(i16 v) {  // deadzone from settings (default ~8k), normalize
+  // Weak symbol may be null in test binaries without settings.cpp.
+  const int dz_set = trt_settings_input_deadzone ? trt_settings_input_deadzone() : 0;
+  const int dz = (dz_set > 0 && dz_set <= 20000) ? dz_set : 8000;
   int a = v;
   if (a > dz) a -= dz; else if (a < -dz) a += dz; else return 0;
   return (int)(a * 100 / (32767 - dz));
 }
-
-} // namespace
-
-extern "C" {
 
 // raw-blob feeders (defined below; used by the host-feed section)
 void trt_raw_post_mouse(i32 dx, i32 dy, u16 btn_flags, u16 btn_data);

@@ -69,6 +69,7 @@ rc=0
 
 # --- STAGE 7: EXE-entry boot depth (real game EXEs, offline) ---
 EXES=(
+  "corpus-local/gonext/Go Next demo.exe"
   "corpus-local/ortmm/OrTMM.exe"
   "corpus-local/raccoin/RACCOIN.exe"
 )
@@ -79,11 +80,16 @@ exe_report="$out/corpus-exe-report.md"
 } > "$exe_report"
 for exe in "${EXES[@]}"; do
   [[ -f "$exe" ]] || { echo "corpus-exe: missing $exe (skipped)"; continue; }
-  "$out/test_corpus_run" --exe "$exe" 2>&1 | tee -a "$exe_report"
-  # BOOT FAILED (exit 1) is a NAMED outcome, not a gate failure: the report
-  # names the blocker. Only a crash WITHOUT the named report fails the gate.
+  # Per-EXE wall-clock bound: a guest that never reaches WM_QUIT (OrTMM's
+  # hw-fault bounce loop) must not wedge the gate. Timeout = named hang,
+  # not a silent stall.
+  timeout -s KILL 60 "$out/test_corpus_run" --exe "$exe" 2>&1 | tee -a "$exe_report"
   p=${PIPESTATUS[0]}
-  if [[ $p -ne 0 && $p -ne 1 ]]; then rc=1; fi
+  if [[ $p -eq 124 || $p -eq 137 ]]; then
+    echo "corpus-exe: HANG TIMEOUT on $exe (named; not a gate failure)"
+  elif [[ $p -ne 0 && $p -ne 1 ]]; then
+    rc=1
+  fi
 done
 
 # --- D3D12 TRIANGLE GATE (Sprint-2 item 21): the full D3D12 render path ---

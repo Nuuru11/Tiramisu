@@ -237,6 +237,14 @@ bool trt_settings_quick_menu_enabled() {
   return g_live.quick_menu_enabled;
 }
 
+// Weak-linked wrapper consumed by bridge_vulkan's shader cache
+// (bridge_vulkan.cpp calls this through a weak symbol; offline test binaries
+// without this file resolve it to null and keep the cache enabled).
+extern "C" int trt_settings_shader_cache_int() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.shader_cache ? 1 : 0;
+}
+
 int trt_settings_resolution_scale() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g_live.resolution_scale;

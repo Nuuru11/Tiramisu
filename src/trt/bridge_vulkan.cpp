@@ -18,6 +18,92 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+
+// Settings knob (shader_cache): weak C-linkage wrapper the cache checks.
+// The real definition (settings.cpp) returns the bool getter as int; weak
+// missing resolves to 0 handled by check_enabled()'s default-on logic.
+extern "C" int trt_settings_shader_cache_int(void) __attribute__((weak));
+
+// ---- shader compile cache (settings knob: shader_cache) -------------------
+// SPIR-V -> HLSL compilation is the single most expensive path on the Vulkan
+// surface (Godot compiles every shader variant at scene load; measured: an
+// end less retry storm when compiles failed). When the knob is on, compile
+// results are memoized by FNV-1a hash of the SPIR-V words + stage + entry +
+// spec constants. In-process memoization only — the console has no writable
+// shader disk cache under AppContainer without a mounted surface.
+#include <mutex>
+#include <unordered_map>
+namespace vkshader_cache {
+struct cache_key {
+  u64 hash;
+  u32 stage;
+  u64 spec_hash;
+  bool operator==(const cache_key& o) const {
+    return hash == o.hash && stage == o.stage && spec_hash == o.spec_hash;
+  }
+};
+struct cache_key_h {
+  size_t operator()(const cache_key& k) const {
+    return (size_t)(k.hash * 0x100000001b3ull ^ (u64)k.stage ^
+                    (k.spec_hash << 13));
+  }
+};
+static std::mutex g_mu;
+static std::unordered_map<cache_key, std::string, cache_key_h> g_cache;
+static bool g_enabled = true;   // default matches settings default
+static bool g_checked = false;
+
+static void check_enabled() {
+  if (g_checked) return;
+  g_checked = true;
+  // Weak-missing symbol resolves to nullptr at link time (same pattern as
+  // trt_settings_write_watch in bridge_kernel32): call only when linked.
+  g_enabled = true;  // default on
+  if (trt_settings_shader_cache_int) g_enabled = (trt_settings_shader_cache_int() != 0);}
+
+static u64 fnv1a(const u32* w, u32 n) {
+  u64 h = 0xcbf29ce484222325ull;
+  for (u32 i = 0; i < n; ++i) {
+    h ^= (u64)w[i];
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
+static u64 spec_fnv(const spirv_spec_entry* s, u32 n) {
+  u64 h = 0x9e3779b97f4a7c15ull;
+  for (u32 i = 0; i < n; ++i) {
+    h ^= (u64)s[i].spec_id ^ ((u64)s[i].value_u32 << 8);
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
+}  // namespace vkshader_cache
+
+// Memoized compile: returns nullptr when the knob is off or on cache miss
+// (caller compiles + stores through spirv_cache_store).
+static const std::string* spirv_cache_lookup(const u32* words, u32 wc,
+                                             spirv_stage st, const char* name,
+                                             const spirv_spec_entry* specs,
+                                             u32 spec_n) {
+  using namespace vkshader_cache;
+  check_enabled();
+  if (!g_enabled) return nullptr;
+  cache_key k{fnv1a(words, wc), (u32)st,
+              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto it = g_cache.find(k);
+  return it == g_cache.end() ? nullptr : &it->second;
+}
+static void spirv_cache_store(const u32* words, u32 wc, spirv_stage st,
+                              const char* name, const spirv_spec_entry* specs,
+                              u32 spec_n, const std::string& hlsl) {
+  using namespace vkshader_cache;
+  if (!g_enabled) return;
+  cache_key k{fnv1a(words, wc), (u32)st,
+              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_cache.emplace(k, hlsl);
+}
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1662,9 +1748,22 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
       collect_spec(st.pSpecializationInfo, specs);
       const auto& spv = d->shaders[st.module].spv;
       spirv_stage sst = (st.stage == 0x10u) ? SPV_STAGE_FRAGMENT : SPV_STAGE_VERTEX;
-      spirv_compile_result cr = spirv_to_hlsl(
+      const std::string* cached = spirv_cache_lookup(
           spv.data(), (u32)spv.size(), sst, st.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+      spirv_compile_result cr;
+      if (cached) {
+        cr.ok = true;
+        cr.hlsl = *cached;
+      } else {
+        cr = spirv_to_hlsl(
+          spv.data(), (u32)spv.size(), sst, st.pName,
+          specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+        if (cr.ok)
+          spirv_cache_store(spv.data(), (u32)spv.size(), sst, st.pName,
+                            specs.empty() ? nullptr : specs.data(),
+                            (u32)specs.size(), cr.hlsl);
+      }
       if (!cr.ok) continue;
       if (sst == SPV_STAGE_VERTEX) vs_h = cr.hlsl;
       else ps_h = cr.hlsl;
@@ -1746,9 +1845,24 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
       std::vector<spirv_spec_entry> specs;
       collect_spec(cis[i].stage.pSpecializationInfo, specs);
       const auto& spv = d->shaders[cis[i].stage.module].spv;
-      spirv_compile_result cr = spirv_to_hlsl(
+      const std::string* cached = spirv_cache_lookup(
+          spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
+          cis[i].stage.pName, specs.empty() ? nullptr : specs.data(),
+          (u32)specs.size());
+      spirv_compile_result cr;
+      if (cached) {
+        cr.ok = true;
+        cr.hlsl = *cached;
+      } else {
+        cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE, cis[i].stage.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+        if (cr.ok)
+          spirv_cache_store(spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
+                            cis[i].stage.pName,
+                            specs.empty() ? nullptr : specs.data(),
+                            (u32)specs.size(), cr.hlsl);
+      }
       if (cr.ok) {
         cs_h = cr.hlsl;
         if (cr.push_constant_bytes) po.push_reg = cr.push_constant_reg;
