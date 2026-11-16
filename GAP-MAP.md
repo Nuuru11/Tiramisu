@@ -81,6 +81,25 @@ Unity games through the same gate.
 - **corpus-run.sh**: per-EXE `timeout -s KILL 60` bound — a guest that never
   reaches WM_QUIT is a NAMED hang, not a gate wedge. Go Next demo.exe added
   to the EXE gate.
+- **Two hardening holes found by writing the regression test** (same day):
+  1. `ptr_in_guest_image`'s "wide host range" fallback accepted UNMAPPED
+     addresses — the exact Go Next shape (metadata at `image+0x64a4894c`,
+     fault `0x1a4a4894c`) would pass a range check and still SIGSEGV at the
+     first `ui[0]` dereference. Fixed with a kernel-backed readability probe
+     (write() to /dev/null returns EFAULT for unmapped pages, no signal;
+     probe fd cached, errno saved/restored — unwinding runs inside exception
+     dispatch).
+  2. The chained-unwind forwarding loop (`UNW_FLAG_CHAININFO`) was unbounded:
+     a self-referential chain (`fn->unwind` pointing back at itself) hangs
+     the dispatcher forever — same livelock family as the OrTMM spin. Fixed:
+     16-hop cap + self-reference check → named verdict, clean fail.
+  Regression tests: `tests/test_unwind_safety.cpp` (6 cases: leaf pop,
+  garbage fn_entry, unmapped metadata, valid minimal unwind still correct,
+  unmapped-in-range probe rejection, chained self-loop). Wiring:
+  `tools/build-test.sh` step 8c.
+- **OrTMM re-identified**: not native C++ — imports python313.dll (embedded
+  CPython 3.13 app). First Python-family corpus entry; explains the EH
+  livelock (CPython signal/EH machinery). COMPATIBILITY.md corrected.
 
 ### History — the one wall (now broken): our own SEH/unwind implementation.
 

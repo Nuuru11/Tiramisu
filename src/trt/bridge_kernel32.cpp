@@ -23,6 +23,12 @@
 #include "bridge_ddraw.h"
 #include "bridge_d3dx9.h"
 #include "bridge_d3d8.h"
+
+// Unwinder readability probe (page_readable): process_vm_readv EFAULT
+// mapped-check (see comment at the probe for why not write()/dev/null).
+#include <errno.h>
+#include <sys/uio.h>
+#include <unistd.h>
 #include "bridge_openal.h"
 #include "bridge_ole.h"
 #include "bridge_shell.h"
@@ -3922,6 +3928,25 @@ void* TRT_STDCALL trt_RtlCaptureContext(void* ctx) {
 // clean "unwind failed" verdict, never a host crash. Safe read = range check
 // against registered guest images + Tiramisu bridge mappings.
 namespace {
+// Readability probe: process_vm_readv copies from the target address and
+// returns EFAULT for unmapped pages — no signal, no crash. (First attempt
+// used write() to /dev/null: WRONG — /dev/null's write handler never reads
+// the user buffer, so unmapped pages "passed" the probe and still SIGSEGV'd
+// at the first ui[0] dereference; caught by the test_unwind_safety
+// regression and confirmed in the disassembly.)
+bool page_readable(const void* p) {
+  char scratch;  // probe writes 1 byte into this local
+  struct iovec local { &scratch, 1 };
+  struct iovec remote { const_cast<void*>(p), 1 };
+  const int saved = errno;
+  const ssize_t r = ::process_vm_readv(::getpid(), &local, 1, &remote, 1, 0);
+  // Only an explicit successful read proves the page is mapped. Any error
+  // (EFAULT unmapped / EPERM e.g. hardened kernels or gdb attach contexts /
+  // ENOSYS) conservatively reads as NOT readable: the caller fails the
+  // unwind cleanly, which is always better than a host SIGSEGV.
+  errno = saved;
+  return r >= 0;
+}
 bool ptr_in_guest_image(const void* p) {
   if (!p) return false;
   const uintptr_t v = (uintptr_t)p;
@@ -3932,10 +3957,11 @@ bool ptr_in_guest_image(const void* p) {
     if (v >= b && v < b + img->size_of_image) return true;
   }
   // .pdata and mapped-file views live outside images; accept a wide host
-  // range. Anything below 4 KiB or in the first/last 64 KiB of the address
-  // space is a null/wild dereference by construction.
+  // range. Anything below 4 KiB or in the last 64 KiB of the address space
+  // is a null/wild dereference by construction. Inside the range, a kernel
+  // readability probe catches unmapped metadata (fail-visible, no SIGSEGV).
   if (v < 0x10000ull || v > 0x7ffffffe0000ull) return false;
-  return true;
+  return page_readable(p);
 }
 // Header read with validation: `ui` must sit inside a guest image and the
 // slot walk stays within the same image.
@@ -3989,10 +4015,46 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
   u8 final_count = 0;
 
   for (int chain_depth = 0; chain_depth < 32; ++chain_depth) {
-    while (fn->unwind & 1u) {
-      fn = (const trt_runtime_fn*)(uintptr_t)(image_base + (fn->unwind & ~1u));
+    // fn->unwind is read ONCE here; the fwd-chase below re-validates every
+    // forwarded fn before ITS unwind read (r14=garbage -> +8 unmapped
+    // SIGSEGV, found by test_unwind_safety t2).
+    u32 fn_unwind = fn->unwind;
+    // Chained unwind info: follow the forwarding pointer, but bounded AND
+    // validated — a corrupt .pdata can chain to itself (livelock) or into
+    // unmapped memory (SIGSEGV on the next `fn->unwind` read; found by the
+    // test_unwind_safety regression). Every hop re-validates before any
+    // dereference; beyond 16 hops or any bad hop -> corrupt, fail cleanly.
+    for (int fwd = 0; (fn_unwind & 1u) != 0u; ++fwd) {
+      const u64 next = image_base + (fn_unwind & ~1u);
+      if (fwd >= 16 || next == (u64)(uintptr_t)fn) {
+        char bl[128];
+        snprintf(bl, sizeof(bl),
+                 "ehfix: chained unwind self-loop/over-deep (base=%llx) -> "
+                 "unwind failed cleanly\n",
+                 (unsigned long long)image_base);
+        ssize_t wrc = ::write(2, bl, strlen(bl));
+        (void)wrc;
+        unwind_failed = true;
+        break;
+      }
+      // Validate the forwarded RUNTIME_FUNCTION (full 12-byte struct) before
+      // the next loop iteration dereferences fn->unwind there.
+      if (!page_readable((const void*)(uintptr_t)next)) {
+        char bl[160];
+        snprintf(bl, sizeof(bl),
+                 "ehfix: chained unwind target unmapped (next=%llx base=%llx)"
+                 " -> unwind failed cleanly\n",
+                 (unsigned long long)next, (unsigned long long)image_base);
+        ssize_t wrc = ::write(2, bl, strlen(bl));
+        (void)wrc;
+        unwind_failed = true;
+        break;
+      }
+      fn = (const trt_runtime_fn*)(uintptr_t)next;
+      fn_unwind = fn->unwind;  // validated above
     }
-    const u8* ui = (const u8*)(uintptr_t)(image_base + fn->unwind);
+    if (unwind_failed) break;
+    const u8* ui = (const u8*)(uintptr_t)(image_base + fn_unwind);
     // Validate the unwind-info pointer BEFORE any dereference. UnityPlayer's
     // crash path handed us metadata outside any mapped image.
     {

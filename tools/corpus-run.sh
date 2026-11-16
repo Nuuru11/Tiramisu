@@ -72,6 +72,8 @@ EXES=(
   "corpus-local/gonext/Go Next demo.exe"
   "corpus-local/ortmm/OrTMM.exe"
   "corpus-local/raccoin/RACCOIN.exe"
+  "corpus-local/openttd/openttd.exe"
+  "corpus-local/cdda/cataclysm-bn-tiles.exe"
 )
 exe_report="$out/corpus-exe-report.md"
 {
