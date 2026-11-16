@@ -934,6 +934,16 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
+  // Per-game profile overrides (tiramisu.profile.ini next to the exe).
+  // Applied on top of global settings; missing file = no-op (returns 0).
+  {
+    const int prof = longan::settings_load_profile(game_dir);
+    char pline[128];
+    snprintf(pline, sizeof(pline),
+             "profile: %d keys applied from %s\\tiramisu.profile.ini",
+             prof, game_dir.c_str());
+    longan::log_line(pline);
+  }
   // A game that ships on a disc image: mount it as D: (read-only, lazily
   // extracted) and run the exe out of the image, so every one of its path
   // requests - assets, music, movies - is answered by the disc itself.

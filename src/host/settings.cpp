@@ -51,6 +51,16 @@ std::string host_settings::to_ini() const {
   s += show_qr ? "show_qr=1\n" : "show_qr=0\n";
   snprintf(buf, sizeof(buf), "log_lines=%d\n", log_lines);
   s += buf;
+  snprintf(buf, sizeof(buf),
+           "resolution_scale=%d\nframe_rate_cap=%d\nmemory_budget_mb=%d\n",
+           resolution_scale, frame_rate_cap, memory_budget_mb);
+  s += buf;
+  s += vsync ? "vsync=1\n" : "vsync=0\n";
+  s += shader_cache ? "shader_cache=1\n" : "shader_cache=0\n";
+  snprintf(buf, sizeof(buf),
+           "audio_buffer_ms=%d\ninput_deadzone=%d\ntexture_quality=%d\n",
+           audio_buffer_ms, input_deadzone, texture_quality);
+  s += buf;
   return s;
 }
 
@@ -95,6 +105,22 @@ int host_settings::apply_ini(const std::string& text) {
       show_qr = (val == "1" || val == "true");
     } else if (key == "log_lines") {
       log_lines = clampi(atoi(val.c_str()), 4, 40);
+    } else if (key == "resolution_scale") {
+      resolution_scale = clampi(atoi(val.c_str()), 50, 200);
+    } else if (key == "frame_rate_cap") {
+      frame_rate_cap = clampi(atoi(val.c_str()), 0, 120);
+    } else if (key == "memory_budget_mb") {
+      memory_budget_mb = clampi(atoi(val.c_str()), 1024, 8192);
+    } else if (key == "vsync") {
+      vsync = (val == "1" || val == "true");
+    } else if (key == "shader_cache") {
+      shader_cache = (val == "1" || val == "true");
+    } else if (key == "audio_buffer_ms") {
+      audio_buffer_ms = clampi(atoi(val.c_str()), 10, 50);
+    } else if (key == "input_deadzone") {
+      input_deadzone = clampi(atoi(val.c_str()), 0, 50);
+    } else if (key == "texture_quality") {
+      texture_quality = clampi(atoi(val.c_str()), 0, 3);
     }
     // unknown keys are kept in the file but ignored — never fatal
   }
@@ -122,6 +148,26 @@ int settings_save(const std::string& local_state) {
   const size_t w = fwrite(text.data(), 1, text.size(), f);
   fclose(f);
   return (w == text.size()) ? 0 : -1;
+}
+
+int settings_load_profile(const std::string& game_dir) {
+  std::string path = game_dir;
+  // normalize separators
+  for (char& c : path) if (c == '/') c = '\\';
+  if (!path.empty() && path.back() != '\\') path += '\\';
+  path += "tiramisu.profile.ini";
+
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return 0;
+  std::string text;
+  char buf[1024];
+  size_t n;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
+  fclose(f);
+
+  std::lock_guard<std::mutex> lk(g_mu);
+  const int applied = g_live.apply_ini(text);
+  return applied;
 }
 
 void settings_store(const host_settings& s, const std::string& local_state) {
@@ -165,6 +211,46 @@ bool trt_settings_write_watch() {
 bool trt_settings_pad_vibration() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g_live.pad_vibration;
+}
+
+int trt_settings_resolution_scale() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.resolution_scale;
+}
+
+int trt_settings_frame_rate_cap() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.frame_rate_cap;
+}
+
+int trt_settings_memory_budget_mb() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.memory_budget_mb;
+}
+
+bool trt_settings_vsync() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.vsync;
+}
+
+bool trt_settings_shader_cache() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.shader_cache;
+}
+
+int trt_settings_audio_buffer_ms() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.audio_buffer_ms;
+}
+
+int trt_settings_input_deadzone() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.input_deadzone;
+}
+
+int trt_settings_texture_quality() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.texture_quality;
 }
 
 } // namespace longan

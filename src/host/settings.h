@@ -32,6 +32,16 @@ struct host_settings {
   bool show_qr = true;                 // QR overlay on the TV dashboard
   int log_lines = 14;                  // dashboard log tail lines, 4..40
 
+  // ---- performance & tuning (new) ----
+  int resolution_scale = 100;          // render resolution %, 50..200
+  int frame_rate_cap = 60;             // 0=unlimited, 30, 60, 120
+  int memory_budget_mb = 4096;         // guest heap cap, 1024..8192
+  bool vsync = true;                   // present with VSync
+  bool shader_cache = true;             // cache compiled SPIR-V->HLSL
+  int audio_buffer_ms = 20;            // WASAPI buffer, 10..50
+  int input_deadzone = 15;             // gamepad deadzone %, 0..50
+  int texture_quality = 2;             // 0=low, 1=med, 2=high, 3=ultra
+
   std::string to_ini() const;
   // Apply parsed ini on top of the current values (missing keys keep
   // defaults). Returns the number of keys applied (0 for an empty file).
@@ -41,8 +51,10 @@ struct host_settings {
 // Load from <local_state>\settings.ini (missing file = defaults) and store
 // as the live settings. Returns the applied-key count.
 int settings_load(const std::string& local_state);
-// Save the live settings back to the same file. Returns 0 on success.
-int settings_save(const std::string& local_state);
+// Load a per-game profile from <game_dir>/tiramisu.profile.ini and apply
+// overrides on top of the live settings. Returns applied-key count (0 if
+// no profile file). Unknown keys are ignored (never fatal).
+int settings_load_profile(const std::string& game_dir);
 // Replace the live settings (clamped to valid ranges) and persist.
 void settings_store(const host_settings& s, const std::string& local_state);
 host_settings settings_get();
@@ -55,6 +67,16 @@ void trt_settings_os(int* major, int* minor, int* build);
 bool trt_settings_write_watch();
 // Whether guest pad-rumble requests reach the pad (false = swallow).
 bool trt_settings_pad_vibration();
+
+// ---- performance/tuning getters (new) ----
+int trt_settings_resolution_scale();   // render resolution %, 50..200
+int trt_settings_frame_rate_cap();     // 0=unlimited, 30, 60, 120
+int trt_settings_memory_budget_mb();   // guest heap cap MB
+bool trt_settings_vsync();
+bool trt_settings_shader_cache();
+int trt_settings_audio_buffer_ms();
+int trt_settings_input_deadzone();
+int trt_settings_texture_quality();
 
 } // namespace longan
 
