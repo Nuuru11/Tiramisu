@@ -46,6 +46,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <csetjmp>
 #include <cstdio>
@@ -79,6 +80,7 @@ DWORD g_ui_tid = 0;
 std::thread g_guest_thread;
 std::string g_pending_launch;
 bool g_mouse_mode = false;
+bool g_quick_menu_open = false;
 bool g_booted = false;
 bool g_setup_done = false;      // first-run setup screen flag
 bool g_setup_active = false;    // currently showing the setup screen
@@ -934,6 +936,16 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
+  // Per-game profile overrides (tiramisu.profile.ini next to the exe).
+  // Applied on top of global settings; missing file = no-op (returns 0).
+  {
+    const int prof = longan::settings_load_profile(game_dir);
+    char pline[128];
+    snprintf(pline, sizeof(pline),
+             "profile: %d keys applied from %s\\tiramisu.profile.ini",
+             prof, game_dir.c_str());
+    longan::log_line(pline);
+  }
   // A game that ships on a disc image: mount it as D: (read-only, lazily
   // extracted) and run the exe out of the image, so every one of its path
   // requests - assets, music, movies - is answered by the disc itself.
@@ -1395,6 +1407,27 @@ struct tiramisu_host
              applied);
     longan::log_line(line);
 
+    // System specs for overlay (read once at boot)
+    {
+      MEMORYSTATUSEX ms{};
+      ms.dwLength = sizeof(ms);
+      GlobalMemoryStatusEx(&ms);
+      HKEY hkey;
+      wchar_t cpuName[128] = L"Unknown CPU";
+      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                        L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0,
+                        KEY_READ, &hkey) == ERROR_SUCCESS) {
+        DWORD sz = sizeof(cpuName);
+        RegQueryValueExW(hkey, L"ProcessorNameString", nullptr, nullptr,
+                         (LPBYTE)cpuName, &sz);
+        RegCloseKey(hkey);
+      }
+      wchar_t info[256];
+      swprintf(info, 256, L"%s | %.0f GB RAM", cpuName,
+               (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
+      longan::ui_set_sysinfo(info);
+    }
+
     // ---- setup screen: steps update live as boot proceeds ----
     g_setup_active = true;
     auto setup_steps = [](std::initializer_list<std::wstring> done,
@@ -1516,10 +1549,25 @@ struct tiramisu_host
         const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
         if (g_guest_running.load()) {
           if (longan::webxfer_poll_stop()) request_guest_stop();
-          if (pad_vm) {
-            if (++vm_hold_ticks == 45) request_guest_stop();
+          if (longan::trt_settings_quick_menu_enabled() && pad_vm) {
+            // RetroArch-style: Back+Start toggles the quick menu
+            static bool qm_was = false;
+            if (!qm_was) {
+              qm_was = true;
+              g_quick_menu_open = !g_quick_menu_open;
+              longan::ui_set_quick_menu(g_quick_menu_open);
+            }
           } else {
-            vm_hold_ticks = 0;
+            // hold Back+Start for 45 ticks to force-stop (escape hatch)
+            if (pad_vm) {
+              if (++vm_hold_ticks == 45) request_guest_stop();
+            } else {
+              vm_hold_ticks = 0;
+            }
+          }
+          if (!pad_vm) {
+            static bool qm_reset = true;
+            qm_reset = true;
           }
         } else {
           vm_hold_ticks = 0;
@@ -1769,14 +1817,60 @@ struct tiramisu_host
 
       // While a guest owns the host swapchain, do not touch D3D11/DXGI from the UI
       // loop; keep pumping CoreWindow events, XInput, virtual mouse, and OpenAL.
-      if (g_guest_running.load()) {
+      // EXCEPTION: if the quick menu is open, render it on top of the game.
+      if (g_guest_running.load() && !g_quick_menu_open) {
         Sleep(4);
+        continue;
+      }
+      if (g_guest_running.load() && g_quick_menu_open) {
+        // quick menu navigation
+        static bool qm_up = false, qm_dn = false, qm_go = false, qm_back = false;
+        if (want_up && !qm_up) { qm_up = true; /* navigate up */ }
+        else if (!want_up) qm_up = false;
+        if (want_dn && !qm_dn) { qm_dn = true; /* navigate down */ }
+        else if (!want_dn) qm_dn = false;
+        if (want_go && !qm_go) {
+          qm_go = true;
+          // A: activate selected item (placeholder)
+        } else if (!want_go) qm_go = false;
+        // B or Back+Start again: close menu
+        if ((b & XINPUT_GAMEPAD_B) && !qm_back) {
+          qm_back = true;
+          g_quick_menu_open = false;
+          longan::ui_set_quick_menu(false);
+        } else if (!(b & XINPUT_GAMEPAD_B)) qm_back = false;
+        if (pad_vm) {
+          static bool qm_toggle = false;
+          if (!qm_toggle) {
+            qm_toggle = true;
+            g_quick_menu_open = false;
+            longan::ui_set_quick_menu(false);
+          }
+        } else {
+          qm_toggle = false;
+        }
+        // render quick menu overlay on top of the frozen game frame
+        longan::swapchain_restore_d3d11();
+        longan::ui_set_screen(longan::UI_QUICKMENU);
+        longan::ui_render();
+        longan::swapchain_present();
+        Sleep(16);  // ~60fps for menu
         continue;
       }
       longan::swapchain_restore_d3d11();
 
       // ---- UI ----
-      // QR/LAN link shown only when the user kept it on (settings)
+      // FPS tracking for overlay
+      static auto fps_last = std::chrono::steady_clock::now();
+      static int fps_frames = 0;
+      fps_frames++;
+      auto now = std::chrono::steady_clock::now();
+      auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - fps_last).count();
+      if (elapsed >= 1000) {
+        longan::ui_set_fps(fps_frames * 1000.0f / elapsed);
+        fps_frames = 0;
+        fps_last = now;
+      }
       longan::ui_set_qr((longan::settings_get().show_qr && !g_steam_busy)
                             ? longan::webxfer_url()
                             : (g_steam_busy ? g_steam_qr : std::string()));

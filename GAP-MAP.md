@@ -57,6 +57,31 @@ address — measured ehfix18 SIGSEGV). RACCOIN ladder: 7/7 REACHED. Go Next
 demo.exe also reports `UNITYMAIN2 CALLED: REACHED (IAT-probed)` — two real
 Unity games through the same gate.
 
+### 2026-11-16 — unwinder hardening + livelock cap + native DLL overrides
+
+- **trt_RtlVirtualUnwind hardened** (kernel32 bridge): UnityPlayer's exception
+  path (Go Next demo full-corpus run) handed the unwinder unwind metadata that
+  is unmapped/corrupt — host SIGSEGV at `trt_RtlVirtualUnwind`, guest fault
+  address `image+0x64a4894c`. The unwinder now validates the unwind-info
+  pointer against registered guest images (`safe_unwind_info`) and returns a
+  clean "unwind failed" verdict (0 = no handler) instead of crashing the
+  host. A corrupt .pdata can never again take the runtime down.
+- **EH bounce livelock capped** (kernel32 bridge, hw-fault handler): OrTMM
+  (first native-C++ corpus entry) spins 14.5M identical (rip,fault) bounces —
+  measured, was the cause of every OrTMM wedge/timeout. Per-thread cap at
+  100k bounces now aborts with a named verdict ("guest livelocked in EH
+  bounce loop").
+- **Native DLL override (Proton WINEDLLOVERRIDES=native equivalent) landed**
+  (module_table.cpp `try_native_override` + `is_overridable_module`): a
+  game-shipped API DLL (dxvk's d3d9.dll, cnc-ddraw, dgVoodoo, ...) shadows the
+  builtin bridge for overridable modules. Loader-critical modules are never
+  shadowed. dxvk-2.5.3 x64 d3d9.dll verified: maps + seals + DllMain + boots
+  as EXE entry (RtlAddFunctionTable registered 8822 funcs). This is the
+  wiring path for existing third-party implementations.
+- **corpus-run.sh**: per-EXE `timeout -s KILL 60` bound — a guest that never
+  reaches WM_QUIT is a NAMED hang, not a gate wedge. Go Next demo.exe added
+  to the EXE gate.
+
 ### History — the one wall (now broken): our own SEH/unwind implementation.
 
 **Import audit of the full RACCOIN stack** (`tools/audit_boot.py` — approximate;
@@ -90,10 +115,118 @@ so the CLI path never runs; the live session ran it via import (see
   case: every `try/catch` in C# game code goes through our unwinder.
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
-- (none — the two-agent wave (items 16 + 12) + orchestrator items (BUG-6
-  remainder, 1L, DXGI BUG-6) are complete; the full canonical gate
-  `build-test.sh` is running as final verification. Next: console M0 when
-  DP credentials arrive.)
+- (none — wave 5 (items 24/25/30/29/35/46-remainder) is complete and verified;
+  next: console M0 when DP credentials arrive, or the command-list recording
+  surface (item 27 remainder) on request.)
+
+**LANDED (boot-depth wave, 2026-11-15, worktree `work/boot-ultrapool` @ b6a7b51,
+all verified offline; gate rc=0, 42× ALL PASS, corpus 8/8 load, 5/5 run-depth):**
+- **Ultra Pool (Godot 4.3 + GodotSteam) — FULL BOOT LIFECYCLE**: CRT → WinMain →
+  window ('Ultrapool') → Vulkan Forward Mobile on the Tiramisu ICD → scene load
+  (achievements/save/daily state) → pump → watchdog WM_CLOSE → Godot's own
+  quit chain (`close_requested` → `SceneTree::_quit`) → ExitProcess(0). The
+  wedge chain that stopped it, each fixed to real Win32 semantics:
+  CV lost-wakeup (release→wait-registration serialized under a wake mutex,
+  table 64→512 slots), WASAPI pacing (GetCurrentPadding timestamp-decay model
+  — Godot paces solely on `buffer_size - padding`; the zero-collapse caused a
+  97%-CPU mix storm holding the CS the main thread needed), MS_VC_EXCEPTION
+  swallowed like the OS does (no debugger), EH dispositions + faithful
+  `trt_C_specific_handler`, dwm `TRT_GUEST_ABI`, AttachConsole=FALSE +
+  synthetic stdio (real pseudo-handles → log ring), Vulkan limits/features
+  from real `vulkan_core.h` types, watchdog posts WM_CLOSE (Godot never reads
+  WM_QUIT — measured against 4.3 sources). Regression-locked in
+  `tests/test_wasapi_pacing.cpp` (padding contract + CV wake atomicity +
+  huge-malloc refusal).
+- **RACCOIN re-measured under the new sync surface**: with `--mock-d3d11`
+  (the documented config) the 8/8 ladder holds AND the game now runs healthy
+  for the full 10s until the watchdog WM_CLOSE, then exits through its own
+  shutdown chain (`SetFullscreenState(0)` → TerminateProcess) — previously it
+  never survived a watchdog interval. Plain `--exe` (stricter, real GPU path)
+  reaches Unity init + pump, then dies in the Unity CrashReporter C++
+  exception path (throw site escapes to a host frame; boundary swallow →
+  WM_QUIT) — that escape attribution is the next named gap, not a sync bug.
+- **Import-gap closures (fail-visible honest stubs)**: dbghelp
+  `SymGetModuleBase64`/`SymFunctionTableAccess64`/`StackWalk64` (0/NULL/FALSE —
+  no module table on console); winmm `waveOutMessage`/`Pause`/`Restart`/
+  `BreakLoop`/`GetErrorText` + `waveInMessage` (MMSYSERR_BADDEVICEID).
+  steam_api64.dll now maps + seals (was FAIL IMPORT) → corpus load 8/8.
+- **`GetStdHandle` synthetic-stdio contract locked** in the guest_engine
+  fixture; `corpus-run.sh` no longer crashes when the D3D12 triangle fixture
+  is not yet built (named SKIP; ordering fix).
+
+- **UWP host build re-verified (`build-host.sh` rc=0)**: the Linux-only CS-stall
+  probe (`syscall(SYS_gettid)`, `::write(2,...)`) was breaking the clang-cl
+  `--uwp` cross-compile (no POSIX fd 2 / sys/syscall.h in WINAPI_FAMILY_APP).
+  Guarded behind `__linux__` so the probe still names stalls on the dev host
+  while the UWP host build stays clean. Duplicated lock block in
+  `trt_EnterCriticalSection` also collapsed. MSIX produced.
+- **DirectInput8 COM personality** closes the `REGDB_E_CLASSNOTREG` gap:
+  `CoCreateInstance(CLSID_DirectInput8)` now hands out the same object
+  `DirectInput8Create` serves (A-twin -> W vtable; unknown IID -> E_NOINTERFACE
+  honestly). Verified S_OK + E_NOINTERFACE, both named.
+- **Items 24/25/30 — D3D12 descriptor wave** (`bridge_d3d12.cpp`): the silent
+  `dev_view_noop` at device slots 17-24 is GONE. Real implementation:
+  per-heap typed record store (`d3d12_view_record`, kind/dim/format/mips/
+  slices/gpu_va/resource), live-heap registry with CPU-handle resolution
+  (handle = cpu_base + idx*increment, boundary + range checked), CreateCBV/
+  SRV/UAV/RTV/DSV/Sampler writing validated records (RTV/DSV require a live
+  resource; CBV requires a nonzero GPU VA; sampler Filter/AddressU/V/W/
+  MaxAnisotropy/ComparisonFunc range-checked; SRV/UAV parse both the BUFFER
+  and TEX2D union arms; null-descriptor init requires BOTH pResource and
+  pDesc null — (null, non-null) now fails VISIBLY in SRV and UAV),
+  CopyDescriptors/CopyDescriptorsSimple with per-range expansion, cross-heap
+  copies and bounds-checked fail-visible rejection. Command-list side:
+  SetDescriptorHeaps (replacing, like the real API), Set[Compute|Graphics]
+  RootDescriptorTable and RootConstantBufferView recorded per slot with
+  soft-resolve WARN-once for unresolvable GPU handles (matching real
+  draw-time faulting), CopyBufferRegion/CopyResource recorded.
+  **Two real bugs the new suite caught and the orchestrator fixed:**
+  1. `k_descheap` IID had `...90f7-12b7...` instead of `...90f7-127b...`
+     (transposed byte pair) — every guest QI for ID3D12DescriptorHeap got
+     E_NOINTERFACE. Fixed; full 24-IID audit of the bridge against the SDK
+     header (xwin d3d12.h + mingw d3d12.h) now passes 24/24.
+  2. WriteToSubresource/ReadFromSubresource packed box content at backing
+     offset 0, ignoring box.left — for buffers (the standard upload path)
+     box.left is a BYTE offset. Both now honor D3D12_BOX semantics (buffer:
+     left = byte offset; texture: texel grid on the 4-byte-per-texel backing,
+     top/front select start row/slice), bounds-checked fail-visible.
+  Also: PSO creation is real (item 29) — CreateGraphicsPipelineState/
+  CreateComputePipelineState validate the legacy descs (root-sig liveness,
+  paired shader bytecode) and CreatePipelineState (slot 47) walks the
+  D3D12_PIPELINE_STATE_STREAM subobject stream (16-byte headers, types
+  0..28, payload-overrun checks, ROOT_SIGNATURE/VS/PS/CS recorded; garbage
+  type or overrun -> E_INVALIDARG + named log). Struct mirrors pinned by
+  static_assert vs the SDK (GPSD 656, CPSD 56, SRV/UAV 40, RTV/DSV 24,
+  SAMPLER 52, stream desc 16 — SDK-verbatim SizeInBytes-first layout
+  verified by header measurement).
+  Evidence: NEW `tests/test_d3d12_desc.cpp` 59/59 ALL PASS (orchestrator-
+  written and -run: handle arithmetic, all six view kinds, 8 fail-visible
+  rejections, range + cross-heap + simple copies, cmdlist binding/copy
+  recording, PSO legacy + stream + 2 garbage rejections, Write/Read
+  subresource round-trip visible through Map, QI on heap/PSO/resource);
+  regressions test_d3d12, test_d3d12_triangle, test_wave2 ALL PASS;
+  RACCOIN `--exe --mock-d3d11` 1 booted / 0 failed (all relinked against
+  the updated libtrt.a by the orchestrator).
+- **Item 35 + item 46 remainder — memory ceiling + crash filter**
+  (`bridge_mem.cpp`, `bridge_kernel32.cpp`): every mapped view tracked in a
+  live-view registry; ceiling 64 live views (env `TRT_MAX_MAPS`, clamped
+  8..4096); over-ceiling maps evict the LEAST-RECENTLY-USED view with a
+  named log line, use-after-evict fails visibly; when nothing is evictable
+  the map fails honestly (NULL + last-error + named log). LRU stamps
+  updated on every map/unmap touch. SetUnhandledExceptionFilter/
+  UnhandledExceptionFilter added to the kernel32 table (filter pointer
+  stored, named registration log) and wired into the runtime's fatal
+  exception path: the stored filter is invoked with the exception record,
+  verdict logged (`no-filter`/`handled`/`unhandled`), RaiseFailFastException
+  semantics preserved, MiniDumpWriteDump's text crash report remains
+  available on the fatal path.
+  Evidence: NEW `tests/test_mem_crash.cpp` ALL PASS (70-map eviction
+  sequence, TRT_MAX_MAPS clamp incl. 8192->4096 probe, unevictable honest
+  failure, filter registration + invocation with correct record, no-filter
+  path); regressions test_kernel32b 17/17, test_ntdll 34/34, test_ole 16/16,
+  test_engine ALL PASS (relinked + rerun by the orchestrator).
+- **Gate wiring**: `tools/build-test.sh` suites 39 (test_d3d12_desc) and 40
+  (test_mem_crash) appended after suite 38.
 
 **LANDED (wave 4, 2026-11-15, all verified offline):**
 - **Item 16 / 1K — ntdll native surface** (`bridge_ntdll.cpp`, `bridge_ole.cpp`):

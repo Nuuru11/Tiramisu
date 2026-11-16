@@ -713,3 +713,19 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_kernel32b.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_kernel32b"
 "$out/test_kernel32b" "$out/guest_kernel32b.exe"
+
+# --- 39. D3D12 descriptor wave: device slots 17-24 (CBV/SRV/UAV/RTV/DSV/
+#         Sampler/CopyDescriptors/CopyDescriptorsSimple), cmdlist binding
+#         slots 28/31/32/37/38, copy slots 15/17, PSO legacy+stream (item 29),
+#         WriteToSubresource/ReadFromSubresource (items 24/25/30) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d12_desc.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_d3d12_desc"
+"$out/test_d3d12_desc"
+
+# --- 40. memory ceiling + MapViewOfFile LRU eviction (item 35) and
+#         SetUnhandledExceptionFilter + fatal-path filter wiring (item 46) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_mem_crash.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_mem_crash"
+"$out/test_mem_crash"

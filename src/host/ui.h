@@ -19,6 +19,7 @@ enum ui_screen {
   UI_SHELF = 0,    // game shelf + status
   UI_SETTINGS = 1, // settings editor
   UI_LOG = 2,      // live log tail
+  UI_QUICKMENU = 3 // in-game quick menu (RetroArch-style)
 };
 
 // one editable setting row on the settings screen
@@ -40,6 +41,9 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
                   bool finished);  // non-empty steps = setup screen on
 void ui_set_screen(ui_screen s);                 // shelf | settings | log
 void ui_set_settings(const ui_setting* rows, int count, int selected);
+void ui_set_quick_menu(bool visible);            // RetroArch-style in-game menu
+void ui_set_fps(float fps);                      // FPS counter for overlay
+void ui_set_sysinfo(const std::wstring& info);   // CPU/GPU/RAM string
 void ui_set_log_tail(const std::vector<std::wstring>& lines);
 void ui_render();
 

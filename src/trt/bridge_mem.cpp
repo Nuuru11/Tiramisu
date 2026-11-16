@@ -56,12 +56,90 @@ struct mapped_view {
   mapping_core* core = nullptr;
   bool flush_on_unmap = false;
   bool from_be = false;
+  u64 stamp = 0;  // LRU recency stamp (g_map_clock at last registry touch)
 };
 
 std::mutex g_mem_mu;
 std::vector<mapping_handle> g_handles;
 std::vector<mapping_core*> g_cores;
 std::vector<mapped_view> g_views;
+
+// Sprint 2 item 35: live-view ceiling + LRU eviction. The registry IS
+// g_views (every map inserts, every unmap removes). The clock ticks once per
+// registry touch (map / flush / unmap), so stamp order == recency order.
+u64 g_map_clock = 0;
+
+// Ceiling: 64 live views by default, TRT_MAX_MAPS overrides (parsed once,
+// clamped 8..4096). Streaming games that leak views hit this valve instead of
+// eating the console's whole memory budget.
+unsigned view_ceiling() {
+  static const unsigned ceiling = [] {
+    unsigned v = 64;
+    const char* s = std::getenv("TRT_MAX_MAPS");
+    if (s && s[0]) {
+      char* end = nullptr;
+      const long n = std::strtol(s, &end, 10);
+      if (end && end != s && n > 0) v = (unsigned)n;
+    }
+    if (v < 8) v = 8;
+    if (v > 4096) v = 4096;
+    return v;
+  }();
+  return ceiling;
+}
+
+void log_ceiling_once() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  char line[96];
+  snprintf(line, sizeof(line), "[trt] mem: view ceiling = %u (TRT_MAX_MAPS=%s)",
+           view_ceiling(),
+           std::getenv("TRT_MAX_MAPS") ? std::getenv("TRT_MAX_MAPS") : "unset");
+  trt_core_log(line);
+}
+
+// Use-after-evict detection: an evicted view's pages return to the runtime
+// (the backing allocation is released), so a guest pointer into it is dead.
+// The bridge cannot trap raw guest reads/writes through the stale pointer
+// (backend-allocated views fault visibly; calloc-backed ones are ordinary
+// freed heap), but any later bridge call through the stale pointer is named
+// ONCE per evicted range instead of being silently ignored.
+struct evicted_range {
+  uintptr_t ptr;
+  size_t bytes;
+  u64 offset;
+  u64 age;       // map-clock age at eviction
+  bool reported; // the use-after-evict line is logged once per range
+};
+std::vector<evicted_range> g_evicted;  // bounded ring: oldest dropped past 128
+
+size_t find_evicted_idx_locked(uintptr_t va) {
+  for (size_t i = 0; i < g_evicted.size(); ++i) {
+    if (va >= g_evicted[i].ptr && va < g_evicted[i].ptr + g_evicted[i].bytes) {
+      return i;
+    }
+  }
+  return SIZE_MAX;
+}
+
+// Returns true (and logs once) when the pointer falls inside an evicted view.
+bool hit_evicted_locked(void* view, const char* op) {
+  const size_t ei = find_evicted_idx_locked((uintptr_t)view);
+  if (ei == SIZE_MAX) return false;
+  evicted_range& r = g_evicted[ei];
+  if (!r.reported) {
+    r.reported = true;
+    char line[224];
+    snprintf(line, sizeof(line),
+             "[trt] mem: use-after-evict detected: %s of ptr=%p hits evicted "
+             "view off=0x%llx len=%llu (age %llu maps) -> view is gone",
+             op, view, (unsigned long long)r.offset,
+             (unsigned long long)r.bytes, (unsigned long long)r.age);
+    trt_core_log(line);
+  }
+  return true;
+}
 
 std::string normalize_map_name_u16(const u16* w) {
   if (!w || !w[0]) return {};
@@ -194,6 +272,94 @@ bool flush_view_locked(const mapped_view& v, size_t sub_off, size_t len) {
     memcpy(v.core->anon_buf + core_off, src, copy_len);
   }
   return true;
+}
+
+// Sprint 2 item 35: evict one view — pages return to the runtime, the range
+// is recorded for use-after-evict detection, registry bookkeeping unwinds.
+mapped_view evict_view_locked(size_t idx) {
+  const mapped_view mv = g_views[idx];
+  g_views.erase(g_views.begin() + (ptrdiff_t)idx);
+  if (g_evicted.size() >= 128) g_evicted.erase(g_evicted.begin());
+  g_evicted.push_back({(uintptr_t)mv.ptr, mv.bytes, mv.offset,
+                       g_map_clock - mv.stamp, false});
+  free_view_buf(mv.ptr, mv.bytes, mv.from_be);
+  if (mv.core && mv.core->view_refs > 0) --mv.core->view_refs;
+  maybe_destroy_core_locked(mv.core);
+  return mv;
+}
+
+// Called on a map that would exceed the ceiling. Evicts the LEAST-RECENTLY-
+// USED view, preferring CLEAN views (flush_on_unmap == false — nothing
+// pending). If every live view is dirty, flush-then-evict the LRU one
+// (flush_view_locked persists the pending bytes first, so no data is lost);
+// a view whose flush FAILS is unevictable and is skipped. Returns false only
+// when nothing could be evicted — the caller fails the map honestly.
+bool evict_lru_for_map_locked(unsigned ceiling) {
+  size_t best = SIZE_MAX;
+  u64 best_stamp = ~0ull;
+  for (size_t i = 0; i < g_views.size(); ++i) {
+    if (g_views[i].flush_on_unmap) continue;  // potentially dirty
+    if (g_views[i].stamp < best_stamp) {
+      best_stamp = g_views[i].stamp;
+      best = i;
+    }
+  }
+  if (best != SIZE_MAX) {
+    const mapped_view mv = evict_view_locked(best);
+    char line[224];
+    snprintf(line, sizeof(line),
+             "[trt] mem: map ceiling %u hit — evicting LRU view ptr=%p "
+             "off=0x%llx len=%llu (age %llu maps)",
+             ceiling, mv.ptr, (unsigned long long)mv.offset,
+             (unsigned long long)mv.bytes,
+             (unsigned long long)(g_map_clock - mv.stamp));
+    trt_core_log(line);
+    return true;
+  }
+
+  // Every live view is dirty: flush-then-evict in LRU order. A flush failure
+  // means the pending data cannot be persisted — that view is unevictable.
+  std::vector<const void*> skipped;
+  for (size_t tries = g_views.size(); tries > 0; --tries) {
+    size_t best_d = SIZE_MAX;
+    u64 best_d_stamp = ~0ull;
+    for (size_t i = 0; i < g_views.size(); ++i) {
+      bool was_skipped = false;
+      for (const void* p : skipped) {
+        if (p == g_views[i].ptr) {
+          was_skipped = true;
+          break;
+        }
+      }
+      if (was_skipped) continue;
+      if (g_views[i].stamp < best_d_stamp) {
+        best_d_stamp = g_views[i].stamp;
+        best_d = i;
+      }
+    }
+    if (best_d == SIZE_MAX) break;
+    mapped_view& v = g_views[best_d];
+    if (flush_view_locked(v, 0, v.bytes)) {
+      const mapped_view mv = evict_view_locked(best_d);
+      char line[256];
+      snprintf(line, sizeof(line),
+               "[trt] mem: map ceiling %u hit — evicting LRU dirty view "
+               "ptr=%p off=0x%llx len=%llu (age %llu maps, flushed first)",
+               ceiling, mv.ptr, (unsigned long long)mv.offset,
+               (unsigned long long)mv.bytes,
+               (unsigned long long)(g_map_clock - mv.stamp));
+      trt_core_log(line);
+      return true;
+    }
+    char line[192];
+    snprintf(line, sizeof(line),
+             "[trt] mem: ceiling eviction: flush of dirty view ptr=%p "
+             "off=0x%llx failed — unevictable, skipping",
+             v.ptr, (unsigned long long)v.offset);
+    trt_core_log(line);
+    skipped.push_back(v.ptr);
+  }
+  return false;
 }
 
 u64 create_mapping_common(u64 hfile, u32 protect, u64 max_size,
@@ -351,11 +517,46 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   }
   if (req_len == 0) req_len = 0x1000ull;
 
+  // Sprint 2 item 35: live-view ceiling. Before allocating another window,
+  // make room by evicting the least-recently-used view (clean preferred;
+  // dirty views are flushed first so no pending data is lost). If nothing
+  // can be evicted the map fails honestly — never silent, never a crash.
+  const unsigned ceiling = view_ceiling();
+  log_ceiling_once();
+  if (g_views.size() + 1 > (size_t)ceiling &&
+      !evict_lru_for_map_locked(ceiling)) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "[trt] mem: map ceiling %u hit — no evictable view -> "
+             "MapViewOfFile fails (ERROR_NOT_ENOUGH_MEMORY, off=0x%llx len=%llu)",
+             ceiling, (unsigned long long)offset,
+             (unsigned long long)req_len);
+    trt_core_log(line);
+    trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
+    return nullptr;
+  }
+
   bool from_be = false;
   void* view_ptr = alloc_view_buf((size_t)req_len, &from_be);
   if (!view_ptr) {
     trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
     return nullptr;
+  }
+
+  // The backend may hand back the SAME address an evicted view used to have
+  // (the pages were released). Any evicted-range record overlapping this live
+  // view is stale from this instant — purge it, or every later unmap/flush of
+  // this live view would be falsely named use-after-evict and refused.
+  for (size_t i = 0; i < g_evicted.size();) {
+    const uintptr_t s = g_evicted[i].ptr;
+    const uintptr_t e = s + g_evicted[i].bytes;
+    const uintptr_t vs = (uintptr_t)view_ptr;
+    const uintptr_t ve = vs + (size_t)req_len;
+    if (s < ve && vs < e) {
+      g_evicted.erase(g_evicted.begin() + (ptrdiff_t)i);
+    } else {
+      ++i;
+    }
   }
 
   if (core->file_handle) {
@@ -399,6 +600,7 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   mv.core = core;
   mv.flush_on_unmap = flush_back;
   mv.from_be = from_be;
+  mv.stamp = ++g_map_clock;  // LRU touch: this map is the most recent use
   ++core->view_refs;
   g_views.push_back(mv);
 
@@ -420,10 +622,12 @@ void* TRT_STDCALL trt_MapViewOfFile(u64 h, u32 access, u32 off_high,
 int TRT_STDCALL trt_FlushViewOfFile(void* view, u64 bytes) {
   if (!view) return 0;
   std::lock_guard<std::mutex> lk(g_mem_mu);
+  if (hit_evicted_locked(view, "flush")) return 0;  // view was evicted: gone
   const uintptr_t va = (uintptr_t)view;
-  for (const mapped_view& mv : g_views) {
+  for (mapped_view& mv : g_views) {
     const uintptr_t base = (uintptr_t)mv.ptr;
     if (va >= base && va < base + mv.bytes) {
+      mv.stamp = ++g_map_clock;  // LRU touch: a flush is active use
       const size_t sub = (size_t)(va - base);
       size_t len = bytes ? (size_t)bytes : (mv.bytes - sub);
       if (sub + len > mv.bytes) len = mv.bytes - sub;
@@ -436,6 +640,7 @@ int TRT_STDCALL trt_FlushViewOfFile(void* view, u64 bytes) {
 int TRT_STDCALL trt_UnmapViewOfFile(void* view) {
   if (!view) return 0;
   std::lock_guard<std::mutex> lk(g_mem_mu);
+  if (hit_evicted_locked(view, "unmap")) return 0;  // view was evicted: gone
   for (size_t i = 0; i < g_views.size(); ++i) {
     if (g_views[i].ptr == view) {
       const mapped_view mv = g_views[i];

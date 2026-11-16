@@ -65,6 +65,16 @@ int TRT_GUEST_ABI trt_D3D12GetInterface(const void* rclsid, const void* riid,
 // Returns the recorded-list count, or -1 if the pointer is not a queue.
 int trt_d3d12_queue_recorded_count(void* queue);
 
+// Descriptor-wave test accessors (host-side introspection; see
+// bridge_d3d12.cpp). Record kind: 0=CBV 1=SRV 2=UAV 3=RTV 4=DSV 5=SAMPLER
+// 0xffffffff=empty; -1 = bad pointer or out-of-range index.
+unsigned trt_d3d12_heap_record_count(void* heap);
+int trt_d3d12_heap_record_kind(void* heap, unsigned idx);
+unsigned trt_d3d12_cmdlist_bound_heap_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_root_table_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_root_cbv_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_copy_count(void* cmdlist);
+
 #ifdef __cplusplus
 }
 #endif
