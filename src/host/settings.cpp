@@ -49,6 +49,9 @@ std::string host_settings::to_ini() const {
   s += write_watch ? "write_watch=1\n" : "write_watch=0\n";
   s += steam_auth ? "steam_auth=1\n" : "steam_auth=0\n";
   s += show_qr ? "show_qr=1\n" : "show_qr=0\n";
+  s += show_fps ? "show_fps=1\n" : "show_fps=0\n";
+  s += show_sysinfo ? "show_sysinfo=1\n" : "show_sysinfo=0\n";
+  s += quick_menu_enabled ? "quick_menu_enabled=1\n" : "quick_menu_enabled=0\n";
   snprintf(buf, sizeof(buf), "log_lines=%d\n", log_lines);
   s += buf;
   snprintf(buf, sizeof(buf),
@@ -103,6 +106,12 @@ int host_settings::apply_ini(const std::string& text) {
       steam_auth = (val == "1" || val == "true");
     } else if (key == "show_qr") {
       show_qr = (val == "1" || val == "true");
+    } else if (key == "show_fps") {
+      show_fps = (val == "1" || val == "true");
+    } else if (key == "show_sysinfo") {
+      show_sysinfo = (val == "1" || val == "true");
+    } else if (key == "quick_menu_enabled") {
+      quick_menu_enabled = (val == "1" || val == "true");
     } else if (key == "log_lines") {
       log_lines = clampi(atoi(val.c_str()), 4, 40);
     } else if (key == "resolution_scale") {
@@ -211,6 +220,21 @@ bool trt_settings_write_watch() {
 bool trt_settings_pad_vibration() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g_live.pad_vibration;
+}
+
+bool trt_settings_show_fps() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.show_fps;
+}
+
+bool trt_settings_show_sysinfo() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.show_sysinfo;
+}
+
+bool trt_settings_quick_menu_enabled() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.quick_menu_enabled;
 }
 
 int trt_settings_resolution_scale() {

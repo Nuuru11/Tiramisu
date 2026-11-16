@@ -41,6 +41,9 @@ int g_qr_size = 0;
 
 // dashboard screens
 ui_screen g_screen = UI_SHELF;
+bool g_quick_menu = false;
+float g_fps = 0.0f;
+std::wstring g_sysinfo;
 std::vector<ui_setting> g_set_rows;
 int g_set_selected = 0;
 std::vector<std::wstring> g_log_tail;
@@ -114,6 +117,15 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
 
 void ui_set_screen(ui_screen s) { g_screen = s; }
 
+void ui_set_quick_menu(bool visible) {
+  g_quick_menu = visible;
+  if (visible) g_screen = UI_QUICKMENU;
+  else g_screen = UI_SHELF;
+}
+
+void ui_set_fps(float fps) { g_fps = fps; }
+void ui_set_sysinfo(const std::wstring& info) { g_sysinfo = info; }
+
 void ui_set_settings(const ui_setting* rows, int count, int selected) {
   g_set_rows.assign(rows, rows + (count > 0 ? count : 0));
   g_set_selected = selected;
@@ -166,7 +178,92 @@ void draw_qr_overlay(float m) {
            L"SCAN OR OPEN LAN URL", g_teal);
 }
 
-void draw_tabs(float m) {
+void draw_quick_menu(float m) {
+  // RetroArch-style semi-transparent overlay on top of the running game
+  const float panel_w = g_w * 0.32f;
+  const float panel_h = g_h * 0.65f;
+  const float px = m;
+  const float py = m + g_h * 0.05f;
+
+  // backdrop
+  D2D1_COLOR_F bg{0.05f, 0.07f, 0.09f, 0.88f};
+  ID2D1SolidColorBrush* bbr = nullptr;
+  g_ctx->CreateSolidColorBrush(bg, &bbr);
+  D2D1_RECT_F panel{px, py, px + panel_w, py + panel_h};
+  g_ctx->FillRectangle(&panel, bbr);
+  bbr->Release();
+
+  // border
+  D2D1_COLOR_F border{0.13f, 0.83f, 0.93f, 0.6f};
+  ID2D1SolidColorBrush* bor = nullptr;
+  g_ctx->CreateSolidColorBrush(border, &bor);
+  g_ctx->DrawRectangle(&panel, bor, 2.0f);
+  bor->Release();
+
+  // title
+  text_out(g_title, px + 16, py + 8, panel_w - 32, g_h * 0.06f,
+           L"Quick Menu", g_teal);
+
+  float y = py + g_h * 0.08f;
+  const float row_h = g_h * 0.045f;
+
+  // FPS
+  if (g_fps > 0) {
+    wchar_t fpsbuf[64];
+    swprintf(fpsbuf, 64, L"FPS: %.1f", g_fps);
+    text_out(g_text, px + 16, y, panel_w - 32, row_h, fpsbuf, g_brush);
+    y += row_h;
+  }
+
+  // System info
+  if (!g_sysinfo.empty()) {
+    text_out(g_small, px + 16, y, panel_w - 32, row_h, g_sysinfo.c_str(), g_dim);
+    y += row_h * 1.5f;
+  }
+
+  // Menu items
+  const wchar_t* items[] = {
+    L"  Resume Game",
+    L"  Settings",
+    L"  Save State",
+    L"  Load State",
+    L"  Reset Game",
+    L"  Exit to Shelf",
+  };
+  for (int i = 0; i < 6; ++i) {
+    text_out(g_text, px + 16, y, panel_w - 32, row_h, items[i], g_brush);
+    y += row_h;
+  }
+
+  // hint
+  text_out(g_small, px + 16, py + panel_h - g_h * 0.04f, panel_w - 32,
+           g_h * 0.03f, L"Back+Start: close menu", g_dim);
+}
+
+void draw_fps_overlay() {
+  if (g_fps <= 0) return;
+  wchar_t buf[32];
+  swprintf(buf, 32, L"%.0f FPS", g_fps);
+  // top-right corner
+  D2D1_COLOR_F bg{0.0f, 0.0f, 0.0f, 0.6f};
+  ID2D1SolidColorBrush* bbr = nullptr;
+  g_ctx->CreateSolidColorBrush(bg, &bbr);
+  D2D1_RECT_F r{g_w - 120, 8, g_w - 8, 36};
+  g_ctx->FillRectangle(&r, bbr);
+  bbr->Release();
+  text_out(g_small, g_w - 112, 10, 100, 24, buf, g_teal);
+}
+
+void draw_sysinfo_overlay() {
+  if (g_sysinfo.empty()) return;
+  D2D1_COLOR_F bg{0.0f, 0.0f, 0.0f, 0.6f};
+  ID2D1SolidColorBrush* bbr = nullptr;
+  g_ctx->CreateSolidColorBrush(bg, &bbr);
+  D2D1_RECT_F r{8, 8, g_w * 0.35f, 28};
+  g_ctx->FillRectangle(&r, bbr);
+  bbr->Release();
+  text_out(g_small, 12, 10, g_w * 0.35f - 8, 20, g_sysinfo.c_str(), g_dim);
+}
   // three-screen tab strip: SHELF / SETTINGS / LOG — teal on the active tab
   const wchar_t* names[3] = {L"SHELF", L"SETTINGS", L"LIVE LOG"};
   const float tab_w = g_w * 0.115f, tab_h = g_h * 0.052f;
@@ -338,6 +435,15 @@ void ui_render() {
       if (old_target) old_target->Release();
       return;
     }
+    if (g_screen == UI_QUICKMENU) {
+      draw_quick_menu(m);
+      g_ctx->EndDraw();
+      if (bmp) bmp->Release();
+      surf->Release();
+      g_ctx->SetTarget(old_target);
+      if (old_target) old_target->Release();
+      return;
+    }
     if (g_screen == UI_LOG) {
       draw_log_screen(m, y + g_h * 0.01f);
       draw_lan_link(m);
@@ -403,6 +509,10 @@ void ui_render() {
 
     draw_qr_overlay(m);
     draw_lan_link(m);
+
+    // FPS and system info overlays (when enabled in settings)
+    if (longan::trt_settings_show_fps()) draw_fps_overlay();
+    if (longan::trt_settings_show_sysinfo()) draw_sysinfo_overlay();
 
     g_ctx->EndDraw();
     if (bmp) bmp->Release();

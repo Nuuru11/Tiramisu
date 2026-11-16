@@ -32,7 +32,12 @@ struct host_settings {
   bool show_qr = true;                 // QR overlay on the TV dashboard
   int log_lines = 14;                  // dashboard log tail lines, 4..40
 
-  // ---- performance & tuning (new) ----
+  // ---- on-screen overlay (new) ----
+  bool show_fps = true;                // FPS counter overlay in-game
+  bool show_sysinfo = false;           // CPU/GPU/RAM overlay
+  bool quick_menu_enabled = true;      // Back+Start opens quick menu
+
+  // ---- performance & tuning ----
   int resolution_scale = 100;          // render resolution %, 50..200
   int frame_rate_cap = 60;             // 0=unlimited, 30, 60, 120
   int memory_budget_mb = 4096;         // guest heap cap, 1024..8192
@@ -67,6 +72,11 @@ void trt_settings_os(int* major, int* minor, int* build);
 bool trt_settings_write_watch();
 // Whether guest pad-rumble requests reach the pad (false = swallow).
 bool trt_settings_pad_vibration();
+
+// ---- overlay getters (new) ----
+bool trt_settings_show_fps();
+bool trt_settings_show_sysinfo();
+bool trt_settings_quick_menu_enabled();
 
 // ---- performance/tuning getters (new) ----
 int trt_settings_resolution_scale();   // render resolution %, 50..200
