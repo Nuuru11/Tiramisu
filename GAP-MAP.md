@@ -129,7 +129,16 @@ all verified offline; gate rc=0, 42× ALL PASS, corpus 8/8 load, 5/5 run-depth):
   fixture; `corpus-run.sh` no longer crashes when the D3D12 triangle fixture
   is not yet built (named SKIP; ordering fix).
 
-**LANDED (wave 5, 2026-11-15, all verified offline):**
+- **UWP host build re-verified (`build-host.sh` rc=0)**: the Linux-only CS-stall
+  probe (`syscall(SYS_gettid)`, `::write(2,...)`) was breaking the clang-cl
+  `--uwp` cross-compile (no POSIX fd 2 / sys/syscall.h in WINAPI_FAMILY_APP).
+  Guarded behind `__linux__` so the probe still names stalls on the dev host
+  while the UWP host build stays clean. Duplicated lock block in
+  `trt_EnterCriticalSection` also collapsed. MSIX produced.
+- **DirectInput8 COM personality** closes the `REGDB_E_CLASSNOTREG` gap:
+  `CoCreateInstance(CLSID_DirectInput8)` now hands out the same object
+  `DirectInput8Create` serves (A-twin -> W vtable; unknown IID -> E_NOINTERFACE
+  honestly). Verified S_OK + E_NOINTERFACE, both named.
 - **Items 24/25/30 — D3D12 descriptor wave** (`bridge_d3d12.cpp`): the silent
   `dev_view_noop` at device slots 17-24 is GONE. Real implementation:
   per-heap typed record store (`d3d12_view_record`, kind/dim/format/mips/
