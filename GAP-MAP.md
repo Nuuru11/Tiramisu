@@ -94,6 +94,41 @@ so the CLI path never runs; the live session ran it via import (see
   next: console M0 when DP credentials arrive, or the command-list recording
   surface (item 27 remainder) on request.)
 
+**LANDED (boot-depth wave, 2026-11-15, worktree `work/boot-ultrapool` @ b6a7b51,
+all verified offline; gate rc=0, 42× ALL PASS, corpus 8/8 load, 5/5 run-depth):**
+- **Ultra Pool (Godot 4.3 + GodotSteam) — FULL BOOT LIFECYCLE**: CRT → WinMain →
+  window ('Ultrapool') → Vulkan Forward Mobile on the Tiramisu ICD → scene load
+  (achievements/save/daily state) → pump → watchdog WM_CLOSE → Godot's own
+  quit chain (`close_requested` → `SceneTree::_quit`) → ExitProcess(0). The
+  wedge chain that stopped it, each fixed to real Win32 semantics:
+  CV lost-wakeup (release→wait-registration serialized under a wake mutex,
+  table 64→512 slots), WASAPI pacing (GetCurrentPadding timestamp-decay model
+  — Godot paces solely on `buffer_size - padding`; the zero-collapse caused a
+  97%-CPU mix storm holding the CS the main thread needed), MS_VC_EXCEPTION
+  swallowed like the OS does (no debugger), EH dispositions + faithful
+  `trt_C_specific_handler`, dwm `TRT_GUEST_ABI`, AttachConsole=FALSE +
+  synthetic stdio (real pseudo-handles → log ring), Vulkan limits/features
+  from real `vulkan_core.h` types, watchdog posts WM_CLOSE (Godot never reads
+  WM_QUIT — measured against 4.3 sources). Regression-locked in
+  `tests/test_wasapi_pacing.cpp` (padding contract + CV wake atomicity +
+  huge-malloc refusal).
+- **RACCOIN re-measured under the new sync surface**: with `--mock-d3d11`
+  (the documented config) the 8/8 ladder holds AND the game now runs healthy
+  for the full 10s until the watchdog WM_CLOSE, then exits through its own
+  shutdown chain (`SetFullscreenState(0)` → TerminateProcess) — previously it
+  never survived a watchdog interval. Plain `--exe` (stricter, real GPU path)
+  reaches Unity init + pump, then dies in the Unity CrashReporter C++
+  exception path (throw site escapes to a host frame; boundary swallow →
+  WM_QUIT) — that escape attribution is the next named gap, not a sync bug.
+- **Import-gap closures (fail-visible honest stubs)**: dbghelp
+  `SymGetModuleBase64`/`SymFunctionTableAccess64`/`StackWalk64` (0/NULL/FALSE —
+  no module table on console); winmm `waveOutMessage`/`Pause`/`Restart`/
+  `BreakLoop`/`GetErrorText` + `waveInMessage` (MMSYSERR_BADDEVICEID).
+  steam_api64.dll now maps + seals (was FAIL IMPORT) → corpus load 8/8.
+- **`GetStdHandle` synthetic-stdio contract locked** in the guest_engine
+  fixture; `corpus-run.sh` no longer crashes when the D3D12 triangle fixture
+  is not yet built (named SKIP; ordering fix).
+
 **LANDED (wave 5, 2026-11-15, all verified offline):**
 - **Items 24/25/30 — D3D12 descriptor wave** (`bridge_d3d12.cpp`): the silent
   `dev_view_noop` at device slots 17-24 is GONE. Real implementation:
