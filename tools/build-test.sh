@@ -293,6 +293,21 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_guest_eh"
 "$out/test_guest_eh" "$out/guest_eh.exe"
 
+# --- 8b. WASAPI pacing + CV wake atomicity (Ultra Pool boot-wedge
+#     regressions: 97%-CPU mix storm, lost SleepConditionVariableSRW wake) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_wasapi_pacing.cpp "$out/libtrt.a" \
+  -o "$out/test_wasapi_pacing" -lpthread
+"$out/test_wasapi_pacing"
+
+# --- 8c. Unwinder safety (Go Next/UnityPlayer host-SIGSEGV regression:
+#     corrupt/unmapped unwind metadata -> clean no-handler verdict, never
+#     a host crash) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_unwind_safety.cpp "$out/libtrt.a" \
+  -o "$out/test_unwind_safety" -lpthread
+"$out/test_unwind_safety"
+
 # --- 9. DirectInput 8: factory -> device -> acquire -> poll -> state ---
 cat > "$out/dinput.def" <<'DEOF'
 LIBRARY dinput8

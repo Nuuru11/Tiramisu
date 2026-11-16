@@ -31,6 +31,11 @@
 #include "thunk.h"
 #include "trt.h"
 
+// Settings knob (memory_budget_mb); weak symbol keeps offline tests green
+// when src/host/settings.cpp is not in the test binary. Missing definition
+// resolves to 0 -> crt_malloc keeps the 256 MB default.
+extern "C" int trt_settings_memory_budget_mb(void) __attribute__((weak));
+
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -479,7 +484,36 @@ void TRT_GUEST_ABI crt_longjmp(void* env, i32 val) {
 #endif
 
 // ---------- memory allocation ---------------------------------------------
-void* TRT_GUEST_ABI crt_malloc(u64 sz) { return malloc((size_t)sz); }
+// Fail-visible huge-allocation probe: a straight pass-through malloc only
+// returns NULL on absurd sizes, and the mixer retry-storm at
+// CowData::_copy_on_write (measured: tid=11 hot loop, error path strings
+// "core/os/memory.cpp"/"alloc_static") is exactly a NULL from here. Log the
+// size when it exceeds any plausible game allocation so the guest-side
+// garbage-size source becomes measurable.
+void* TRT_GUEST_ABI crt_malloc(u64 sz) {
+  // Settings knob: memory_budget_mb caps the single-allocation refusal
+  // threshold. Default 256 MB; a user can raise it for big allocators
+  // (Unreal-class) or lower it to catch runaway allocations early.
+  // Weak symbol (declared at file scope below): offline test binaries
+  // without settings.cpp keep the 256 MB default (weak resolves to 0).
+  u64 cap = 268435456ull;  // 256 MB default
+  const int mb = trt_settings_memory_budget_mb ? trt_settings_memory_budget_mb() : 0;
+  if (mb > 0) cap = (u64)mb * 1048576ull;
+  if (sz > cap) {
+    static unsigned huge_named = 0;  // racy counter; only used for log caps
+    const unsigned n = huge_named;
+    if (n < 8) {
+      char hl[96];
+      snprintf(hl, sizeof(hl),
+               "msvcrt: malloc(sz=%llu) -> NULL (huge; call #%u)",
+               (unsigned long long)sz, n + 1);
+      trt_core_log(hl);
+      huge_named = n + 1;
+    }
+    return nullptr;
+  }
+  return malloc((size_t)sz);
+}
 void* TRT_GUEST_ABI crt_calloc(u64 n, u64 sz) { return calloc((size_t)n, (size_t)sz); }
 void* TRT_GUEST_ABI crt_realloc(void* p, u64 sz) { return realloc(p, (size_t)sz); }
 void  TRT_GUEST_ABI crt_free(void* p) { free(p); }

@@ -122,6 +122,53 @@ int TRT_GUEST_ABI dbg_SymGetLineFromAddr64(void* proc, u64 addr, u32* displaceme
   return 0;
 }
 
+u64 TRT_GUEST_ABI dbg_SymGetModuleBase64(void* proc, u64 addr) {
+  char line[160];
+  (void)proc;
+  // Real Win32 returns the base of the module containing addr, 0 when no
+  // module matches. The console bridge keeps no crash-time module table
+  // (no PDBs, no symbol server), so every address stays unattributed —
+  // the same honesty as SymFromAddr -> FALSE. Steam's crash handler uses
+  // this for log attribution only; a 0 base is a legal non-match there.
+  snprintf(line, sizeof(line),
+           "dbghelp: SymGetModuleBase64 -> 0 (no module table on console; "
+           "addr=0x%llx stays unattributed)", (unsigned long long)addr);
+  log_line(line);
+  return 0;
+}
+
+// Real Win32 returns the RUNTIME_FUNCTION (unwind info) for addr so
+// StackWalk64 can unwind; the console bridge keeps no crash-time module
+// table, so no entry is resolvable — NULL, the documented no-match value.
+// Steam's crash handler treats this as "cannot attribute stack frames".
+void* TRT_GUEST_ABI dbg_SymFunctionTableAccess64(void* proc, u64 addr) {
+  char line[160];
+  (void)proc;
+  snprintf(line, sizeof(line),
+           "dbghelp: SymFunctionTableAccess64 -> NULL (no module table on "
+           "console; addr=0x%llx unwind unattributed)",
+           (unsigned long long)addr);
+  log_line(line);
+  return nullptr;
+}
+
+// Real Win32 walks the stack via the provided machine context; without a
+// module table/unwind reader it fails — FALSE is the documented failure.
+// Steam logs the failure and continues (measured crash-handler shape:
+// "SymInitialize() failed: %llu" path exists in its strings).
+int TRT_GUEST_ABI dbg_StackWalk64(u32 machine, void* hprocess, void* hthread,
+                                  void* frame, void* context,
+                                  void* read_mem, void* xfer_func,
+                                  void* get_module_base, void* ftab_access) {
+  char line[128];
+  (void)machine; (void)hprocess; (void)hthread; (void)frame; (void)context;
+  (void)read_mem; (void)xfer_func; (void)get_module_base; (void)ftab_access;
+  snprintf(line, sizeof(line),
+           "dbghelp: StackWalk64 -> FALSE (no unwind support on console)");
+  log_line(line);
+  return 0;
+}
+
 int TRT_GUEST_ABI dbg_SymCleanup(void* proc) {
   for (u32 i = 0; i < 16; ++i) {
     if (g_sym[i].tag && g_sym[i].base == proc) {
@@ -261,6 +308,12 @@ int trt_bridge_register_dbghelp(void) {
       {"SymGetLineFromAddr64", (void*)&dbg_SymGetLineFromAddr64},
       {"SymGetLineFromAddrW64", (void*)&dbg_SymGetLineFromAddr64},
       {"SymGetLineFromAddr", (void*)&dbg_SymGetLineFromAddr64},
+      {"SymGetModuleBase64", (void*)&dbg_SymGetModuleBase64},
+      {"SymGetModuleBase", (void*)&dbg_SymGetModuleBase64},
+      {"SymFunctionTableAccess64", (void*)&dbg_SymFunctionTableAccess64},
+      {"SymFunctionTableAccess", (void*)&dbg_SymFunctionTableAccess64},
+      {"StackWalk64", (void*)&dbg_StackWalk64},
+      {"StackWalk", (void*)&dbg_StackWalk64},
       {"SymLoadModuleEx", (void*)&dbg_SymLoadModuleEx},
       {"SymRegisterFunctionEntryCallback64",
        (void*)&dbg_SymRegisterFunctionEntryCallback64},

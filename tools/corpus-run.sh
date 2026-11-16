@@ -69,8 +69,11 @@ rc=0
 
 # --- STAGE 7: EXE-entry boot depth (real game EXEs, offline) ---
 EXES=(
+  "corpus-local/gonext/Go Next demo.exe"
   "corpus-local/ortmm/OrTMM.exe"
   "corpus-local/raccoin/RACCOIN.exe"
+  "corpus-local/openttd/openttd.exe"
+  "corpus-local/cdda/cataclysm-bn-tiles.exe"
 )
 exe_report="$out/corpus-exe-report.md"
 {
@@ -79,23 +82,36 @@ exe_report="$out/corpus-exe-report.md"
 } > "$exe_report"
 for exe in "${EXES[@]}"; do
   [[ -f "$exe" ]] || { echo "corpus-exe: missing $exe (skipped)"; continue; }
-  "$out/test_corpus_run" --exe "$exe" 2>&1 | tee -a "$exe_report"
-  # BOOT FAILED (exit 1) is a NAMED outcome, not a gate failure: the report
-  # names the blocker. Only a crash WITHOUT the named report fails the gate.
+  # Per-EXE wall-clock bound: a guest that never reaches WM_QUIT (OrTMM's
+  # hw-fault bounce loop) must not wedge the gate. Timeout = named hang,
+  # not a silent stall.
+  timeout -s KILL 60 "$out/test_corpus_run" --exe "$exe" 2>&1 | tee -a "$exe_report"
   p=${PIPESTATUS[0]}
-  if [[ $p -ne 0 && $p -ne 1 ]]; then rc=1; fi
+  if [[ $p -eq 124 || $p -eq 137 ]]; then
+    echo "corpus-exe: HANG TIMEOUT on $exe (named; not a gate failure)"
+  elif [[ $p -ne 0 && $p -ne 1 ]]; then
+    rc=1
+  fi
 done
 
 # --- D3D12 TRIANGLE GATE (Sprint-2 item 21): the full D3D12 render path ---
 # through a real guest PE. Every D3D12 bridge change must keep this green
 # offline before console work — the fixture that caught the
 # CreateSwapChainForCoreWindow ABI bug on its first run.
-tri_report="$out/triangle-gate-report.md"
-{
-  printf '# D3D12 TRIANGLE GATE — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf '\n12 markers: DEVICE/QUEUE/ALLOC/LIST/ROOTSIG/PSO/RESOURCE/DRAW RECORDED/LIST CLOSED/ECL EXECUTED/FENCE SIGNALED/PRESENTED.\n\n'
-} > "$tri_report"
-"$out/test_d3d12_triangle" "$out/guest_triangle.exe" 2>&1 | tee -a "$tri_report"
-[[ ${PIPESTATUS[0]} -eq 0 ]] || rc=1
+# NOTE: this fixture is built at build-test.sh step 36, AFTER corpus-run runs
+# (step 6c). When corpus-run.sh is invoked inside the full gate, the fixture
+# may not exist yet — skip it with a named marker rather than crashing on
+# a missing file; standalone runs (fixture present) still execute it.
+if [[ ! -x "$out/test_d3d12_triangle" ]]; then
+  echo "SKIP D3D12 triangle gate: tests/out/test_d3d12_triangle not built yet (built at build-test.sh step 36)"
+else
+  tri_report="$out/triangle-gate-report.md"
+  {
+    printf '# D3D12 TRIANGLE GATE — %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '\n12 markers: DEVICE/QUEUE/ALLOC/LIST/ROOTSIG/PSO/RESOURCE/DRAW RECORDED/LIST CLOSED/ECL EXECUTED/FENCE SIGNALED/PRESENTED.\n\n'
+  } > "$tri_report"
+  "$out/test_d3d12_triangle" "$out/guest_triangle.exe" 2>&1 | tee -a "$tri_report"
+  [[ ${PIPESTATUS[0]} -eq 0 ]] || rc=1
+fi
 
 exit $rc

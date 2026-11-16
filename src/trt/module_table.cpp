@@ -11,9 +11,12 @@
 #include "trt.h"
 #include "apiset.h"
 #include "thunk.h"
+#include "images.h"
+#include "pe_exports.h"
 
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 namespace {
 
@@ -102,10 +105,64 @@ const char* dll_alias_lookup(const char* name) {
   return nullptr;
 }
 
+// Native DLL override: a game-shipped DLL (dxvk's d3d9.dll, cnc-ddraw,
+// dgVoodoo, the VC runtime, ...) shadows Tiramisu's builtin bridge for that
+// module — the same WINEDLLOVERRIDES=native idea Proton uses. This is how
+// existing third-party implementations get wired in: drop the DLL next to
+// the game's .exe and it is loaded instead of our bridge.
+//
+// Only API modules are overridable; core system modules (kernel32, ntdll,
+// user32, ...) are NEVER shadowed because a fake would break the loader's
+// own assumptions.
+bool is_overridable_module(const char* name) {
+  static const char* kNoOverride[] = {
+      "kernel32.dll", "ntdll.dll", "user32.dll", "gdi32.dll",
+      "advapi32.dll", "ole32.dll", "oleaut32.dll", "comctl32.dll",
+      "shell32.dll", "shlwapi.dll", "ws2_32.dll", "crypt32.dll",
+      "bcrypt.dll", "sechost.dll", "rpcrt4.dll", "kernelbase.dll",
+      "ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+      "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
+      "combase.dll", "dwrite.dll", "d2d1.dll", "d3d10.dll", "d3d12.dll",
+      "dxgi.dll", "version.dll",
+  };
+  for (const char* no : kNoOverride)
+    if (name_eq(name, no)) return false;
+  return true;
+}
+
+// Try to load <search_dir>/<module> and resolve `symbol` from it. Returns
+// nullptr when no native DLL exists or the symbol isn't exported.
+void* try_native_override(const char* module, const char* symbol,
+                          u16 ordinal) {
+  if (!module || !is_overridable_module(module)) return nullptr;
+  const char* dir = trt_runtime_search_dir();
+  if (!dir || !dir[0]) return nullptr;
+  char host[1024];
+  snprintf(host, sizeof(host), "%s/%s", dir, module);
+  struct stat st{};
+  if (stat(host, &st) != 0 || !S_ISREG(st.st_mode)) return nullptr;
+
+  // already loaded? reuse the registry handle
+  trt_image* img = trt_images_find(module);
+  if (!img) {
+    img = trt_load_pe(host, module, 1 /*run DllMain*/);
+    if (!img) return nullptr;
+  }
+  if (!img) return nullptr;
+  return trt_pe_find_export(trt_runtime_backend(), trt_runtime_resolver(),
+                            img, symbol, ordinal);
+}
+
 // resolve() adapter the loader consumes
 void* resolve_through_table(void* user, const char* module,
                             const char* symbol, u16 ordinal) {
   (void)user;
+
+  // ---- native DLL override -------------------------------------------
+  // A game-shipped DLL shadows our builtin bridge for overridable API
+  // modules (dxvk's d3d9.dll, cnc-ddraw, dgVoodoo, ...). Proton's
+  // WINEDLLOVERRIDES=native equivalent.
+  if (void* fn = try_native_override(module, symbol, ordinal)) return fn;
 
   // Ordinal-only import (hint/name parse produced no symbol, e.g. OrTMM's
   // COMCTL32 bare hint/ord 380): synthesize the "#<ordinal>" name the

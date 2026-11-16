@@ -272,6 +272,7 @@ i64 TRT_STDCALL trt_DefWindowProcW(void* hwnd, u32 msg, u64 wp, i64 lp) {
   return msg == 0x0010 ? 1 : 0;  // WM_CLOSE -> TRUE
 }
 
+void* TRT_STDCALL trt_GetActiveWindow(void);
 void* TRT_STDCALL trt_GetActiveWindow(void) {
   std::lock_guard<std::mutex> lk(g_win_mu);
   if (g_focus_window && find_win_locked((u64)(uintptr_t)g_focus_window)) {

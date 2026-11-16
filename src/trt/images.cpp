@@ -301,18 +301,27 @@ void trt_images_register_main(trt_image* img, const char* guest_name) {
   ++g_image_count;
 }
 
-// enumeration for the psapi/dbghelp bridges (the REAL guest module list)
-int trt_images_count(void) { return g_image_count; }
+// enumeration for the psapi/dbghelp bridges (the REAL guest module list).
+// Locking matches the writer (trt_images_register_main holds g_img_mu):
+// unlocked readers raced register/resize and returned garbage entries — the
+// unwinder then "validated" metadata against a bogus image and crashed.
+int trt_images_count(void) {
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  return g_image_count;
+}
 
 trt_image* trt_images_nth(int idx) {
+  std::lock_guard<std::mutex> lk(g_img_mu);
   return (idx >= 0 && idx < g_image_count) ? g_images[idx].img : nullptr;
 }
 
 const char* trt_images_nth_name(int idx) {
+  std::lock_guard<std::mutex> lk(g_img_mu);
   return (idx >= 0 && idx < g_image_count) ? g_images[idx].name : nullptr;
 }
 
 const char* trt_images_nth_path(int idx) {
+  std::lock_guard<std::mutex> lk(g_img_mu);
   return (idx >= 0 && idx < g_image_count) ? g_images[idx].path : nullptr;
 }
 

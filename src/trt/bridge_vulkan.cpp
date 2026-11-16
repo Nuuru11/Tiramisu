@@ -4,9 +4,106 @@
 #include "spirv_hlsl.h"
 #include "thunk.h"
 
+// Real Vulkan ABI for the physical-device properties/limits structs: hand-
+// rolled mirrors drifted once (a zeroed limits block reported
+// maxFragmentInputComponents=0 -> Godot computed "maximum varyings = 0" ->
+// EVERY shader compile failed -> endless scene-import retry storm). The
+// header layout is stable and pointer-free; the static_asserts below pin it.
+#if __has_include(<vulkan/vulkan_core.h>)
+#include <vulkan/vulkan_core.h>
+#else
+#include "vulkan_core_stub.h"
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+
+// Settings knob (shader_cache): weak C-linkage wrapper the cache checks.
+// The real definition (settings.cpp) returns the bool getter as int; weak
+// missing resolves to 0 handled by check_enabled()'s default-on logic.
+extern "C" int trt_settings_shader_cache_int(void) __attribute__((weak));
+
+// ---- shader compile cache (settings knob: shader_cache) -------------------
+// SPIR-V -> HLSL compilation is the single most expensive path on the Vulkan
+// surface (Godot compiles every shader variant at scene load; measured: an
+// end less retry storm when compiles failed). When the knob is on, compile
+// results are memoized by FNV-1a hash of the SPIR-V words + stage + entry +
+// spec constants. In-process memoization only — the console has no writable
+// shader disk cache under AppContainer without a mounted surface.
+#include <mutex>
+#include <unordered_map>
+namespace vkshader_cache {
+struct cache_key {
+  u64 hash;
+  u32 stage;
+  u64 spec_hash;
+  bool operator==(const cache_key& o) const {
+    return hash == o.hash && stage == o.stage && spec_hash == o.spec_hash;
+  }
+};
+struct cache_key_h {
+  size_t operator()(const cache_key& k) const {
+    return (size_t)(k.hash * 0x100000001b3ull ^ (u64)k.stage ^
+                    (k.spec_hash << 13));
+  }
+};
+static std::mutex g_mu;
+static std::unordered_map<cache_key, std::string, cache_key_h> g_cache;
+static bool g_enabled = true;   // default matches settings default
+static bool g_checked = false;
+
+static void check_enabled() {
+  if (g_checked) return;
+  g_checked = true;
+  // Weak-missing symbol resolves to nullptr at link time (same pattern as
+  // trt_settings_write_watch in bridge_kernel32): call only when linked.
+  g_enabled = true;  // default on
+  if (trt_settings_shader_cache_int) g_enabled = (trt_settings_shader_cache_int() != 0);}
+
+static u64 fnv1a(const u32* w, u32 n) {
+  u64 h = 0xcbf29ce484222325ull;
+  for (u32 i = 0; i < n; ++i) {
+    h ^= (u64)w[i];
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
+static u64 spec_fnv(const spirv_spec_entry* s, u32 n) {
+  u64 h = 0x9e3779b97f4a7c15ull;
+  for (u32 i = 0; i < n; ++i) {
+    h ^= (u64)s[i].spec_id ^ ((u64)s[i].value_u32 << 8);
+    h *= 0x100000001b3ull;
+  }
+  return h;
+}
+}  // namespace vkshader_cache
+
+// Memoized compile: returns nullptr when the knob is off or on cache miss
+// (caller compiles + stores through spirv_cache_store).
+static const std::string* spirv_cache_lookup(const u32* words, u32 wc,
+                                             spirv_stage st, const char* name,
+                                             const spirv_spec_entry* specs,
+                                             u32 spec_n) {
+  using namespace vkshader_cache;
+  check_enabled();
+  if (!g_enabled) return nullptr;
+  cache_key k{fnv1a(words, wc), (u32)st,
+              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  std::lock_guard<std::mutex> lk(g_mu);
+  auto it = g_cache.find(k);
+  return it == g_cache.end() ? nullptr : &it->second;
+}
+static void spirv_cache_store(const u32* words, u32 wc, spirv_stage st,
+                              const char* name, const spirv_spec_entry* specs,
+                              u32 spec_n, const std::string& hlsl) {
+  using namespace vkshader_cache;
+  if (!g_enabled) return;
+  cache_key k{fnv1a(words, wc), (u32)st,
+              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_cache.emplace(k, hlsl);
+}
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -58,20 +155,21 @@ struct vk_ext_props {
 struct vk_layer_props {
   char layerName[256]; u32 specVersion; u32 implementationVersion; char description[256];
 };
-struct vk_phys_dev_limits {
-  u32 raw[128];
-};
-struct vk_phys_dev_props {
-  u32 apiVersion; u32 driverVersion; u32 vendorID; u32 deviceID; u32 deviceType;
-  char deviceName[256]; u8 pipelineCacheUUID[16];
-  u32 maxImageDimension1D; u32 maxImageDimension2D; u32 maxImageDimension3D;
-  u32 maxImageDimensionCube; u32 maxImageArrayLayers; u32 maxTexelBufferElements;
-  u32 maxUniformBufferRange; u32 maxStorageBufferRange; u32 maxPushConstantsSize;
-  u32 raw_rest[120];
-};
-struct vk_phys_dev_props2 { u32 sType; void* pNext; vk_phys_dev_props properties; };
-struct vk_phys_dev_features { u32 features[55]; };
-struct vk_phys_dev_features2 { u32 sType; void* pNext; vk_phys_dev_features features; };
+// The properties/limits structs now come straight from <vulkan/vulkan_core.h>
+// (see the include above). Static asserts pin the ABI the ICD was measured on.
+#if __has_include(<vulkan/vulkan_core.h>)
+static_assert(sizeof(VkPhysicalDeviceLimits) == 504,
+              "VkPhysicalDeviceLimits ABI drift");
+static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
+              "VkPhysicalDeviceProperties.limits offset drift");
+#endif
+// Local aliases keep the existing call sites unchanged.
+using vk_phys_dev_props = VkPhysicalDeviceProperties;
+using vk_phys_dev_props2 = VkPhysicalDeviceProperties2;
+using vk_phys_dev_limits = VkPhysicalDeviceLimits;
+using vk_phys_dev_features = VkPhysicalDeviceFeatures;
+using vk_phys_dev_features2 = VkPhysicalDeviceFeatures2;
+// props2/features use the real header types (aliased above).
 struct vk_qf_props { u32 queueFlags; u32 queueCount; u32 timestampValidBits; vk_extent3d minImageTransferGranularity; };
 struct vk_qf_props2 { u32 sType; void* pNext; vk_qf_props queueFamilyProperties; };
 struct vk_mem_type { u32 propertyFlags; u32 heapIndex; };
@@ -834,31 +932,185 @@ i32 TRT_GUEST_ABI trt_vkEnumeratePhysicalDevices(void* inst_v, u32* pCount, void
   return VK_INCOMPLETE_V;
 }
 
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties(void*, vk_phys_dev_props* p) {
+// Desktop-class limits (AMD Navi 21 class, consistent with the vendorID/
+// deviceID above). Values are the SPIR-V->HLSL->D3D11 bridge's honest
+// capability floor: everything here is either truly supported by the D3D11
+// path or enforced by the shader translator. Zeroed limits previously made
+// Godot compute "maximum varyings = 0" and fail EVERY shader compile.
+static void fill_phys_dev_limits(VkPhysicalDeviceLimits* L) {
+  *L = {};
+  L->maxImageDimension1D = 16384;
+  L->maxImageDimension2D = 16384;
+  L->maxImageDimension3D = 2048;
+  L->maxImageDimensionCube = 16384;
+  L->maxImageArrayLayers = 2048;
+  L->maxTexelBufferElements = 0x8000000ull < (1ull << 32) ? 134217728u : 134217728u;
+  L->maxUniformBufferRange = 65536;
+  L->maxStorageBufferRange = 134217728;
+  L->maxPushConstantsSize = 256;
+  L->maxMemoryAllocationCount = 4294967295u;  // D3D11: no hard allocation cap
+  L->maxSamplerAllocationCount = 2048;
+  L->bufferImageGranularity = 4096;
+  L->sparseAddressSpaceSize = 0;  // sparse not bridged (fail-visible elsewhere)
+  L->maxBoundDescriptorSets = 8;
+  L->maxPerStageDescriptorSamplers = 16;
+  L->maxPerStageDescriptorUniformBuffers = 15;   // D3D11.1 b-constraint
+  L->maxPerStageDescriptorStorageBuffers = 8;
+  L->maxPerStageDescriptorSampledImages = 128;
+  L->maxPerStageDescriptorStorageImages = 8;
+  L->maxPerStageDescriptorInputAttachments = 8;
+  L->maxPerStageResources = 128;
+  L->maxDescriptorSetSamplers = 48;
+  L->maxDescriptorSetUniformBuffers = 90;
+  L->maxDescriptorSetUniformBuffersDynamic = 15;
+  L->maxDescriptorSetStorageBuffers = 72;
+  L->maxDescriptorSetStorageBuffersDynamic = 24;
+  L->maxDescriptorSetSampledImages = 768;
+  L->maxDescriptorSetStorageImages = 72;
+  L->maxDescriptorSetInputAttachments = 72;
+  L->maxVertexInputAttributes = 32;
+  L->maxVertexInputBindings = 32;
+  L->maxVertexInputAttributeOffset = 2047;   // D3D11: 4GB-1 really, keep sane
+  L->maxVertexInputBindingStride = 2048;     // D3D11: 4096 for 11.1; conservative
+  L->maxVertexOutputComponents = 128;        // D3D11: 32x4-vs-out
+  L->maxTessellationGenerationLevel = 64;
+  L->maxTessellationPatchSize = 32;
+  L->maxTessellationControlPerVertexInputComponents = 128;
+  L->maxTessellationControlPerVertexOutputComponents = 128;
+  L->maxTessellationControlPerPatchOutputComponents = 120;
+  L->maxTessellationControlTotalOutputComponents = 4096;
+  L->maxTessellationEvaluationInputComponents = 128;
+  L->maxTessellationEvaluationOutputComponents = 128;
+  L->maxGeometryShaderInvocations = 32;
+  L->maxGeometryInputComponents = 64;
+  L->maxGeometryOutputComponents = 128;
+  L->maxGeometryOutputVertices = 1024;
+  L->maxGeometryTotalOutputComponents = 1024;
+  // The load-bearing one: Godot computes its varying budget from this.
+  L->maxFragmentInputComponents = 128;       // D3D11: 32x4-ps-in
+  L->maxFragmentOutputAttachments = 8;
+  L->maxFragmentDualSrcAttachments = 1;
+  L->maxFragmentCombinedOutputResources = 8;
+  L->maxComputeSharedMemorySize = 32768;
+  L->maxComputeWorkGroupCount[0] = 65535;
+  L->maxComputeWorkGroupCount[1] = 65535;
+  L->maxComputeWorkGroupCount[2] = 65535;
+  L->maxComputeWorkGroupInvocations = 1024;
+  L->maxComputeWorkGroupSize[0] = 1024;
+  L->maxComputeWorkGroupSize[1] = 1024;
+  L->maxComputeWorkGroupSize[2] = 64;
+  L->subPixelPrecisionBits = 8;
+  L->subTexelPrecisionBits = 8;
+  L->mipmapPrecisionBits = 8;
+  L->maxDrawIndexedIndexValue = 4294967294u;  // D3D11: 32-bit indices
+  L->maxDrawIndirectCount = 65535;
+  L->maxSamplerLodBias = 16.0f;
+  L->maxSamplerAnisotropy = 16.0f;
+  L->maxViewports = 16;
+  L->maxViewportDimensions[0] = 16384;
+  L->maxViewportDimensions[1] = 16384;
+  L->viewportBoundsRange[0] = -32768.0f;
+  L->viewportBoundsRange[1] = 32767.0f;
+  L->viewportSubPixelBits = 8;
+  L->minMemoryMapAlignment = 4096;
+  L->minTexelBufferOffsetAlignment = 256;
+  L->minUniformBufferOffsetAlignment = 16;   // D3D11 constant-buffer 16B
+  L->minStorageBufferOffsetAlignment = 16;
+  L->minTexelOffset = -32;
+  L->maxTexelOffset = 31;
+  L->minTexelGatherOffset = -32;
+  L->maxTexelGatherOffset = 31;
+  L->minInterpolationOffset = -0.5f;
+  L->maxInterpolationOffset = 0.5f;
+  L->subPixelInterpolationOffsetBits = 8;
+  L->maxFramebufferWidth = 16384;
+  L->maxFramebufferHeight = 16384;
+  L->maxFramebufferLayers = 2048;
+  L->framebufferColorSampleCounts = 0x7F;    // 1|2|4|8|16|32|64
+  L->framebufferDepthSampleCounts = 0x7F;
+  L->framebufferStencilSampleCounts = 0x7F;
+  L->framebufferNoAttachmentsSampleCounts = 0x7F;
+  L->maxColorAttachments = 8;
+  L->sampledImageColorSampleCounts = 0x7F;
+  L->sampledImageIntegerSampleCounts = 0x7F;
+  L->sampledImageDepthSampleCounts = 0x7F;
+  L->sampledImageStencilSampleCounts = 0x7F;
+  L->storageImageSampleCounts = 0x3F;
+  L->maxSampleMaskWords = 1;
+  L->timestampComputeAndGraphics = VK_TRUE;
+  L->timestampPeriod = 1.0f;                 // 1 ns (D3D11 Query timestamp)
+  L->maxClipDistances = 8;
+  L->maxCullDistances = 8;
+  L->maxCombinedClipAndCullDistances = 8;
+  L->discreteQueuePriorities = 2;
+  L->pointSizeRange[0] = 0.0f;
+  L->pointSizeRange[1] = 8191.0f;
+  L->lineWidthRange[0] = 1.0f;
+  L->lineWidthRange[1] = 8.0f;
+  L->pointSizeGranularity = 0.0625f;
+  L->lineWidthGranularity = 0.0625f;
+  L->strictLines = VK_FALSE;
+  L->standardSampleLocations = VK_TRUE;
+  L->optimalBufferCopyOffsetAlignment = 1;
+  L->optimalBufferCopyRowPitchAlignment = 1;
+  L->nonCoherentAtomSize = 256;
+}
+
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties(void*, VkPhysicalDeviceProperties* p) {
   if (!p) return;
   memset(p, 0, sizeof(*p));
   p->apiVersion = VK_MAKE_VER(1, 3, 255);
   p->driverVersion = 1;
   p->vendorID = 0x1002u;
   p->deviceID = 0x73DFu;
-  p->deviceType = 1; // INTEGRATED_GPU
+  p->deviceType = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
   snprintf(p->deviceName, sizeof(p->deviceName), "Tiramisu Vulkan->D3D11");
-  p->maxImageDimension1D = 16384;
-  p->maxImageDimension2D = 16384;
-  p->maxImageDimension3D = 2048;
-  p->maxImageDimensionCube = 16384;
-  p->maxImageArrayLayers = 2048;
-  p->maxUniformBufferRange = 65536;
-  p->maxStorageBufferRange = 134217728;
-  p->maxPushConstantsSize = 256;
+  fill_phys_dev_limits(&p->limits);
+  p->sparseProperties.residencyStandard2DBlockShape = VK_FALSE;
+  // sparse not bridged: all sparse properties honestly false (zeroed)
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties2(void* pd, vk_phys_dev_props2* p2) {
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties2(void* pd, VkPhysicalDeviceProperties2* p2) {
   if (p2) trt_vkGetPhysicalDeviceProperties(pd, &p2->properties);
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, vk_phys_dev_features* f) {
-  if (f) for (int i = 0; i < 55; ++i) f->features[i] = 1;
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, VkPhysicalDeviceFeatures* f) {
+  if (f) {
+    *f = {};
+    // Features actually honored by the SPIR-V->HLSL->D3D11 bridge; the rest
+    // stay false rather than promising what the bridge can't deliver.
+    // Godot's _check_device_features hard-gates on imageCubeArray +
+    // independentBlend (rendering_device_driver_vulkan.cpp:_check_device_features
+    // — measured live: alert "does not support the following features" ->
+    // Vulkan init aborted -> forced GL fallback). Both are real D3D11
+    // capabilities the bridge carries.
+    f->robustBufferAccess = VK_TRUE;
+    f->fullDrawIndexUint32 = VK_TRUE;
+    f->independentBlend = VK_TRUE;
+    f->imageCubeArray = VK_TRUE;
+    f->dualSrcBlend = VK_TRUE;
+    f->sampleRateShading = VK_TRUE;
+    f->fragmentStoresAndAtomics = VK_TRUE;
+    f->vertexPipelineStoresAndAtomics = VK_TRUE;
+    f->shaderClipDistance = VK_TRUE;
+    f->shaderCullDistance = VK_TRUE;
+    f->shaderImageGatherExtended = VK_TRUE;
+    f->shaderStorageImageExtendedFormats = VK_TRUE;
+    f->depthClamp = VK_TRUE;
+    f->depthBiasClamp = VK_TRUE;
+    f->fillModeNonSolid = VK_TRUE;
+    f->multiViewport = VK_TRUE;
+    f->samplerAnisotropy = VK_TRUE;
+    f->textureCompressionBC = VK_TRUE;
+    f->tessellationShader = VK_TRUE;
+    f->geometryShader = VK_TRUE;
+    f->shaderTessellationAndGeometryPointSize = VK_TRUE;
+    f->occlusionQueryPrecise = VK_TRUE;
+    f->pipelineStatisticsQuery = VK_TRUE;
+    f->shaderFloat64 = VK_FALSE;  // D3D11: 64-bit shader floats are optional
+    f->shaderInt64 = VK_FALSE;
+    f->sparseBinding = VK_FALSE;  // sparse not bridged
+  }
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures2(void* pd, vk_phys_dev_features2* f2) {
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures2(void* pd, VkPhysicalDeviceFeatures2* f2) {
   if (f2) trt_vkGetPhysicalDeviceFeatures(pd, &f2->features);
 }
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFormatProperties(void*, u32, vk_fmt_props* p) {
@@ -1496,9 +1748,22 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
       collect_spec(st.pSpecializationInfo, specs);
       const auto& spv = d->shaders[st.module].spv;
       spirv_stage sst = (st.stage == 0x10u) ? SPV_STAGE_FRAGMENT : SPV_STAGE_VERTEX;
-      spirv_compile_result cr = spirv_to_hlsl(
+      const std::string* cached = spirv_cache_lookup(
           spv.data(), (u32)spv.size(), sst, st.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+      spirv_compile_result cr;
+      if (cached) {
+        cr.ok = true;
+        cr.hlsl = *cached;
+      } else {
+        cr = spirv_to_hlsl(
+          spv.data(), (u32)spv.size(), sst, st.pName,
+          specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+        if (cr.ok)
+          spirv_cache_store(spv.data(), (u32)spv.size(), sst, st.pName,
+                            specs.empty() ? nullptr : specs.data(),
+                            (u32)specs.size(), cr.hlsl);
+      }
       if (!cr.ok) continue;
       if (sst == SPV_STAGE_VERTEX) vs_h = cr.hlsl;
       else ps_h = cr.hlsl;
@@ -1580,9 +1845,24 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
       std::vector<spirv_spec_entry> specs;
       collect_spec(cis[i].stage.pSpecializationInfo, specs);
       const auto& spv = d->shaders[cis[i].stage.module].spv;
-      spirv_compile_result cr = spirv_to_hlsl(
+      const std::string* cached = spirv_cache_lookup(
+          spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
+          cis[i].stage.pName, specs.empty() ? nullptr : specs.data(),
+          (u32)specs.size());
+      spirv_compile_result cr;
+      if (cached) {
+        cr.ok = true;
+        cr.hlsl = *cached;
+      } else {
+        cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE, cis[i].stage.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
+        if (cr.ok)
+          spirv_cache_store(spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
+                            cis[i].stage.pName,
+                            specs.empty() ? nullptr : specs.data(),
+                            (u32)specs.size(), cr.hlsl);
+      }
       if (cr.ok) {
         cs_h = cr.hlsl;
         if (cr.push_constant_bytes) po.push_reg = cr.push_constant_reg;

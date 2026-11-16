@@ -83,7 +83,7 @@ typedef struct {                 // Win64 EXCEPTION_POINTERS
 __attribute__((used)) int __C_specific_handler(ex_record* rec, u64 frame,
                                                unsigned char* ctx,
                                                dispatcher_ctx* dc) {
-  if (!dc || !dc->handler_data) return 1;  // ExceptionContinueSearch
+  if (!dc || !dc->handler_data) return 0;  // ExceptionContinueSearch
   const u64 image = dc->image_base;
   const u64 pc = dc->control_pc - image;  // control PC as an RVA
   const scope_table* st = (const scope_table*)(unsigned long long)dc->handler_data;
@@ -108,9 +108,9 @@ __attribute__((used)) int __C_specific_handler(ex_record* rec, u64 frame,
                   (void*)(unsigned long long)dc->history_table);
       return 1;  // not reached: RtlUnwindEx resumes in the __except block
     }
-    if (verdict == -1) return 0;  // EXCEPTION_CONTINUE_EXECUTION
+    if (verdict == -1) return 1;  // EXCEPTION_CONTINUE_EXECUTION
   }
-  return 1;  // ExceptionContinueSearch
+  return 0;  // ExceptionContinueSearch
 }
 
 // ---- test state -----------------------------------------------------------

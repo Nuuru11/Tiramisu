@@ -87,7 +87,7 @@ bool g_setup_active = false;    // currently showing the setup screen
 
 // dashboard settings screen state (rows mirror longan::host_settings;
 // the string/int buffers are edited here, applied via settings_store)
-longan::ui_setting g_set_rows[9];
+longan::ui_setting g_set_rows[18];
 int g_set_count = 0;
 int g_set_selected = 0;
 longan::ui_screen g_screen = longan::UI_SHELF;
@@ -1161,12 +1161,20 @@ void steam_begin() {
 // what the renderer draws).
 const wchar_t* k_input_choices[4] = {L"auto", L"controller", L"kbm",
                                      L"pad2kbm"};
+const wchar_t* k_cap_choices[4] = {L"0", L"30", L"60", L"120"};
 
 void sync_settings_rows() {
   const auto& s = longan::settings_get();
   auto set_bool = [](longan::ui_setting& r, bool v) {
     r.is_bool = true; r.is_choice = false; r.is_int = false;
     r.value[0] = v ? L'1' : L'0'; r.value[1] = 0;
+  };
+  auto set_cap = [](longan::ui_setting& r, int v) {
+    r.is_bool = false; r.is_choice = true; r.is_int = false;
+    const wchar_t* best = k_cap_choices[0];
+    for (int k = 0; k < 4; ++k)
+      if (_wtoi(k_cap_choices[k]) == v) best = k_cap_choices[k];
+    wcscpy(r.value, best);
   };
   int i = 0;
   // 0 default input
@@ -1217,6 +1225,45 @@ void sync_settings_rows() {
   wcscpy(g_set_rows[i].label, L"Show QR / LAN link on TV");
   set_bool(g_set_rows[i], s.show_qr);
   ++i;
+  // 9 FPS overlay
+  wcscpy(g_set_rows[i].label, L"Show FPS counter");
+  set_bool(g_set_rows[i], s.show_fps);
+  ++i;
+  // 10 sysinfo overlay
+  wcscpy(g_set_rows[i].label, L"Show system specs overlay");
+  set_bool(g_set_rows[i], s.show_sysinfo);
+  ++i;
+  // 11 quick menu
+  wcscpy(g_set_rows[i].label, L"Back+Start quick menu");
+  set_bool(g_set_rows[i], s.quick_menu_enabled);
+  ++i;
+  // 12 vsync
+  wcscpy(g_set_rows[i].label, L"VSync");
+  set_bool(g_set_rows[i], s.vsync);
+  ++i;
+  // 13 frame rate cap
+  wcscpy(g_set_rows[i].label, L"Frame rate cap (0=off)");
+  set_cap(g_set_rows[i], s.frame_rate_cap);
+  ++i;
+  // 14 memory budget
+  wcscpy(g_set_rows[i].label, L"Memory budget MB (guest heap)");
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.memory_budget_mb);
+  ++i;
+  // 15 input deadzone
+  wcscpy(g_set_rows[i].label, L"Controller deadzone (0-20000)");
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.input_deadzone);
+  ++i;
+  // 16 audio buffer
+  wcscpy(g_set_rows[i].label, L"Audio buffer ms");
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.audio_buffer_ms);
+  ++i;
+  // 17 shader cache
+  wcscpy(g_set_rows[i].label, L"Shader compile cache");
+  set_bool(g_set_rows[i], s.shader_cache);
+  ++i;
   g_set_count = i;
 }
 
@@ -1244,6 +1291,15 @@ void apply_settings_rows() {
     else if (i == 6) s.write_watch = (wcscmp(r.value, L"1") == 0);
     else if (i == 7) s.steam_auth = (wcscmp(r.value, L"1") == 0);
     else if (i == 8) s.show_qr = (wcscmp(r.value, L"1") == 0);
+    else if (i == 9) s.show_fps = (wcscmp(r.value, L"1") == 0);
+    else if (i == 10) s.show_sysinfo = (wcscmp(r.value, L"1") == 0);
+    else if (i == 11) s.quick_menu_enabled = (wcscmp(r.value, L"1") == 0);
+    else if (i == 12) s.vsync = (wcscmp(r.value, L"1") == 0);
+    else if (i == 13) s.frame_rate_cap = _wtoi(r.value);
+    else if (i == 14) s.memory_budget_mb = _wtoi(r.value);
+    else if (i == 15) s.input_deadzone = _wtoi(r.value);
+    else if (i == 16) s.audio_buffer_ms = _wtoi(r.value);
+    else if (i == 17) s.shader_cache = (wcscmp(r.value, L"1") == 0);
   }
   longan::settings_store(s, g_local_state);
   char line[128];
@@ -1262,19 +1318,28 @@ bool edit_setting_row(int dir) {
     return true;
   }
   if (r.is_choice) {
+    // row-specific choice lists: frame cap (13) cycles 0/30/60/120,
+    // everything else is the input-mode list.
+    const wchar_t** list = (g_set_selected == 13) ? k_cap_choices
+                                                  : k_input_choices;
     int cur = 0;
     for (int k = 0; k < 4; ++k)
-      if (wcscmp(r.value, k_input_choices[k]) == 0) cur = k;
+      if (wcscmp(r.value, list[k]) == 0) cur = k;
     cur = (cur + dir + 4) % 4;
-    wcscpy(r.value, k_input_choices[cur]);
+    wcscpy(r.value, list[cur]);
     return true;
   }
   if (r.is_int) {
-    // mouse/wheel speeds: step 2 for mouse, 5 for wheel
-    const int step = (g_set_selected == 2) ? 5 : 2;
+    // per-row step and range: mouse/wheel speeds 1..100, memory budget
+    // 128..8192 MB, deadzone 0..20000, audio buffer 10..500 ms
+    int step = 2, lo = 1, hi = 100;
+    if (g_set_selected == 2) { step = 5; }
+    else if (g_set_selected == 14) { step = 128; lo = 128; hi = 8192; }
+    else if (g_set_selected == 15) { step = 500; lo = 0; hi = 20000; }
+    else if (g_set_selected == 16) { step = 10; lo = 10; hi = 500; }
     int v = _wtoi(r.value) + dir * step;
-    if (v < 1) v = 1;
-    if (v > 100) v = 100;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
     swprintf(r.value, 64, L"%d", v);
     return true;
   }
