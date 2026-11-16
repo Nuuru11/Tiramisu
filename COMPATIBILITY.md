@@ -37,6 +37,31 @@
   CrashReporter dir — guest never calls CreateDirectoryW). Named gap.
 - **Gaps:** CrashReporter shutdown exception attribution; insights JSON write path.
 
+### Go Next! Demo (Unity 6 IL2CPP, Steam)
+- **Status:** Tier C (offline) — named blocker, active investigation
+- **Engine:** Unity 6000, IL2CPP + DStorage, DirectX 11/12
+- **Depth:** CRT ✓ WINMAIN ✓ UNITYMAIN2 ✓ — dies in SEH unwinding
+- **Notes:** Minimal-corpus run (exe + UnityPlayer + GameAssembly) reaches
+  UnityMain2 then exits rc=1. Full-corpus run (with baselib, DStorage, data)
+  SIGSEGVs inside `trt_RtlVirtualUnwind` — UnityPlayer's exception path hands
+  the unwinder corrupted/unmapped unwind metadata. Fixed: the unwinder now
+  validates unwind-info pointers against registered guest images and returns
+  a clean "unwind failed" verdict instead of crashing the host. Re-measurement
+  pending with the hardened unwinder.
+- **Gaps:** UnityPlayer SEH unwind metadata validation (hardened, re-measure);
+  DStorage DLLs excluded from minimal corpus.
+
+### OrTMM (OpenTyrian-mod, native C++ PE32+)
+- **Status:** Tier C (offline) — named livelock, capped
+- **Engine:** Native C++ (non-Unity), DirectInput8 + bare ordinal imports
+- **Depth:** CRT ✓ WINMAIN ✓ — enters an EH bounce livelock
+- **Notes:** First native-C++ (non-Unity) corpus entry. Boots through CRT +
+  WinMain, then a single (rip,fault) pair is "handled" forever — 14.5M
+  identical EH bounces. Fixed: per-thread bounce cap at 100k now terminates
+  with a named verdict instead of spinning. Re-measurement pending.
+- **Gaps:** EH bounce livelock root cause (rip=7e014aeefbe1, fault=0); likely
+  a guest fault handler that restores a faulting context incorrectly.
+
 ## Corpus load matrix (DLLs that map + seal cleanly)
 | PE | Status |
 |----|--------|
@@ -45,8 +70,27 @@
 | steam_api64.dll | Maps + seals (was FAIL IMPORT; closed) |
 | UnityPlayer.dll | DllMain → 0x1 |
 | GameAssembly.dll (96MB IL2CPP) | DllMain → 0x1 |
+| dxvk-2.5.3 d3d9.dll (native override) | Maps + seals + DllMain; boots as EXE entry |
 | RACCOIN.exe | Boots (see above) |
 | Ultra Pool game.exe | Boots (see above) |
+| OrTMM.exe | Boots to EH livelock (see above) |
+| Go Next demo.exe | Boots to UnityMain2 (see above) |
+
+## Native DLL overrides (Proton-style)
+
+Games shipping their own API DLLs (dxvk, cnc-ddraw, dgVoodoo, special K, the
+VC runtime) shadow Tiramisu's builtin bridge for that module. Drop the DLL in
+the game directory next to the .exe and it is loaded instead of our bridge —
+the same `WINEDLLOVERRIDES=native` mechanism Proton uses.
+
+**Never overridden** (loader-critical): kernel32, ntdll, user32, gdi32,
+advapi32, ole32, oleaut32, comctl32, shell32, shlwapi, ws2_32, crypt32,
+bcrypt, sechost, rpcrt4, kernelbase, ucrtbase, vcruntime140*, msvcp140*,
+combase, dwrite, d2d1, d3d10, d3d12, dxgi, version.
+
+Everything else (d3d9, d3d8, ddraw, dsound, dinput8, winmm, xinput1_4,
+steam_api64 handled separately) is overridable. dxvk-2.5.3's d3d9.dll is in
+the corpus and maps+seals+boots.
 
 ## Permanent exclusions
 | Category | Examples | Reason |

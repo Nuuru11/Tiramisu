@@ -57,6 +57,31 @@ address — measured ehfix18 SIGSEGV). RACCOIN ladder: 7/7 REACHED. Go Next
 demo.exe also reports `UNITYMAIN2 CALLED: REACHED (IAT-probed)` — two real
 Unity games through the same gate.
 
+### 2026-11-16 — unwinder hardening + livelock cap + native DLL overrides
+
+- **trt_RtlVirtualUnwind hardened** (kernel32 bridge): UnityPlayer's exception
+  path (Go Next demo full-corpus run) handed the unwinder unwind metadata that
+  is unmapped/corrupt — host SIGSEGV at `trt_RtlVirtualUnwind`, guest fault
+  address `image+0x64a4894c`. The unwinder now validates the unwind-info
+  pointer against registered guest images (`safe_unwind_info`) and returns a
+  clean "unwind failed" verdict (0 = no handler) instead of crashing the
+  host. A corrupt .pdata can never again take the runtime down.
+- **EH bounce livelock capped** (kernel32 bridge, hw-fault handler): OrTMM
+  (first native-C++ corpus entry) spins 14.5M identical (rip,fault) bounces —
+  measured, was the cause of every OrTMM wedge/timeout. Per-thread cap at
+  100k bounces now aborts with a named verdict ("guest livelocked in EH
+  bounce loop").
+- **Native DLL override (Proton WINEDLLOVERRIDES=native equivalent) landed**
+  (module_table.cpp `try_native_override` + `is_overridable_module`): a
+  game-shipped API DLL (dxvk's d3d9.dll, cnc-ddraw, dgVoodoo, ...) shadows the
+  builtin bridge for overridable modules. Loader-critical modules are never
+  shadowed. dxvk-2.5.3 x64 d3d9.dll verified: maps + seals + DllMain + boots
+  as EXE entry (RtlAddFunctionTable registered 8822 funcs). This is the
+  wiring path for existing third-party implementations.
+- **corpus-run.sh**: per-EXE `timeout -s KILL 60` bound — a guest that never
+  reaches WM_QUIT is a NAMED hang, not a gate wedge. Go Next demo.exe added
+  to the EXE gate.
+
 ### History — the one wall (now broken): our own SEH/unwind implementation.
 
 **Import audit of the full RACCOIN stack** (`tools/audit_boot.py` — approximate;
