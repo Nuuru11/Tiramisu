@@ -3437,35 +3437,6 @@ bool is_guest_exec_pc(u64 pc) {
   return va_find_idx_locked((uintptr_t)pc) >= 0;
 }
 
-#if !defined(_WIN32) && defined(__x86_64__)
-// Win64 x64 CONTEXT register offsets (verified against mingw winnt.h; 0x4d0 B)
-constexpr size_t k_ctx_flags  = 0x030;
-constexpr size_t k_ctx_eflags = 0x044;
-constexpr size_t k_ctx_rax    = 0x078;
-constexpr size_t k_ctx_rip    = 0x0F8;
-constexpr size_t k_ctx_xmm0   = 0x1A0;
-constexpr size_t k_ctx_size   = 0x4D0;
-
-inline u64 ctx_gpr(const u8* c, u8 reg) {
-  u64 v = 0;
-  if (reg < 16) memcpy(&v, c + k_ctx_rax + (size_t)reg * 8, 8);
-  return v;
-}
-inline void ctx_set_gpr(u8* c, u8 reg, u64 v) {
-  if (reg < 16) memcpy(c + k_ctx_rax + (size_t)reg * 8, &v, 8);
-}
-inline u64 ctx_rip(const u8* c) {
-  u64 v = 0; memcpy(&v, c + k_ctx_rip, 8); return v;
-}
-inline void ctx_set_rip(u8* c, u64 v) { memcpy(c + k_ctx_rip, &v, 8); }
-inline u32 ctx_eflags(const u8* c) {
-  u32 v = 0; memcpy(&v, c + k_ctx_eflags, 4); return v;
-}
-inline void ctx_set_eflags(u8* c, u32 v) { memcpy(c + k_ctx_eflags, &v, 4); }
-inline u8* ctx_xmm(u8* c, u8 reg) {
-  return c + k_ctx_xmm0 + (size_t)(reg & 15u) * 16;
-}
-
 struct trt_ex_record {
   u32 code;
   u32 flags;
@@ -3499,12 +3470,45 @@ struct trt_dispatcher_ctx {
 };
 static_assert(sizeof(trt_dispatcher_ctx) == 88, "Win64 DISPATCHER_CONTEXT size");
 
+
+// Win64 x64 CONTEXT register offsets (verified against mingw winnt.h; 0x4d0 B)
+constexpr size_t k_ctx_flags  = 0x030;
+constexpr size_t k_ctx_eflags = 0x044;
+constexpr size_t k_ctx_rax    = 0x078;
+constexpr size_t k_ctx_rip    = 0x0F8;
+constexpr size_t k_ctx_xmm0   = 0x1A0;
+constexpr size_t k_ctx_size   = 0x4D0;
+
+inline u64 ctx_gpr(const u8* c, u8 reg) {
+  u64 v = 0;
+  if (reg < 16) memcpy(&v, c + k_ctx_rax + (size_t)reg * 8, 8);
+  return v;
+}
+inline void ctx_set_gpr(u8* c, u8 reg, u64 v) {
+  if (reg < 16) memcpy(c + k_ctx_rax + (size_t)reg * 8, &v, 8);
+}
+inline u64 ctx_rip(const u8* c) {
+  u64 v = 0; memcpy(&v, c + k_ctx_rip, 8); return v;
+}
+inline void ctx_set_rip(u8* c, u64 v) { memcpy(c + k_ctx_rip, &v, 8); }
+inline u32 ctx_eflags(const u8* c) {
+  u32 v = 0; memcpy(&v, c + k_ctx_eflags, 4); return v;
+}
+inline void ctx_set_eflags(u8* c, u32 v) { memcpy(c + k_ctx_eflags, &v, 4); }
+inline u8* ctx_xmm(u8* c, u8 reg) {
+  return c + k_ctx_xmm0 + (size_t)(reg & 15u) * 16;
+}
+
+
+#if !defined(_WIN32) && defined(__x86_64__)
+
 struct dispatch_node {
   u64 return_pc;
   u8 throw_ctx[k_ctx_size];
   dispatch_node* prev;
 };
 __thread dispatch_node* t_dispatch_head = nullptr;
+
 
 // Funclet resume records. When RtlUnwindEx stops at TargetFrame and resumes
 // the catch/__finally funclet via trt_restore_win64_context, the funclet runs

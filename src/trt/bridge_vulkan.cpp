@@ -9,7 +9,11 @@
 // maxFragmentInputComponents=0 -> Godot computed "maximum varyings = 0" ->
 // EVERY shader compile failed -> endless scene-import retry storm). The
 // header layout is stable and pointer-free; the static_asserts below pin it.
+#if __has_include(<vulkan/vulkan_core.h>)
 #include <vulkan/vulkan_core.h>
+#else
+#include "vulkan_core_stub.h"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -67,10 +71,12 @@ struct vk_layer_props {
 };
 // The properties/limits structs now come straight from <vulkan/vulkan_core.h>
 // (see the include above). Static asserts pin the ABI the ICD was measured on.
+#if __has_include(<vulkan/vulkan_core.h>)
 static_assert(sizeof(VkPhysicalDeviceLimits) == 504,
               "VkPhysicalDeviceLimits ABI drift");
 static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
               "VkPhysicalDeviceProperties.limits offset drift");
+#endif
 // Local aliases keep the existing call sites unchanged.
 using vk_phys_dev_props = VkPhysicalDeviceProperties;
 using vk_phys_dev_props2 = VkPhysicalDeviceProperties2;
