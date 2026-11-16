@@ -11,12 +11,18 @@
 // The device hands out the classic states: DIMOUSESTATE (dx/dy/buttons)
 // and the 256-byte keyboard state (one byte per virtual key).
 #include "bridge_dinput.h"
+#include "bridge_ole.h"
 #include "thunk.h"
 #include "input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+namespace {
+// named-line logging (fail-visible surface, same shape as the other bridges)
+void di_log(const char* s) { trt_core_log(s); }
+#define log_line(s_) di_log(s_)
 
 namespace {
 
@@ -546,7 +552,52 @@ int TRT_GUEST_ABI trt_DirectInput8Create(void* hinst, u32 version,
   return DI_OK_;
 }
 
-int trt_bridge_register_dinput(void) {
+} // extern "C"
+
+// CLSID_DirectInput8 {25E609E4-B259-11CF-BFC7-444553540000} — the COM path
+// to the same object DirectInput8Create hands out. Games created through
+// CoCreateInstance (Unity input plugins, SDL windows) were refused with
+// REGDB_E_CLASSNOTREG even though the dll surface existed (measured: the
+// corpus gap list named this CLSID).
+// NOTE: factories are invoked by the HOST ole bridge (plain SysV); only the
+// vtbl methods of the returned object are TRT_GUEST_ABI.
+int dinput8_com_factory(const void* iid, void** out, void* user) {
+  (void)user;
+  if (!iid || !out) return (int)0x80070057;  // E_INVALIDARG
+  *out = &g_di8_obj;
+  char line[128];
+  // IID_IDirectInput8W  {1237BF00-12BE-101C-9B1D-08002BB30F25}
+  // IID_IDirectInput8A  {1237BF01-12BE-101C-9B1D-08002BB30F25}
+  static const u8 k_iid_di8w[16] = {0x00, 0xBF, 0x37, 0x12, 0xBE, 0x12, 0x1C,
+                                    0x10, 0x9B, 0x1D, 0x08, 0x00, 0x2B, 0xB3,
+                                    0x0F, 0x25};
+  static const u8 k_iid_di8a[16] = {0x01, 0xBF, 0x37, 0x12, 0xBE, 0x12, 0x1C,
+                                    0x10, 0x9B, 0x1D, 0x08, 0x00, 0x2B, 0xB3,
+                                    0x0F, 0x25};
+  const bool w = memcmp(iid, k_iid_di8w, 16) == 0;
+  const bool a = memcmp(iid, k_iid_di8a, 16) == 0;
+  if (w || a) {
+    snprintf(line, sizeof(line),
+             "dinput8: CoCreateInstance(CLSID_DirectInput8, IID_IDirectInput8%c)"
+             " -> IDirectInput8W object (A-twin served by the W vtable)",
+             a ? 'A' : 'W');
+    log_line(line);
+    return DI_OK_;
+  }
+  snprintf(line, sizeof(line),
+           "dinput8: CoCreateInstance(CLSID_DirectInput8) -> E_NOINTERFACE "
+           "(IID not IDirectInput8W/A)");
+  log_line(line);
+  return (int)0x80004002;  // E_NOINTERFACE
+}
+
+extern "C" int trt_bridge_register_dinput(void) {
+  // CLSID_DirectInput8 {25E609E4-B259-11CF-BFC7-444553540000}
+  static const u8 k_clsid_dinput8[16] = {0xE4, 0x09, 0xE6, 0x25, 0x59, 0xB2,
+                                         0xCF, 0x11, 0xBF, 0xC7, 0x44, 0x45,
+                                         0x53, 0x54, 0x00, 0x00};
+  trt_ole_register_class(k_clsid_dinput8, &dinput8_com_factory, nullptr);
+
   static const trt_named_fn k_fns[] = {
       {"DirectInput8Create", (void*)&trt_DirectInput8Create},
       {"trt_di_feed_move", (void*)&trt_di_feed_move},
