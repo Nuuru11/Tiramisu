@@ -66,7 +66,8 @@ int main() {
                                 &establisher, nullptr);
   (void)rc;
   CHECK(establisher == (u64)(uintptr_t)&rsp_slot, "leaf: establisher = rsp");
-  // rip restored from the stack slot; rsp advanced by 8
+  // rip restored from the stack slot, rsp advanced by 8 (asserted via ctx
+  // readback in t4's fuller variant; here we assert the no-crash property).
   CHECK(true, "leaf: no crash (reached here)");
   printf("  [t1 leaf pop]\n");
   // ---- test 2: garbage fn_entry (unmapped pointer) -> clean 0 ----
