@@ -760,3 +760,10 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_fmod.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_fmod"
 "$out/test_fmod"
+
+# --- 44. loader fuzzer: malformed PEs must fail NAMED, never crash the host
+#         (the launch path reads untrusted game files) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_fuzz_loader.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_fuzz_loader"
+"$out/test_fuzz_loader"

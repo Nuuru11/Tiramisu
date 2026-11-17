@@ -55,6 +55,14 @@ int g_extn = 0;
 std::vector<std::string> g_log;
 
 void* l_alloc(size_t bytes, u64 pref) {
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && \
+    defined(__clang__) && __has_feature(address_sanitizer))
+  {  // ASan's shadow gap swallows the guests' usual preferred bases
+     // (0x140000000 is INSIDE it): let the kernel pick; the loader relocates.
+    const uintptr_t _b = (uintptr_t)(size_t)pref;
+    if (_b >= 0x00008fff7000ull && _b <= 0x02008fff6fffull) pref = 0;
+  }
+#endif
   void* p = mmap(pref ? (void*)(uintptr_t)pref : nullptr, bytes,
                  PROT_READ | PROT_WRITE,
                  pref ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)

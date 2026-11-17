@@ -401,11 +401,13 @@ int TRT_GUEST_ABI dx_CreateTextureFromFileInMemory(void* dev,
 
   tex_peek t{};
   // BMP: 'BM' + 54-byte BITMAPINFOHEADER (most games use 32-bit BMPs)
+  // NOTE: read the header fields with memcpy — the guest may hand us data at
+  // ANY alignment (a u32 cast at +10/+18/+22 is UB; caught by UBSan).
   if (bytes >= 54 && d[0] == 'B' && d[1] == 'M') {
-    const u32 off = *(const u32*)(d + 10);
-    const u32 w = *(const u32*)(d + 18);
-    const i32 h32 = *(const i32*)(d + 22);
-    const u16 bpp = *(const u16*)(d + 28);
+    u32 off; memcpy(&off, d + 10, 4);
+    u32 w; memcpy(&w, d + 18, 4);
+    i32 h32; memcpy(&h32, d + 22, 4);
+    u16 bpp; memcpy(&bpp, d + 28, 2);
     if (w && h32 != 0 && (bpp == 24 || bpp == 32)) {
       t.w = w;
       t.h = (u32)(h32 < 0 ? -h32 : h32);

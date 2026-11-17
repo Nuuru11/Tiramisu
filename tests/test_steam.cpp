@@ -21,11 +21,23 @@ extent g_extents[16];
 int g_extent_count = 0;
 
 void* linux_alloc(size_t bytes, u64 preferred_base) {
-  void* p = mmap(preferred_base ? (void*)(uintptr_t)preferred_base : nullptr,
-                 bytes, PROT_READ | PROT_WRITE,
-                 preferred_base ? (MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS)
-                                : (MAP_PRIVATE | MAP_ANONYMOUS),
-                 -1, 0);
+  void* p = nullptr;
+  if (preferred_base) {
+    // ASan's shadow gap swallows the guest's usual preferred bases
+    // (0x140000000 is INSIDE it — measured "unknown-crash" false positives):
+    // under sanitizers, let the kernel pick and let the loader relocate.
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && \
+    (defined(__clang__) && __has_feature(address_sanitizer)))
+    const uintptr_t gap_lo = 0x00008fff7000ull, gap_hi = 0x02008fff6fffull;
+    if (preferred_base >= gap_lo && preferred_base <= gap_hi) preferred_base = 0;
+#endif
+    if (preferred_base)
+      p = mmap((void*)(uintptr_t)preferred_base, bytes, PROT_READ | PROT_WRITE,
+               MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  }
+  if (!p || p == MAP_FAILED)
+    p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
+             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (p == MAP_FAILED) return nullptr;
   if (g_extent_count < 16) {
     g_extents[g_extent_count].base = p;

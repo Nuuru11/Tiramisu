@@ -18,6 +18,14 @@
 #include <vector>
 #include <string>
 
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+extern "C" void __asan_unpoison_memory_region(const volatile void*, size_t)
+    __attribute__((weak));
+static const auto asan_unpoison = __asan_unpoison_memory_region;
+#  endif
+#endif
+
 namespace {
 
 u16 rd16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
@@ -675,6 +683,16 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
            (unsigned long long)preferred,
            (unsigned long long)size_of_image, (unsigned long long)entry_rva);
   logf_be(be, line);
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+  // ASan cannot see mmap-backed guest memory: every legitimate guest write
+  // into its own image reads as a wild "unknown-crash" (measured: the D3D
+  // surface memsets at the image base). Unpoison the whole image so ASan
+  // supervises guest writes as valid memory — real overflows past the image
+  // are still caught.
+  if (asan_unpoison) asan_unpoison(img.base, size_of_image);
+#  endif
+#endif
   return TRT_OK;
 }
 

@@ -87,6 +87,14 @@ extent g_extents[65536];
 int g_extent_count = 0;
 
 void* linux_alloc(size_t bytes, u64 preferred_base) {
+#if defined(__SANITIZE_ADDRESS__) || (defined(__has_feature) && \
+    defined(__clang__) && __has_feature(address_sanitizer))
+  {  // ASan's shadow gap swallows the guests' usual preferred bases
+     // (0x140000000 is INSIDE it): let the kernel pick; the loader relocates.
+    const uintptr_t _b = (uintptr_t)(size_t)preferred_base;
+    if (_b >= 0x00008fff7000ull && _b <= 0x02008fff6fffull) preferred_base = 0;
+  }
+#endif
   if (preferred_base) {
     const uintptr_t want = (uintptr_t)preferred_base;
     const uintptr_t want_end = want + bytes;
