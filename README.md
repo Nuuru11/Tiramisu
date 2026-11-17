@@ -9,8 +9,6 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-<img src="docs/logo.png" alt="Tiramisu logo" width="128"/>
-
 ![Status](https://img.shields.io/badge/status-real%20Steam%20games%20boot%20%2B%20render--loop%20proven-brightgreen)
 ![Gates](https://img.shields.io/badge/offline%20gates-49%2F49%20pass-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
