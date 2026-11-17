@@ -13,7 +13,8 @@ out="${1:-out}"
 cp package/AppxManifest.xml "$out/layout/AppxManifest.xml"
 mkdir -p "$out/layout/Assets"
 cp tests/out/guest_hello.exe "$out/layout/guest_hello.exe"
-[[ -f "$out/layout/Assets/StoreLogo.png" ]] || python3 tools/gen-assets.py "$out/layout/Assets"
+# regenerate the real branding assets every pack (sources: package/branding)
+python3 tools/gen-assets.py "$out/layout/Assets"
 
 # ---- test cert (never committed; subject == Publisher) ----------------------
 if [[ ! -f "$out/dev.pfx" ]]; then
