@@ -93,7 +93,7 @@ for t in $suites; do
     || { echo "SANITIZE-GATE: $t BUILD FAILED"; rc=1; continue; }
   # the drive_c-arg suites need the mount point to EXIST (the VFS mount
   # fails otherwise and relative-path resolution falls to the host cwd)
-  [[ "$t" == test_engine || "$t" == test_reg ]] && mkdir -p /tmp/tir-san-drive_c
+  [[ "$t" == test_engine || "$t" == test_reg ]] && rm -rf /tmp/tir-san-drive_c; mkdir -p /tmp/tir-san-drive_c  # FRESH state: build-test rm -rf its DRIEC too
   ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 \
   UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
     timeout 300 "$out/$t" $g > "$out/$t.san.log" 2>&1

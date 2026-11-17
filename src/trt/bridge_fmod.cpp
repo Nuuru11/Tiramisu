@@ -23,6 +23,7 @@
 #include "trt.h"
 
 #include <chrono>
+#include <mutex>
 #include <stdio.h>
 #include <thread>
 #include <utility>
@@ -166,25 +167,36 @@ void feeder_push_once(fmod_channel* fc) {
                          s->channels, s->bps, s->is_float, fc->volume);
 }
 
+// channel state (playing/paused/volume) is touched by the guest thread AND
+// the feeder thread — measured data race (TSan gate) without this lock.
+static std::mutex g_ch_mu;
+
 void feeder_fn(void) {
   while (g_feeder_run) {
     int active = 0;
-    for (u32 i = 0; i < g_feeder_count; ++i) {
-      fmod_channel* fc = g_feeders[i].ch;
-      if (!fc || !fc->playing || fc->paused) continue;
-      fmod_sound* s = fc->snd;
-      if (!s || !s->pcm || !s->loop) continue;
-      // re-push at ~1/2 the sound's duration, bounded to 250ms steps
-      u32 dur_ms = s->length_ms;
-      unsigned step = dur_ms ? (dur_ms / 2u) : 250u;
-      if (step < 30u) step = 30u;
-      if (step > 250u) step = 250u;
-      feeder_push_once(fc);
-      active = 1;
-      std::this_thread::sleep_for(std::chrono::milliseconds(step));
+    unsigned longest_step = 50u;
+    {  // ONE lock for registry + channel state; NO sleep inside it
+      // (std::mutex is not recursive — and PlaySound must not wait 250ms
+      // behind a sleeping feeder)
+      std::lock_guard<std::mutex> lk(g_ch_mu);
+      const u32 feeder_n = g_feeder_count;
+      for (u32 i = 0; i < feeder_n; ++i) {
+        fmod_channel* fc = g_feeders[i].ch;
+        if (!fc || !fc->playing || fc->paused) continue;
+        fmod_sound* s = fc->snd;
+        if (!s || !s->pcm || !s->loop) continue;
+        // re-push at ~1/2 the sound's duration, bounded to 250ms steps
+        u32 dur_ms = s->length_ms;
+        unsigned step = dur_ms ? (dur_ms / 2u) : 250u;
+        if (step < 30u) step = 30u;
+        if (step > 250u) step = 250u;
+        if (step > longest_step) longest_step = step;
+        feeder_push_once(fc);
+        active = 1;
+      }
     }
-    if (!active)
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    std::this_thread::sleep_for(std::chrono::milliseconds(active ? longest_step
+                                                                 : 50u));
   }
 }
 
@@ -200,6 +212,7 @@ void feeder_ensure(void) {
 }
 
 void feeder_drop(fmod_channel* fc) {
+  std::lock_guard<std::mutex> lk(g_ch_mu);
   for (u32 i = 0; i < g_feeder_count; ++i)
     if (g_feeders[i].ch == fc) {
       g_feeders[i] = g_feeders[g_feeder_count - 1];
@@ -575,17 +588,19 @@ int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* channel_or_index,
   fmod_obj* o = (fmod_obj*)obj_make(FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_PARAM_;
   fmod_channel* fc = &o->ch;
-  fc->snd = &so->snd;
-  fc->volume = 1.0f;
-  fc->paused = paused ? 1 : 0;
-  fc->playing = 1;
-  fc->voice_id = (u64)(uintptr_t)o * 2654435761ull + 1ull;
-  if (!fc->paused && so->snd.pcm) {
-    feeder_push_once(fc);
-    if (so->snd.loop) {
-      if (g_feeder_count < 32) g_feeders[g_feeder_count++].ch = fc;
-      feeder_ensure();
-    }
+  {
+    std::lock_guard<std::mutex> lk(g_ch_mu);
+    fc->snd = &so->snd;
+    fc->volume = 1.0f;
+    fc->paused = paused ? 1 : 0;
+    fc->playing = 1;
+    fc->voice_id = (u64)(uintptr_t)o * 2654435761ull + 1ull;
+    if (!fc->paused && so->snd.pcm) feeder_push_once(fc);
+  }
+  if (!paused && so->snd.pcm && so->snd.loop) {
+    { std::lock_guard<std::mutex> lk(g_ch_mu);
+      if (g_feeder_count < 32) g_feeders[g_feeder_count++].ch = fc; }
+    feeder_ensure();
   }
   if (so->snd.silent && so->snd.pcm == nullptr) {
     // one named line per silent sound (first play only: snd->silent acts as
@@ -605,7 +620,7 @@ int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* channel_or_index,
 int TRT_GUEST_ABI fmod_Channel_Stop(void* ch) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  o->ch.playing = 0;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); o->ch.playing = 0; }
   feeder_drop(&o->ch);
   return FMOD_OK_;
 }
@@ -613,35 +628,35 @@ int TRT_GUEST_ABI fmod_Channel_Stop(void* ch) {
 int TRT_GUEST_ABI fmod_Channel_SetVolume(void* ch, float vol) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  o->ch.volume = vol;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); o->ch.volume = vol; }
   return FMOD_OK_;
 }
 
 int TRT_GUEST_ABI fmod_Channel_GetVolume(void* ch, float* vol) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  if (vol) *vol = o->ch.volume;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); if (vol) *vol = o->ch.volume; }
   return FMOD_OK_;
 }
 
 int TRT_GUEST_ABI fmod_Channel_SetPaused(void* ch, int paused) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  o->ch.paused = paused ? 1 : 0;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); o->ch.paused = paused ? 1 : 0; }
   return FMOD_OK_;
 }
 
 int TRT_GUEST_ABI fmod_Channel_GetPaused(void* ch, int* paused) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  if (paused) *paused = o->ch.paused;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); if (paused) *paused = o->ch.paused; }
   return FMOD_OK_;
 }
 
 int TRT_GUEST_ABI fmod_Channel_IsPlaying(void* ch, int* playing) {
   fmod_obj* o = obj_check(ch, FM_T_CHANNEL);
   if (!o) return FMOD_ERR_INVALID_HANDLE_;
-  if (playing) *playing = o->ch.playing;
+  { std::lock_guard<std::mutex> lk(g_ch_mu); if (playing) *playing = o->ch.playing; }
   return FMOD_OK_;
 }
 

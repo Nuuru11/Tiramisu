@@ -138,6 +138,39 @@ so the CLI path never runs; the live session ran it via import (see
   next: console M0 when DP credentials arrive, or the command-list recording
   surface (item 27 remainder) on request.)
 
+**OPEN BUG (named, measured): missed relocation at non-preferred bases.**
+The TSan gate SEGV'd inside `name_eq` (module_table.cpp:29) while resolving
+a guest import whose module-name pointer landed OUTSIDE the relocated image
+(rsi=0x100004200c20, image size 0x352000). Signature: a guest loaded at a
+non-preferred base takes a fault through a pointer the reloc pass did not
+fix. The same signature appeared in RACCOIN's earlier flake (plugin load at
+a relocated base -> UnityPlayer NULL-call). The reloc machinery itself is
+proven (guest_hello_reloc verifies values), so the suspect is RELOC
+COVERAGE for a specific guest shape — e.g. lld-link emitting reloc blocks
+the loader's walk skips, or the import-directory/name RVAs being treated as
+absolute. Reproduce: run test_ntdll under tools/tsan-gate.sh (the guest maps
+at a kernel-chosen base there). This is the LAST loader-class blocker for
+guaranteeing "boots at ANY base".
+
+**LANDED (certainty layer, 2026-11-17):**
+- **tools/sanitize-gate.sh** — the whole runtime under ASan+UBSan
+  (recover=false), every guest-executing suite with its exact guest args
+  (mirrored from build-test.sh): **35 suites ALL CLEAN**.
+- **tools/tsan-gate.sh** — same suites under ThreadSanitizer: caught a REAL
+  data race in bridge_fmod (channel state written by PlaySound, read by the
+  feeder thread) — FIXED with a channel mutex; caught a mixed-atomicity
+  race in WaitOnAddress (plain read vs the guest's Interlocked store) —
+  FIXED with acquire-atomic loads (also more correct Win32 semantics).
+- **tests/test_fuzz_loader (suite 44)** — 4000 random PE mutations + 9
+  structural attacks; the host survives every input, failures named.
+- **REAL UB fixed**: bridge_d3dx9 misaligned u32/u16 loads from guest file
+  data (memcpy reads now — the old code was UB on strict platforms).
+- **ASan environment fixes**: guest-image unpoison at map time (ASan cannot
+  see mmap-backed guest memory); test allocators avoid ASan's shadow gap
+  (0x140000000 preferred bases are INSIDE it); function-type CFI disabled
+  in the gates (the guest<->host boundary is an intentional dual-ABI
+  crossing — impossible on console where one ABI exists).
+
 **LANDED (FMOD audio bridge — new game-class unlock, 2026-11-17 early):**
 - **NEW bridge_fmod.cpp** — fmodex.dll / fmodex64.dll / fmod.dll /
   fmodstudio.dll / fmodstudioL.dll registered as one BUILTIN table (28

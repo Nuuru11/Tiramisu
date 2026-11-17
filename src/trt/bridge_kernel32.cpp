@@ -1073,11 +1073,19 @@ void TRT_STDCALL trt_Sleep(u32 ms) {
 // that the caller dereferences (measured live: Go Next demo.exe SIGSEGV at
 // UnityPlayer+0x16da6a6, vtable call returned 0).
 static bool wait_addr_same(volatile void* addr, void* cmp, u32 size) {
+  // the loads are ATOMIC (acquire): the signaler's store is Interlocked
+  // (guest code) — a plain read here is a mixed-atomicity data race
+  // (measured by the TSan gate) and real Win32 gives the wait an acquire
+  // fence anyway.
   switch (size) {
-    case 1: return *(volatile u8*)addr == *(u8*)cmp;
-    case 2: return *(volatile u16*)addr == *(u16*)cmp;
-    case 4: return *(volatile u32*)addr == *(u32*)cmp;
-    case 8: return *(volatile u64*)addr == *(u64*)cmp;
+    case 1: return __atomic_load_n((volatile u8*)addr, __ATOMIC_ACQUIRE) ==
+                    *(u8*)cmp;
+    case 2: return __atomic_load_n((volatile u16*)addr, __ATOMIC_ACQUIRE) ==
+                    *(u16*)cmp;
+    case 4: return __atomic_load_n((volatile u32*)addr, __ATOMIC_ACQUIRE) ==
+                    *(u32*)cmp;
+    case 8: return __atomic_load_n((volatile u64*)addr, __ATOMIC_ACQUIRE) ==
+                    *(u64*)cmp;
     default: return false;
   }
 }
