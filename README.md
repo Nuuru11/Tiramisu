@@ -31,8 +31,6 @@ Series X|S Dev Mode. No CPU emulation for 64-bit games: the console is x64,
 so guests run at **native speed** on the same core, the same ABI, the same
 process — Tiramisu is the operating system around them.
 
-Named after the fruit-emulator tradition (yuzu, citra, papaya).
-
 ```text
 Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
   └── trt — Tiramisu runtime
