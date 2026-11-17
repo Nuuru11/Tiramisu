@@ -12,8 +12,9 @@ corpus-local/
 # vendored donors (MIT/Zlib licenses): strip VCS metadata and GL4ES trace
 # archives (46M of .tgz game traces — test data, not needed for the build)
 third_party/gl4es/.git/
-third_party/gl4es/traces/
-third_party/gl4es/refs/
-third_party/gl4es/spec/
+
+
+
 third_party/d3d8to9/.git/
 third_party/mojoshader/.git/
+.mochi/
