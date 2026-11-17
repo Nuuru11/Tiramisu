@@ -56,6 +56,12 @@ extern "C" int __attribute__((ms_abi)) trt_GetTempPathW(u32 size, u16* buf);
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <utility>
+
+// tests/corpus_ucrt_wrappers.c: ms_abi wrappers over host libc for the UCRT
+// C-library surface (the MinGW DLLs' DllMain CRT init calloc's first thing —
+// the blanket-0 answer NULL'd it and the guest aborted; see the wrapper file).
+void* ucrt_wrap_resolve(const char* symbol);
 #include <sys/stat.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -597,6 +603,63 @@ com_obj g_factory  = {g_factory_vtbl};
 com_obj g_sc       = {g_sc_vtbl};
 com_obj g_res      = {g_res_vtbl};
 
+// ---- per-slot hit counters: the frame-loop probe --------------------------
+// Every mock slot starts as a counting thunk (returns 0 like ret_zero) and
+// records which vtbl slots the guest actually calls. Named handlers overwrite
+// their slots AFTER the counting fill, so positions are never guessed — the
+// histogram is measured, then the boot report prints it. This is how the
+// render loop gets proven offline: thousands of context calls + a repeating
+// swapchain slot = Unity's frame loop spinning; the repeating SC slot is
+// Present (called once per frame).
+static u64 g_dev_hits[50];
+static u64 g_ctx_hits[144];
+static u64 g_sc_hits[32];
+template <int N> static i64 TRT_GUEST_ABI dev_thunk(void) { ++g_dev_hits[N]; return 0; }
+template <int N> static i64 TRT_GUEST_ABI ctx_thunk(void) { ++g_ctx_hits[N]; return 0; }
+template <int N> static i64 TRT_GUEST_ABI sc_thunk(void) { ++g_sc_hits[N]; return 0; }
+template <int N> void fill_counting(const void** v) { v[N] = (const void*)&dev_thunk<N>; }
+template <int... Is> void fill_counting_seq(const void** v, int which,
+                                            std::integer_sequence<int, Is...>) {
+  ((v[Is] = which == 0   ? (const void*)&dev_thunk<Is>
+           : which == 1 ? (const void*)&ctx_thunk<Is>
+                        : (const void*)&sc_thunk<Is>),
+   ...);
+}
+static void fill_counting_all(const void** v, int n, int which) {
+  if (n == 50) fill_counting_seq(v, which, std::make_integer_sequence<int, 50>{});
+  else if (n == 144) fill_counting_seq(v, which, std::make_integer_sequence<int, 144>{});
+  else if (n == 32) fill_counting_seq(v, which, std::make_integer_sequence<int, 32>{});
+}
+static void mock_dump_hits(void) {
+  u64 dev_total = 0, ctx_total = 0, sc_total = 0;
+  for (int i = 0; i < 50; ++i) dev_total += g_dev_hits[i];
+  for (int i = 0; i < 144; ++i) ctx_total += g_ctx_hits[i];
+  for (int i = 0; i < 32; ++i) sc_total += g_sc_hits[i];
+  printf("  mock gpu calls        : dev=%llu ctx=%llu sc=%llu\n",
+         (unsigned long long)dev_total, (unsigned long long)ctx_total,
+         (unsigned long long)sc_total);
+  // top-6 context slots (draws/state sets) + every hit swapchain slot
+  int top[6] = {-1, -1, -1, -1, -1, -1};
+  for (int i = 0; i < 144; ++i) {
+    for (int k = 0; k < 6; ++k) {
+      if (top[k] < 0 || g_ctx_hits[i] > g_ctx_hits[top[k]]) {
+        for (int m = 5; m > k; --m) top[m] = top[m - 1];
+        top[k] = i;
+        break;
+      }
+    }
+  }
+  printf("  mock ctx top slots    :");
+  for (int k = 0; k < 6; ++k)
+    if (top[k] >= 0 && g_ctx_hits[top[k]] > 0)
+      printf(" %d(x%llu)", top[k], (unsigned long long)g_ctx_hits[top[k]]);
+  printf("\n  mock sc hit slots     :");
+  for (int i = 0; i < 32; ++i)
+    if (g_sc_hits[i])
+      printf(" %d(x%llu)", i, (unsigned long long)g_sc_hits[i]);
+  printf("\n");
+}
+
 static void fill_vtbl(const void** v, int n, const void* def) {
   for (int i = 0; i < n; ++i) v[i] = def;
   v[0] = (const void*)&qi_self;
@@ -608,7 +671,7 @@ static void init(void) {
   static int inited = 0;
   if (inited) return;
   inited = 1;
-  fill_vtbl(g_dev_vtbl, 50, (const void*)&ret_zero);
+  fill_counting_all(g_dev_vtbl, 50, 0);  // counting default; named slots below
   g_dev_vtbl[0]  = (const void*)&dev_qi;
   g_dev_vtbl[3]  = (const void*)&out4_res;   // CreateBuffer
   g_dev_vtbl[4]  = (const void*)&out4_res;   // CreateTexture1D
@@ -644,7 +707,7 @@ static void init(void) {
   g_dev_vtbl[37] = (const void*)&dev_get_fl;
   g_dev_vtbl[40] = (const void*)&dev_get_ctx;
 
-  fill_vtbl(g_ctx_vtbl, 144, (const void*)&ret_zero);
+  fill_counting_all(g_ctx_vtbl, 144, 1);
   g_ctx_vtbl[3]  = (const void*)&child_get_dev;
   g_ctx_vtbl[14] = (const void*)&ctx_map;
   g_ctx_vtbl[29] = (const void*)&ctx_get_data;
@@ -673,7 +736,7 @@ static void init(void) {
   g_factory_vtbl[12] = (const void*)&factory_enum_adapters;
   g_factory_vtbl[15] = (const void*)&factory_create_sc_hwnd;
 
-  fill_vtbl(g_sc_vtbl, 32, (const void*)&ret_zero);
+  fill_counting_all(g_sc_vtbl, 32, 2);
   g_sc_vtbl[5]  = (const void*)&ret_dxgi_not_found;
   g_sc_vtbl[6]  = (const void*)&adapter_get_parent;
   g_sc_vtbl[7]  = (const void*)&child_get_dev;
@@ -803,6 +866,12 @@ void* console_system_load(const char* module, const char* symbol) {
         if (k_console_named_fns[i].fn) return k_console_named_fns[i].fn;
         break;  // named but no fn: fall through to the blanket 0 bind
       }
+    }
+    // MinGW/UCRT C-library surface: real ms_abi wrappers over host libc.
+    // ucrtbase!calloc answered 0 -> libwinpthread's first allocation NULL'd
+    // -> store fault -> EH bounce loop -> abort (measured on libstdc++-6.dll).
+    if (wl_ieq(module, "ucrtbase.dll")) {
+      if (void* f = ucrt_wrap_resolve(symbol)) return f;
     }
     // STAGE 7 discovery: name every blanket-0 bind of a whitelisted SYSTEM
     // symbol — each line is a candidate surface for the next fix-cycle.
@@ -1101,16 +1170,36 @@ void raise_trap(unsigned code) {
   longjmp(g_boot.back, 1);
 }
 
-// the watchdog: if the boot did not produce a message loop within 10s,
-// force the quit path the console's shell would eventually force
+// the watchdog: force the quit path the console's shell would eventually
+// force — but measure IDLENESS, not wall time. RACCOIN under desktop load
+// spends >10s in il2cpp metadata load + a 40-thread init storm; the old
+// wall-clock watchdog fired WM_CLOSE mid-initialization, the shutdown raced
+// the plugin load, and UnityPlayer NULL-called during teardown (measured:
+// SIGSEGV at 0x0 in UnityPlayer +0xa37d63, intermittent with machine load).
+// observe() stamps every trt log line as engine activity; the watchdog fires
+// after 10s of SILENCE (a hung/idle pump) or a 120s hard wall (a noisy
+// guest that never quits still gets bounded).
+static unsigned long boot_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long)ts.tv_sec * 1000ul + (unsigned long)(ts.tv_nsec / 1000000);
+}
+static volatile unsigned long g_last_activity_ms;
+static volatile int g_activity_started;
 void* watchdog_fn(void*) {
-  for (int i = 0; i < 100; ++i) {
-    struct timespec ts{0, 100 * 1000000};  // 100ms steps
+  g_last_activity_ms = boot_now_ms();
+  g_activity_started = 1;
+  for (int i = 0; i < 1200; ++i) {  // 100ms steps, 120s hard wall
+    struct timespec ts{0, 100 * 1000000};
     nanosleep(&ts, nullptr);
     if (g_boot.quit_seen || g_boot.trapped) return nullptr;
+    const unsigned long now = boot_now_ms();
+    const unsigned long since_activity = now - g_last_activity_ms;
+    if (since_activity < 10000ul) continue;  // engine is working: let it
+    break;                                   // 10s silent: hung or idle-pump
   }
   g_boot.watchdog_fired = 1;
-  trt_core_log("trt: boot-watchdog fired (10s without WM_QUIT) -> posting WM_CLOSE");
+  trt_core_log("trt: boot-watchdog fired (10s without engine activity or 120s wall) -> posting WM_CLOSE");
   // Godot's Windows quit path is WM_CLOSE -> guest WndProc ->
   // WINDOW_EVENT_CLOSE_REQUEST -> SceneTree quit (measured against
   // godot 4.3 display_server_windows.cpp / window.cpp / scene_tree.cpp:
@@ -1126,6 +1215,7 @@ void* watchdog_fn(void*) {
 
 // depth-ladder detection: called from trt_log_ring (same thread as the guest)
 void observe(const char* line) {
+  if (g_activity_started) g_last_activity_ms = boot_now_ms();  // engine alive
   // NOTE: UnityMain2 is NOT detected here. It is called guest->guest (no
   // bridge line ever mentions the call) and matching "UnityMain2" anywhere
   // false-positives on the IMPORT-BIND line ("trt: bind
@@ -1322,6 +1412,7 @@ static int boot_run_entry(void* img_v, const char* name) {
   printf("  PUMP ENTERED          : %s\n", marker(g_boot.pump_started));
   printf("  PUMP QUIT             : %s\n", marker(g_boot.quit_seen));
   printf("  messages dispatched   : %u\n", trt_msg_dispatched());
+  mock_gpu::mock_dump_hits();
 
   if (g_boot.trapped == 1) {
     printf("\nBOOT EXITED %s: ExitProcess(rc=%d) at last bridge: %s\n", name,

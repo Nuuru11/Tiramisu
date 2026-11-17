@@ -1888,8 +1888,20 @@ struct tiramisu_host
         continue;
       }
       if (g_guest_running.load() && g_quick_menu_open) {
-        // quick menu navigation
+        // quick menu navigation — this branch runs on the UI loop, NOT in the
+        // pad-poll block above (whose locals are out of scope here), so poll
+        // the pad fresh.
         static bool qm_up = false, qm_dn = false, qm_go = false, qm_back = false;
+        XINPUT_STATE qm_xs{};
+        ZeroMemory(&qm_xs, sizeof(qm_xs));
+        const u16 qm_b = (XInputGetState(0, &qm_xs) == ERROR_SUCCESS)
+                             ? qm_xs.Gamepad.wButtons
+                             : 0;
+        const bool want_up = (qm_b & XINPUT_GAMEPAD_DPAD_UP) != 0;
+        const bool want_dn = (qm_b & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
+        const bool want_go = (qm_b & XINPUT_GAMEPAD_A) != 0;
+        const bool pad_vm =
+            (qm_b & XINPUT_GAMEPAD_BACK) && (qm_b & XINPUT_GAMEPAD_START);
         if (want_up && !qm_up) { qm_up = true; /* navigate up */ }
         else if (!want_up) qm_up = false;
         if (want_dn && !qm_dn) { qm_dn = true; /* navigate down */ }
@@ -1899,13 +1911,13 @@ struct tiramisu_host
           // A: activate selected item (placeholder)
         } else if (!want_go) qm_go = false;
         // B or Back+Start again: close menu
-        if ((b & XINPUT_GAMEPAD_B) && !qm_back) {
+        if ((qm_b & XINPUT_GAMEPAD_B) && !qm_back) {
           qm_back = true;
           g_quick_menu_open = false;
           longan::ui_set_quick_menu(false);
-        } else if (!(b & XINPUT_GAMEPAD_B)) qm_back = false;
+        } else if (!(qm_b & XINPUT_GAMEPAD_B)) qm_back = false;
+        static bool qm_toggle = false;
         if (pad_vm) {
-          static bool qm_toggle = false;
           if (!qm_toggle) {
             qm_toggle = true;
             g_quick_menu_open = false;

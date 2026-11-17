@@ -26,9 +26,12 @@
 
 // Unwinder readability probe (page_readable): process_vm_readv EFAULT
 // mapped-check (see comment at the probe for why not write()/dev/null).
+// Linux-only syscalls: guarded so the UWP host build uses VirtualQuery.
+#ifdef __linux__
 #include <errno.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 #include "bridge_openal.h"
 #include "bridge_ole.h"
 #include "bridge_shell.h"
@@ -40,6 +43,8 @@
 #include "bridge_steam.h"
 #include "bridge_comctl.h"
 #include "bridge_gdi.h"
+#include "bridge_gdiplus.h"
+#include "bridge_fmod.h"
 #include "bridge_wininet.h"
 #include "bridge_psapi.h"
 #include "bridge_iphlpapi.h"
@@ -52,6 +57,14 @@
 #include "bridge_vulkan.h"
 #include "bridge_mf.h"
 #include "bridge_gameinput.h"
+
+// ---- 5 GB memory-budget governor (bridge_membudget.cpp): every host-side
+// byte that stands in for guest commit charges one ledger. Over-budget
+// commits refuse with ERROR_COMMITMENT_LIMIT so the guest's own low-memory
+// paths run instead of a platform kill. ----
+extern "C" int trt_mem_budget_charge_commit(u64 bytes);
+extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
+extern "C" void trt_mem_budget_report(char* line, unsigned cap);
 
 #include <atomic>
 #include <chrono>
@@ -187,16 +200,25 @@ void* TRT_STDCALL trt_HeapCreate(u32 flags, u64 init, u64 max) {
 void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   (void)heap;
   // backend alloc = RW memory; flags HEAP_ZERO_MEMORY = 0x8
-  u8* p = (u8*)g_be.alloc((size_t)(bytes ? bytes : 1), 0);
-  if (p && (flags & 0x8)) memset(p, 0, (size_t)bytes);
-  if (p) heap_rec_add(p, (size_t)bytes);  // HeapSize/HeapReAlloc need this
+  const size_t n = (size_t)(bytes ? bytes : 1);
+  if (trt_mem_budget_charge_commit((u64)n) != 0) return nullptr;  // 1455
+  u8* p = (u8*)g_be.alloc(n, 0);
+  if (!p) {
+    trt_mem_budget_discharge_commit((u64)n);
+    return nullptr;
+  }
+  if (flags & 0x8) memset(p, 0, n);
+  heap_rec_add(p, n);  // HeapSize/HeapReAlloc need this
   return p;
 }
 
 int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
+  size_t freed = 0;
+  heap_rec_find(p, &freed);
   heap_rec_del(p);  // drop the size record (HeapSize honesty after free)
   if (p) g_be.release(p, 0);  // backend tracks size internally (mmap/UWP)
+  if (freed) trt_mem_budget_discharge_commit((u64)freed);
   return 1;
 }
 
@@ -650,6 +672,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     };
     u32 eff_prot = pclean;
     bool pending_rx = false;
+    if (trt_mem_budget_charge_commit(sz) != 0) return nullptr;  // 1455 set
     if (do_commit(tprot) != 0) {
       if (pclean == 0x40u || pclean == 0x80u) {
         if (do_commit(TRT_PROT_R | TRT_PROT_W) == 0) {
@@ -657,10 +680,12 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
           pending_rx = true;
           trt_core_log("kernel32: VirtualAlloc(COMMIT RWX) -> W^X two-phase JIT (armed RW, flips RX on FlushInstructionCache)");
         } else {
+          trt_mem_budget_discharge_commit(sz);
           set_err_for_current_thread(87);
           return nullptr;
         }
       } else {
+        trt_mem_budget_discharge_commit(sz);
         set_err_for_current_thread(87);
         return nullptr;
       }
@@ -701,12 +726,14 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     return p;
   }
 
+  if (trt_mem_budget_charge_commit(sz) != 0) return nullptr;  // 1455 set
   void* p = g_be.alloc(sz, (u64)(uintptr_t)addr);
   if (!p && addr) {
     // hint address unavailable: retry at any free base
     p = g_be.alloc(sz, 0);
   }
   if (!p) {
+    trt_mem_budget_discharge_commit(sz);
     set_err_for_current_thread(8);  // NOT_ENOUGH_MEMORY
     return nullptr;
   }
@@ -720,6 +747,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
           pending_rx = true;
           trt_core_log("kernel32: VirtualAlloc(RWX) -> W^X two-phase JIT (armed RW, flips RX on FlushInstructionCache)");
         } else {
+          trt_mem_budget_discharge_commit(sz);
           g_be.release(p, sz);
           set_err_for_current_thread(87);
           return nullptr;
@@ -728,6 +756,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
         if (pclean & 0xF0u) {
           trt_core_log("kernel32: VirtualAlloc(EXEC) rejected by host backend");
         }
+        trt_mem_budget_discharge_commit(sz);
         g_be.release(p, sz);
         set_err_for_current_thread(87);
         return nullptr;
@@ -769,21 +798,27 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
     if (s < e) {
       if (dfn) dfn((void*)s, e - s);
       else if (g_be.protect) g_be.protect((void*)s, e - s, 0);
+      trt_mem_budget_discharge_commit((u64)(e - s));
       return 1;
     }
     return 0;
   }
   if (type != 0x8000u /*MEM_RELEASE*/) return 0;
   size_t r_size = (size_t)bytes;
+  u64 release_committed = 0;
   {
     std::lock_guard<std::mutex> lk(g_va_mu);
     const int idx = va_find_idx_locked((uintptr_t)addr);
     if (idx >= 0 && g_va[(size_t)idx].base == (uintptr_t)addr) {
       if (!r_size) r_size = g_va[(size_t)idx].size;
+      for (const va_extent& ex : g_va[(size_t)idx].extents) {
+        if (ex.state == 0x1000u) release_committed += (u64)ex.size;
+      }
       g_va[(size_t)idx].base = 0;
       g_va[(size_t)idx].extents.clear();
     }
   }
+  if (release_committed) trt_mem_budget_discharge_commit(release_committed);
   g_be.release(addr, r_size);
   return 1;
 }
@@ -1266,6 +1301,10 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_comctl();
   // gdi32: the GDI object/state surface (fonts, DC-coupled state)
   trt_bridge_register_gdi();
+  // gdiplus: GDI+ 2D flat API (BotW-Native launcher/setup UI, recorded)
+  trt_bridge_register_gdiplus();
+  // fmod: FMOD Ex/Studio audio (wav/pcm real through the host mixer)
+  trt_bridge_register_fmod();
   // STAGE 5 boot determinism: the 7 UNCERTAIN console DLLs converted to
   // BUILTIN honest-runtime — the boot no longer depends on unproven
   // console presence (wininet/psapi/iphlpapi/imm32/crypt32/dbghelp/dbgcore)
@@ -1297,7 +1336,7 @@ void trt_bridge_boot(const trt_backend* be) {
 // ================= files on the VFS (the game-transfer path) ================
 namespace {
 
-struct file_rec { void* os; u8 mode; u32 refs; char vpath[512]; };
+struct file_rec { void* os; u8 mode; u32 refs; char vpath[512]; u32 io_modes; };
 std::deque<file_rec> g_files;
 std::mutex g_files_mu;
 
@@ -1387,6 +1426,7 @@ void* file_alloc(FILE* os, u8 mode, const char* vpath = nullptr) {
       g_files[i].os = os;
       g_files[i].mode = mode;
       g_files[i].refs = 1;
+      g_files[i].io_modes = 0;  // a reused slot resets its notification modes
       snprintf(g_files[i].vpath, sizeof(g_files[i].vpath), "%s",
                vpath ? vpath : "");
       return (void*)(uintptr_t)(0x77700000u | (u32)i);
@@ -1562,6 +1602,13 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
 }
 
 static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
+                          void* overlapped, size_t* n_out, u32* io_err_out);
+// mmap fast path for large positional reads (defined below; shared with
+// trt_file_pread — the streaming engines' window population).
+static bool file_pread_mmap_locked(FILE* os, u64 offset, void* dst,
+                                   size_t bytes, size_t* got_out);
+
+static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
                           void* overlapped, size_t* n_out, u32* io_err_out) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(h);
@@ -1575,6 +1622,17 @@ static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
     trt_SetLastError(87);
     if (n_out) *n_out = 0;
     return 0;
+  }
+  if (overlapped && !is_write) {
+    const u64 off = ((const u64*)overlapped)[2];
+    size_t got = 0;
+    if (file_pread_mmap_locked(os, off, buf, bytes, &got)) {
+      if (n_out) *n_out = got;
+      // at/past EOF is a clean zero-byte read: ERROR_HANDLE_EOF, exactly the
+      // fread path's contract (the guest's ReadFileEx maps it to STATUS_END_OF_FILE)
+      if (io_err_out) *io_err_out = (bytes > 0 && got == 0) ? 38u : 0u;
+      return 1;
+    }
   }
   if (overlapped) {
     const u64 off = ((const u64*)overlapped)[2];
@@ -1722,6 +1780,44 @@ int trt_file_stat_size(void* handle, u64* size_out) {
   return 1;
 }
 
+// mmap fast path for LARGE positional reads (streaming engines' window
+// population): map the page range, copy from the page cache, unmap — no
+// stdio buffering, no seek dance. Falls back to the fread path for small
+// reads, non-regular files, on mmap failure, and on non-Linux hosts (the
+// console keeps its native path). TRT_IO_MMAP_MIN tunes/disables (bytes).
+static bool file_pread_mmap_locked(FILE* os, u64 offset, void* dst,
+                                   size_t bytes, size_t* got_out) {
+#ifdef __linux__
+  static const size_t k_mmap_min = [] {
+    const char* env = getenv("TRT_IO_MMAP_MIN");
+    const long long v = env && *env ? atoll(env) : 1048576LL;  // 1 MiB default
+    return v > 0 ? (size_t)v : 0;  // 0 disables the fast path
+  }();
+  if (!k_mmap_min || bytes < k_mmap_min) return false;
+  struct stat st{};
+  const int fd = fileno(os);
+  if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return false;
+  const u64 fsize = (u64)st.st_size;
+  if (offset >= fsize) {  // at/past EOF: a clean zero-byte read
+    if (got_out) *got_out = 0;
+    return true;
+  }
+  const size_t want =
+      (u64)bytes <= fsize - offset ? bytes : (size_t)(fsize - offset);
+  const u64 pa = offset & ~4095ULL;
+  const size_t span = (size_t)((offset - pa) + want);
+  void* m = mmap(nullptr, span, PROT_READ, MAP_PRIVATE, fd, (off_t)pa);
+  if (m == MAP_FAILED) return false;  // fall back to the fread path
+  memcpy(dst, (const u8*)m + (offset - pa), want);
+  munmap(m, span);
+  if (got_out) *got_out = want;
+  return true;
+#else
+  (void)os; (void)offset; (void)dst; (void)bytes; (void)got_out;
+  return false;
+#endif
+}
+
 int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
                    size_t* read_out) {
   if (read_out) *read_out = 0;
@@ -1730,12 +1826,17 @@ int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
   file_rec* rec = file_at_locked(handle);
   if (!rec) return 0;
   FILE* os = (FILE*)rec->os;
+  size_t got = 0;
+  if (file_pread_mmap_locked(os, offset, dst, bytes, &got)) {
+    if (read_out) *read_out = got;
+    return 1;
+  }
   const i64 cur = os_tell64(os);
   if (!os_seek64(os, (i64)offset, SEEK_SET)) {
     if (cur >= 0) os_seek64(os, cur, SEEK_SET);
     return 0;
   }
-  const size_t got = bytes ? fread(dst, 1, bytes, os) : 0;
+  got = bytes ? fread(dst, 1, bytes, os) : 0;
   if (cur >= 0) os_seek64(os, cur, SEEK_SET);
   if (read_out) *read_out = got;
   return 1;
@@ -3198,16 +3299,23 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   if (!p) return trt_HeapAlloc(heap, flags, bytes);
   size_t old = 0;
   heap_rec_find(p, &old);
-  u8* np = (u8*)g_be.alloc((size_t)(bytes ? bytes : 1), 0);
-  if (!np) { set_err_for_current_thread(8); return nullptr; }
+  const size_t want = (size_t)(bytes ? bytes : 1);
+  if (trt_mem_budget_charge_commit((u64)want) != 0) return nullptr;  // 1455
+  u8* np = (u8*)g_be.alloc(want, 0);
+  if (!np) {
+    trt_mem_budget_discharge_commit((u64)want);
+    set_err_for_current_thread(8);
+    return nullptr;
+  }
   const size_t copied = old ? (old < (size_t)bytes ? old : (size_t)bytes) : 0;
   if (copied) memcpy(np, p, copied);
   if ((flags & 0x8) && (size_t)bytes > copied) {
     memset(np + copied, 0, (size_t)bytes - copied);
   }
   heap_rec_del(p);
-  heap_rec_add(np, (size_t)bytes);
+  heap_rec_add(np, want);
   g_be.release(p, 0);
+  if (old) trt_mem_budget_discharge_commit((u64)old);
   return np;
 }
 
@@ -3934,6 +4042,7 @@ namespace {
 // the user buffer, so unmapped pages "passed" the probe and still SIGSEGV'd
 // at the first ui[0] dereference; caught by the test_unwind_safety
 // regression and confirmed in the disassembly.)
+#ifdef __linux__
 bool page_readable(const void* p) {
   char scratch;  // probe writes 1 byte into this local
   struct iovec local { &scratch, 1 };
@@ -3947,6 +4056,18 @@ bool page_readable(const void* p) {
   errno = saved;
   return r >= 0;
 }
+#else
+// UWP/console host: VirtualQuery answers committed pages without signals —
+// same conservative contract (anything not provably committed+readable is
+// NOT readable; the caller fails the unwind cleanly).
+bool page_readable(const void* p) {
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+  if (mbi.State != MEM_COMMIT) return false;
+  const DWORD bad = PAGE_NOACCESS | PAGE_GUARD;
+  return (mbi.Protect & bad) == 0;
+}
+#endif
 bool ptr_in_guest_image(const void* p) {
   if (!p) return false;
   const uintptr_t v = (uintptr_t)p;
@@ -4238,6 +4359,17 @@ u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
   return 0;
 #endif
 }
+
+namespace {
+std::atomic<void*> g_unhandled_filter{nullptr};
+
+const char* eh_filter_verdict_name(i32 v) {
+  if (v == 1 /*EXCEPTION_EXECUTE_HANDLER*/) return "handled";
+  if (v == -1 /*EXCEPTION_CONTINUE_EXECUTION*/)
+    return "unhandled(continue-exec)";  // undefined per MSDN; treated as death
+  return "unhandled";
+}
+}  // namespace
 
 #if !defined(_WIN32) && defined(__x86_64__)
 static bool eh_trace_enabled() {
@@ -4836,16 +4968,6 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep) {
 // once with a Win64 EXCEPTION_POINTERS before terminating, and the
 // UnhandledExceptionFilter export consults it exactly as real Win32 does
 // (return the filter's verdict; EXCEPTION_CONTINUE_SEARCH with none stored).
-namespace {
-std::atomic<void*> g_unhandled_filter{nullptr};
-
-const char* eh_filter_verdict_name(i32 v) {
-  if (v == 1 /*EXCEPTION_EXECUTE_HANDLER*/) return "handled";
-  if (v == -1 /*EXCEPTION_CONTINUE_EXECUTION*/)
-    return "unhandled(continue-exec)";  // undefined per MSDN; treated as death
-  return "unhandled";
-}
-}  // namespace
 
 // Sprint 3 item 46: the terminal unhandled-exception path gives the stored
 // SetUnhandledExceptionFilter one look at the record before the runtime
@@ -6709,6 +6831,52 @@ u32 TRT_STDCALL trt_GetCurrentPackagePath(u32* len, u16* path) {
   return 15700u;
 }
 
+// FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (0x1) / FILE_SKIP_SET_EVENT_ON_HANDLE
+// (0x2), stored per file handle. trt_iocp_notify_io (bridge_thread.cpp)
+// consults bit 0 so a SUCCESSFUL overlapped I/O signals the event but does
+// NOT post a completion packet — the previous ok-stub handed engines that
+// set the flag phantom double-completions (event AND packet).
+int TRT_STDCALL trt_SetFileCompletionNotificationModes(void* file_handle, u8 flags) {
+  if (!file_handle || file_handle == (void*)(uintptr_t)-1) {
+    trt_SetLastError(6u); // ERROR_INVALID_HANDLE
+    return 0;
+  }
+  if (flags & ~0x3u) {
+    trt_SetLastError(87u); // ERROR_INVALID_PARAMETER
+    char line[160];
+    snprintf(line, sizeof(line),
+             "kernel32: file completion notification modes flags=0x%x -> "
+             "invalid combination (ERROR_INVALID_PARAMETER)", flags);
+    trt_core_log(line);
+    return 0;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_files_mu);
+    file_rec* rec = file_at_locked(file_handle);
+    if (!rec) {
+      trt_SetLastError(6u);
+      return 0;
+    }
+    rec->io_modes = flags;
+  }
+  char line[160];
+  snprintf(line, sizeof(line),
+           "kernel32: file completion notification modes = 0x%x%s%s stored",
+           flags,
+           (flags & 0x1u) ? " [SKIP_COMPLETION_PORT_ON_SUCCESS]" : "",
+           (flags & 0x2u) ? " [SKIP_SET_EVENT_ON_HANDLE]" : "");
+  trt_core_log(line);
+  return 1;
+}
+
+// Consulted by the IOCP notify path (bridge_thread.cpp): bit 0 suppresses
+// the success completion packet for this handle.
+extern "C" int trt_file_io_modes(void* file_handle) {
+  std::lock_guard<std::mutex> lk(g_files_mu);
+  const file_rec* rec = file_at_locked(file_handle);
+  return rec ? (int)rec->io_modes : 0;
+}
+
 // ---- Sprint 1 gap batch: interlocked primitives (master prompt 1B) -------
 // Win32 signed semantics: InterlockedIncrement/Decrement return the NEW
 // value; InterlockedExchangeAdd/Exchange/CompareExchange return the OLD.
@@ -6960,6 +7128,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"GetCurrentApplicationUserModelId", (void*)&trt_GetCurrentApplicationUserModelId},
   {"GetCurrentPackageId", (void*)&trt_GetCurrentPackageId},
   {"GetCurrentPackagePath", (void*)&trt_GetCurrentPackagePath},
+  {"SetFileCompletionNotificationModes", (void*)&trt_SetFileCompletionNotificationModes},
 };
 
 int trt_bridge_register_kernel32(void) {

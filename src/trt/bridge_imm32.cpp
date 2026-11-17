@@ -149,6 +149,14 @@ void* TRT_GUEST_ABI imm_ImmGetDefaultIMEWnd(void* hwnd) {
   return nullptr;
 }
 
+// ImmGetIMEFileNameA: no IME is installed on the console, so there is no
+// IME file name. 0 = ERROR_INSUFFICIENT_BUFFER-style empty name; SDL treats
+// "no IME file" as "IME absent" and uses raw keyboard input.
+u32 TRT_GUEST_ABI imm_ImmGetIMEFileNameA(void* hwnd, char* buf, u32 max_len) {
+  log_line("imm32: ImmGetIMEFileNameA -> 0 (no IME installed on console)");
+  return 0;
+}
+
 int trt_bridge_register_imm32(void) {
   static const trt_named_fn k_fns[] = {
       {"ImmGetContext", (void*)&imm_ImmGetContext},
@@ -172,6 +180,7 @@ int trt_bridge_register_imm32(void) {
       {"ImmIsIME", (void*)&imm_ImmIsIME},
       {"ImmDisableIME", (void*)&imm_ImmDisableIME},
       {"ImmGetDefaultIMEWnd", (void*)&imm_ImmGetDefaultIMEWnd},
+      {"ImmGetIMEFileNameA", (void*)&imm_ImmGetIMEFileNameA},
   };
   trt_module_register("imm32.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

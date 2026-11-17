@@ -592,6 +592,20 @@ int TRT_GUEST_ABI crypt_CryptBinaryToStringA(const u8* bin, u32 cb_bin,
   return 0;
 }
 
+// CertFindCertificateInStore: no cert store exists on the console, so no
+// certificate can ever match. NULL = "not found" (real Win32 semantics for an
+// empty store); OpenSSL treats it as untrusted and fails TLS by name.
+void* TRT_GUEST_ABI crypt_CertFindCertificateInStore(void* hCertStore,
+                                                     u32 dwCertEncodingType,
+                                                     u32 dwFindFlags,
+                                                     u32 dwFindType,
+                                                     const void* pvFindPara,
+                                                     void* pPrevCertContext) {
+  log_line("crypt32: CertFindCertificateInStore -> NULL (store is empty on "
+           "console; TLS cert paths fail named)");
+  return nullptr;
+}
+
 int trt_bridge_register_crypt32(void) {
   static const trt_named_fn k_fns[] = {
       {"CertOpenSystemStoreW", (void*)&crypt_CertOpenSystemStoreW},
@@ -604,6 +618,8 @@ int trt_bridge_register_crypt32(void) {
       {"CertVerifyCertificateChainPolicy",
        (void*)&crypt_CertVerifyCertificateChainPolicy},
       {"CertFreeCertificateContext", (void*)&crypt_CertFreeCertificateContext},
+      {"CertFindCertificateInStore",
+       (void*)&crypt_CertFindCertificateInStore},
       {"CertFreeCertificateChain", (void*)&crypt_CertFreeCertificateChain},
       {"CertEnumCertificatesInStore",
        (void*)&crypt_CertEnumCertificatesInStore},

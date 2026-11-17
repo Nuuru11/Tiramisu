@@ -19,6 +19,10 @@
 #include <vector>
 
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
+// 5 GB memory-budget governor (bridge_membudget.cpp): mapped views charge
+// the same ledger as VirtualAlloc/heap commit — over-budget maps refuse.
+extern "C" int trt_mem_budget_charge_map(u64 bytes);
+extern "C" void trt_mem_budget_discharge_map(u64 bytes);
 
 namespace {
 
@@ -282,6 +286,7 @@ mapped_view evict_view_locked(size_t idx) {
   if (g_evicted.size() >= 128) g_evicted.erase(g_evicted.begin());
   g_evicted.push_back({(uintptr_t)mv.ptr, mv.bytes, mv.offset,
                        g_map_clock - mv.stamp, false});
+  trt_mem_budget_discharge_map((u64)mv.bytes);
   free_view_buf(mv.ptr, mv.bytes, mv.from_be);
   if (mv.core && mv.core->view_refs > 0) --mv.core->view_refs;
   maybe_destroy_core_locked(mv.core);
@@ -537,8 +542,14 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   }
 
   bool from_be = false;
+  // Budget: the view's bytes join the same ledger as VirtualAlloc commit.
+  // Refusal fails the map honestly (named, 1455) — the guest's streaming
+  // layer retries with a smaller window instead of walking off the 5 GB
+  // cliff and getting the whole process killed by the platform.
+  if (trt_mem_budget_charge_map((u64)req_len) != 0) return nullptr;
   void* view_ptr = alloc_view_buf((size_t)req_len, &from_be);
   if (!view_ptr) {
+    trt_mem_budget_discharge_map((u64)req_len);
     trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
     return nullptr;
   }
@@ -563,6 +574,7 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
     size_t got = 0;
     if (!trt_file_pread(core->file_handle, offset, view_ptr, (size_t)req_len,
                         &got)) {
+      trt_mem_budget_discharge_map((u64)req_len);
       free_view_buf(view_ptr, (size_t)req_len, from_be);
       trt_SetLastError(k_err_invalid_handle);
       return nullptr;
@@ -646,6 +658,7 @@ int TRT_STDCALL trt_UnmapViewOfFile(void* view) {
       const mapped_view mv = g_views[i];
       g_views.erase(g_views.begin() + (ptrdiff_t)i);
       if (mv.flush_on_unmap) flush_view_locked(mv, 0, mv.bytes);
+      trt_mem_budget_discharge_map((u64)mv.bytes);
       free_view_buf(mv.ptr, mv.bytes, mv.from_be);
       if (mv.core && mv.core->view_refs > 0) --mv.core->view_refs;
       maybe_destroy_core_locked(mv.core);

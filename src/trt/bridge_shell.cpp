@@ -377,9 +377,38 @@ void TRT_GUEST_ABI shell_DragAcceptFiles(void* hwnd, int accept) {
   (void)hwnd; (void)accept;
 }
 
+void TRT_GUEST_ABI shell_DragFinish(void* hdrop) {
+  // DragQueryFileW hands back synthetic records (no GlobalAlloc backing), so
+  // there is nothing to GlobalFree — the real contract (release the HDROP)
+  // is met vacuously. Logged so a future real-HDROP implementation revisits.
+  char line[96];
+  snprintf(line, sizeof(line), "shell: DragFinish(%p) -> released (synthetic)",
+           hdrop);
+  log_line(line);
+}
+
 u32 TRT_GUEST_ABI shell_DragQueryFileW(void* hdrop, u32 idx, u16* buf, u32 cch) {
   (void)hdrop; (void)idx;
   if (buf && cch > 0) buf[0] = 0;
+  return 0;
+}
+
+void* TRT_GUEST_ABI shell_SHBrowseForFolderW(const void* browse_info) {
+  // No shell folder browser on the console. NULL = the user cancelled the
+  // dialog (real semantics); the caller falls back to typed path entry.
+  char line[96];
+  snprintf(line, sizeof(line),
+           "shell: SHBrowseForFolderW -> NULL (no folder picker on console; "
+           "caller falls back to manual entry)");
+  log_line(line);
+  return nullptr;
+}
+
+int TRT_GUEST_ABI shell_SHGetPathFromIDListW(const void* pidl, u16* path) {
+  (void)pidl;
+  if (path) path[0] = 0;
+  // No PIDLs are ever handed out (SHBrowseForFolderW returns NULL), so no
+  // PIDL can resolve to a path — FALSE is the honest answer.
   return 0;
 }
 
@@ -432,6 +461,9 @@ int trt_bridge_register_shell(void) {
       {"SHFileOperationW", (void*)&shell_SHFileOperationW},
       {"DragAcceptFiles", (void*)&shell_DragAcceptFiles},
       {"DragQueryFileW", (void*)&shell_DragQueryFileW},
+      {"DragFinish", (void*)&shell_DragFinish},
+      {"SHBrowseForFolderW", (void*)&shell_SHBrowseForFolderW},
+      {"SHGetPathFromIDListW", (void*)&shell_SHGetPathFromIDListW},
       {"SHCreateItemFromParsingName", (void*)&shell_SHCreateItemFromParsingName},
       {"SHGetPropertyStoreForWindow", (void*)&shell_SHGetPropertyStoreForWindow},
       {"SetCurrentProcessExplicitAppUserModelID",

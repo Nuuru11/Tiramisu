@@ -138,6 +138,177 @@ so the CLI path never runs; the live session ran it via import (see
   next: console M0 when DP credentials arrive, or the command-list recording
   surface (item 27 remainder) on request.)
 
+**LANDED (FMOD audio bridge — new game-class unlock, 2026-11-17 early):**
+- **NEW bridge_fmod.cpp** — fmodex.dll / fmodex64.dll / fmod.dll /
+  fmodstudio.dll / fmodstudioL.dll registered as one BUILTIN table (28
+  functions): the FMOD Ex and Studio C exports share the lifecycle names,
+  and the C++ API is inline wrappers over them, so one table covers both
+  families. Unlocks the FMOD game class (thousands of indie/AA titles)
+  which previously died at audio init.
+- **Real audio path**: System lifecycle (Create/Init/Update/Release) ->
+  CreateSound/CreateStream resolve guest paths through the VFS -> WAV
+  (RIFF PCM 8/16/24/32) decodes for real -> trt_audio_submit_voice to the
+  host mixer. OGG payloads decode via **vendored stb_vorbis 1.24 (public
+  domain, src/trt/vendor_stb_vorbis.c, STB_VORBIS_NO_STDIO)** — the biggest
+  FMOD payload class is now audible, not silent.
+- **Looping**: FMOD_LOOP_NORMAL sounds are fed by a bridge scheduler thread
+  that re-pushes decoded PCM until Channel_Stop (the mixer FIFO absorbs it).
+- **Named-silent path**: MP3 / FSB banks / ADPCM have no decoder yet — the
+  sound handle, channel control, and state machine are real; audio is
+  SILENT with a named per-sound log ("decoder pending"). Never a fake
+  success.
+- **Ownership discipline**: Sound payload pointers may point INSIDE the
+  malloc'd file buffer — fmod_sound carries alloc_base (the owned base) and
+  pcm (possibly interior); Release frees the base only. Measured: freeing
+  the interior pointer heap-corrupted and SIGSEGV'd the host (gdb:
+  arena_for_chunk) before the fix.
+- **Gate: test_fmod (suite 43)** — 21 checks: lifecycle, WAV decode via VFS
+  staging (CreateFileW write -> bridge read), mixer capture hook verifying
+  the exact PCM payload (22050 frames 44.1k stereo s16), volume, stop,
+  loop feeder, ogg named-silent, handle discipline (released handle
+  rejected, garbage handle -> FMOD_ERR_INVALID_HANDLE). ALL PASS.
+- **Bridge-surface audit correction**: the old matrix listed
+  Interlocked*/ConditionVariables/RawInput as gaps — ALL PRESENT (stale
+  matrix). The memory bridge already implements the W^X two-phase JIT
+  fallback (VirtualProtect RWX denied -> arm RW -> flip RX on
+  FlushInstructionCache), which is the mono-JIT enabler; Unity mono games
+  are architecturally viable, not blocked.
+
+**LANDED (RACCOIN playable-path proof + watchdog fix, 2026-11-16 night):**
+- **The render loop is PROVEN offline.** The mock-d3d11 harness (COM GPU
+  hooks injected so Unity's D3D11CreateDevice succeeds) now counts every
+  vtbl-slot hit. Measured on RACCOIN, three consecutive stable runs:
+  **2.7-2.8 MILLION device-context calls and ~268k DrawIndexed in the 10s
+  window** — Unity's frame loop spins end-to-end through the D3D11 surface
+  (per-frame RSSetState / IASetVertexBuffers / IASetIndexBuffer /
+  VSSetShaderResources / VSSetSamplers + per-draw calls, 88k swapchain
+  calls), then a clean ExitProcess(0). The mock histogram is printed in the
+  boot report (per-slot template thunks — slot positions are MEASURED, never
+  guessed; named handlers overwrite after the counting fill).
+- **NEW GATE: mock-render** (corpus-run.sh) — boots RACCOIN with
+  --mock-d3d11 and enforces ctx_calls >= 100000. A regression that starves
+  the pump or breaks device init now fails named instead of silently.
+- **Watchdog root-cause fix (the intermittent RACCOIN boot failure):** the
+  old watchdog fired WM_CLOSE after 10s WALL TIME. Under desktop load
+  RACCOIN's init (il2cpp metadata + 40-thread storm) exceeds 10s, the
+  watchdog fired MID-INITIALIZATION, the shutdown raced the plugin load
+  (SetDllDirectoryW(Plugins/x86_64) -> relocated module load), and
+  UnityPlayer NULL-called during teardown (SIGSEGV at 0x0, UnityPlayer
+  +0xa37d63, intermittent with machine load — 3 clean runs then 2 failures
+  before the fix). The watchdog now measures 10s of ENGINE SILENCE
+  (observe() stamps every trt log line as activity) with a 120s hard wall.
+  Three consecutive stability runs after the fix: RC=0, zero failures.
+- **RACCOIN ladder is now 7/7 with a device present** (mock hooks): the
+  D3D11 DEVICE ACQUIRED marker that was console-only offline now flips in
+  the harness — the guest-side chain (Unity -> device -> swapchain ->
+  render loop) is fully proven; only the console's REAL device execution
+  remains hardware-verifiable (M0).
+
+**LANDED (BotW-Native corpus wave + UCRT real-answer surface, 2026-11-16 evening, all gates green):**
+- **BotW-Native v0.1.2 added to the corpus** (corpus-local/botw-native/): the
+  static recomp of BOTW Wii U v1.5.0 — BotWRecomp.exe (497 MB, the actual
+  game), 3 launchers, and the full MinGW/SDL3/OpenSSL/glslang/SPIRV DLL set.
+  Vulkan-only renderer rides the PROVEN ICD path (the same one Godot booted
+  through). Bridge gaps closed to make the whole set load + init clean:
+  gdi32 GetICMProfileW/GetPixelFormat/SetDCBrushColor, crypt32
+  CertFindCertificateInStore, imm32 ImmGetIMEFileNameA, setupapi
+  CM_Locate_DevNodeA/CM_Get_Parent/CM_Get_Device_IDA, ws2_32
+  getservbyname/getservbyport/WSADuplicateSocketA/WSAGetOverlappedResult/
+  WSAStringToAddressA, shell32 DragFinish/SHBrowseForFolderW/
+  SHGetPathFromIDListW, comctl32 SetWindowSubclass/RemoveWindowSubclass/
+  DefSubclassProc (recorded chain, base-wndproc forward), and a NEW
+  bridge_gdiplus.cpp (32 GDI+ flat-API functions; object lifecycle real,
+  draw sites recorded — launcher UI surface).
+- **THE BIG ONE — UCRT blanket-0 replaced with real answers**
+  (tests/corpus_ucrt_wrappers.c): the corpus runner's SYSTEM bind answered
+  every whitelisted-but-unnamed symbol with a 0-returning stub. MinGW DLLs'
+  DllMain CRT init calls ucrtbase!calloc first thing -> NULL -> store fault
+  -> EH bounce livelock -> abort (measured: libstdc++-6.dll signal 6, 100k
+  identical bounces at libwinpthread +0x6d0c, rax=0). 115 ms_abi wrappers
+  over host libc now answer the pure-computation UCRT surface (heap, mem/
+  str/wcs, ctype, math, qsort with a Win64-ABI compare callback, _initterm
+  family, _errno family, rand_s, exit/_exit through the guest exit trap).
+  Deliberately still blanket-0 (named): printf family (MS va_list ABI),
+  Win32-handle file family (needs VFS), _gmtime64/strftime (struct tm
+  layout), localeconv (lconv layout), _beginthreadex, setjmp/longjmp.
+  Result: EVERY corpus DLL now runs DllMain(PROCESS_ATTACH) clean —
+  libwinpthread, libgcc, libstdc++, SDL3, libcrypto, glslang, SPIRV-Tools,
+  zlib1, libzstd, libiconv + RACCOIN's UnityPlayer/GameAssembly/baselib.
+- **Gate plumbing fixes:** corpus-smoke.sh/corpus-run.sh explicit compile
+  lists were missing bridge_gdiplus/bridge_nvapi/bridge_res (added);
+  build-test.sh parallelism is now TRT_JOBS-overridable (the N97 OOM-killed
+  lld-link mid-gate under desktop load — deterministic silent death after
+  test_d3d12_triangle, cost three false gate failures to pin).
+- **Gate status:** build-test RC=0 (48x ALL PASS), corpus-smoke 29 ok /
+  0 failed / 3 skipped, corpus-run RC=0 with 3/3 EXE boots. RACCOIN ladder
+  6/7 offline — the missing marker (D3D11 DEVICE ACQUIRED) is host-device
+  presence: the console host's publish_gpu_hooks() injects the real D3D11
+  device + CoreWindow swapchain, so that marker flips on Xbox (M0).
+
+**LANDED (wave-6 completion + mmap streaming I/O, 2026-11-16 later, all four gates green):**
+- **Suite 39 (test_d3d12_desc) COMPLETED** — the half-merged block finished:
+  `queue_desc_pod` defined (16B, bridge-layout), the `res_desc_pod` typo ->
+  the existing `resource_desc_pod`, UPLOAD heap-props + 64 KiB BUFFER desc for
+  CreateCommittedResource2 (slot 69), a REAL root signature created through
+  device slot 16 for the root-signature recording checks, and
+  `clvt = vtbl_of(cl)`. 77 checks ALL PASS — the D3D12 command-list recording
+  surface (topology/viewports/scissors/PSO/both root sigs/VB binds/RTVs/
+  queries/bundle-reject/ClearState-reset) is now gate-enforced, no stash
+  gymnastics needed for full-gate runs.
+- **mmap fast path for large positional reads** (`file_pread_mmap_locked`,
+  shared by `trt_file_pread` — the MapViewOfFile window population — and the
+  overlapped ReadFile branch): reads >= `TRT_IO_MMAP_MIN` (default 1 MiB, 0
+  disables) map the page range and copy from the page cache — no stdio
+  buffering, no seek dance. EOF clamp + past-EOF zero-byte read preserve the
+  fread path's exact contract (ERROR_HANDLE_EOF shape). Console keeps its
+  native path. Suite 42 block E: 4 MiB pattern file, 2 MiB read at offset
+  1 MiB (payload verified), EOF clamp, past-EOF — ALL PASS.
+- **Gate status 2026-11-16 final:** build-test 42× ALL PASS (no stash),
+  build-host RC=0, corpus-smoke 14/0/3, corpus-run 3/3 EXE boots, MSIX
+  repacked + signed (out/Tiramisu.msix).
+
+**LANDED (5 GB budget governor + async-I/O contract, 2026-11-16, all gates green):**
+- **`bridge_membudget.cpp` NEW — the 5 GB memory-budget governor.** ONE ledger
+  for every host-side byte that stands in for guest commit:
+  VirtualAlloc commit/decommit/release (extent-summed at RELEASE),
+  HeapAlloc/HeapFree/HeapReAlloc, MapViewOfFile/UnmapViewOfFile + both LRU
+  eviction paths. Budget = `TRT_MEM_BUDGET_MB` (default 5120 = the console
+  Game-package allocation, clamp 1..16384, parsed once per process). Over-budget
+  commits/maps refuse with a named rate-limited log + ERROR_COMMITMENT_LIMIT
+  (1455) so the guest's own low-memory paths run instead of a platform kill;
+  80%/90% soft logs fire once; `trt_mem_budget_report()` renders the crash-report
+  line. Evidence: NEW `tests/test_membudget.cpp` (suite 41) — ledger arithmetic,
+  peak, mapped subclass, over-discharge clamp, plus a re-exec'd 16 MB-budget
+  integration probe (VirtualAlloc refuse/commit/decommit/release, heap
+  refuse/free/retry, map refuse/unmap) ALL PASS.
+- **Async file-I/O contract locked (NEW `tests/test_io_async.cpp`, suite 42).**
+  Overlapped ReadFile at a 64-bit offset → OVERLAPPED.Internal/InternalHigh
+  filled, hEvent signaled, payload from the right offset, and GQCS dequeues the
+  packet with the association's key + the caller's OVERLAPPED pointer; FIFO
+  packet order across multiple reads.
+- **`SetFileCompletionNotificationModes` became REAL (was an ok-stub — engines
+  that set FILE_SKIP_COMPLETION_PORT_ON_SUCCESS got phantom double-completions:
+  event AND packet).** Modes stored per file handle (`file_rec.io_modes`),
+  `trt_iocp_notify_io` consults bit 0 and suppresses the success packet (the
+  event still signals); invalid flag combinations fail ERROR_INVALID_PARAMETER,
+  unknown handles ERROR_INVALID_HANDLE. test_ntdll's stub-era check updated to
+  the real contract (real handle accepts / unknown → 6 / 0x4 → 87).
+- **Wiring trap fixed for future bridge files:** corpus-smoke.sh and
+  corpus-run.sh link test_corpus/test_corpus_run from INDIVIDUAL sources (not
+  libtrt.a) and build-host.sh runs build-test.sh as its "offline loader test"
+  stage — a new `src/trt/*.cpp` must be added to FOUR script lists
+  (build-test glob is automatic; build-host, corpus-smoke, corpus-run are
+  manual) or the gates fail with confusing undefined references.
+- **UWP host build fixed** (3da09af "community UX" had committed host code that
+  never compiled under clang-cl: the splice ate `draw_tabs()`'s header in
+  ui.cpp leaving its body at file scope, and main.cpp declared `qm_toggle`
+  inside the `if` but used it in the `else`). Both mechanical-fixed; gate 2 now
+  reaches the host compile for the first time since the dashboard wave.
+- **Gate status 2026-11-16:** build-test.sh 42× ALL PASS (suites 1-42 incl. the
+  two new ones); corpus-smoke 14 ok / 0 failed / 3 skipped; corpus-run 3/3 EXE
+  boots (Go Next, OrTMM, RACCOIN rc=0 through its own shutdown chain) with the
+  governor live — zero BUDGET REFUSAL lines across all boots.
+
 **LANDED (boot-depth wave, 2026-11-15, worktree `work/boot-ultrapool` @ b6a7b51,
 all verified offline; gate rc=0, 42× ALL PASS, corpus 8/8 load, 5/5 run-depth):**
 - **Ultra Pool (Godot 4.3 + GodotSteam) — FULL BOOT LIFECYCLE**: CRT → WinMain →

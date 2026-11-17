@@ -178,9 +178,24 @@ u32 TRT_GUEST_ABI trt_XInputGetDSoundAudioDeviceGuids(u32 user_index,
   return k_err_success;
 }
 
+u32 TRT_GUEST_ABI trt_XInputWaitForGuideButton(u32 user_index, u32 flags, void* unreserved) {
+  (void)flags;
+  (void)unreserved;
+  return trt_pad_connected(user_index) ? k_err_success : k_err_device_not_connected;
+}
+
+u32 TRT_GUEST_ABI trt_XInputCancelGuideButtonWait(u32 user_index) {
+  return trt_pad_connected(user_index) ? k_err_success : k_err_device_not_connected;
+}
+
+u32 TRT_GUEST_ABI trt_XInputPowerOffController(u32 user_index) {
+  return trt_pad_connected(user_index) ? k_err_success : k_err_device_not_connected;
+}
+
 int trt_bridge_register_xinput(void) {
   static const trt_named_fn k_fns[] = {
       {"XInputGetState", (void*)&trt_XInputGetState},
+      {"XInputGetStateEx", (void*)&trt_XInputGetState},
       {"XInputSetState", (void*)&trt_XInputSetState},
       {"XInputGetCapabilities", (void*)&trt_XInputGetCapabilities},
       {"XInputEnable", (void*)&trt_XInputEnable},
@@ -189,7 +204,10 @@ int trt_bridge_register_xinput(void) {
       {"XInputGetAudioDeviceIds", (void*)&trt_XInputGetAudioDeviceIds},
       {"XInputGetDSoundAudioDeviceGuids",
        (void*)&trt_XInputGetDSoundAudioDeviceGuids},
-      // Ordinals imported directly by UnityPlayer.dll (#2, #3) and SDL2 (#100)
+      {"XInputWaitForGuideButton", (void*)&trt_XInputWaitForGuideButton},
+      {"XInputCancelGuideButtonWait", (void*)&trt_XInputCancelGuideButtonWait},
+      {"XInputPowerOffController", (void*)&trt_XInputPowerOffController},
+      // Ordinals imported directly by UnityPlayer.dll (#2, #3) and SDL2 (#100..#103)
       {"#2", (void*)&trt_XInputGetState},
       {"#3", (void*)&trt_XInputSetState},
       {"#4", (void*)&trt_XInputGetCapabilities},
@@ -198,6 +216,9 @@ int trt_bridge_register_xinput(void) {
       {"#7", (void*)&trt_XInputGetBatteryInformation},
       {"#8", (void*)&trt_XInputGetKeystroke},
       {"#100", (void*)&trt_XInputGetState},
+      {"#101", (void*)&trt_XInputWaitForGuideButton},
+      {"#102", (void*)&trt_XInputCancelGuideButtonWait},
+      {"#103", (void*)&trt_XInputPowerOffController},
   };
   const int n = (int)(sizeof(k_fns) / sizeof(k_fns[0]));
   trt_module_register("xinput1_4.dll", TRT_ROUTE_BUILTIN, k_fns, n);

@@ -22,13 +22,14 @@ LLVM_DLLTOOL="$LLVM_BIN/llvm-dlltool"
 objdir="$out/trt_objs"
 rm -rf "$objdir" "$out/libtrt.a"
 mkdir -p "$objdir"
-printf '%s\n' src/trt/*.cpp | xargs -P"$(nproc)" -I{} bash -c '
+printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-$(nproc)}" -I{} bash -c '
   f="$1"
   base="$(basename "$f" .cpp)"
   clang++ -std=c++20 -O2 -Wall -fno-pie -c "$f" -o "'"$objdir"'/${base}.o"
 ' _ {}
 clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
 clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
+clang -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$objdir/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO
 ar rcs "$out/libtrt.a" "$objdir"/*.o
 
 # --- 1. import library for the guest (tiramisu_host.dll) ---
@@ -737,3 +738,25 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_mem_crash.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_mem_crash"
 "$out/test_mem_crash"
+
+# --- 41. 5 GB memory-budget governor: one ledger for VirtualAlloc commit,
+#         heap and mapped views; over-budget refusals named (1455) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_membudget.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_membudget"
+"$out/test_membudget"
+
+# --- 42. async file-I/O contract: overlapped read -> GQCS packet, the
+#         FILE_SKIP_COMPLETION_PORT_ON_SUCCESS flag honored (no packet),
+#         mode-flag validation, FIFO packet order ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_io_async.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_io_async"
+"$out/test_io_async"
+
+# --- 43. FMOD bridge: lifecycle + wav decode via VFS + mixer submit + loop
+#         feeder + compressed named-silent + handle discipline ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_fmod.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_fmod"
+"$out/test_fmod"

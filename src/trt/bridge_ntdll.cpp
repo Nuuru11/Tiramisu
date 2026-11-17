@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread>
 #include <unordered_set>
 
 extern "C" {
@@ -34,6 +35,7 @@ void* TRT_STDCALL trt_VirtualAlloc2(void* proc, void* base_addr, u64 size,
                                     u32 param_count);
 int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type);
 int TRT_STDCALL trt_VirtualProtect(void* addr, u64 bytes, u32 prot, u32* old_prot);
+u64 TRT_STDCALL trt_VirtualQuery(const void* addr, void* mbi_out, u64 len);
 u32 TRT_STDCALL trt_GetLastError(void);
 void TRT_STDCALL trt_SetLastError(u32 e);
 int TRT_STDCALL trt_MultiByteToWideChar(u32 cp, u32 flags, const char* src,
@@ -790,6 +792,188 @@ u8 TRT_GUEST_ABI nt_RtlEqualUnicodeString(const nt_unicode_str* s1,
 u32 TRT_GUEST_ABI nt_RtlGetLastWin32Error(void) { return trt_GetLastError(); }
 void TRT_GUEST_ABI nt_RtlSetLastWin32Error(u32 e) { trt_SetLastError(e); }
 
+// ---- System / Process / VirtualMemory Query Surfaces -----------------------
+static u32 nt_cpu_count() {
+  u32 n = (u32)std::thread::hardware_concurrency();
+  return n ? n : 8u;
+}
+
+#pragma pack(push, 1)
+struct nt_system_basic_info {
+  u32 reserved;
+  u32 timer_resolution;
+  u32 page_size;
+  u32 number_of_physical_pages;
+  u32 lowest_physical_page_number;
+  u32 highest_physical_page_number;
+  u32 allocation_granularity;
+  u32 abi_pad; // real x64 ABI: 4 bytes pad before the ULONG_PTR fields (sizeof must be 64)
+  u64 minimum_user_mode_address;
+  u64 maximum_user_mode_address;
+  u64 active_processors_affinity_mask;
+  u8 number_of_processors;
+  u8 pad[7];
+};
+struct nt_system_processor_info {
+  u16 processor_architecture;
+  u16 processor_level;
+  u16 processor_revision;
+  u16 maximum_processors;
+  u32 processor_feature_bits;
+};
+struct nt_system_logical_proc_info {
+  u64 processor_mask;
+  u32 relationship;
+  u32 pad;
+  u64 flags[2];
+};
+struct nt_process_basic_info {
+  u64 exit_status;
+  u64 peb_base_address;
+  u64 affinity_mask;
+  u64 base_priority;
+  u64 unique_process_id;
+  u64 inherited_from_unique_process_id;
+};
+#pragma pack(pop)
+
+u32 TRT_GUEST_ABI nt_NtQuerySystemInformation(u32 cls, void* buf, u32 len,
+                                             u32* ret_len) {
+  const u32 cpus = nt_cpu_count();
+  if (cls == 0 /*SystemBasicInformation*/) {
+    if (ret_len) *ret_len = (u32)sizeof(nt_system_basic_info);
+    if (!buf || len < sizeof(nt_system_basic_info)) return 0xC0000004u; // STATUS_INFO_LENGTH_MISMATCH
+    nt_system_basic_info sbi{};
+    sbi.timer_resolution = 156250;
+    sbi.page_size = 4096u;
+    sbi.number_of_physical_pages = 5u * 1024u * 256u; // 5 GiB in 4K pages
+    sbi.lowest_physical_page_number = 1u;
+    sbi.highest_physical_page_number = sbi.number_of_physical_pages;
+    sbi.allocation_granularity = 65536u;
+    sbi.minimum_user_mode_address = 0x0000000000010000ULL;
+    sbi.maximum_user_mode_address = 0x00007FFFFFFEFFFFULL;
+    sbi.active_processors_affinity_mask = (cpus >= 64) ? ~0ULL : ((1ULL << cpus) - 1ULL);
+    sbi.number_of_processors = (u8)(cpus > 255 ? 255 : cpus);
+    memcpy(buf, &sbi, sizeof(sbi));
+    return 0u;
+  }
+  if (cls == 1 /*SystemProcessorInformation*/) {
+    if (ret_len) *ret_len = (u32)sizeof(nt_system_processor_info);
+    if (!buf || len < sizeof(nt_system_processor_info)) return 0xC0000004u;
+    nt_system_processor_info spi{};
+    spi.processor_architecture = 9; // PROCESSOR_ARCHITECTURE_AMD64
+    spi.processor_level = 23;       // AMD Zen 2 family
+    spi.processor_revision = 0x4700;
+    spi.maximum_processors = (u16)(cpus > 65535 ? 65535 : cpus);
+    spi.processor_feature_bits = 0x3FFFFFFFu;
+    memcpy(buf, &spi, sizeof(spi));
+    return 0u;
+  }
+  if (cls == 2 /*SystemPerformanceInformation*/ || cls == 3 /*SystemTimeOfDayInformation*/) {
+    const u32 min_sz = (cls == 2) ? 48u : 48u;
+    if (ret_len) *ret_len = len ? len : min_sz;
+    if (!buf || len < min_sz) return 0xC0000004u;
+    memset(buf, 0, len);
+    return 0u;
+  }
+  if (cls == 73 /*SystemLogicalProcessorInformation*/) {
+    const u32 need = (u32)sizeof(nt_system_logical_proc_info);
+    if (ret_len) *ret_len = need;
+    if (!buf || len < need) return 0xC0000004u;
+    nt_system_logical_proc_info lpi{};
+    lpi.processor_mask = (cpus >= 64) ? ~0ULL : ((1ULL << cpus) - 1ULL);
+    lpi.relationship = 0; // RelationProcessorCore
+    memcpy(buf, &lpi, sizeof(lpi));
+    return 0u;
+  }
+  if (cls == 5 /*SystemProcessInformation*/) {
+    // Minimal single-process entry: NextEntryOffset=0, NumberOfThreads=1, ImageName empty.
+    const u32 need = 256u;
+    if (ret_len) *ret_len = need;
+    if (!buf || len < need) return 0xC0000004u;
+    memset(buf, 0, need);
+    u32* u32s = (u32*)buf;
+    u32s[1] = 1u; // NumberOfThreads
+    return 0u;
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "ntdll: NtQuerySystemInformation(class=%u) -> STATUS_NOT_IMPLEMENTED", cls);
+  trt_core_log(line);
+  return 0xC0000002u; // STATUS_NOT_IMPLEMENTED
+}
+
+u32 TRT_GUEST_ABI nt_NtQueryInformationProcess(void* proc, u32 cls, void* buf,
+                                                u32 len, u32* ret_len) {
+  (void)proc;
+  if (cls == 0 /*ProcessBasicInformation*/) {
+    if (ret_len) *ret_len = (u32)sizeof(nt_process_basic_info);
+    if (!buf || len < sizeof(nt_process_basic_info)) return 0xC0000004u;
+    nt_process_basic_info pbi{};
+    pbi.exit_status = 259u; // STILL_ACTIVE
+    pbi.affinity_mask = (nt_cpu_count() >= 64) ? ~0ULL : ((1ULL << nt_cpu_count()) - 1ULL);
+    pbi.base_priority = 8;
+    pbi.unique_process_id = 1000u;
+    pbi.inherited_from_unique_process_id = 100u;
+    memcpy(buf, &pbi, sizeof(pbi));
+    return 0u;
+  }
+  if (cls == 7 /*ProcessDebugPort*/ || cls == 26 /*ProcessWow64Information*/) {
+    if (ret_len) *ret_len = 8u;
+    if (!buf || len < 8u) return 0xC0000004u;
+    *(u64*)buf = 0ULL;
+    return 0u;
+  }
+  if (cls == 30 /*ProcessDebugObjectHandle*/) {
+    if (ret_len) *ret_len = 8u;
+    if (!buf || len < 8u) return 0xC0000004u;
+    *(u64*)buf = 0ULL;
+    return 0xC0000353u; // STATUS_PORT_NOT_SET
+  }
+  if (cls == 31 /*ProcessDebugFlags*/) {
+    if (ret_len) *ret_len = 4u;
+    if (!buf || len < 4u) return 0xC0000004u;
+    *(u32*)buf = 1u; // PROCESS_DEBUG_INHERIT (not debugged)
+    return 0u;
+  }
+  if (cls == 27 /*ProcessImageFileName*/ || cls == 43 /*ProcessImageFileNameWin32*/) {
+    const char* path = (cls == 43) ? "Z:\\game.exe" : "\\Device\\HarddiskVolume1\\game.exe";
+    const u32 chars = (u32)strlen(path);
+    const u32 str_bytes = chars * 2u;
+    const u32 need = (u32)sizeof(nt_unicode_str) + str_bytes + 2u;
+    if (ret_len) *ret_len = need;
+    if (!buf || len < need) return 0xC0000004u;
+    auto* us = (nt_unicode_str*)buf;
+    u16* wstr = (u16*)((u8*)buf + sizeof(nt_unicode_str));
+    for (u32 i = 0; i < chars; ++i) wstr[i] = (u16)(u8)path[i];
+    wstr[chars] = 0;
+    us->length = (u16)str_bytes;
+    us->max_length = (u16)(str_bytes + 2u);
+    us->buffer = wstr;
+    return 0u;
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "ntdll: NtQueryInformationProcess(class=%u) -> STATUS_NOT_IMPLEMENTED", cls);
+  trt_core_log(line);
+  return 0xC0000002u;
+}
+
+u32 TRT_GUEST_ABI nt_NtQueryVirtualMemory(void* proc, const void* addr, u32 cls,
+                                          void* buf, u64 len, u64* ret_len) {
+  (void)proc;
+  if (cls == 0 /*MemoryBasicInformation*/) {
+    const u64 wrote = trt_VirtualQuery(addr, buf, len);
+    if (ret_len) *ret_len = wrote;
+    return wrote ? 0u : 0xC000000Du;
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "ntdll: NtQueryVirtualMemory(class=%u) -> STATUS_NOT_IMPLEMENTED", cls);
+  trt_core_log(line);
+  return 0xC0000002u;
+}
+
 } // namespace
 
 int trt_bridge_register_ntdll(void) {
@@ -831,6 +1015,9 @@ int trt_bridge_register_ntdll(void) {
       {"NtWaitForSingleObject", (void*)&nt_NtWaitForSingleObject},
       {"NtSignalAndWaitForSingleObject",
        (void*)&nt_NtSignalAndWaitForSingleObject},
+      {"NtQuerySystemInformation", (void*)&nt_NtQuerySystemInformation},
+      {"NtQueryInformationProcess", (void*)&nt_NtQueryInformationProcess},
+      {"NtQueryVirtualMemory", (void*)&nt_NtQueryVirtualMemory},
       {"RaiseFailFastException", (void*)&nt_RaiseFailFastException},
       {"EtwEventRegister", (void*)&nt_EtwEventRegister},
       {"EtwEventUnregister", (void*)&nt_EtwEventUnregister},

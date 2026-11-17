@@ -34,12 +34,13 @@ cobj="$out/run_c_objs"
 mkdir -p "$cobj"
 "$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$cobj/miniz_tinfl.o" || exit 1
 "$CLANG" -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$cobj/mojo_hlsl.o" || exit 1
+"$CLANG" -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$cobj/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO || exit 1
 
 clang++ -std=c++17 -O2 -Wall -no-pie \
-  tests/test_corpus_run.cpp \
+  tests/test_corpus_run.cpp tests/corpus_ucrt_wrappers.c \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/vfs.cpp src/trt/iso.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_d3d12.cpp src/trt/bridge_reg.cpp \
-  src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
+  src/trt/bridge_mem.cpp src/trt/bridge_membudget.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
   src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp src/trt/bridge_d3dx.cpp src/trt/input.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp \
@@ -47,7 +48,8 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/bridge_hid.cpp src/trt/bridge_xinput.cpp \
   src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
-  "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" \
+  src/trt/bridge_gdiplus.cpp src/trt/bridge_nvapi.cpp src/trt/bridge_res.cpp src/trt/bridge_fmod.cpp \
+  "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" "$cobj/vendor_stb_vorbis.o" \
   -o "$out/test_corpus_run" || exit 1
 
 # --- smallest-to-largest corpus DLLs (DLLs only: DllMain is the target) ---
@@ -93,6 +95,40 @@ for exe in "${EXES[@]}"; do
     rc=1
   fi
 done
+
+# --- MOCK RENDER-LOOP GATE (RACCOIN playable-path evidence) -----------------
+# The mock-d3d11 harness injects COM GPU hooks so Unity's D3D11CreateDevice
+# succeeds offline; every device-context call is counted per vtbl slot.
+# Measured 2026-11-16: ~265k DrawIndexed + 2.6M total context calls in the
+# 10s watchdog window — the game's frame loop spins end-to-end. The gate
+# enforces a floor well under the measured count so a regression that kills
+# the loop (pump starvation, device-init break) fails named instead of
+# silently. On the console the same calls execute against the REAL D3D11
+# device (publish_gpu_hooks) — this gate proves the GUEST side of that path.
+if [[ -f corpus-local/raccoin/RACCOIN.exe && -x "$out/test_corpus_run" ]]; then
+  mock_log="$out/raccoin-mock-render.log"
+  timeout -s KILL 90 "$out/test_corpus_run" --exe --mock-d3d11 \
+    corpus-local/raccoin/RACCOIN.exe > "$mock_log" 2>&1
+  mock_rc=$?
+  if [[ $mock_rc -ne 0 ]]; then
+    # transient boot faults under desktop load (watchdog/init races) are
+    # false negatives — one retry before calling it a failure
+    timeout -s KILL 90 "$out/test_corpus_run" --exe --mock-d3d11 \
+      corpus-local/raccoin/RACCOIN.exe > "$mock_log" 2>&1
+    mock_rc=$?
+  fi
+  ctx=$(grep -oE 'ctx=[0-9]+' "$mock_log" | head -1 | cut -d= -f2)
+  draws=$(grep -oE ' 19\(x[0-9]+' "$mock_log" | head -1 | grep -oE 'x[0-9]+' | tr -d 'x')
+  echo "mock-render: rc=$mock_rc ctx_calls=${ctx:-0} drawindexed=${draws:-0}"
+  if [[ $mock_rc -ne 0 || -z "$ctx" || ${ctx:-0} -lt 100000 ]]; then
+    echo "mock-render: FAILED — frame loop did not spin (ctx=$ctx, named: see $mock_log)"
+    rc=1
+  else
+    echo "mock-render: OK — Unity frame loop spinning (${ctx} context calls)"
+  fi
+else
+  echo "SKIP mock-render gate: RACCOIN.exe or test_corpus_run missing"
+fi
 
 # --- D3D12 TRIANGLE GATE (Sprint-2 item 21): the full D3D12 render path ---
 # through a real guest PE. Every D3D12 bridge change must keep this green

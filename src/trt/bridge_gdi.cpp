@@ -751,6 +751,22 @@ int TRT_GUEST_ABI trt_DescribePixelFormat(void* hdc, int iPixelFormat,
   }
   return 1;
 }
+u32 TRT_GUEST_ABI trt_SetDCBrushColor(void* hdc, u32 color) {
+  (void)hdc;
+  char line[96];
+  snprintf(line, sizeof(line),
+           "gdi32: SetDCBrushColor(%06x) -> 000000 (no DC brush state)",
+           color & 0xFFFFFFu);
+  log_line(line);
+  return 0;  // previous color: black (no state tracked)
+}
+int TRT_GUEST_ABI trt_GetPixelFormat(void* hdc) {
+  (void)hdc;
+  // The bridge models one fixed pixel format (index 1) per DC — the same
+  // model ChoosePixelFormat/DescribePixelFormat/SetPixelFormat implement.
+  // Returning it (not 0) is what keeps SDL3's GL-attribute path consistent.
+  return 1;
+}
 int TRT_GUEST_ABI trt_SetPixelFormat(void* hdc, int fmt, const void* descr) {
   (void)hdc; (void)descr;
   char line[96];
@@ -864,8 +880,20 @@ int TRT_GUEST_ABI gdi_D3DKMTEnumAdapters(void* args) {
   return 0;  // STATUS_SUCCESS
 }
 
+// GetICMProfileW: the console has no ICM color-management profiles. FALSE
+// means "no profile associated with this DC" (real Win32 semantics); SDL3
+// then skips color-space setup and uses the default framebuffer path.
+int TRT_GUEST_ABI gdi_GetICMProfileW(void* hdc, u32* name_len, u16* name) {
+  (void)hdc;
+  (void)name_len;
+  (void)name;
+  log_line("gdi32: GetICMProfileW -> FALSE (no ICM profile on console)");
+  return 0;
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
+      {"GetICMProfileW", (void*)&gdi_GetICMProfileW},
       {"D3DKMTOpenAdapterFromLuid", (void*)&gdi_D3DKMTOpenAdapterFromLuid},
       {"D3DKMTCloseAdapter", (void*)&gdi_D3DKMTCloseAdapter},
       {"D3DKMTQueryAdapterInfo", (void*)&gdi_D3DKMTQueryAdapterInfo},
@@ -948,6 +976,8 @@ int trt_bridge_register_gdi(void) {
       {"ChoosePixelFormat", (void*)&trt_ChoosePixelFormat},
       {"DescribePixelFormat", (void*)&trt_DescribePixelFormat},
       {"SetPixelFormat", (void*)&trt_SetPixelFormat},
+      {"GetPixelFormat", (void*)&trt_GetPixelFormat},
+      {"SetDCBrushColor", (void*)&trt_SetDCBrushColor},
       {"SwapBuffers", (void*)&trt_SwapBuffers},
       {"SetDeviceGammaRamp", (void*)&trt_SetDeviceGammaRamp},
       {"GetDeviceGammaRamp", (void*)&trt_GetDeviceGammaRamp},

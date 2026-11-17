@@ -32,6 +32,10 @@ extern std::atomic<u64> g_wa_timed_out;
 // breaks here to stop the process at the moment the CS-stall probe names a
 // wedged owner.
 extern "C" void trt_cs_stall_probe_pause(void);
+
+// Per-handle file completion-notification modes (definition in
+// bridge_kernel32.cpp): bit 0 = FILE_SKIP_COMPLETION_PORT_ON_SUCCESS.
+extern "C" int trt_file_io_modes(void* file_handle);
 #include <mutex>
 #include <string>
 #include <thread>
@@ -674,6 +678,11 @@ void trt_iocp_notify_io(u64 file_handle, u32 bytes, void* overlapped) {
   std::lock_guard<std::mutex> lk(g_obj_mu);
   auto it = g_iocp_assocs.find(file_handle);
   if (it == g_iocp_assocs.end()) return;
+  // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS (bridge_kernel32.cpp stores the
+  // per-handle modes): a successful overlapped I/O signals the OVERLAPPED
+  // event but posts NO completion packet — posting one anyway handed
+  // engines that set the flag phantom double-completions.
+  if (trt_file_io_modes((void*)(uintptr_t)file_handle) & 0x1u) return;
   sync_object* port = object_for_locked(it->second.iocp_handle);
   if (!port || port->kind != OBJ_IOCP || port->iocp_closed) return;
   port->iocp_queue.push_back(

@@ -100,6 +100,65 @@ int TRT_GUEST_ABI trt_InitCommonControlsEx(const iccx* classes) {
   return 1;  // TRUE: accepted (console has no common controls to draw)
 }
 
+// ---- Subclass family (SetWindowSubclass/RemoveWindowSubclass/DefSubclassProc)
+// Real Win32 keeps a per-window subclass chain and a "current proc" cursor
+// during dispatch. The console window layer has no comctl32 message loop
+// integration, so the chain is RECORDED (named, per window) and
+// DefSubclassProc forwards to the window's base wndproc (DefWindowProcW).
+// Subclass hooks are theme/editor tweaks; boot depth does not depend on
+// them firing. Every install is logged so a game that truly needs the hook
+// shows up as a named work item, not a silent no-op.
+// bridge_user32.cpp owns the base window procedure
+i64 TRT_GUEST_ABI trt_DefWindowProcW(void* hwnd, u32 msg, u64 wparam,
+                                     u64 lparam);
+
+struct sub_class {
+  void* hwnd;
+  void* proc;
+  u64 id;
+  u64 refdata;
+  int used;
+};
+static sub_class g_subclasses[128];
+static int g_subclass_count = 0;
+
+int TRT_GUEST_ABI trt_SetWindowSubclass(void* hwnd, void* proc, u64 id,
+                                        u64 refdata) {
+  if (!hwnd || !proc) return 0;
+  if (g_subclass_count < (int)(sizeof(g_subclasses) / sizeof(g_subclasses[0]))) {
+    sub_class& s = g_subclasses[g_subclass_count++];
+    s.hwnd = hwnd;
+    s.proc = proc;
+    s.id = id;
+    s.refdata = refdata;
+    s.used = 1;
+  }
+  char line[128];
+  snprintf(line, sizeof(line),
+           "comctl32: SetWindowSubclass hwnd=%p proc=%p id=%llu -> recorded "
+           "(chain not dispatched; DefSubclassProc -> base wndproc)",
+           hwnd, proc, (unsigned long long)id);
+  log_line(line);
+  return 1;
+}
+
+int TRT_GUEST_ABI trt_RemoveWindowSubclass(void* hwnd, void* proc, u64 id) {
+  for (int i = 0; i < g_subclass_count; ++i) {
+    if (g_subclasses[i].used && g_subclasses[i].hwnd == hwnd &&
+        g_subclasses[i].proc == proc && g_subclasses[i].id == id) {
+      g_subclasses[i].used = 0;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+i64 TRT_GUEST_ABI trt_DefSubclassProc(void* hwnd, u32 msg, u64 wparam,
+                                      u64 lparam) {
+  // Forward to the base window procedure (see the chain note above).
+  return trt_DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
 int trt_bridge_register_comctl(void) {
   static const trt_named_fn k_comctl32_fns[] = {
       {"InitCommonControls", (void*)&trt_InitCommonControls},
@@ -109,6 +168,9 @@ int trt_bridge_register_comctl(void) {
       // import table). The loader passes ordinal-only imports here with
       // symbol == NULL, so the ordinal is registered as "#380".
       {"#380", (void*)&trt_InitCommonControlsEx},
+      {"SetWindowSubclass", (void*)&trt_SetWindowSubclass},
+      {"RemoveWindowSubclass", (void*)&trt_RemoveWindowSubclass},
+      {"DefSubclassProc", (void*)&trt_DefSubclassProc},
   };
   trt_module_register("comctl32.dll", TRT_ROUTE_BUILTIN, k_comctl32_fns,
                       (int)(sizeof(k_comctl32_fns) / sizeof(k_comctl32_fns[0])));

@@ -147,6 +147,8 @@ std::mutex g_live_mu;
 std::unordered_set<void*> g_live_heaps;
 std::unordered_set<void*> g_live_resources;
 std::unordered_set<void*> g_live_rootsigs;
+std::unordered_set<void*> g_live_psos;
+std::unordered_set<void*> g_live_cmdlists;
 
 // log-once gate for recording-level success lines / soft warnings (the
 // fail-visible E_INVALIDARG lines log EVERY time — garbage is rare and each
@@ -168,6 +170,8 @@ static void d3d12_log_once(u32 bit, const char* line) {
 struct d3d12_desc_heap;
 static bool is_live_resource(const void* p);
 static bool is_live_root_sig(const void* p);
+static bool is_live_pso(const void* p);
+static bool is_live_cmdlist(const void* p);
 static d3d12_desc_heap* resolve_gpu_handle(u64 h, u32* out_idx,
                                            const char* api, char* reason,
                                            size_t reason_sz);
@@ -983,6 +987,10 @@ void simple_child_destroy(com_base* b) {
     std::lock_guard<std::mutex> lk(g_live_mu);
     g_live_rootsigs.erase(c);
   }
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_psos.erase(c);
+  }
   delete c;
 }
 
@@ -1079,6 +1087,31 @@ const void* g_alloc_vtbl[9] = {
 };
 
 // ---- ID3D12GraphicsCommandList ---------------------------------------------
+struct d3d12_vb_view_t {
+  u64 buffer_location;
+  u32 size_in_bytes;
+  u32 stride_in_bytes;
+};
+struct d3d12_ib_view_t {
+  u64 buffer_location;
+  u32 size_in_bytes;
+  u32 format;
+};
+struct d3d12_viewport_t {
+  float top_left_x;
+  float top_left_y;
+  float width;
+  float height;
+  float min_depth;
+  float max_depth;
+};
+struct d3d12_rect_t {
+  i32 left;
+  i32 top;
+  i32 right;
+  i32 bottom;
+};
+
 struct d3d12_cmd_list : com_base {
   u32 type = 0;
   bool closed = false;
@@ -1104,8 +1137,39 @@ struct d3d12_cmd_list : com_base {
     bool graphics;
   };
   std::vector<root_cbv> root_cbvs;
+  // Pipeline, IA, RS, OM, Query, and Marker state recorded per call.
+  u32 topology = 0;
+  u32 viewport_count = 0;
+  d3d12_viewport_t viewport0{};
+  u32 scissor_count = 0;
+  d3d12_rect_t scissor0{};
+  float blend_factor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+  u32 stencil_ref = 0;
+  void* bound_pso = nullptr;
+  void* gfx_rootsig = nullptr;
+  void* comp_rootsig = nullptr;
+  u32 root_consts = 0;
+  u32 root_srv_uav_binds = 0;
+  u32 vb_binds = 0;
+  d3d12_vb_view_t vb0{};
+  bool ib_bound = false;
+  d3d12_ib_view_t ib{};
+  u32 rtv_count = 0;
+  bool dsv_bound = false;
+  u32 bundles_executed = 0;
+  u32 discards = 0;
+  u32 queries = 0;
+  u32 markers = 0;
+  i32 event_depth = 0;
+  u64 predication_va = 0;
 };
-void cmdlist_destroy(com_base* b) { delete (d3d12_cmd_list*)b; }
+void cmdlist_destroy(com_base* b) {
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_cmdlists.erase(b);
+  }
+  delete (d3d12_cmd_list*)b;
+}
 
 u32 TRT_GUEST_ABI cmd_get_type(void* self) { return ((d3d12_cmd_list*)self)->type; }
 int TRT_GUEST_ABI cmd_close(void* self) {
@@ -1114,18 +1178,47 @@ int TRT_GUEST_ABI cmd_close(void* self) {
   cl->closed = true;
   return k_s_ok;
 }
-int TRT_GUEST_ABI cmd_reset(void* self, void* alloc, void*) {
-  if (!alloc) return k_e_invalidarg;
-  auto* cl = (d3d12_cmd_list*)self;
-  cl->closed = false;
+static void cmdlist_clear_recorded_state(d3d12_cmd_list* cl, void* pso) {
   cl->draws = cl->dispatches = cl->clears = cl->barriers = 0;
   cl->copies = cl->resolves = 0;
   cl->bound_heaps.clear();
   cl->root_tables.clear();
   cl->root_cbvs.clear();
+  cl->topology = 0;
+  cl->viewport_count = 0;
+  cl->viewport0 = {};
+  cl->scissor_count = 0;
+  cl->scissor0 = {};
+  cl->blend_factor[0] = cl->blend_factor[1] = cl->blend_factor[2] = cl->blend_factor[3] = 1.0f;
+  cl->stencil_ref = 0;
+  cl->bound_pso = pso;
+  cl->gfx_rootsig = nullptr;
+  cl->comp_rootsig = nullptr;
+  cl->root_consts = 0;
+  cl->root_srv_uav_binds = 0;
+  cl->vb_binds = 0;
+  cl->vb0 = {};
+  cl->ib_bound = false;
+  cl->ib = {};
+  cl->rtv_count = 0;
+  cl->dsv_bound = false;
+  cl->bundles_executed = 0;
+  cl->discards = 0;
+  cl->queries = 0;
+  cl->markers = 0;
+  cl->event_depth = 0;
+  cl->predication_va = 0;
+}
+int TRT_GUEST_ABI cmd_reset(void* self, void* alloc, void* pso) {
+  if (!alloc) return k_e_invalidarg;
+  auto* cl = (d3d12_cmd_list*)self;
+  cl->closed = false;
+  cmdlist_clear_recorded_state(cl, pso);
   return k_s_ok;
 }
-void TRT_GUEST_ABI cmd_clear_state(void*, void*) {}
+void TRT_GUEST_ABI cmd_clear_state(void* self, void* pso) {
+  cmdlist_clear_recorded_state((d3d12_cmd_list*)self, pso);
+}
 void TRT_GUEST_ABI cmd_draw_inst(void* self, u32 verts, u32 insts, u32 sv,
                                  u32 siv) {
   auto* cl = (d3d12_cmd_list*)self;
@@ -1143,7 +1236,159 @@ void TRT_GUEST_ABI cmd_dispatch(void* self, u32, u32, u32) { ++((d3d12_cmd_list*
 void TRT_GUEST_ABI cmd_barrier(void* self, u32 n, const void*) { ((d3d12_cmd_list*)self)->barriers += n; }
 void TRT_GUEST_ABI cmd_clear_rtv(void* self, u64, const void*, u32, const void*) { ++((d3d12_cmd_list*)self)->clears; }
 void TRT_GUEST_ABI cmd_clear_dsv(void* self, u64, u32, float, u8, u32, const void*) { ++((d3d12_cmd_list*)self)->clears; }
-void TRT_GUEST_ABI cmd_noop(void*) {}
+void TRT_GUEST_ABI cmd_ia_set_topo(void* self, u32 topo) {
+  ((d3d12_cmd_list*)self)->topology = topo;
+}
+void TRT_GUEST_ABI cmd_rs_set_viewports(void* self, u32 n, const d3d12_viewport_t* vps) {
+  auto* cl = (d3d12_cmd_list*)self;
+  cl->viewport_count = n;
+  if (n && vps) cl->viewport0 = vps[0];
+}
+void TRT_GUEST_ABI cmd_rs_set_scissors(void* self, u32 n, const d3d12_rect_t* rects) {
+  auto* cl = (d3d12_cmd_list*)self;
+  cl->scissor_count = n;
+  if (n && rects) cl->scissor0 = rects[0];
+}
+void TRT_GUEST_ABI cmd_om_set_blend_factor(void* self, const float* bf) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (bf) {
+    for (int i = 0; i < 4; ++i) cl->blend_factor[i] = bf[i];
+  } else {
+    for (int i = 0; i < 4; ++i) cl->blend_factor[i] = 1.0f;
+  }
+}
+void TRT_GUEST_ABI cmd_om_set_stencil_ref(void* self, u32 ref) {
+  ((d3d12_cmd_list*)self)->stencil_ref = ref;
+}
+void TRT_GUEST_ABI cmd_set_pso(void* self, void* pso) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (pso && !is_live_pso(pso)) {
+    view_fail("cl SetPipelineState", "pPipelineState was not created by this device");
+    return;
+  }
+  cl->bound_pso = pso;
+}
+void TRT_GUEST_ABI cmd_exec_bundle(void* self, void* bundle) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!bundle || !is_live_cmdlist(bundle)) {
+    view_fail("cl ExecuteBundle",
+              !bundle ? "pCommandList is null" : "bundle was not created by this device");
+    return;
+  }
+  ++cl->bundles_executed;
+}
+void TRT_GUEST_ABI cmd_set_comp_rootsig(void* self, void* rs) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (rs && !is_live_root_sig(rs)) {
+    view_fail("cl SetComputeRootSignature", "pRootSignature was not created by this device");
+    return;
+  }
+  cl->comp_rootsig = rs;
+}
+void TRT_GUEST_ABI cmd_set_gfx_rootsig(void* self, void* rs) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (rs && !is_live_root_sig(rs)) {
+    view_fail("cl SetGraphicsRootSignature", "pRootSignature was not created by this device");
+    return;
+  }
+  cl->gfx_rootsig = rs;
+}
+void TRT_GUEST_ABI cmd_set_comp_root_const(void* self, u32, u32, u32) {
+  ++((d3d12_cmd_list*)self)->root_consts;
+}
+void TRT_GUEST_ABI cmd_set_gfx_root_const(void* self, u32, u32, u32) {
+  ++((d3d12_cmd_list*)self)->root_consts;
+}
+void TRT_GUEST_ABI cmd_set_comp_root_consts(void* self, u32, u32 n, const void*, u32) {
+  ((d3d12_cmd_list*)self)->root_consts += n;
+}
+void TRT_GUEST_ABI cmd_set_gfx_root_consts(void* self, u32, u32 n, const void*, u32) {
+  ((d3d12_cmd_list*)self)->root_consts += n;
+}
+void TRT_GUEST_ABI cmd_set_comp_root_srv(void* self, u32, u64) {
+  ++((d3d12_cmd_list*)self)->root_srv_uav_binds;
+}
+void TRT_GUEST_ABI cmd_set_gfx_root_srv(void* self, u32, u64) {
+  ++((d3d12_cmd_list*)self)->root_srv_uav_binds;
+}
+void TRT_GUEST_ABI cmd_set_comp_root_uav(void* self, u32, u64) {
+  ++((d3d12_cmd_list*)self)->root_srv_uav_binds;
+}
+void TRT_GUEST_ABI cmd_set_gfx_root_uav(void* self, u32, u64) {
+  ++((d3d12_cmd_list*)self)->root_srv_uav_binds;
+}
+void TRT_GUEST_ABI cmd_ia_set_ib(void* self, const d3d12_ib_view_t* view) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (view) {
+    cl->ib_bound = true;
+    cl->ib = *view;
+  } else {
+    cl->ib_bound = false;
+    cl->ib = {};
+  }
+}
+void TRT_GUEST_ABI cmd_ia_set_vbs(void* self, u32, u32 n, const d3d12_vb_view_t* views) {
+  auto* cl = (d3d12_cmd_list*)self;
+  cl->vb_binds += n;
+  if (n && views) cl->vb0 = views[0];
+}
+void TRT_GUEST_ABI cmd_so_set_targets(void* self, u32, u32, const void*) {
+  (void)self;
+}
+void TRT_GUEST_ABI cmd_om_set_rtvs(void* self, u32 n, const void*, int, const void* dsv) {
+  auto* cl = (d3d12_cmd_list*)self;
+  cl->rtv_count = n;
+  cl->dsv_bound = (dsv != nullptr);
+}
+void TRT_GUEST_ABI cmd_clear_uav_uint(void* self, u64, u64, void*, const u32*, u32, const void*) {
+  ++((d3d12_cmd_list*)self)->clears;
+}
+void TRT_GUEST_ABI cmd_clear_uav_float(void* self, u64, u64, void*, const float*, u32, const void*) {
+  ++((d3d12_cmd_list*)self)->clears;
+}
+void TRT_GUEST_ABI cmd_discard_resource(void* self, void* res, const void*) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (!res || !is_live_resource(res)) {
+    view_fail("cl DiscardResource",
+              !res ? "pResource is null" : "resource was not created by this device");
+    return;
+  }
+  ++cl->discards;
+}
+void TRT_GUEST_ABI cmd_begin_query(void* self, void*, u32, u32) {
+  ++((d3d12_cmd_list*)self)->queries;
+}
+void TRT_GUEST_ABI cmd_end_query(void* self, void*, u32, u32) {
+  ++((d3d12_cmd_list*)self)->queries;
+}
+void TRT_GUEST_ABI cmd_resolve_query(void* self, void*, u32, u32, u32, void* dst, u64) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (dst && !is_live_resource(dst)) {
+    view_fail("cl ResolveQueryData", "pDestinationBuffer was not created by this device");
+    return;
+  }
+  ++cl->queries;
+}
+void TRT_GUEST_ABI cmd_set_predication(void* self, void* buf, u64 off, u32) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (buf && !is_live_resource(buf)) {
+    view_fail("cl SetPredication", "pBuffer was not created by this device");
+    return;
+  }
+  cl->predication_va = buf ? (off + 1ULL) : 0ULL;
+}
+void TRT_GUEST_ABI cmd_set_marker(void* self, u32, const void*, u32) {
+  ++((d3d12_cmd_list*)self)->markers;
+}
+void TRT_GUEST_ABI cmd_begin_event(void* self, u32, const void*, u32) {
+  auto* cl = (d3d12_cmd_list*)self;
+  ++cl->markers;
+  ++cl->event_depth;
+}
+void TRT_GUEST_ABI cmd_end_event(void* self) {
+  auto* cl = (d3d12_cmd_list*)self;
+  if (cl->event_depth > 0) --cl->event_depth;
+}
 
 // ---- command-list copies + descriptor/root slots (0-based vtbl slots) ------
 // Every op validates its arguments against the live-object registries and
@@ -1490,45 +1735,45 @@ const void* g_cmdlist_vtbl[84] = {
     (const void*)&cmd_copy_resource,       // 17 CopyResource
     (const void*)&cmd_copy_tiles,          // 18 CopyTiles
     (const void*)&cmd_resolve_subresource, // 19 ResolveSubresource
-    (const void*)&cmd_noop,            // 20 IASetPrimitiveTopology
-    (const void*)&cmd_noop,            // 21 RSSetViewports
-    (const void*)&cmd_noop,            // 22 RSSetScissorRects
-    (const void*)&cmd_noop,            // 23 OMSetBlendFactor
-    (const void*)&cmd_noop,            // 24 OMSetStencilRef
-    (const void*)&cmd_noop,            // 25 SetPipelineState
-    (const void*)&cmd_barrier,         // 26 ResourceBarrier
-    (const void*)&cmd_noop,            // 27 ExecuteBundle
-    (const void*)&cmd_set_desc_heaps,   // 28 SetDescriptorHeaps
-    (const void*)&cmd_noop,            // 29 SetComputeRootSignature
-    (const void*)&cmd_noop,            // 30 SetGraphicsRootSignature
+    (const void*)&cmd_ia_set_topo,            // 20 IASetPrimitiveTopology
+    (const void*)&cmd_rs_set_viewports,       // 21 RSSetViewports
+    (const void*)&cmd_rs_set_scissors,        // 22 RSSetScissorRects
+    (const void*)&cmd_om_set_blend_factor,    // 23 OMSetBlendFactor
+    (const void*)&cmd_om_set_stencil_ref,     // 24 OMSetStencilRef
+    (const void*)&cmd_set_pso,                // 25 SetPipelineState
+    (const void*)&cmd_barrier,                // 26 ResourceBarrier
+    (const void*)&cmd_exec_bundle,            // 27 ExecuteBundle
+    (const void*)&cmd_set_desc_heaps,         // 28 SetDescriptorHeaps
+    (const void*)&cmd_set_comp_rootsig,       // 29 SetComputeRootSignature
+    (const void*)&cmd_set_gfx_rootsig,        // 30 SetGraphicsRootSignature
     (const void*)&cmd_set_compute_root_table,   // 31 SetComputeRootDescriptorTable
     (const void*)&cmd_set_graphics_root_table,  // 32 SetGraphicsRootDescriptorTable
-    (const void*)&cmd_noop,            // 33 SetComputeRoot32BitConstant
-    (const void*)&cmd_noop,            // 34 SetGraphicsRoot32BitConstant
-    (const void*)&cmd_noop,            // 35 SetComputeRoot32BitConstants
-    (const void*)&cmd_noop,            // 36 SetGraphicsRoot32BitConstants
+    (const void*)&cmd_set_comp_root_const,    // 33 SetComputeRoot32BitConstant
+    (const void*)&cmd_set_gfx_root_const,     // 34 SetGraphicsRoot32BitConstant
+    (const void*)&cmd_set_comp_root_consts,   // 35 SetComputeRoot32BitConstants
+    (const void*)&cmd_set_gfx_root_consts,    // 36 SetGraphicsRoot32BitConstants
     (const void*)&cmd_set_compute_root_cbv,     // 37 SetComputeRootConstantBufferView
     (const void*)&cmd_set_graphics_root_cbv,    // 38 SetGraphicsRootConstantBufferView
-    (const void*)&cmd_noop,            // 39 SetComputeRootShaderResourceView
-    (const void*)&cmd_noop,            // 40 SetGraphicsRootShaderResourceView
-    (const void*)&cmd_noop,            // 41 SetComputeRootUnorderedAccessView
-    (const void*)&cmd_noop,            // 42 SetGraphicsRootUnorderedAccessView
-    (const void*)&cmd_noop,            // 43 IASetIndexBuffer
-    (const void*)&cmd_noop,            // 44 IASetVertexBuffers
-    (const void*)&cmd_noop,            // 45 SOSetTargets
-    (const void*)&cmd_noop,            // 46 OMSetRenderTargets
-    (const void*)&cmd_clear_dsv,       // 47 ClearDepthStencilView
-    (const void*)&cmd_clear_rtv,       // 48 ClearRenderTargetView
-    (const void*)&cmd_noop,            // 49 ClearUnorderedAccessViewUint
-    (const void*)&cmd_noop,            // 50 ClearUnorderedAccessViewFloat
-    (const void*)&cmd_noop,            // 51 DiscardResource
-    (const void*)&cmd_noop,            // 52 BeginQuery
-    (const void*)&cmd_noop,            // 53 EndQuery
-    (const void*)&cmd_noop,            // 54 ResolveQueryData
-    (const void*)&cmd_noop,            // 55 SetPredication
-    (const void*)&cmd_noop,            // 56 SetMarker
-    (const void*)&cmd_noop,            // 57 BeginEvent
-    (const void*)&cmd_noop,            // 58 EndEvent
+    (const void*)&cmd_set_comp_root_srv,      // 39 SetComputeRootShaderResourceView
+    (const void*)&cmd_set_gfx_root_srv,       // 40 SetGraphicsRootShaderResourceView
+    (const void*)&cmd_set_comp_root_uav,      // 41 SetComputeRootUnorderedAccessView
+    (const void*)&cmd_set_gfx_root_uav,       // 42 SetGraphicsRootUnorderedAccessView
+    (const void*)&cmd_ia_set_ib,              // 43 IASetIndexBuffer
+    (const void*)&cmd_ia_set_vbs,             // 44 IASetVertexBuffers
+    (const void*)&cmd_so_set_targets,         // 45 SOSetTargets
+    (const void*)&cmd_om_set_rtvs,            // 46 OMSetRenderTargets
+    (const void*)&cmd_clear_dsv,              // 47 ClearDepthStencilView
+    (const void*)&cmd_clear_rtv,              // 48 ClearRenderTargetView
+    (const void*)&cmd_clear_uav_uint,         // 49 ClearUnorderedAccessViewUint
+    (const void*)&cmd_clear_uav_float,        // 50 ClearUnorderedAccessViewFloat
+    (const void*)&cmd_discard_resource,       // 51 DiscardResource
+    (const void*)&cmd_begin_query,            // 52 BeginQuery
+    (const void*)&cmd_end_query,              // 53 EndQuery
+    (const void*)&cmd_resolve_query,          // 54 ResolveQueryData
+    (const void*)&cmd_set_predication,        // 55 SetPredication
+    (const void*)&cmd_set_marker,             // 56 SetMarker
+    (const void*)&cmd_begin_event,            // 57 BeginEvent
+    (const void*)&cmd_end_event,              // 58 EndEvent
     (const void*)&cmd_draw_inst,       // 59 ExecuteIndirect
     // ---- ID3D12GraphicsCommandList1..9 extensions (slots 60-83) ------------
     // Logged no-ops: the slot EXISTS (ABI-correct arity) so versioned QI can
@@ -1823,6 +2068,10 @@ static int pso_finish(void* self, d3d12_simple_child* p, void** out_pso,
   p->vtbl = g_pso_vtbl;
   p->device = (d3d12_device*)self;
   p->destroy_fn = &simple_child_destroy;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_psos.insert(p);
+  }
   *out_pso = p;
   char line[96];
   snprintf(line, sizeof(line), "d3d12: %s recorded", api);
@@ -2063,13 +2312,18 @@ int TRT_GUEST_ABI dev_create_pso_stream(void* self,
 }
 
 int TRT_GUEST_ABI dev_create_cmdlist(void* self, u32, u32 type, void* alloc,
-                                     void*, const void*, void** out_cl) {
+                                     void* pso, const void*, void** out_cl) {
   if (!alloc || !out_cl) return k_e_invalidarg;
   auto* cl = new d3d12_cmd_list();
   cl->vtbl = g_cmdlist_vtbl;
   cl->device = (d3d12_device*)self;
   cl->destroy_fn = &cmdlist_destroy;
   cl->type = type;
+  cl->bound_pso = pso;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_cmdlists.insert(cl);
+  }
   *out_cl = cl;
   return k_s_ok;
 }
@@ -2083,6 +2337,10 @@ int TRT_GUEST_ABI dev_create_cmdlist1(void* self, u32, u32 type, u32,
   cl->destroy_fn = &cmdlist_destroy;
   cl->type = type;
   cl->closed = true;
+  {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    g_live_cmdlists.insert(cl);
+  }
   *out_cl = cl;
   return k_s_ok;
 }
@@ -2190,6 +2448,18 @@ static bool is_live_root_sig(const void* p) {
   if (!p) return false;
   std::lock_guard<std::mutex> lk(g_live_mu);
   return g_live_rootsigs.count(const_cast<void*>(p)) != 0;
+}
+
+static bool is_live_pso(const void* p) {
+  if (!p) return false;
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  return g_live_psos.count(const_cast<void*>(p)) != 0;
+}
+
+static bool is_live_cmdlist(const void* p) {
+  if (!p) return false;
+  std::lock_guard<std::mutex> lk(g_live_mu);
+  return g_live_cmdlists.count(const_cast<void*>(p)) != 0;
 }
 
 // Resolves a CPU descriptor handle to (heap, index). Returns nullptr (with a
@@ -2913,7 +3183,106 @@ d3d12_luid_t* TRT_GUEST_ABI dev_get_luid(void* self, d3d12_luid_t* ret) {
   return ret;
 }
 
-const void* g_device_vtbl[57] = {
+int TRT_GUEST_ABI dev_unimpl_named(void*, const char* name) {
+  char line[128];
+  snprintf(line, sizeof(line), "d3d12: %s -> E_NOTIMPL (unimplemented)", name);
+  trt_core_log(line);
+  return k_e_notimpl;
+}
+int TRT_GUEST_ABI dev_create_lifetime_tracker(void*, void*, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device5::CreateLifetimeTracker");
+}
+void TRT_GUEST_ABI dev_remove_device(void*) {
+  trt_core_log("d3d12: ID3D12Device5::RemoveDevice called");
+}
+int TRT_GUEST_ABI dev_enum_meta_cmds(void*, u32* num, void*) {
+  if (num) *num = 0;
+  return k_s_ok;
+}
+int TRT_GUEST_ABI dev_enum_meta_params(void*, const void*, u32, u32* num, void*) {
+  if (num) *num = 0;
+  return k_s_ok;
+}
+int TRT_GUEST_ABI dev_create_meta_cmd(void*, const void*, u32, const void*, u64, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device5::CreateMetaCommand");
+}
+int TRT_GUEST_ABI dev_create_state_obj(void*, const void*, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device5::CreateStateObject");
+}
+struct d3d12_rtas_prebuild_info_t {
+  u64 result_data_max_size_in_bytes;
+  u64 scratch_data_size_in_bytes;
+  u64 update_scratch_data_size_in_bytes;
+};
+struct d3d12_build_rtas_inputs_t {
+  u32 type;
+  u32 flags;
+  u32 num_descs;
+};
+void TRT_GUEST_ABI dev_get_rtas_prebuild_info(void*, const d3d12_build_rtas_inputs_t* inputs,
+                                              d3d12_rtas_prebuild_info_t* out) {
+  if (!out) return;
+  const u64 n = (inputs && inputs->num_descs) ? inputs->num_descs : 1;
+  out->result_data_max_size_in_bytes = ((n * 256ULL) + 255ULL) & ~255ULL;
+  out->scratch_data_size_in_bytes = ((n * 512ULL) + 255ULL) & ~255ULL;
+  out->update_scratch_data_size_in_bytes = ((n * 256ULL) + 255ULL) & ~255ULL;
+}
+u32 TRT_GUEST_ABI dev_check_driver_match(void*, u32, const void*) {
+  return 0;  // D3D12_DRIVER_MATCHING_IDENTIFIER_COMPATIBLE_WITH_DEVICE
+}
+int TRT_GUEST_ABI dev_set_bg_proc_mode(void*, u32, u32, void*, int*) {
+  return k_s_ok;
+}
+int TRT_GUEST_ABI dev_add_to_state_obj(void*, const void*, void*, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device7::AddToStateObject");
+}
+int TRT_GUEST_ABI dev_create_prot_res1(void*, const void*, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device7::CreateProtectedResourceSession1");
+}
+d3d12_alloc_info_t* TRT_GUEST_ABI dev_alloc_info2(void* self, d3d12_alloc_info_t* ret,
+                                                  u32 visible_mask, u32 count,
+                                                  const d3d12_resource_desc_t* descs,
+                                                  void* info1_out) {
+  (void)info1_out;
+  return dev_alloc_info(self, ret, visible_mask, count, descs);
+}
+int TRT_GUEST_ABI dev_create_resource2(void* self, const d3d12_heap_props_t* props,
+                                       u32 heap_flags, const d3d12_resource_desc_t* desc,
+                                       u32 init_state, const void* clear_val,
+                                       void* prot, u32, const u32*,
+                                       const void* riid, void** out_res) {
+  (void)prot;
+  return dev_create_resource(self, props, heap_flags, desc, init_state, clear_val,
+                             riid, out_res);
+}
+int TRT_GUEST_ABI dev_create_placed1(void* self, void* heap, u64 off,
+                                     const d3d12_resource_desc_t* desc, u32 init_state,
+                                     const void* clear_val, u32, const u32*,
+                                     const void* riid, void** out_res) {
+  return dev_create_placed(self, heap, off, desc, init_state, clear_val, riid, out_res);
+}
+void TRT_GUEST_ABI dev_create_sampler_feedback_uav(void*, void*, void*, u64) {
+  trt_core_log("d3d12: ID3D12Device8::CreateSamplerFeedbackUnorderedAccessView (recorded no-op)");
+}
+void TRT_GUEST_ABI dev_footprints1(void* self, const d3d12_resource_desc_t* desc,
+                                   u32 first_sub, u32 num_sub, u64 base_off,
+                                   d3d12_placed_footprint_t* layouts,
+                                   u32* num_rows, u64* row_bytes, u64* total_bytes) {
+  dev_footprints(self, desc, first_sub, num_sub, base_off, layouts, num_rows,
+                 row_bytes, total_bytes);
+}
+int TRT_GUEST_ABI dev_create_shader_cache(void*, const void*, const void*, void**) {
+  return dev_unimpl_named(nullptr, "ID3D12Device9::CreateShaderCacheSession");
+}
+int TRT_GUEST_ABI dev_shader_cache_ctrl(void*, u32, u32) {
+  return k_s_ok;
+}
+int TRT_GUEST_ABI dev_create_queue1(void* self, const d3d12_queue_desc_t* desc,
+                                    const void* riid, const void*, void** out_q) {
+  return dev_create_queue(self, desc, riid, out_q);
+}
+
+const void* g_device_vtbl[76] = {
     (const void*)&dev_qi,               // 0 QueryInterface
     (const void*)&base_addref,          // 1 AddRef
     (const void*)&base_release,         // 2 Release
@@ -2971,7 +3340,29 @@ const void* g_device_vtbl[57] = {
     (const void*)&dev_create_heap1,     // 54 CreateHeap1
     (const void*)&dev_unimpl,           // 55 CreateReservedResource1
     (const void*)&dev_alloc_info,       // 56 GetResourceAllocationInfo1
+    // ---- ID3D12Device5..9 (slots 57-75) ----------------------------------
+    (const void*)&dev_create_lifetime_tracker,     // 57 Device5 CreateLifetimeTracker
+    (const void*)&dev_remove_device,               // 58 Device5 RemoveDevice
+    (const void*)&dev_enum_meta_cmds,              // 59 Device5 EnumerateMetaCommands
+    (const void*)&dev_enum_meta_params,            // 60 Device5 EnumerateMetaCommandParameters
+    (const void*)&dev_create_meta_cmd,             // 61 Device5 CreateMetaCommand
+    (const void*)&dev_create_state_obj,            // 62 Device5 CreateStateObject
+    (const void*)&dev_get_rtas_prebuild_info,      // 63 Device5 GetRaytracingAccelerationStructurePrebuildInfo
+    (const void*)&dev_check_driver_match,          // 64 Device5 CheckDriverMatchingIdentifier
+    (const void*)&dev_set_bg_proc_mode,            // 65 Device6 SetBackgroundProcessingMode
+    (const void*)&dev_add_to_state_obj,            // 66 Device7 AddToStateObject
+    (const void*)&dev_create_prot_res1,            // 67 Device7 CreateProtectedResourceSession1
+    (const void*)&dev_alloc_info2,                 // 68 Device8 GetResourceAllocationInfo2
+    (const void*)&dev_create_resource2,            // 69 Device8 CreateCommittedResource2
+    (const void*)&dev_create_placed1,              // 70 Device8 CreatePlacedResource1
+    (const void*)&dev_create_sampler_feedback_uav, // 71 Device8 CreateSamplerFeedbackUnorderedAccessView
+    (const void*)&dev_footprints1,                 // 72 Device8 GetCopyableFootprints1
+    (const void*)&dev_create_shader_cache,         // 73 Device9 CreateShaderCacheSession
+    (const void*)&dev_shader_cache_ctrl,           // 74 Device9 ShaderCacheControl
+    (const void*)&dev_create_queue1,               // 75 Device9 CreateCommandQueue1
 };
+static_assert(sizeof(g_device_vtbl) / sizeof(g_device_vtbl[0]) == 76,
+              "ID3D12Device9 vtbl must stay 76 slots (Win64 ABI)");
 
 // ---- Agility SDK helper interfaces (SDKConfiguration / DeviceFactory) -----
 struct simple_com {
@@ -3071,6 +3462,40 @@ u32 trt_d3d12_cmdlist_root_cbv_count(void* obj) {
 u32 trt_d3d12_cmdlist_copy_count(void* obj) {
   if (!obj) return 0;
   return ((d3d12_cmd_list*)obj)->copies;
+}
+
+u32 trt_d3d12_cmdlist_topology(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->topology : 0;
+}
+void* trt_d3d12_cmdlist_pso(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->bound_pso : nullptr;
+}
+void* trt_d3d12_cmdlist_gfx_rootsig(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->gfx_rootsig : nullptr;
+}
+void* trt_d3d12_cmdlist_comp_rootsig(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->comp_rootsig : nullptr;
+}
+u32 trt_d3d12_cmdlist_rtv_count(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->rtv_count : 0;
+}
+u32 trt_d3d12_cmdlist_vb_binds(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->vb_binds : 0;
+}
+u32 trt_d3d12_cmdlist_viewport_count(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->viewport_count : 0;
+}
+u32 trt_d3d12_cmdlist_scissor_count(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->scissor_count : 0;
+}
+u32 trt_d3d12_cmdlist_draws(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->draws : 0;
+}
+u32 trt_d3d12_cmdlist_queries(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->queries : 0;
+}
+u32 trt_d3d12_cmdlist_bundles(void* obj) {
+  return obj ? ((d3d12_cmd_list*)obj)->bundles_executed : 0;
 }
 
 int trt_d3d12_is_queue(void* obj) {

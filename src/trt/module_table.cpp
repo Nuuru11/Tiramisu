@@ -140,7 +140,13 @@ void* try_native_override(const char* module, const char* symbol,
   char host[1024];
   snprintf(host, sizeof(host), "%s/%s", dir, module);
   struct stat st{};
+#ifdef _WIN32
+  // The UWP (WINAPI_FAMILY_APP) UCRT hides the POSIX S_IS* macros; the CRT
+  // file-mode bit is the same value.
+  if (stat(host, &st) != 0 || !(st.st_mode & _S_IFREG)) return nullptr;
+#else
   if (stat(host, &st) != 0 || !S_ISREG(st.st_mode)) return nullptr;
+#endif
 
   // already loaded? reuse the registry handle
   trt_image* img = trt_images_find(module);

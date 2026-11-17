@@ -448,6 +448,75 @@ void* TRT_GUEST_ABI trt_SetupDiOpenDevRegKey(void* dev_info, void* dev_data,
   return (void*)(uintptr_t)-1;
 }
 
+// ---- CFGMGR32-style device-node queries (imported by SDL3 via SETUPAPI) ----
+// SDL3 walks SetupDiGetClassDevsA -> EnumDeviceInfo -> DeviceInstanceId ->
+// CM_Locate_DevNodeA -> CM_Get_Parent -> CM_Get_Device_IDA to build a stable
+// gamepad ID. The console exposes no Plug&Play tree, so: locating a node
+// synthesizes a stable devinst from the ID string, the parent query reports
+// CR_NO_SUCH_DEVNODE (SDL then uses the instance ID as-is — the honest
+// answer: this device has no enumerable parent), and the ID query returns the
+// synthetic ID it was located under.
+static u32 hid_devinst_from_id(const char* id) {
+  u32 h = 2166136261u;
+  for (const char* p = id; p && *p; ++p) {
+    h ^= (u8)*p;
+    h *= 16777619u;
+  }
+  return h ? h : 1u;  // devinst 0 is reserved-ish; never hand back 0
+}
+
+i32 TRT_GUEST_ABI hid_CM_Locate_DevNodeA(u32* devinst, const char* device_id,
+                                          u32 flags) {
+  if (!devinst || !device_id || !device_id[0]) {
+    hidlog::line("setupapi: CM_Locate_DevNodeA -> CR_INVALID_DEVINST");
+    return 0x0D;  // CR_INVALID_DEVINST
+  }
+  *devinst = hid_devinst_from_id(device_id);
+  char _l[160];
+  snprintf(_l, sizeof(_l),
+           "setupapi: CM_Locate_DevNodeA(%s) -> synthetic devinst 0x%08x",
+           device_id, *devinst);
+  hidlog::line(_l);
+  return 0;  // CR_SUCCESS
+}
+
+i32 TRT_GUEST_ABI hid_CM_Get_Parent(u32* parent_devinst, u32 devinst,
+                                     u32 flags) {
+  (void)devinst;
+  (void)flags;
+  if (parent_devinst) *parent_devinst = 0;
+  char _l[160];
+  snprintf(_l, sizeof(_l),
+           "setupapi: CM_Get_Parent(0x%08x) -> CR_NO_SUCH_DEVNODE (no PnP "
+           "tree on console; caller falls back to the instance ID)",
+           devinst);
+  hidlog::line(_l);
+  return 0x0E;  // CR_NO_SUCH_DEVNODE
+}
+
+i32 TRT_GUEST_ABI hid_CM_Get_Device_IDA(u32 devinst, char* buf, u32 buf_len,
+                                         u32 flags) {
+  if (!buf || buf_len == 0) {
+    hidlog::line("setupapi: CM_Get_Device_IDA -> CR_INVALID_BUFFER");
+    return 0x03;  // CR_INVALID_BUFFER (closest CR code)
+  }
+  u32 h = devinst ? devinst : 1u;
+  char id[64];
+  snprintf(id, sizeof(id), "TRT\\DEVINST_%08x", h);
+  if (strlen(id) + 1 > buf_len) {
+    char _l[96];
+    snprintf(_l, sizeof(_l), "setupapi: CM_Get_Device_IDA -> CR_BUFFER_SMALL");
+    hidlog::line(_l);
+    return 0x03;
+  }
+  memcpy(buf, id, strlen(id) + 1);
+  char _l[128];
+  snprintf(_l, sizeof(_l), "setupapi: CM_Get_Device_IDA(0x%08x) -> \"%s\"",
+           devinst, id);
+  hidlog::line(_l);
+  return 0;  // CR_SUCCESS
+}
+
 int trt_bridge_register_hid(void) {
   static const trt_named_fn k_hid_fns[] = {
       {"HidD_GetHidGuid", (void*)&trt_HidD_GetHidGuid},
@@ -496,6 +565,9 @@ int trt_bridge_register_hid(void) {
       {"SetupDiGetDeviceInstanceIdW", (void*)&trt_SetupDiGetDeviceInstanceIdW},
       {"SetupDiGetDeviceInstanceIdA", (void*)&trt_SetupDiGetDeviceInstanceIdA},
       {"SetupDiOpenDevRegKey", (void*)&trt_SetupDiOpenDevRegKey},
+      {"CM_Locate_DevNodeA", (void*)&hid_CM_Locate_DevNodeA},
+      {"CM_Get_Parent", (void*)&hid_CM_Get_Parent},
+      {"CM_Get_Device_IDA", (void*)&hid_CM_Get_Device_IDA},
   };
   trt_module_register("hid.dll", TRT_ROUTE_BUILTIN, k_hid_fns,
                       (int)(sizeof(k_hid_fns) / sizeof(k_hid_fns[0])));

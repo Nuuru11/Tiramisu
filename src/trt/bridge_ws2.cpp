@@ -81,6 +81,7 @@ constexpr i32 k_wsa_ewouldblock = 10035;
 constexpr i32 k_wsa_eopnotsupp = 10045;
 constexpr i32 k_wsa_enotsock = 10038;
 constexpr i32 k_wsa_host_not_found = 11001;
+constexpr i32 k_wsa_eafnosupport = 10047;
 
 constexpr i32 k_fd_read = 1 << 0;
 constexpr i32 k_fd_write = 1 << 1;
@@ -2200,6 +2201,96 @@ const trt_named_fn k_wsock32_fns[] = {
 };
 
 #if !defined(_WIN32)
+// forward decls: the extra-fns table sits above the definitions
+void* TRT_GUEST_ABI ws2_getservbyname(const char* name, const char* proto);
+void* TRT_GUEST_ABI ws2_getservbyport(i32 port, const char* proto);
+i32 TRT_GUEST_ABI ws2_WSADuplicateSocketA(u64 s, u32 dwProcessId,
+                                          void* lpProtocolInfo);
+int TRT_GUEST_ABI ws2_WSAGetOverlappedResult(u64 s, void* lpOverlapped,
+                                             u32* lpcbTransfer, int fWait,
+                                             u32* lpdwFlags);
+i32 TRT_GUEST_ABI ws2_WSAStringToAddressA(const char* AddressString,
+                                          i32 AddressFamily,
+                                          const void* lpProtocolInfo,
+                                          u8* lpAddress, i32* lpAddressLength);
+
+// ---- BotW-Native chain gaps (libcrypto-3 + SDL3 imports) ----
+
+// getservbyname/getservbyport: no /etc/services database is shipped with the
+// runtime. NULL = "service unknown" (real semantics); callers fall back to
+// literal port numbers, which is all OpenSSL ever needs.
+void* TRT_GUEST_ABI ws2_getservbyname(const char* name,
+                                               const char* proto) {
+  (void)proto;
+  set_wsa_err(k_wsa_host_not_found);  // WSANO_DATA: name has no record
+  return nullptr;
+}
+
+void* TRT_GUEST_ABI ws2_getservbyport(i32 port, const char* proto) {
+  (void)port;
+  (void)proto;
+  set_wsa_err(k_wsa_host_not_found);
+  return nullptr;
+}
+
+// WSADuplicateSocketA: cross-process socket duplication has no consumer on
+// the console (one process, no WSAPROTOCOL negotiation). Named failure.
+i32 TRT_GUEST_ABI ws2_WSADuplicateSocketA(u64 s, u32 dwProcessId,
+                                          void* lpProtocolInfo) {
+  (void)s;
+  (void)dwProcessId;
+  (void)lpProtocolInfo;
+  set_wsa_err(k_wsa_einval);
+  return k_wsa_einval;
+}
+
+// WSAGetOverlappedResult: the bridge's async I/O completes synchronously, so
+// there are no deferred results to fetch. FALSE + WSAEINVAL (no overlapped
+// operation pending) is the honest answer.
+int TRT_GUEST_ABI ws2_WSAGetOverlappedResult(u64 s, void* lpOverlapped,
+                                             u32* lpcbTransfer, int fWait,
+                                             u32* lpdwFlags) {
+  (void)s;
+  (void)lpOverlapped;
+  (void)fWait;
+  if (lpcbTransfer) *lpcbTransfer = 0;
+  if (lpdwFlags) *lpdwFlags = 0;
+  set_wsa_err(k_wsa_einval);
+  return 0;  // FALSE
+}
+
+// WSAStringToAddressA: honest parse — dotted-quad IPv4 via inet_pton into the
+// guest sockaddr_in (family 2, port 0, network-order address); anything else
+// (IPv6 text, hostnames) fails WSAEINVAL like real Win32 without the parser.
+i32 TRT_GUEST_ABI ws2_WSAStringToAddressA(const char* AddressString,
+                                          i32 AddressFamily,
+                                          const void* lpProtocolInfo,
+                                          u8* lpAddress, i32* lpAddressLength) {
+  (void)lpProtocolInfo;
+  if (!AddressString || !lpAddress || !lpAddressLength ||
+      *lpAddressLength < 16) {
+    set_wsa_err(k_wsa_einval);
+    return k_wsa_einval;
+  }
+  if (AddressFamily != 2 /* AF_INET */) {
+    set_wsa_err(k_wsa_eafnosupport);
+    return k_wsa_eafnosupport;
+  }
+  unsigned char bin[4];
+  if (::inet_pton(AF_INET, AddressString, bin) != 1) {
+    set_wsa_err(k_wsa_einval);
+    return k_wsa_einval;
+  }
+  memset(lpAddress, 0, 16);
+  u16 fam = 2;
+  memcpy(lpAddress, &fam, 2);          // sin_family
+  // sin_port stays 0; sin_addr at offset 4, network order
+  memcpy(lpAddress + 4, bin, 4);
+  *lpAddressLength = 16;
+  set_wsa_err(0);
+  return 0;
+}
+
 const trt_named_fn k_ws2_extra_fns[] = {
     {"WSASocketA",               (void*)&ws2_WSASocketA},
     {"WSASocketW",               (void*)&ws2_WSASocketW},
@@ -2233,6 +2324,11 @@ const trt_named_fn k_ws2_extra_fns[] = {
     {"inet_ntop",                (void*)&ws2_inet_ntop},
     {"InetPtonW",                (void*)&ws2_InetPtonW},
     {"InetNtopW",                (void*)&ws2_InetNtopW},
+    {"getservbyname",            (void*)&ws2_getservbyname},
+    {"getservbyport",            (void*)&ws2_getservbyport},
+    {"WSADuplicateSocketA",      (void*)&ws2_WSADuplicateSocketA},
+    {"WSAGetOverlappedResult",   (void*)&ws2_WSAGetOverlappedResult},
+    {"WSAStringToAddressA",      (void*)&ws2_WSAStringToAddressA},
 };
 #endif
 

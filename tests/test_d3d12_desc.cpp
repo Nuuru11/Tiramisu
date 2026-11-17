@@ -105,6 +105,14 @@ static_assert(sizeof(resource_desc_pod) == 56,
               "resource desc mirror 56 (real D3D12_RESOURCE_DESC is 52; the "
               "mirror's trailing pad is never read)");
 
+struct queue_desc_pod {             // D3D12_COMMAND_QUEUE_DESC (16)
+  u32 type;
+  i32 priority;
+  u32 flags;
+  u32 node_mask;
+};
+static_assert(sizeof(queue_desc_pod) == 16, "queue desc 16");
+
 struct cbv_desc_pod {               // D3D12_CONSTANT_BUFFER_VIEW_DESC (16)
   u64 buffer_location;
   u32 size_in_bytes;
@@ -709,6 +717,105 @@ int main() {
   qv = nullptr;
   hr = ((qi_fn)vtbl_of(buf1)[0])(buf1, &iid_res, &qv);
   CHECK(hr == 0 && qv == buf1, "resource QI(ID3D12Resource) -> S_OK, self");
+
+  // ---- I. ID3D12Device5..9 vtbl slots (57..75) -------------------------------
+  // Verify Device5..9 methods don't walk off the end of g_device_vtbl (76 slots)
+  // and return honest results / fail-visible E_NOTIMPL.
+  typedef void(TRT_GUEST_ABI * rtas_prebuild_fn)(void*, const void*, void*);
+  typedef u32(TRT_GUEST_ABI * chk_drv_fn)(void*, u32, const void*);
+  typedef int(TRT_GUEST_ABI * create_state_obj_fn)(void*, const void*, const void*, void**);
+  typedef int(TRT_GUEST_ABI * create_res2_fn)(void*, const heap_props_pod*, u32,
+                                              const resource_desc_pod*, u32,
+                                              const void*, void*, u32, const u32*,
+                                              const void*, void**);
+  typedef int(TRT_GUEST_ABI * create_q1_fn)(void*, const queue_desc_pod*, const void*,
+                                            const void*, void**);
+  struct { u32 type; u32 flags; u32 num_descs; } rtas_in{0, 0, 4};
+  struct { u64 res_sz; u64 scratch_sz; u64 update_sz; } rtas_out{};
+  ((rtas_prebuild_fn)dvt[63])(dev, &rtas_in, &rtas_out);
+  CHECK(rtas_out.res_sz > 0 && rtas_out.scratch_sz > 0,
+        "Device5::GetRaytracingAccelerationStructurePrebuildInfo computes sizes");
+  CHECK(((chk_drv_fn)dvt[64])(dev, 0, nullptr) == 0,
+        "Device5::CheckDriverMatchingIdentifier -> COMPATIBLE_WITH_DEVICE");
+  void* dummy_so = nullptr;
+  hr = ((create_state_obj_fn)dvt[62])(dev, nullptr, &iid_res, &dummy_so);
+  CHECK(hr != 0 && dummy_so == nullptr,
+        "Device5::CreateStateObject -> E_NOTIMPL (fail visible)");
+  void* res2 = nullptr;
+  heap_props_pod hp_upload{1, 2, 0, 1, 1};  // UPLOAD heap, WRITE_COMBINE, node 1
+  resource_desc_pod buf_desc{};
+  buf_desc.dimension = 1;  // BUFFER
+  buf_desc.width = 65536;
+  buf_desc.height = 1;
+  buf_desc.depth_or_array = 1;
+  buf_desc.mip_levels = 1;
+  buf_desc.sample_count = 1;
+  hr = ((create_res2_fn)dvt[69])(dev, &hp_upload, 0, &buf_desc, 0x803u, nullptr,
+                                 nullptr, 0, nullptr, &iid_res, &res2);
+  CHECK(hr == 0 && res2 != nullptr, "Device8::CreateCommittedResource2 -> S_OK");
+  void* q1 = nullptr;
+  queue_desc_pod qd{0, 0, 0, 0};
+  hr = ((create_q1_fn)dvt[75])(dev, &qd, &iid_res, nullptr, &q1);
+  CHECK(hr == 0 && q1 != nullptr, "Device9::CreateCommandQueue1 -> S_OK");
+
+  // ---- J. Command-list full state recording (former cmd_noop slots) ----------
+  typedef void(TRT_GUEST_ABI * set_topo_fn)(void*, u32);
+  typedef void(TRT_GUEST_ABI * set_vps_fn)(void*, u32, const void*);
+  typedef void(TRT_GUEST_ABI * set_pso_fn)(void*, void*);
+  typedef void(TRT_GUEST_ABI * set_rs_fn)(void*, void*);
+  typedef void(TRT_GUEST_ABI * set_vbs_fn)(void*, u32, u32, const void*);
+  typedef void(TRT_GUEST_ABI * set_rtvs_fn)(void*, u32, const void*, int, const void*);
+  typedef void(TRT_GUEST_ABI * begin_query_fn)(void*, void*, u32, u32);
+  typedef void(TRT_GUEST_ABI * exec_bundle_fn)(void*, void*);
+
+  const void** clvt = vtbl_of(cl);
+  // a REAL root signature through device slot 16 (CreateRootSignature) —
+  // the recorded object the root-signature slots must hand back
+  static const u8 rs_blob[16] = {0x44, 0x58, 0x42, 0x43, 0x01, 0, 0, 0,
+                                 0x02, 0,   0,   0,   0,    0, 0, 0};
+  typedef int(TRT_GUEST_ABI * create_rs_fn)(void*, u32, const void*, u64,
+                                            const void*, void**);
+  void* rs = nullptr;
+  hr = ((create_rs_fn)dvt[16])(dev, 0, rs_blob, sizeof(rs_blob), nullptr, &rs);
+  CHECK(hr == 0 && rs != nullptr, "CreateRootSignature(16-byte blob) -> S_OK");
+
+  ((set_topo_fn)clvt[20])(cl, 4); // D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST
+  struct { float x, y, w, h, mn, mx; } vp{0, 0, 1280, 720, 0, 1};
+  ((set_vps_fn)clvt[21])(cl, 1, &vp);
+  struct { i32 l, t, r, b; } sc{0, 0, 1280, 720};
+  ((set_vps_fn)clvt[22])(cl, 1, &sc);
+  ((set_pso_fn)clvt[25])(cl, pso);
+  ((set_rs_fn)clvt[30])(cl, rs);
+  ((set_rs_fn)clvt[29])(cl, rs);
+  struct { u64 loc; u32 sz; u32 stride; } vbv{0x1000, 144, 12};
+  ((set_vbs_fn)clvt[44])(cl, 0, 1, &vbv);
+  u64 rtv_dummy = 0;
+  ((set_rtvs_fn)clvt[46])(cl, 1, &rtv_dummy, 1, &rtv_dummy);
+  ((begin_query_fn)clvt[52])(cl, nullptr, 0, 0);
+  ((begin_query_fn)clvt[53])(cl, nullptr, 0, 0);
+
+  CHECK(trt_d3d12_cmdlist_topology(cl) == 4, "cl IASetPrimitiveTopology recorded");
+  CHECK(trt_d3d12_cmdlist_viewport_count(cl) == 1, "cl RSSetViewports recorded");
+  CHECK(trt_d3d12_cmdlist_scissor_count(cl) == 1, "cl RSSetScissorRects recorded");
+  CHECK(trt_d3d12_cmdlist_pso(cl) == pso, "cl SetPipelineState recorded");
+  CHECK(trt_d3d12_cmdlist_gfx_rootsig(cl) == rs, "cl SetGraphicsRootSignature recorded");
+  CHECK(trt_d3d12_cmdlist_comp_rootsig(cl) == rs, "cl SetComputeRootSignature recorded");
+  CHECK(trt_d3d12_cmdlist_vb_binds(cl) == 1, "cl IASetVertexBuffers recorded");
+  CHECK(trt_d3d12_cmdlist_rtv_count(cl) == 1, "cl OMSetRenderTargets recorded");
+  CHECK(trt_d3d12_cmdlist_queries(cl) == 2, "cl Begin/EndQuery recorded");
+
+  // Bogus PSO / bundle rejected visibly (state unchanged)
+  ((set_pso_fn)clvt[25])(cl, (void*)0xDEAD);
+  CHECK(trt_d3d12_cmdlist_pso(cl) == pso, "cl SetPipelineState(bogus) rejected visibly");
+  ((exec_bundle_fn)clvt[27])(cl, (void*)0xDEAD);
+  CHECK(trt_d3d12_cmdlist_bundles(cl) == 0, "cl ExecuteBundle(bogus) rejected visibly");
+
+  // ClearState resets recorded state
+  typedef void(TRT_GUEST_ABI * clear_state_fn)(void*, void*);
+  ((clear_state_fn)clvt[11])(cl, nullptr);
+  CHECK(trt_d3d12_cmdlist_topology(cl) == 0 && trt_d3d12_cmdlist_pso(cl) == nullptr &&
+            trt_d3d12_cmdlist_gfx_rootsig(cl) == nullptr && trt_d3d12_cmdlist_rtv_count(cl) == 0,
+        "cl ClearState clears all recorded state");
 
   printf("checks=%d failures=%d\n", g_checks, g_failures);
   if (g_failures == 0) {

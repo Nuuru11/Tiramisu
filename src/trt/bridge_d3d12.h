@@ -74,6 +74,17 @@ unsigned trt_d3d12_cmdlist_bound_heap_count(void* cmdlist);
 unsigned trt_d3d12_cmdlist_root_table_count(void* cmdlist);
 unsigned trt_d3d12_cmdlist_root_cbv_count(void* cmdlist);
 unsigned trt_d3d12_cmdlist_copy_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_topology(void* cmdlist);
+void* trt_d3d12_cmdlist_pso(void* cmdlist);
+void* trt_d3d12_cmdlist_gfx_rootsig(void* cmdlist);
+void* trt_d3d12_cmdlist_comp_rootsig(void* cmdlist);
+unsigned trt_d3d12_cmdlist_rtv_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_vb_binds(void* cmdlist);
+unsigned trt_d3d12_cmdlist_viewport_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_scissor_count(void* cmdlist);
+unsigned trt_d3d12_cmdlist_draws(void* cmdlist);
+unsigned trt_d3d12_cmdlist_queries(void* cmdlist);
+unsigned trt_d3d12_cmdlist_bundles(void* cmdlist);
 
 #ifdef __cplusplus
 }
