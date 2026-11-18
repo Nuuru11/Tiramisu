@@ -27,6 +27,15 @@ namespace {
 
 trt_gpu_hooks g_hooks;
 
+void* retain_com_object(void* object) {
+  if (object) {
+    const auto vtable = *static_cast<const void***>(object);
+    using add_ref = u32 (TRT_GUEST_ABI *)(void*);
+    if (vtable && vtable[1]) reinterpret_cast<add_ref>(const_cast<void*>(vtable[1]))(object);
+  }
+  return object;
+}
+
 constexpr int TRT_E_NOTIMPL = 0x80004001;  // E_NOTIMPL
 constexpr int TRT_E_NOINTERFACE = 0x80004002;
 constexpr int TRT_E_INVALIDARG = 0x80070057;  // E_INVALIDARG (TRT_-prefixed: never a Win32 macro name)
@@ -108,6 +117,7 @@ u32 g_sc_buf_count = 2;
 u32 g_sc_width = 1280;
 u32 g_sc_height = 720;
 u32 g_sc_colorspace = 0;
+std::atomic<bool> g_sc_presented{false};
 
 struct fake_swapchain {
   const void** vtbl;
@@ -223,7 +233,11 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
   void* slot = real_sc_slot(8);
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
-    return ((fn_t)slot)(sc, sync, safe_flags);
+    const int hr = ((fn_t)slot)(sc, sync, safe_flags);
+    if (hr == 0 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
+        !g_sc_presented.exchange(true))
+      trt_core_log("d3d: guest presented its first frame");
+    return hr;
   }
   if (g_sc_is_d3d12) {
     g_sc_backbuf_idx = (g_sc_backbuf_idx + 1u) % (g_sc_buf_count ? g_sc_buf_count : 2u);
@@ -285,6 +299,8 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
 }
 int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32 fmt, u32 flags) {
   (void)self;
+  if (!g_sc_is_d3d12 && g_hooks.set_d3d11_swapchain_format)
+    return g_hooks.set_d3d11_swapchain_format(fmt);
   void* sc = active_sc();
   void* slot = real_sc_slot(13);
   int hr = 0;
@@ -1038,6 +1054,7 @@ int TRT_GUEST_ABI fake_GetParent(void*, void**) { return TRT_E_NOTIMPL; }
 int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
                           void** swapchain) {
   if (!swapchain) return TRT_E_NOINTERFACE;
+  g_sc_presented.store(false);
   if (trt_d3d12_is_queue(device)) {
     if (g_hooks.acquire_d3d12_swapchain) {
       void* sc12 = nullptr;
@@ -1059,6 +1076,13 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
     return 0;
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
+  if (g_hooks.set_d3d11_swapchain_format) {
+    const int hr = g_hooks.set_d3d11_swapchain_format(fmt);
+    if (hr < 0) {
+      *swapchain = nullptr;
+      return hr;
+    }
+  }
   g_sc_is_d3d12 = false;
   *swapchain = &g_swapchain_proxy_obj;
   return 0;
@@ -1295,8 +1319,8 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
   const int hr = trt_apply_fl_contract(feature_levels, feature_level_count,
                                        &negotiated);
   if (hr != 0) return hr;
-  if (out_device) *out_device = g_hooks.device;
-  if (out_context) *out_context = g_hooks.context;
+  if (out_device) *out_device = retain_com_object(g_hooks.device);
+  if (out_context) *out_context = retain_com_object(g_hooks.context);
   if (out_level) *out_level = negotiated;
   return 0;  // S_OK
 }
@@ -1316,7 +1340,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDeviceAndSwapChain(void* adapter, u3
                                        sdk_version, out_device, out_level,
                                        out_context);
   if (hr != 0) return hr;
-  if (out_swapchain) *out_swapchain = g_hooks.swapchain;
+  if (out_swapchain) *out_swapchain = retain_com_object(g_hooks.swapchain);
   return 0;
 }
 

@@ -302,9 +302,9 @@ int main() {
     // dashboard page carries the settings card + connect card
     std::string page = http_req(port, "GET", "/", "");
     CHECK(page.find("200 OK") != std::string::npos &&
-              page.find("Console Settings") != std::string::npos &&
+              page.find("id=settings") != std::string::npos &&
               page.find("/api/settings") != std::string::npos &&
-              page.find("Connect (Scan or Type)") != std::string::npos,
+              page.find("Console connection") != std::string::npos,
           "dashboard HTML ships settings + connect cards");
   }
 

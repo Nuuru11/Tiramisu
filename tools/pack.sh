@@ -15,6 +15,14 @@ mkdir -p "$out/layout/Assets"
 cp tests/out/guest_hello.exe "$out/layout/guest_hello.exe"
 # regenerate the real branding assets every pack (sources: package/branding)
 python3 tools/gen-assets.py "$out/layout/Assets"
+# CONSOLE-PROVEN envelope ONLY: the Xbox AppX deployment is picky about asset
+# naming variants — the extra tiles (Square310x310, Wide310x150, per-scale
+# Square44x44 subdirs) went in once and the console refused activation with
+# 0x80070002. Strip everything the four-asset manifest envelope doesn't name.
+find "$out/layout/Assets" -type f ! -name 'StoreLogo.png' \
+  ! -name 'Square150x150Logo.png' ! -name 'Square44x44Logo.png' \
+  ! -name 'SplashScreen.png' -delete
+find "$out/layout/Assets" -type d -empty -delete
 
 # ---- test cert (never committed; subject == Publisher) ----------------------
 if [[ ! -f "$out/dev.pfx" ]]; then

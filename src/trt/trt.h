@@ -87,7 +87,7 @@ int   trt_guest_tls_register(const u8* raw, size_t raw_size, size_t total_size,
                              u32* out_index);
 void  trt_guest_tls_sync_thread(void);
 void** trt_guest_tls_array(void);
-void  trt_guest_tls_bind_host_slot(void** host_tls, void** guest_tls);
+void  trt_guest_tls_bind_host_slots(void** host_tls, void** guest_tls);
 
 // Map a PE64 from a file image. Read-only view of [file, file+file_size).
 // Stages: validate -> alloc -> headers+sections -> relocs -> imports -> TLS.

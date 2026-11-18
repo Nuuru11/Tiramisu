@@ -34,6 +34,9 @@ std::vector<std::wstring> g_lines;
 std::vector<std::wstring> g_setup_steps;
 int g_setup_done_count = 0;
 bool g_setup_finished = false;
+bool g_first_run = true;
+std::wstring g_transfer_url;
+std::wstring g_transfer_status;
 std::vector<ui_game> g_games;
 int g_selected = 0;
 std::string g_qr_text;
@@ -65,9 +68,9 @@ void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
 
   g_d2d_device->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &g_ctx);
 
-  D2D1_COLOR_F white{0.94f, 0.96f, 0.97f, 1.0f};
-  D2D1_COLOR_F teal{0.125f, 0.502f, 0.553f, 1.0f};
-  D2D1_COLOR_F dim{0.45f, 0.52f, 0.55f, 1.0f};
+  D2D1_COLOR_F white{0.98f, 0.92f, 0.83f, 1.0f};
+  D2D1_COLOR_F teal{0.87f, 0.59f, 0.34f, 1.0f};
+  D2D1_COLOR_F dim{0.73f, 0.64f, 0.56f, 1.0f};
   g_ctx->CreateSolidColorBrush(white, &g_brush);
   g_ctx->CreateSolidColorBrush(teal, &g_teal);
   g_ctx->CreateSolidColorBrush(dim, &g_dim);
@@ -116,6 +119,13 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
   g_setup_finished = finished;
 }
 
+void ui_dismiss_first_run() { g_first_run = false; }
+
+void ui_set_transfer(std::wstring url, std::wstring status) {
+  g_transfer_url.swap(url);
+  g_transfer_status.swap(status);
+}
+
 void ui_set_screen(ui_screen s) { g_screen = s; }
 
 void ui_set_quick_menu(bool visible) {
@@ -137,32 +147,36 @@ void ui_set_log_tail(const std::vector<std::wstring>& lines) {
 }
 
 void ui_set_qr(const std::string& qr_text) {
+  if (g_qr_text == qr_text) return;
   g_qr_text = qr_text;
   g_qr_size = 0;
   if (!qr_text.empty()) {
-    qrcodegen_encodeText(qr_text.c_str(), g_qr, g_qr, qrcodegen_Ecc_MEDIUM,
-                         qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
-                         qrcodegen_Mask_AUTO, true);
-    g_qr_size = qrcodegen_getSize(g_qr);
+    uint8_t work[qrcodegen_BUFFER_LEN_MAX];
+    if (qrcodegen_encodeText(qr_text.c_str(), work, g_qr, qrcodegen_Ecc_MEDIUM,
+                            qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                            qrcodegen_Mask_AUTO, true))
+      g_qr_size = qrcodegen_getSize(g_qr);
   }
 }
 
 void text_out(IDWriteTextFormat* fmt, float x, float y, float w, float h,
               const wchar_t* s, ID2D1SolidColorBrush* br) {
   D2D1_RECT_F r{x, y, x + w, y + h};
-  g_ctx->DrawText(s, (UINT32)wcslen(s), fmt, r, br);
+  g_ctx->DrawText(s, (UINT32)wcslen(s), fmt, r, br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
 void draw_qr_overlay(float m) {
   if (g_qr_size <= 0) return;
-  const float q = g_h * 0.30f;
-  const float qx = g_w - m - q, qy = g_h - m - q - g_h * 0.04f;
-  D2D1_RECT_F bg{qx - 14, qy - 14, qx + q + 14, qy + q + 14};
+  const float cell = (float)(int)(g_h * 0.25f / (g_qr_size + 8));
+  if (cell < 1) return;
+  const float q = cell * g_qr_size, quiet = 4 * cell;
+  const float qx = (float)(int)(g_w - m - q - quiet);
+  const float qy = (float)(int)(g_h - m - q - quiet - g_h * 0.06f);
+  D2D1_RECT_F bg{qx - quiet, qy - quiet, qx + q + quiet, qy + q + quiet};
   D2D1_COLOR_F white{0.94f, 0.96f, 0.97f, 1.0f};
   ID2D1SolidColorBrush* wbr = nullptr;
   g_ctx->CreateSolidColorBrush(white, &wbr);
   g_ctx->FillRectangle(&bg, wbr);
-  const float cell = q / (float)g_qr_size;
   D2D1_COLOR_F black{0.05f, 0.07f, 0.086f, 1.0f};
   ID2D1SolidColorBrush* bbr = nullptr;
   g_ctx->CreateSolidColorBrush(black, &bbr);
@@ -175,7 +189,7 @@ void draw_qr_overlay(float m) {
       }
   bbr->Release();
   wbr->Release();
-  text_out(g_small, qx - 14, qy + q + 18, q + 28, g_h * 0.04f,
+  text_out(g_small, qx - quiet, qy + q + quiet + 8, q + 2 * quiet, g_h * 0.04f,
            L"SCAN OR OPEN LAN URL", g_teal);
 }
 
@@ -266,28 +280,26 @@ void draw_sysinfo_overlay() {
   text_out(g_small, 12, 10, g_w * 0.35f - 8, 20, g_sysinfo.c_str(), g_dim);
 }
 
+void draw_panel(float x, float y, float w, float h, bool focused = false) {
+  D2D1_ROUNDED_RECT box{{x, y, x + w, y + h}, 14.0f, 14.0f};
+  ID2D1SolidColorBrush* surface = nullptr;
+  const D2D1_COLOR_F color{0.18f, 0.12f, 0.09f, 1.0f};
+  if (SUCCEEDED(g_ctx->CreateSolidColorBrush(color, &surface))) {
+    g_ctx->FillRoundedRectangle(&box, surface);
+    surface->Release();
+  }
+  if (focused) g_ctx->DrawRoundedRectangle(&box, g_teal, 3.0f);
+}
+
 void draw_tabs(float m) {
-  // three-screen tab strip: SHELF / SETTINGS / LOG — teal on the active tab
-  const wchar_t* names[3] = {L"SHELF", L"SETTINGS", L"LIVE LOG"};
-  const float tab_w = g_w * 0.115f, tab_h = g_h * 0.052f;
-  for (int i = 0; i < 3; ++i) {
-    const float tx = m + i * (tab_w + g_w * 0.012f);
-    D2D1_RECT_F bg{tx, m * 0.52f, tx + tab_w, m * 0.52f + tab_h};
-    if ((int)g_screen == i) g_ctx->FillRectangle(&bg, g_teal);
-    else {
-      D2D1_COLOR_F slate{0.10f, 0.13f, 0.17f, 0.85f};
-      ID2D1SolidColorBrush* sbr = nullptr;
-      g_ctx->CreateSolidColorBrush(slate, &sbr);
-      g_ctx->FillRectangle(&bg, sbr);
-      sbr->Release();
-    }
-    D2D1_COLOR_F fg{0.94f, 0.96f, 0.97f, 1.0f};
-    ID2D1SolidColorBrush* fbr = nullptr;
-    g_ctx->CreateSolidColorBrush(fg, &fbr);
-    D2D1_RECT_F tr{tx + 10, m * 0.52f, tx + tab_w, m * 0.52f + tab_h};
-    // small centered label
-    g_ctx->DrawText(names[i], (UINT32)wcslen(names[i]), g_small, tr, fbr);
-    fbr->Release();
+  const wchar_t* names[UI_TAB_COUNT] = {L"Home", L"Settings", L"Live Log", L"Setup"};
+  const float w = g_w * 0.11f, h = g_h * 0.05f, y = g_h * 0.045f;
+  for (int i = 0; i < UI_TAB_COUNT; ++i) {
+    const float x = m + i * (w + g_w * 0.012f);
+    const bool focused = (g_first_run ? UI_SETUP : g_screen) == i;
+    draw_panel(x, y, w, h, focused);
+    text_out(g_text, x + 16, y + 4, w - 24, h - 4, names[i],
+             focused ? g_teal : g_dim);
   }
 }
 
@@ -385,46 +397,52 @@ void ui_render() {
 
     const float m = g_h * 0.06f;
 
-    // ---- first-run setup screen ----
-    if (!g_setup_steps.empty()) {
-      text_out(g_title, m, m * 0.55f, g_w - 2 * m, g_h * 0.1f,
-               L"Tiramisu Setup", g_teal);
-      float sy = m + g_h * 0.12f;
-      const float step_h = g_h * 0.062f;
-      const float setup_w = (g_qr_size > 0) ? (g_w - m - (g_h * 0.30f + 56.0f)) : (g_w - 2 * m);
-      for (size_t i = 0; i < g_setup_steps.size() && sy < g_h - m; ++i) {
-        // done = teal check, current = white, pending = dim
+    if (g_screen != UI_QUICKMENU)
+      g_ctx->Clear(D2D1_COLOR_F{0.09f, 0.058f, 0.044f, 1.0f});
+    if (g_screen != UI_QUICKMENU) draw_tabs(m);
+
+    if ((g_first_run && !g_setup_steps.empty()) || g_screen == UI_SETUP) {
+      const float y = g_h * 0.27f, h = g_h * 0.61f;
+      const float left = (g_w - 3 * m) * 0.55f;
+      const float right_x = 2 * m + left, right = g_w - right_x - m;
+      text_out(g_title, m, g_h * 0.13f, g_w - 2 * m, g_h * 0.11f,
+               L"Set up Tiramisu", g_brush);
+      draw_panel(m, y, left, h);
+      draw_panel(right_x, y, right, h);
+      text_out(g_text, m + 24, y + 20, left - 48, 50, L"System check", g_teal);
+      float row_y = y + g_h * 0.08f;
+      for (size_t i = 0; i < g_setup_steps.size(); ++i) {
         const bool done = (int)i < g_setup_done_count;
-        const bool cur = (int)i == g_setup_done_count && !g_setup_finished;
-        wchar_t mark[4] = L"+  ";
-        if (done) { mark[0] = (wchar_t)0x2713; mark[1] = L' '; mark[2] = L' '; }
-        const std::wstring row = std::wstring(mark) + g_setup_steps[i];
-        if (done) text_out(g_text, m, sy, setup_w, step_h, row.c_str(), g_teal);
-        else if (cur) text_out(g_text, m, sy, setup_w, step_h, row.c_str(), g_brush ? g_brush : g_dim);
-        else text_out(g_text, m, sy, setup_w, step_h, row.c_str(), g_dim);
-        sy += step_h;
+        const std::wstring row = (done ? L"✓  " : L"·  ") + g_setup_steps[i];
+        text_out(g_small, m + 28, row_y, left - 56, g_h * 0.05f,
+                 row.c_str(), done ? g_brush : g_dim);
+        row_y += g_h * 0.055f;
       }
-      if (g_setup_finished)
-        text_out(g_text, m, g_h - m - g_h * 0.06f, setup_w, g_h * 0.06f,
-                 L"Setup complete — scan QR or press A for shelf", g_teal);
-      draw_qr_overlay(m);
+      text_out(g_text, right_x + 24, y + 20, right - 48, 50,
+               L"Transfer games", g_teal);
+      text_out(g_small, right_x + 24, y + g_h * 0.085f, right - 48,
+               g_h * 0.045f, g_transfer_url.empty() ? L"LAN address unavailable" :
+               g_transfer_url.c_str(), g_brush);
+      text_out(g_small, right_x + 24, y + g_h * 0.135f, right - 48,
+               g_h * 0.09f, g_transfer_status.c_str(), g_dim);
+      draw_qr_overlay(m + 20);
+      if (g_setup_finished) {
+        text_out(g_small, m, g_h * 0.89f, left, g_h * 0.05f,
+                 g_first_run ? L"A  Open Home" : L"LB  Live Log    RB  Home", g_teal);
+      }
       g_ctx->EndDraw();
-      if (bmp) bmp->Release();
+      bmp->Release();
       surf->Release();
       g_ctx->SetTarget(old_target);
       if (old_target) old_target->Release();
       return;
     }
 
-    // title + tab strip
-    text_out(g_title, m, m * 0.55f, g_w * 0.5f, g_h * 0.1f, L"Tiramisu", g_teal);
-    draw_tabs(m);
-
-    // transfer URL + status lines
-    float y = m + g_h * 0.1f;
-    for (const auto& l : g_lines) {
-      text_out(g_small, m, y, g_w - 2 * m, g_h * 0.045f, l.c_str(), g_dim);
-      y += g_h * 0.042f;
+    float y = g_h * 0.15f;
+    if (g_screen == UI_SETTINGS || g_screen == UI_LOG) {
+      text_out(g_title, m, y, g_w - 2 * m, g_h * 0.10f,
+               g_screen == UI_SETTINGS ? L"Settings" : L"Live Log", g_brush);
+      y += g_h * 0.10f;
     }
 
     if (g_screen == UI_SETTINGS) {
@@ -458,58 +476,47 @@ void ui_render() {
       return;
     }
 
-    // game shelf (scrollable 6-row window clear of bottom-right QR)
-    y += g_h * 0.02f;
-    const float row_h = g_h * 0.072f;
-    const float qr_q = (g_qr_size > 0) ? (g_h * 0.30f) : 0.0f;
-    const float shelf_w =
-        (g_qr_size > 0) ? (g_w - m - (qr_q + 56.0f + m * 0.4f)) : (g_w - 2 * m);
+    const float qr_space = g_qr_size > 0 ? g_h * 0.30f : 0.0f;
+    const float width = g_w - 2 * m - qr_space;
+    const float hero_h = g_h * 0.26f;
+    const bool selected = g_selected >= 0 && g_selected < (int)g_games.size();
+    draw_panel(m, y, width, hero_h, selected);
+    text_out(g_small, m + 30, y + 24, width - 60, 42,
+             selected ? L"SELECTED GAME" : L"TIRAMISU", g_teal);
+    text_out(g_title, m + 30, y + g_h * 0.065f, width - 60, g_h * 0.095f,
+             selected ? g_games[g_selected].name.c_str() : L"Your Xbox game library", g_brush);
+    text_out(g_small, m + 30, y + g_h * 0.162f, width - 60, g_h * 0.04f,
+             selected ? g_games[g_selected].exe.c_str() :
+             L"Open Setup to transfer your first game.", g_dim);
+    text_out(g_text, m + 30, y + g_h * 0.205f, width - 60, g_h * 0.045f,
+             selected ? L"A  Play      Left / Right  Choose executable" :
+                        L"LB  Setup", g_teal);
+
+    y += hero_h + g_h * 0.03f;
+    text_out(g_text, m, y, width, g_h * 0.045f, L"Installed games", g_brush);
+    y += g_h * 0.052f;
     const int total = (int)g_games.size();
-    const int max_rows = 6;
-    int start = 0;
-    if (total > max_rows) {
-      start = g_selected - 2;
-      if (start < 0) start = 0;
-      if (start + max_rows > total) start = total - max_rows;
-    }
-    if (start > 0) {
-      text_out(g_small, m, y - g_h * 0.025f, shelf_w, g_h * 0.03f,
-               L"▲ more games above", g_dim);
-    }
-    int shown = 0;
-    for (int i = start; i < total && shown < max_rows; ++i) {
-      const float a = i == g_selected ? 1.0f : 0.0f;
-      if (a > 0.0f) {
-        D2D1_RECT_F sel{m - 12, y - 4, m + shelf_w + 12, y + row_h};
-        g_ctx->FillRectangle(&sel, g_teal);
-      }
-      // selection row inverts: dark text on teal
-      ID2D1SolidColorBrush* br = g_dim;
-      D2D1_COLOR_F onsel{0.05f, 0.07f, 0.086f, 1.0f};
-      ID2D1SolidColorBrush* fg = g_dim;
-      if (i == g_selected) {
-        g_ctx->CreateSolidColorBrush(onsel, &fg);
-      }
-      std::wstring row = g_games[i].name + L"   —   " + g_games[i].exe;
-      if (!g_games[i].meta.empty()) row += L"  [" + g_games[i].meta + L"]";
-      text_out(g_text, m, y, shelf_w, row_h, row.c_str(),
-               i == g_selected ? fg : br);
-      if (i == g_selected) fg->Release();
+    const int rows = 4;
+    int start = g_selected >= rows ? g_selected - rows + 1 : 0;
+    const float row_h = g_h * 0.057f;
+    for (int i = start; i < total && i < start + rows; ++i) {
+      draw_panel(m, y, width, row_h - 7, i == g_selected);
+      text_out(g_text, m + 16, y + 3, width - 32, row_h - 10,
+               g_games[i].name.c_str(), i == g_selected ? g_brush : g_dim);
       y += row_h;
-      ++shown;
     }
-    if (start + shown < total) {
-      const std::wstring more =
-          L"▼ " + std::to_wstring(total - (start + shown)) + L" more below";
-      text_out(g_small, m, y, shelf_w, g_h * 0.03f, more.c_str(), g_dim);
-    }
-    if (g_games.empty()) {
-      text_out(g_text, m, y, shelf_w, row_h * 1.6f,
-               L"No games yet — scan the QR or open the URL above from any device\n"
-               L"to drop a game folder or .zip right onto the console", g_dim);
-      y += row_h * 1.6f;
+    if (total > rows) {
+      const std::wstring position = std::to_wstring(g_selected + 1) + L" / " +
+                                   std::to_wstring(total);
+      text_out(g_small, m, y + 4, width, row_h, position.c_str(), g_dim);
     }
 
+    const float status_y = g_h * 0.795f;
+    for (size_t i = 0; i < g_lines.size() && i < 2; ++i)
+      text_out(g_small, m, status_y + i * g_h * 0.036f, width, g_h * 0.036f,
+               g_lines[i].c_str(), g_dim);
+    text_out(g_small, m, g_h * 0.88f, width, g_h * 0.045f,
+             L"Up / Down  Select game     LB / RB  Switch screen     Y  Steam", g_dim);
     draw_qr_overlay(m);
     draw_lan_link(m);
 

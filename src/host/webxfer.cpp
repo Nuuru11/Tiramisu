@@ -522,48 +522,53 @@ std::string games_json() {
 const char* k_upload_page =
   "<!doctype html><html><head><meta charset=utf-8>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>Tiramisu Console Dashboard</title><style>"
-  "*{box-sizing:border-box}"
-  "body{background:#0b0f14;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+  "<meta name=theme-color content='#1b120e'><title>Tiramisu Companion</title><style>"
+  "*{box-sizing:border-box}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #f1b477;outline-offset:2px}"
+  "body{background:#1b120e;color:#fff0dc;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
   "max-width:780px;margin:0 auto;padding:20px}"
   "header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}"
-  "h1{color:#29a8b8;font-size:24px;margin:0}h2{font-size:15px;color:#8fa6b2;margin:0 0 10px}"
-  ".card{background:#121821;border:1px solid #1e2a38;border-radius:12px;padding:16px;margin-bottom:16px}"
+  "h1{color:#e5a568;font-size:24px;margin:0}h2{font-size:15px;color:#d7b89f;margin:0 0 10px}"
+  ".card{background:#2b1e17;border:1px solid #513829;border-radius:12px;padding:16px;margin-bottom:16px}"
   ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
-  ".btn{padding:10px 14px;border:0;border-radius:8px;background:#20808d;color:#fff;font-weight:700;cursor:pointer;font-size:14px}"
-  ".btn:hover{background:#2898a7}.btn:disabled{background:#2a3a3e;color:#789}"
-  ".btn-sec{background:#1c2735;color:#cfe2ec}.btn-danger{background:#8b2635;color:#ffd6dc}"
-  "input,select{background:#0b1017;color:#e6edf3;border:1px solid #263649;border-radius:8px;padding:8px 10px;font-size:14px}"
-  ".drop{border:2px dashed #20808d;border-radius:10px;padding:20px;text-align:center;color:#9bb5bf;background:#0e141c;margin-bottom:10px}"
-  ".drop.over{border-color:#44d9ec;background:#11232c}"
-  "#bar{height:8px;background:#1b2532;border-radius:4px;overflow:hidden;margin:10px 0}"
-  "#fill{height:100%;width:0;background:#29a8b8;transition:width .2s}"
-  ".game{background:#0f151e;border:1px solid #1f2c3c;border-radius:10px;padding:12px;margin-bottom:10px}"
+  ".btn{padding:10px 14px;min-height:44px;border:0;border-radius:8px;background:#e5a568;color:#241812;font-weight:700;cursor:pointer;font-size:14px}"
+  ".btn:hover{background:#f1b477}.btn:disabled{background:#2a3a3e;color:#789}"
+  ".btn-sec{background:#423024;color:#f8e7d3}.btn-danger{background:#8b2635;color:#ffd6dc}"
+  "input,select{background:#211612;color:#fff0dc;border:1px solid #614534;border-radius:8px;padding:8px 10px;font-size:14px}"
+  ".drop{border:2px dashed #b47340;border-radius:10px;padding:20px;text-align:center;color:#d7b89f;background:#211612;margin-bottom:10px}"
+  ".drop.over{border-color:#f1b477;background:#3c281c}"
+  "#bar{height:8px;background:#483222;border-radius:4px;overflow:hidden;margin:10px 0}"
+  "#fill{height:100%;width:0;background:#e5a568;transition:width .2s}"
+  ".game{background:#241812;border:1px solid #553a2b;border-radius:10px;padding:12px;margin-bottom:10px}"
   ".game-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}"
   ".game-cfg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}"
   "@media(max-width:560px){.game-cfg{grid-template-columns:1fr}}"
-  "pre{background:#080b0f;border:1px solid #1c2530;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#a8c0cc;white-space:pre-wrap}"
-  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#172430;color:#7ccbd6}"
+  "pre{background:#1f1510;border:1px solid #503728;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#e4c5ac;white-space:pre-wrap}"
+  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#3f2a1d;color:#f1b477}"
   ".connect{display:flex;gap:16px;align-items:center;flex-wrap:wrap}"
   "#qrx canvas{border:8px solid #fff;border-radius:8px;background:#fff}"
   ".conn-info{flex:1;min-width:220px}"
-  ".conn-url{font-size:18px;font-weight:600;color:#44d9ec;word-break:break-all}"
-  ".conn-sub{font-size:13px;color:#8ea8b5;margin-top:6px}"
-  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #17212e}"
-  ".setrow label{font-size:14px;color:#cfe2ec}"
+  ".conn-url{font-size:18px;font-weight:600;color:#f1b477;word-break:break-all}"
+  ".conn-sub{font-size:13px;color:#c9a88f;margin-top:6px}"
+  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #4b3426}"
+  ".setrow label{font-size:14px;color:#f8e7d3}"
   ".setrow input,.setrow select{width:100%}"
   "@media(max-width:560px){.setrow{grid-template-columns:1fr}}"
+  "nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}"
+  "nav a{color:#f1b477;background:#3f2a1d;padding:10px 14px;border-radius:8px;text-decoration:none}"
+  "@media(max-width:560px){body{padding:12px}.card{padding:12px}input,select{font-size:16px}}"
   "</style></head><body>"
-  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill>Shelf Ready</span></div>"
+  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill role=status>Connecting…</span></div>"
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
-  "<div class=card><h2>Connect (Scan or Type)</h2>"
+  "<nav aria-label=Companion><a href='#transfer'>Transfer</a><a href='#games'>Games</a>"
+  "<a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
+  "<div class=card><h2>Console connection</h2>"
   "<div class=connect><div id=qrx></div><div class=conn-info>"
   "<div class=conn-url id=connurl>—</div>"
-  "<div class=conn-sub>This page IS the console dashboard — you are already connected.</div>"
-  "<div class=conn-sub style='color:#5a7684'>The TV shows the same QR under Settings → “Show QR / LAN link on TV”.</div>"
+  "<div class=conn-sub>Keep this device and Xbox on the same network.</div>"
+  "<div class=conn-sub style='color:#c9a88f'>Open Setup on the Xbox to find its QR code.</div>"
   "</div></div></div>"
-  "<div class=card><h2>Add Any PC / Steam Game (Unpacked Folder or .zip)</h2>"
+  "<div class=card id=transfer><h2>Transfer a game</h2>"
   "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b> or <b>.zip</b> here, or use the buttons below</div>"
   "<div class=row style='margin-bottom:10px'>"
   "<input id=gname placeholder='Game Name (auto from folder/zip)' style='flex:1;min-width:180px'>"
@@ -572,13 +577,13 @@ const char* k_upload_page =
   "<input type=file id=fdir webkitdirectory directory multiple style='display:none'>"
   "<input type=file id=fzip accept='.zip' style='display:none'></div>"
   "<div id=bar><div id=fill></div></div>"
-  "<div id=log style='font-size:13px;color:#8ea8b5;min-height:18px'>Ready over LAN</div></div>"
-  "<div class=card><h2>Games on Xbox Console</h2><div id=list><span style='color:#678'>loading...</span></div></div>"
-  "<div class=card><h2>Console Settings</h2>"
-  "<div id=setwrap><span style='color:#678'>loading settings...</span></div>"
+  "<div id=log role=status style='font-size:13px;color:#c9a88f;min-height:18px'>Ready over LAN</div></div>"
+  "<div class=card id=games><h2>Installed games</h2><div id=list><span style='color:#c9a88f'>loading...</span></div></div>"
+  "<div class=card id=settings><h2>Console settings</h2>"
+  "<div id=setwrap><span style='color:#c9a88f'>loading settings...</span></div>"
   "<div class=row style='margin-top:10px'><button class=btn onclick=saveSettings()>Save Settings</button>"
-  "<span id=setstat style='color:#8ea8b5;font-size:13px'></span></div></div>"
-  "<div class=card><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
+  "<span id=setstat style='color:#c9a88f;font-size:13px'></span></div></div>"
+  "<div class=card id=console-logs><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
   "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div>"
   "<pre id=logs style='margin-top:10px'>Click Refresh Logs or wait for auto-refresh...</pre></div>"
   "<script>"
@@ -647,8 +652,8 @@ const char* k_upload_page =
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
-  "async function refreshStatus(){try{const s=await(await fetch('/api/status')).json();"
-  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Shelf Ready';}catch{}}"
+  "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
+  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox connected';}catch{E('runpill').textContent='Xbox unavailable';}}"
   "async function loadLogs(){E('logs').textContent=await(await fetch('/api/logs')).text();}"
   // ---- settings editor ----
   "const SET_DEFS=["
@@ -1132,16 +1137,32 @@ void listener_thread() {
     sock_t c = accept(g_listener, nullptr, nullptr);
     if (c == kBadSock) {
       if (g_stop) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
+    // SOCKET TIMEOUTS: a half-open client (a timed-out poller, a phone that
+    // walked away) must not park a worker in recv() forever. Measured death
+    // spiral: stuck workers piled up, the overflow path ran handle_client
+    // INLINE on the listener, and one blocked request killed the whole
+    // dashboard while the UI kept rendering. handle_client's sock_guard
+    // closes the socket, so the worker only unregisters.
+#ifdef _WIN32
+    const DWORD to_ms = 30000;  // 30s
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_ms, sizeof(to_ms));
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to_ms, sizeof(to_ms));
+#else
+    struct timeval to_tv = {30, 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_tv, sizeof(to_tv));
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to_tv, sizeof(to_tv));
+#endif
     if (g_workers.load() < 16) {
       g_workers.fetch_add(1);
       std::thread([c]() {
-        handle_client(c);
+        handle_client(c);  // sock_guard closes c
         g_workers.fetch_sub(1);
       }).detach();
     } else {
-      handle_client(c);
+      sock_close(c);  // busy: refuse instead of blocking the listener
     }
   }
 }
@@ -1307,6 +1328,28 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
 std::string webxfer_start(const std::string& local_state, int display_w) {
   (void)display_w;
   return webxfer_start_port(local_state, 9127);
+}
+
+bool webxfer_find_game(const char* name, char* out_exe, size_t cap) {
+  if (!name || !name[0] || !out_exe || cap == 0) return false;
+  out_exe[0] = 0;
+  std::lock_guard<std::mutex> lk(g_mu);
+  std::vector<dir_ent> ents;
+  list_dir_entries(g_games_dir, &ents);
+  const std::string sep(1, XFER_SEP);
+  for (const auto& d : ents) {
+    if (!d.is_dir || d.name != name) continue;
+    const std::string gdir = g_games_dir + sep + d.name;
+    std::vector<std::string> exes;
+    std::string exe;
+    scan_game_exes(gdir, d.name, &exes, &exe);
+    if (exe.empty()) return false;
+    const size_t need = exe.size() + 1;
+    if (need > cap) return false;
+    memcpy(out_exe, exe.c_str(), need);
+    return true;
+  }
+  return false;
 }
 
 bool webxfer_poll_launch(std::string* out_name) {

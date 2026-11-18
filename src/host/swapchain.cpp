@@ -5,6 +5,7 @@
 // CoreWindow swapchain is cleanly rebound to that ID3D12CommandQueue and
 // restored to D3D11 when the guest exits back to the launcher.
 #include "swapchain.h"
+#include "host_log.h"
 #include "d3d9_backend.hpp"
 #include "gl_backend.hpp"
 #include "vk_backend.hpp"
@@ -132,6 +133,35 @@ DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
   }
 }
 
+// A flip-model swapchain takes an UNORM format. D3D11 still permits an
+// sRGB render-target view on that buffer when the guest requests sRGB.
+int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
+  if (!g_swap || !g_ctx || !g_device) return E_FAIL;
+  if (format == DXGI_FORMAT_UNKNOWN) return S_OK;
+  const auto wanted = sanitize_flip_fmt(format);
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  HRESULT hr = g_swap->GetDesc1(&desc);
+  if (FAILED(hr) || desc.Format == wanted) return hr;
+
+  g_ctx->ClearState();
+  g_rtv = nullptr;
+  g_ctx->Flush();
+  hr = g_swap->ResizeBuffers(0, desc.Width, desc.Height, wanted, desc.Flags);
+  winrt::com_ptr<ID3D11Texture2D> back;
+  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
+    g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+    d3d9_rt::g_rt.rtv = g_rtv.get();
+    gl_rt::g_glrt.main_rtv = g_rtv.get();
+    vk_rt::g_vkrt.main_rtv = g_rtv.get();
+  }
+  char message[120];
+  snprintf(message, sizeof(message), "d3d: CoreWindow backbuffer format %u -> %u, hr=0x%08lx",
+           static_cast<unsigned>(desc.Format), static_cast<unsigned>(wanted),
+           static_cast<unsigned long>(hr));
+  log_line(message);
+  return hr;
+}
+
 void publish_gpu_hooks() {
   trt_gpu_hooks hooks{};
   hooks.device = g_device.get();
@@ -172,6 +202,7 @@ void publish_gpu_hooks() {
     return S_OK;
   };
   hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
+  hooks.set_d3d11_swapchain_format = &set_d3d11_swapchain_format;
   hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,
                               u32 count, void* const* queues, u32 num_queues,
                               u32 node_mask, void** out_dev, void** out_ctx,
@@ -277,6 +308,10 @@ void swapchain_restore_d3d11() {
   g_in_d3d12 = false;
   create_d3d11_corewindow_swapchain();
   publish_gpu_hooks();
+}
+
+void swapchain_restore_launcher_format() {
+  set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM);
 }
 
 void swapchain_render_frame(float t) {

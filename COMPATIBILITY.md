@@ -35,7 +35,13 @@
 - **Notes:** Runs healthy for 10s under mock-d3d11. Plain-GPU path dies in the
   Unity CrashReporter insights-crash-report.json write (CreateFileW fails on the
   CrashReporter dir — guest never calls CreateDirectoryW). Named gap.
-- **Gaps:** CrashReporter shutdown exception attribution; insights JSON write path.
+- **[XBOX] Series S, Tiramisu 0.2.1.7:** Native D3D11 resource creation
+  progresses after preserving native DLL TLS during guest execution. The
+  CoreWindow backbuffer accepts the requested sRGB view format and Unity
+  submits a frame. The console shows a black screen before Unity posts
+  `WM_QUIT` and returns to Tiramisu with exit code 0. Sustained play is open.
+- **Gaps:** Reason for Unity's clean exit on Xbox and the CrashReporter
+  insights JSON write path.
 
 ### Go Next! Demo (Unity 6 IL2CPP, Steam)
 - **Status:** Tier C (offline) — named blocker, active investigation

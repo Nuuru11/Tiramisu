@@ -429,6 +429,13 @@ i64 TRT_STDCALL trt_DispatchMessageW(const guest_msg* m) {
                          ? (u64)m->lParam
                          : m->hwnd;
   if (!target) return 0;
+  if (m->message == 0x0002u || m->message == 0x0010u) {
+    char line[110];
+    snprintf(line, sizeof(line), "user32: dispatch %s to hwnd=0x%llx",
+             m->message == 0x0002u ? "WM_DESTROY" : "WM_CLOSE",
+             static_cast<unsigned long long>(target));
+    log_line(line);
+  }
   const i64 rc = dispatch(target, m->message, m->wParam, m->lParam);
   if (m->message == 0x0002u) {
     std::lock_guard<std::mutex> lk(g_win_mu);
@@ -740,6 +747,10 @@ i64 TRT_STDCALL trt_SendMessageW(void* hwnd, u32 msg, u64 wp, i64 lp) {
 
 // PostQuitMessage(code): the guest asks the loop to end
 void TRT_STDCALL trt_PostQuitMessage(i32 code) {
+  char line[120];
+  snprintf(line, sizeof(line), "user32: PostQuitMessage(%d), caller=%p",
+           code, __builtin_return_address(0));
+  log_line(line);
   trt_bridge_post_quit(code);
 }
 

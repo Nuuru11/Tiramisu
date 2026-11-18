@@ -839,9 +839,80 @@ void host_exit_trap(int code) {
   ExitThread((DWORD)code);
 }
 
-static int guest_seh_filter(void* ep) {
-  return (trt_dispatch_win32_exception(ep) == -1) ? EXCEPTION_CONTINUE_EXECUTION
-                                                  : EXCEPTION_EXECUTE_HANDLER;
+static void describe_fault_pc(uintptr_t pc, char* out, size_t cap) {
+  const char* module = "unknown";
+  uintptr_t offset = pc;
+  char native_name[MAX_PATH]{};
+  MEMORY_BASIC_INFORMATION memory{};
+  if (VirtualQuery(reinterpret_cast<void*>(pc), &memory, sizeof(memory))) {
+    offset = pc - reinterpret_cast<uintptr_t>(memory.AllocationBase);
+    const char* guest = trt_images_name(memory.AllocationBase);
+    if (guest) {
+      module = guest;
+    } else {
+      if (GetModuleFileNameA(static_cast<HMODULE>(memory.AllocationBase),
+                             native_name, sizeof(native_name))) {
+        const char* leaf = strrchr(native_name, '\\');
+        module = leaf ? leaf + 1 : native_name;
+      }
+    }
+  }
+
+  snprintf(out, cap, "%s+0x%llx (pc=%p)", module,
+           static_cast<unsigned long long>(offset), reinterpret_cast<void*>(pc));
+}
+
+static int capture_fault_stack(const CONTEXT* initial, DWORD64* frames, int cap) {
+  int count = 0;
+  CONTEXT ctx = *initial;
+  __try {
+    while (ctx.Rip && count < cap) {
+      frames[count++] = ctx.Rip;
+      const DWORD64 previous_rsp = ctx.Rsp;
+      DWORD64 base = 0;
+      if (const auto fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr)) {
+        PVOID handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx, &handler_data,
+                         &establisher, nullptr);
+      } else {
+        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+        ctx.Rsp += sizeof(DWORD64);
+      }
+      if (ctx.Rsp <= previous_rsp) break;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+  return count;
+}
+
+static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
+  if (trt_dispatch_win32_exception(ep) == -1) return EXCEPTION_CONTINUE_EXECUTION;
+  const EXCEPTION_RECORD& record = *ep->ExceptionRecord;
+  char where[192];
+  describe_fault_pc(reinterpret_cast<uintptr_t>(record.ExceptionAddress),
+                    where, sizeof(where));
+  char line[320];
+  if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      record.NumberParameters >= 2) {
+    const ULONG_PTR kind = record.ExceptionInformation[0];
+    snprintf(line, sizeof(line),
+             "guest fault: 0x%08lx at %s, %s address %p",
+             (unsigned long)record.ExceptionCode, where,
+             kind == 0 ? "read" : kind == 1 ? "write" : "execute",
+             reinterpret_cast<void*>(record.ExceptionInformation[1]));
+  } else {
+    snprintf(line, sizeof(line), "guest fault: 0x%08lx at %s",
+             (unsigned long)record.ExceptionCode, where);
+  }
+  longan::log_line(line);
+  DWORD64 frames[32];
+  const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
+  for (int i = 1; i < count; ++i) {
+    describe_fault_pc(static_cast<uintptr_t>(frames[i]), where, sizeof(where));
+    snprintf(line, sizeof(line), "guest fault caller %d: %s", i, where);
+    longan::log_line(line);
+  }
+  return EXCEPTION_EXECUTE_HANDLER;
 }
 
 // Pure-POD SEH wrapper: allows C++ try/catch inside guest PE images to unwind
@@ -1347,6 +1418,18 @@ bool edit_setting_row(int dir) {
 }
 
 // ---------------- the app ----------------
+// BUILTIN provider for tiramisu_host.dll (guest-importable host surface).
+// BOTH exports must be here: guest_hello imports LogU32 AND QueryBuild —
+// a missing one fails the whole import bind (rc=IMPORT on the console).
+static void TRT_GUEST_ABI host_builtin_log_u32(unsigned tag, unsigned value) {
+  char line[64];
+  snprintf(line, sizeof(line), "guest marker: tag=%u value=%u", tag, value);
+  longan::log_line(line);
+}
+static unsigned TRT_GUEST_ABI host_builtin_query_build(void) {
+  return 0x00020100u;  // runtime build 0.2.1
+}
+
 struct tiramisu_host
     : implements<tiramisu_host, IFrameworkViewSource, IFrameworkView> {
   CoreWindow m_window{nullptr};
@@ -1522,7 +1605,8 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
     longan::ui_set_qr(url);
-    const std::wstring url_step = L"Transfer server: " + u82ws(url);
+    const std::wstring url_step = url.empty() ? L"Transfer unavailable"
+                                              : L"Transfer server ready";
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  L"Audio ready", url_step},
                 L"Scanning for games…", false);
@@ -1531,7 +1615,16 @@ struct tiramisu_host
                  L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);
 
-    // builtin self-test: proves the whole pipeline on hardware
+    // builtin self-test: proves the whole pipeline on hardware.
+    // guest_hello imports tiramisu_host.dll!TiramisuHostLogU32 — the BUILTIN
+    // provider must be registered or the selftest fails rc=IMPORT on console
+    // (the offline tests register their own; the host app never did).
+    static const trt_named_fn k_host_builtin_fns[] = {
+        {"TiramisuHostLogU32", (void*)&host_builtin_log_u32},
+        {"TiramisuHostQueryBuild", (void*)&host_builtin_query_build},
+    };
+    trt_module_register("tiramisu_host.dll", TRT_ROUTE_BUILTIN,
+                        k_host_builtin_fns, 2);
     const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
     snprintf(line, sizeof(line), "selftest: rc=%s (%s)", trt_errstr(gr.map_rc),
              gr.detail);
@@ -1575,14 +1668,15 @@ struct tiramisu_host
         // RB/LB cycle dashboard screens (shelf -> settings -> log) on the
         // launcher; keyboard: Tab / Shift+Tab.
         const bool want_rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ||
-                             trt_key_down(0x09 /*VK_TAB*/);
+                             (trt_key_down(0x09 /*VK_TAB*/) &&
+                              !trt_key_down(0x10 /*VK_SHIFT*/));
         const bool want_lb = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) ||
                              (trt_key_down(0x10 /*VK_SHIFT*/) &&
                               trt_key_down(0x09 /*VK_TAB*/));
         if (!g_guest_running.load() && g_setup_active == false) {
           if (want_rb && !rb_btn) {
             rb_btn = true;
-            g_screen = (longan::ui_screen)(((int)g_screen + 1) % 3);
+            g_screen = (longan::ui_screen)(((int)g_screen + 1) % longan::UI_TAB_COUNT);
             longan::ui_set_screen(g_screen);
             if (g_screen == longan::UI_SETTINGS) {
               sync_settings_rows();
@@ -1591,7 +1685,8 @@ struct tiramisu_host
           } else if (!want_rb) rb_btn = false;
           if (want_lb && !lb_btn) {
             lb_btn = true;
-            g_screen = (longan::ui_screen)(((int)g_screen + 2) % 3);
+            g_screen = (longan::ui_screen)(((int)g_screen + longan::UI_TAB_COUNT - 1) %
+                                          longan::UI_TAB_COUNT);
             longan::ui_set_screen(g_screen);
             if (g_screen == longan::UI_SETTINGS) {
               sync_settings_rows();
@@ -1696,7 +1791,7 @@ struct tiramisu_host
             a_btn = true;
             if (g_setup_active && g_setup_done) {
               g_setup_active = false;  // leave setup, open the shelf
-              longan::ui_set_setup({}, 0, false);
+              longan::ui_dismiss_first_run();
             } else if (!g_setup_active && !g_games.empty()) {
               g_pending_launch = g_games[g_selected].name;
             }
@@ -1839,7 +1934,7 @@ struct tiramisu_host
           g_pending_launch = webname;
           if (g_setup_active && g_setup_done) {
             g_setup_active = false;
-            longan::ui_set_setup({}, 0, false);
+            longan::ui_dismiss_first_run();
           }
           bool found = false;
           for (const auto& ge : g_games)
@@ -1849,6 +1944,36 @@ struct tiramisu_host
         if (!g_pending_launch.empty()) {
           const std::string want = g_pending_launch;
           g_pending_launch.clear();
+          bool shelf_hit = false;
+          for (const auto& ge : g_games)
+            if (ge.name == want) { shelf_hit = true; break; }
+          if (!shelf_hit) {
+            // console reality: the shelf's FindFirstFileA scan can come up
+            // empty while the web dashboard's enumeration lists the game —
+            // fall back to the webxfer's own list so a web launch NEVER
+            // drops silently
+            char wexe[1024] = {};
+            if (longan::webxfer_find_game(want.c_str(), wexe, sizeof(wexe))) {
+              std::string dir_rel = want;
+              for (char& c : dir_rel) if (c == '/') c = '\\';
+              game_entry fge;
+              fge.name = want;
+              fge.exe = wexe;
+              fge.exes.push_back(wexe);
+              fge.dir = g_games_dir + std::string(1, '\\') + dir_rel;
+              fge.input_mode = "auto";
+              char found_line[192];
+              snprintf(found_line, sizeof(found_line),
+                       "shelf: %s -> %s (web list fallback)", want.c_str(), wexe);
+              longan::log_line(found_line);
+              g_games.push_back(std::move(fge));
+            } else {
+              char drop[160];
+              snprintf(drop, sizeof(drop),
+                       "launch %s: game not found on shelf or web list", want.c_str());
+              longan::log_line(drop);
+            }
+          }
           for (const auto& ge : g_games) {
             if (ge.name == want) {
               if (g_guest_thread.joinable()) g_guest_thread.join();
@@ -1869,7 +1994,9 @@ struct tiramisu_host
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);
                 longan::log_line(line);
-                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
+                set_guest_status(want + ": " + (gr.map_rc == TRT_OK ? gr.detail
+                                                                   : trt_errstr(gr.map_rc)));
+                longan::webxfer_set_running_game("");
                 g_guest_running.store(false);
               });
               break;
@@ -1935,6 +2062,7 @@ struct tiramisu_host
         continue;
       }
       longan::swapchain_restore_d3d11();
+      longan::swapchain_restore_launcher_format();
 
       // ---- UI ----
       // FPS tracking for overlay
@@ -1948,9 +2076,14 @@ struct tiramisu_host
         fps_frames = 0;
         fps_last = now;
       }
-      longan::ui_set_qr((longan::settings_get().show_qr && !g_steam_busy)
-                            ? longan::webxfer_url()
-                            : (g_steam_busy ? g_steam_qr : std::string()));
+      const std::string transfer_url = longan::webxfer_url();
+      longan::ui_set_transfer(u82ws(transfer_url),
+                               u82ws(longan::webxfer_status_line()));
+      const bool showing_setup = g_setup_active || g_screen == longan::UI_SETUP;
+      longan::ui_set_qr(showing_setup ? transfer_url
+                        : g_steam_busy ? g_steam_qr
+                        : longan::settings_get().show_qr ? transfer_url
+                        : std::string());
       if (!g_setup_active) {
         std::vector<longan::ui_game> uig;
         for (const auto& ge : g_games) {
@@ -1965,9 +2098,7 @@ struct tiramisu_host
         longan::ui_set_games(uig, g_selected);
         std::vector<std::wstring> lines;
         lines.push_back(u82ws(longan::webxfer_status_line()));
-        lines.push_back(
-            L"Phone/PC: scan QR or type LAN URL to drop a game folder or .zip");
-        lines.push_back(u82ws("guest: " + get_guest_status()));
+        lines.push_back(u82ws(get_guest_status()));
         lines.push_back(u82ws(g_steam_status +
                               (g_mouse_mode ? "  |  MOUSE/KBM MODE" : "")));
         char audio_line[128];
