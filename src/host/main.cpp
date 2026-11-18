@@ -203,6 +203,12 @@ void uwp_log(const char* line) { longan::log_line(line); }
 
 std::atomic<bool> g_uwp_raw_mouse{false};
 
+extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
+
+bool launcher_key(u16 vk) {
+  return trt_key_down(vk) || (trt_key_async(vk) & 1) != 0;
+}
+
 inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
   if (vk == 0x10 /*VK_SHIFT*/) return (scan == 0x36u || ext) ? 0xA1u : 0xA0u;
   if (vk == 0x11 /*VK_CONTROL*/) return ext ? 0xA3u : 0xA2u;
@@ -1568,6 +1574,7 @@ struct tiramisu_host
     });
     m_focus = window.Activated([](CoreWindow const&, WindowActivatedEventArgs const& a) {
       const bool focused = a.WindowActivationState() != CoreWindowActivationState::Deactivated;
+      longan::log_line(focused ? "input: CoreWindow activated" : "input: CoreWindow deactivated");
       if (!focused) trt_input_release_all();
       if (g_guest_running.load()) {
         trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, focused ? 1 : 0, 0);
@@ -1589,6 +1596,59 @@ struct tiramisu_host
       }
     } catch (...) {
       longan::log_line("input: CoreWindow pointer events active");
+    }
+  }
+
+  void apply_web_controls() {
+    const auto events = longan::webxfer_control_events();
+    for (const auto& event : events) {
+      const bool down = event.second != 0;
+      switch (event.kind) {
+        case 'a': {
+          int w, h, x, y;
+          trt_display_size(&w, &h);
+          trt_mouse_pos(&x, &y);
+          trt_input_mouse_delta_raw(event.first * (w - 1) / 1000 - x,
+                                    event.second * (h - 1) / 1000 - y);
+          break;
+        }
+        case 'm':
+          trt_input_mouse_delta_raw(event.first, event.second);
+          break;
+        case 'b':
+          m_web_buttons[event.first] = down;
+          trt_input_mouse_button(event.first, down);
+          if (event.first == 0 && !down) launcher_click();
+          break;
+        case 'k': {
+          const auto vk = static_cast<u16>(event.first);
+          const u32 scan = trt_MapVirtualKeyW(vk, 4 /*MAPVK_VK_TO_VSC_EX*/);
+          const bool repeat = down && m_web_keys[vk];
+          m_web_keys[vk] = down;
+          trt_input_key_event2(vk, down, static_cast<u16>(scan & 0xff),
+                               (scan >> 8) != 0, repeat);
+          break;
+        }
+        case 'w':
+          trt_input_wheel(event.first);
+          break;
+        case 't':
+          trt_input_char_event(static_cast<u32>(event.first));
+          break;
+        case 'r':
+          for (unsigned i = 0; i < 5; ++i) {
+            if (m_web_buttons[i]) trt_input_mouse_button(i, false);
+            m_web_buttons[i] = false;
+          }
+          for (u16 vk = 8; vk < 255; ++vk) {
+            if (!m_web_keys[vk]) continue;
+            const u32 scan = trt_MapVirtualKeyW(vk, 4);
+            trt_input_key_event2(vk, false, static_cast<u16>(scan & 0xff),
+                                 (scan >> 8) != 0, false);
+            m_web_keys[vk] = false;
+          }
+          break;
+      }
     }
   }
 
@@ -1703,6 +1763,16 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "transfer: %s (QR on TV)", url.c_str());
     longan::log_line(line);
     longan::ui_set_qr(url);
+    const auto code = longan::webxfer_control_code();
+    if (!url.empty() && !code.empty())
+      longan::ui_set_control_hint(L"PC controls: /controls   Code: " + u82ws(code));
+    namespace wdi = winrt::Windows::Devices::Input;
+    int keyboard = -1, mouse = -1;
+    try { keyboard = wdi::KeyboardCapabilities().KeyboardPresent(); } catch (...) {}
+    try { mouse = wdi::MouseCapabilities().MousePresent(); } catch (...) {}
+    snprintf(line, sizeof(line), "input: Xbox device query keyboard=%d mouse=%d (-1 unavailable)",
+             keyboard, mouse);
+    longan::log_line(line);
     const std::wstring url_step = url.empty() ? L"Transfer unavailable"
                                               : L"Transfer server ready";
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
@@ -1746,6 +1816,7 @@ struct tiramisu_host
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+      apply_web_controls();
 
       // ---- controller & keyboard launcher navigation ----
       XINPUT_STATE xs{};
@@ -1766,11 +1837,11 @@ struct tiramisu_host
         // RB/LB cycle dashboard screens (shelf -> settings -> log) on the
         // launcher; keyboard: Tab / Shift+Tab.
         const bool want_rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ||
-                             (trt_key_down(0x09 /*VK_TAB*/) &&
+                             (launcher_key(0x09 /*VK_TAB*/) &&
                               !trt_key_down(0x10 /*VK_SHIFT*/));
         const bool want_lb = (b & XINPUT_GAMEPAD_LEFT_SHOULDER) ||
                              (trt_key_down(0x10 /*VK_SHIFT*/) &&
-                              trt_key_down(0x09 /*VK_TAB*/));
+                              launcher_key(0x09 /*VK_TAB*/));
         if (!g_guest_running.load() && g_setup_active == false) {
           if (want_rb && !rb_btn) {
             rb_btn = true;
@@ -1793,17 +1864,17 @@ struct tiramisu_host
           } else if (!want_lb) lb_btn = false;
         }
         const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) ||
-                             trt_key_down(0x26 /*VK_UP*/) || trt_key_down('W');
+                             launcher_key(0x26 /*VK_UP*/) || launcher_key('W');
         const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) ||
-                             trt_key_down(0x28 /*VK_DOWN*/) || trt_key_down('S');
+                             launcher_key(0x28 /*VK_DOWN*/) || launcher_key('S');
         const bool want_lt = (b & XINPUT_GAMEPAD_DPAD_LEFT) ||
-                             trt_key_down(0x25 /*VK_LEFT*/);
+                             launcher_key(0x25 /*VK_LEFT*/);
         const bool want_rt = (b & XINPUT_GAMEPAD_DPAD_RIGHT) ||
-                             trt_key_down(0x27 /*VK_RIGHT*/);
+                             launcher_key(0x27 /*VK_RIGHT*/);
         const bool want_go = (b & XINPUT_GAMEPAD_A) ||
-                             trt_key_down(0x0D /*VK_RETURN*/) ||
-                             trt_key_down(0x20 /*VK_SPACE*/);
-        const bool want_st = (b & XINPUT_GAMEPAD_Y) || trt_key_down('Y');
+                             launcher_key(0x0D /*VK_RETURN*/) ||
+                             launcher_key(0x20 /*VK_SPACE*/);
+        const bool want_st = (b & XINPUT_GAMEPAD_Y) || launcher_key('Y');
         const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
         if (g_guest_running.load()) {
           if (longan::webxfer_poll_stop()) request_guest_stop();
@@ -2241,6 +2312,8 @@ struct tiramisu_host
     }
   }
 
+  bool m_web_keys[256]{};
+  bool m_web_buttons[5]{};
   winrt::event_token m_kd{}, m_ku{}, m_cr{}, m_pp{}, m_pr{}, m_pm{}, m_pw{},
       m_mm{}, m_focus{};
 };

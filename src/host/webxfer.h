@@ -7,6 +7,7 @@
 #define TIRAMISU_WEBXFER_H
 
 #include <string>
+#include <vector>
 
 namespace longan {
 
@@ -52,6 +53,11 @@ std::string webxfer_status_line();
 // Current transfer URL shown in the QR (empty until started).
 std::string webxfer_url();
 unsigned short webxfer_port();
+
+// Paired LAN input. The UI thread applies these to Tiramisu's input bridge.
+struct web_control_event { char kind; int first; int second; };
+std::vector<web_control_event> webxfer_control_events();
+std::string webxfer_control_code();
 
 void webxfer_shutdown();
 

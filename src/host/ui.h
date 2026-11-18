@@ -43,6 +43,7 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
                   bool finished);
 void ui_dismiss_first_run();
 void ui_set_transfer(std::wstring url, std::wstring status);
+void ui_set_control_hint(std::wstring hint);
 void ui_set_screen(ui_screen s);                 // shelf | settings | log
 void ui_set_settings(const ui_setting* rows, int count, int selected);
 void ui_set_quick_menu(bool visible);            // RetroArch-style in-game menu

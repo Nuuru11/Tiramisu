@@ -15,6 +15,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
 
@@ -23,6 +24,8 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <bcrypt.h>
+  #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
   using sock_t = SOCKET;
   static const sock_t kBadSock = INVALID_SOCKET;
@@ -53,6 +56,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,6 +70,44 @@ webxfer_state g;
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_workers{0};
 sock_t g_listener = kBadSock;
+
+using control_clock = std::chrono::steady_clock;
+std::mutex g_control_mu;
+std::string g_control_code;
+std::string g_control_token;
+std::vector<web_control_event> g_control_events;
+control_clock::time_point g_control_last{};
+control_clock::time_point g_control_retry{};
+unsigned g_control_bad_codes = 0;
+
+bool control_random(void* data, size_t size) {
+#ifdef _WIN32
+  return BCryptGenRandom(nullptr, static_cast<PUCHAR>(data),
+                         static_cast<ULONG>(size), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+  FILE* source = fopen("/dev/urandom", "rb");
+  if (!source) return false;
+  const bool ok = fread(data, 1, size, source) == size;
+  fclose(source);
+  return ok;
+#endif
+}
+
+void reset_web_controls() {
+  unsigned bytes = 0;
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  g_control_code.clear();
+  if (control_random(&bytes, sizeof(bytes))) {
+    char code[9];
+    snprintf(code, sizeof(code), "%08u", bytes % 100000000u);
+    g_control_code = code;
+  }
+  g_control_token.clear();
+  g_control_events.clear();
+  g_control_last = {};
+  g_control_retry = {};
+  g_control_bad_codes = 0;
+}
 
 std::string g_local_state_dir;
 std::string g_games_dir;
@@ -750,6 +792,104 @@ void respond(sock_t s, const char* code, const char* ctype,
   if (!body.empty()) send_all(s, body.data(), body.size());
 }
 
+std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
+                              size_t size) {
+  std::string body(pre, std::min(size, pre_len));
+  while (body.size() < size) {
+    char buf[512];
+    const int count = recv(s, buf, static_cast<int>(
+        std::min(sizeof(buf), size - body.size())), 0);
+    if (count <= 0) break;
+    body.append(buf, count);
+  }
+  return body;
+}
+
+bool parse_control_events(const std::string& body, std::vector<web_control_event>* events) {
+  std::istringstream input(body);
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream row(line);
+    web_control_event e{};
+    std::string extra;
+    if (!(row >> e.kind >> e.first >> e.second) || (row >> extra) ||
+        events->size() == 128) return false;
+    const bool down = e.second == 0 || e.second == 1;
+    switch (e.kind) {
+      case 'a':
+        if (e.first < 0 || e.first > 1000 || e.second < 0 || e.second > 1000) return false;
+        break;
+      case 'm':
+        if (e.first < -2048 || e.first > 2048 || e.second < -2048 || e.second > 2048) return false;
+        break;
+      case 'b': if (e.first < 0 || e.first > 4 || !down) return false; break;
+      case 'k': if (e.first < 8 || e.first > 254 || !down) return false; break;
+      case 'w': if (e.first != 120 && e.first != -120) return false; break;
+      case 't': if (e.first < 32 || e.first > 65535) return false; break;
+      case 'r': break;
+      default: return false;
+    }
+    events->push_back(e);
+  }
+  return true;
+}
+
+void handle_controls(sock_t s, const std::string& path, const std::string& auth,
+                     const std::string& body) {
+  std::string output;
+  const char* status = "200 OK";
+  {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    const auto now = control_clock::now();
+    if (path == "/api/controls/pair") {
+      if (now < g_control_retry) {
+        status = "429 Too Many Requests";
+      } else if (g_control_code.empty() || body != g_control_code) {
+        status = "401 Unauthorized";
+        if (++g_control_bad_codes >= 5) {
+          g_control_bad_codes = 0;
+          g_control_retry = now + std::chrono::minutes(1);
+        }
+      } else {
+        unsigned char random[16]{};
+        if (!control_random(random, sizeof(random))) {
+          status = "503 Service Unavailable";
+        } else {
+          constexpr char hex[] = "0123456789abcdef";
+          for (unsigned char byte : random) {
+            output += hex[byte >> 4];
+            output += hex[byte & 15];
+          }
+          g_control_token = "Bearer " + output;
+          g_control_events = {{'r', 0, 0}};
+          g_control_last = now;
+          g_control_bad_codes = 0;
+        }
+      }
+    } else if (g_control_token.empty() || auth != g_control_token) {
+      status = "401 Unauthorized";
+    } else if (path == "/api/controls/leave") {
+      g_control_token.clear();
+      g_control_events = {{'r', 0, 0}};
+      g_control_last = {};
+    } else if (path == "/api/controls/input") {
+      std::vector<web_control_event> events;
+      if (!parse_control_events(body, &events)) {
+        status = "400 Bad Request";
+      } else if (g_control_events.size() + events.size() > 512) {
+        g_control_events = {{'r', 0, 0}};
+        status = "429 Too Many Requests";
+      } else {
+        g_control_events.insert(g_control_events.end(), events.begin(), events.end());
+        g_control_last = now;
+      }
+    } else {
+      status = "404 Not Found";
+    }
+  }
+  respond(s, status, "text/plain; charset=utf-8", output);
+}
+
 void handle_client(sock_t s) {
   sock_guard sg{s};
   char req[16384];
@@ -798,6 +938,43 @@ void handle_client(sock_t s) {
     query = target.substr(qm + 1);
   }
 
+  if (strcmp(method, "GET") == 0 && url_path == "/controls") {
+    respond(s, "200 OK", "text/html; charset=utf-8", k_controls_page);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path.rfind("/api/controls/", 0) == 0) {
+    // Do not allow cross-origin browser requests to operate the app.
+    const auto origin = hdrs_low.find("\r\norigin:");
+    const auto host = hdrs_low.find("\r\nhost:");
+    if (origin != std::string::npos && host != std::string::npos) {
+      const auto value = [&](size_t at, size_t field) {
+        const size_t start = at + field;
+        return trim_ws(hdrs_low.substr(start, hdrs_low.find("\r\n", start) - start));
+      };
+      if (value(origin, 9) != "http://" + value(host, 7)) {
+        respond(s, "403 Forbidden", "text/plain", "");
+        return;
+      }
+    }
+    if (content_len > 2048) {
+      respond(s, "413 Payload Too Large", "text/plain", "");
+      return;
+    }
+    const auto at = hdrs_low.find("\r\nauthorization:");
+    std::string auth;
+    if (at != std::string::npos) {
+      const size_t start = at + 16;
+      auth = trim_ws(hdrs.substr(start, hdrs.find("\r\n", start) - start));
+    }
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const auto body = read_control_body(s, pre, pre_len, static_cast<size_t>(content_len));
+    if (body.size() != content_len) {
+      respond(s, "400 Bad Request", "text/plain", "");
+      return;
+    }
+    handle_controls(s, url_path, auth, body);
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/") {
     respond(s, "200 OK", "text/html; charset=utf-8", k_upload_page);
     return;
@@ -1268,6 +1445,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
   {
     std::lock_guard<std::mutex> lk(g_mu);
     g = webxfer_state{};
+    reset_web_controls();
     g_local_state_dir = local_state;
     const std::string sep(1, XFER_SEP);
     g_games_dir = local_state + sep + "games";
@@ -1377,6 +1555,23 @@ bool webxfer_poll_rescan() {
 void webxfer_set_running_game(const std::string& name) {
   std::lock_guard<std::mutex> lk(g_mu);
   g.running_game = name;
+}
+
+std::vector<web_control_event> webxfer_control_events() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  if (g_control_last != control_clock::time_point{} &&
+      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
+    g_control_last = {};
+    g_control_events = {{'r', 0, 0}};
+  }
+  std::vector<web_control_event> events;
+  events.swap(g_control_events);
+  return events;
+}
+
+std::string webxfer_control_code() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  return g_control_code;
 }
 
 void webxfer_shutdown() {

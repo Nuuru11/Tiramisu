@@ -38,6 +38,7 @@ bool g_setup_finished = false;
 bool g_first_run = true;
 std::wstring g_transfer_url;
 std::wstring g_transfer_status;
+std::wstring g_control_hint;
 std::vector<ui_game> g_games;
 int g_selected = 0;
 std::string g_qr_text;
@@ -121,6 +122,8 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
 }
 
 void ui_dismiss_first_run() { g_first_run = false; }
+
+void ui_set_control_hint(std::wstring hint) { g_control_hint.swap(hint); }
 
 void ui_set_transfer(std::wstring url, std::wstring status) {
   g_transfer_url.swap(url);
@@ -302,6 +305,9 @@ void draw_tabs(float m) {
     text_out(g_text, x + 16, y + 4, w - 24, h - 4, names[i],
              focused ? g_teal : g_dim);
   }
+  if (!g_control_hint.empty())
+    text_out(g_small, g_w * 0.54f, y + 4, g_w * 0.44f, h,
+             g_control_hint.c_str(), g_teal);
 }
 
 void draw_settings_screen(float m, float y0) {
