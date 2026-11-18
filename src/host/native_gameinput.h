@@ -8,7 +8,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 
 extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 
@@ -25,7 +27,7 @@ class native_gameinput {
     using create_fn = HRESULT (WINAPI*)(IGameInput**);
     const auto create = reinterpret_cast<create_fn>(GetProcAddress(module, "GameInputCreate"));
     if (create && SUCCEEDED(create(input_.put())) && input_) {
-      input_->SetFocusPolicy(GameInputDisableBackgroundInput);
+      // The CoreWindow loop only polls while this app has focus.
       log_line("input: native GameInput ready");
     }
   }
@@ -42,6 +44,8 @@ class native_gameinput {
     keys_ = {};
     mouse_ = {};
     mouse_baseline_ = false;
+    keyboard_missing_since_ = 0;
+    mouse_missing_since_ = 0;
   }
 
   // Return a left release so the UI can handle a click on the launcher.
@@ -58,61 +62,112 @@ class native_gameinput {
   }
 
  private:
+  void log_reading_status(GameInputKind kind, HRESULT result, IGameInputReading* reading) {
+    auto& last_logged = kind == GameInputKindKeyboard
+        ? keyboard_status_log_at_ : mouse_status_log_at_;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last_logged < 5000) return;
+    last_logged = now;
+    char line[160]{};
+    const auto sequence = reading ? reading->GetSequenceNumber(kind) : 0;
+    if (kind == GameInputKindKeyboard) {
+      std::array<GameInputKeyState, 256> states{};
+      const auto count = reading ? std::min<size_t>(states.size(),
+          reading->GetKeyState(static_cast<uint32_t>(states.size()), states.data())) : 0;
+      std::snprintf(line, sizeof(line),
+          "input: GameInput keyboard hr=0x%08lx seq=%llu active=%zu",
+          static_cast<unsigned long>(result), static_cast<unsigned long long>(sequence), count);
+    } else {
+      GameInputMouseState state{};
+      const bool available = reading && reading->GetMouseState(&state);
+      std::snprintf(line, sizeof(line),
+          "input: GameInput mouse hr=0x%08lx seq=%llu state=%u buttons=0x%02x",
+          static_cast<unsigned long>(result), static_cast<unsigned long long>(sequence),
+          available ? 1u : 0u, available ? state.buttons : 0u);
+    }
+    log_line(line);
+  }
+
   struct key {
     u16 scan{};
     bool extended{};
     bool down{};
   };
 
+  void release_keyboard() {
+    for (unsigned vk = 8; vk < keys_.size(); ++vk) {
+      if (keys_[vk].down)
+        trt_input_key_event2(static_cast<u16>(vk), false, keys_[vk].scan,
+                             keys_[vk].extended, false);
+    }
+    keys_ = {};
+    keyboard_active_.store(false);
+  }
+
+  void release_mouse() {
+    for (unsigned button = 0; button < 5; ++button) {
+      if (mouse_.buttons & (1u << button)) trt_input_mouse_button(button, false);
+    }
+    mouse_ = {};
+    mouse_baseline_ = false;
+    mouse_active_.store(false);
+  }
+
   template<class Apply>
   void drain(GameInputKind kind, winrt::com_ptr<IGameInputReading>& last, Apply apply) {
-    if (last) {
-      winrt::com_ptr<IGameInputDevice> device;
-      last->GetDevice(device.put());
-      if (device && !(device->GetDeviceStatus() & GameInputDeviceConnected)) {
-        if (kind == GameInputKindKeyboard) {
-          for (unsigned vk = 8; vk < keys_.size(); ++vk) {
-            if (keys_[vk].down)
-              trt_input_key_event2(static_cast<u16>(vk), false, keys_[vk].scan,
-                                   keys_[vk].extended, false);
-          }
-          keys_ = {};
-          keyboard_active_.store(false);
-        } else {
-          for (unsigned button = 0; button < 5; ++button) {
-            if (mouse_.buttons & (1u << button)) trt_input_mouse_button(button, false);
-          }
-          mouse_ = {};
-          mouse_baseline_ = false;
-          mouse_active_.store(false);
-        }
+    auto& missing_since = kind == GameInputKindKeyboard
+        ? keyboard_missing_since_ : mouse_missing_since_;
+    winrt::com_ptr<IGameInputReading> current;
+    const HRESULT result = input_->GetCurrentReading(kind, nullptr, current.put());
+    log_reading_status(kind, result, current.get());
+    if (FAILED(result) || !current) {
+      const auto now = GetTickCount64();
+      if (!missing_since) missing_since = now;
+      if (last && now - missing_since >= 500) {
+        if (kind == GameInputKindKeyboard) release_keyboard();
+        else release_mouse();
         last = nullptr;
-      }
-    }
-    if (!last) {
-      winrt::com_ptr<IGameInputReading> current;
-      if (SUCCEEDED(input_->GetCurrentReading(kind, nullptr, current.put())) && current) {
-        apply(*current);
-        last = std::move(current);
       }
       return;
     }
-    // Walk transitions rather than sampling the latest state: a tap may
-    // start and finish between two UI frames.
-    for (unsigned i = 0; i < 128; ++i) {
+    missing_since = 0;
+    if (!last) {
+      apply(*current);
+      last = std::move(current);
+      return;
+    }
+
+    // Device status can be stale while this Xbox still returns live readings.
+    // Use the reading stream itself to decide whether input is available.
+    // Drain short taps from the history when it advances. Some runtime paths
+    // expose fresh snapshots even when the historical iterator stops.
+    const auto current_sequence = current->GetSequenceNumber(kind);
+    bool advanced = false;
+    for (unsigned i = 0; i < 64; ++i) {
+      const auto last_sequence = last->GetSequenceNumber(kind);
+      if (current_sequence && current_sequence <= last_sequence) break;
       winrt::com_ptr<IGameInputReading> next;
-      const HRESULT hr = input_->GetNextReading(last.get(), kind, nullptr, next.put());
-      if (hr == GAMEINPUT_E_REFERENCE_READING_TOO_OLD) {
-        winrt::com_ptr<IGameInputReading> current;
-        if (SUCCEEDED(input_->GetCurrentReading(kind, nullptr, current.put())) && current) {
-          apply(*current);
-          last = std::move(current);
-        }
-        break;
-      }
-      if (FAILED(hr) || !next) break;
+      if (FAILED(input_->GetNextReading(last.get(), kind, nullptr, next.put())) ||
+          !next || next.get() == last.get()) break;
+      const auto next_sequence = next->GetSequenceNumber(kind);
+      if (next_sequence && next_sequence <= last_sequence) break;
       apply(*next);
       last = std::move(next);
+      advanced = true;
+    }
+    if (!advanced || current_sequence > last->GetSequenceNumber(kind)) {
+      if (!advanced && current_sequence > last->GetSequenceNumber(kind)) {
+        bool& reported = kind == GameInputKindKeyboard
+            ? keyboard_snapshot_reported_ : mouse_snapshot_reported_;
+        if (!reported) {
+          reported = true;
+          log_line(kind == GameInputKindKeyboard
+                       ? "input: native keyboard uses latest readings"
+                       : "input: native mouse uses latest readings");
+        }
+      }
+      apply(*current);
+      last = std::move(current);
     }
   }
 
@@ -136,13 +191,15 @@ class native_gameinput {
       next[vk] = {static_cast<u16>(scan & 0xffu), extended, true};
       if (!state.isDeadKey && state.codePoint >= 32) text[vk] = state.codePoint;
     }
-    if (!keyboard_active_.exchange(true))
-      log_line("input: native GameInput keyboard selected");
     const bool shortcut = next[0xa2].down || next[0xa3].down ||
                           next[0xa4].down || next[0xa5].down;
     for (unsigned vk = 8; vk < next.size(); ++vk) {
       if (keys_[vk].down == next[vk].down) continue;
       const auto& state = next[vk].down ? next[vk] : keys_[vk];
+      if (!keyboard_active_.exchange(true) && !keyboard_seen_) {
+        keyboard_seen_ = true;
+        log_line("input: native GameInput keyboard transition applied");
+      }
       if (!next[vk].down || !trt_key_down(static_cast<u16>(vk))) {
         trt_input_key_event2(static_cast<u16>(vk), next[vk].down, state.scan,
                              state.extended, false);
@@ -155,23 +212,37 @@ class native_gameinput {
   bool update_mouse(IGameInputReading& reading) {
     GameInputMouseState next{};
     if (!reading.GetMouseState(&next)) return false;
-    if (!mouse_active_.exchange(true))
-      log_line("input: native GameInput mouse selected");
     if (mouse_baseline_) {
       const auto delta = [](int64_t after, int64_t before) {
         return static_cast<i32>(std::clamp(after - before, int64_t(-32767), int64_t(32767)));
       };
       const auto dx = delta(next.positionX, mouse_.positionX);
       const auto dy = delta(next.positionY, mouse_.positionY);
-      if (dx || dy) trt_input_mouse_delta_raw(dx, dy);
+      if (dx || dy) {
+        mouse_active_.store(true);
+        if (!mouse_motion_seen_) {
+          mouse_motion_seen_ = true;
+          log_line("input: native GameInput mouse movement applied");
+        }
+        trt_input_mouse_delta_raw(dx, dy);
+      }
       const auto wheel = delta(next.wheelY, mouse_.wheelY);
-      if (wheel) trt_input_wheel(wheel);
+      if (wheel) {
+        mouse_active_.store(true);
+        trt_input_wheel(wheel);
+      }
     }
     const unsigned changed = next.buttons ^ mouse_.buttons;
     for (unsigned button = 0; button < 5; ++button) {
       const unsigned mask = 1u << button;
-      if (changed & mask)
-        trt_input_mouse_button(button, (next.buttons & mask) != 0);
+      if (!(changed & mask)) continue;
+      mouse_active_.store(true);
+      if (!mouse_button_seen_) {
+        mouse_button_seen_ = true;
+        log_line("input: native GameInput mouse button applied");
+      }
+      const bool down = (next.buttons & mask) != 0;
+      if (trt_mouse_button(button) != down) trt_input_mouse_button(button, down);
     }
     const bool clicked = (changed & 1u) && !(next.buttons & 1u);
     mouse_ = next;
@@ -185,6 +256,15 @@ class native_gameinput {
   std::array<key, 256> keys_{};
   GameInputMouseState mouse_{};
   bool mouse_baseline_ = false;
+  bool keyboard_seen_ = false;
+  bool mouse_motion_seen_ = false;
+  bool mouse_button_seen_ = false;
+  bool keyboard_snapshot_reported_ = false;
+  bool mouse_snapshot_reported_ = false;
+  ULONGLONG keyboard_status_log_at_ = 0;
+  ULONGLONG mouse_status_log_at_ = 0;
+  ULONGLONG keyboard_missing_since_ = 0;
+  ULONGLONG mouse_missing_since_ = 0;
   std::atomic<bool> keyboard_active_{false};
   std::atomic<bool> mouse_active_{false};
 };
