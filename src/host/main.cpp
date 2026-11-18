@@ -43,6 +43,7 @@
 #include <dwrite.h>
 #include <d3d11.h>
 #include <xinput.h>
+#include "native_gameinput.h"
 
 #include <algorithm>
 #include <atomic>
@@ -202,6 +203,8 @@ int uwp_register_unwind(void* image_base, const void* pdata, u32 count) {
 void uwp_log(const char* line) { longan::log_line(line); }
 
 std::atomic<bool> g_uwp_raw_mouse{false};
+longan::native_gameinput g_native_input;
+bool g_input_focused = false;
 
 extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 
@@ -1511,6 +1514,7 @@ struct tiramisu_host
                              static_cast<int>(sc.height / 2));
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
+      if (g_native_input.keyboard_active()) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -1524,6 +1528,7 @@ struct tiramisu_host
                            s.IsExtendedKey ? 1 : 0, s.WasKeyDown ? 1 : 0);
     });
     m_ku = window.KeyUp([](CoreWindow const&, KeyEventArgs const& a) {
+      if (g_native_input.keyboard_active()) return;
       const auto s = a.KeyStatus();
       const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
                                               (u16)s.ScanCode,
@@ -1533,10 +1538,12 @@ struct tiramisu_host
     });
     m_cr = window.CharacterReceived(
         [](CoreWindow const&, CharacterReceivedEventArgs const& a) {
+          if (g_native_input.keyboard_active()) return;
           trt_input_char_event((u32)a.KeyCode());
         });
     m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
+      if (g_native_input.mouse_active()) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
@@ -1551,6 +1558,7 @@ struct tiramisu_host
     });
     m_pr = window.PointerReleased([this](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
+      if (g_native_input.mouse_active()) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
@@ -1559,6 +1567,7 @@ struct tiramisu_host
     });
     m_pm = window.PointerMoved([](CoreWindow const& sender,
                                   PointerEventArgs const& a) {
+      if (g_native_input.mouse_active()) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -1568,6 +1577,7 @@ struct tiramisu_host
     });
     m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
+      if (g_native_input.mouse_active()) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
@@ -1575,7 +1585,11 @@ struct tiramisu_host
     m_focus = window.Activated([](CoreWindow const&, WindowActivatedEventArgs const& a) {
       const bool focused = a.WindowActivationState() != CoreWindowActivationState::Deactivated;
       longan::log_line(focused ? "input: CoreWindow activated" : "input: CoreWindow deactivated");
-      if (!focused) trt_input_release_all();
+      g_input_focused = focused;
+      if (!focused) {
+        trt_input_release_all();
+        g_native_input.suspend();
+      }
       if (g_guest_running.load()) {
         trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, focused ? 1 : 0, 0);
         trt_msg_post(0x0006u /*WM_ACTIVATE*/, focused ? 1 : 0, 0);
@@ -1588,6 +1602,7 @@ struct tiramisu_host
     try {
       if (const auto mouse = wdi::MouseDevice::GetForCurrentView()) {
         m_mm = mouse.MouseMoved([](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+          if (g_native_input.mouse_active()) return;
           if (!g_uwp_raw_mouse.exchange(true))
             longan::log_line("input: physical relative mouse motion received");
           const auto d = a.MouseDelta();
@@ -1808,7 +1823,11 @@ struct tiramisu_host
   void Run() {
     g_ui_tid = GetCurrentThreadId();
     CoreWindow::GetForCurrentThread().Activate();
-    if (!g_booted) { g_booted = true; boot_all(); }
+    if (!g_booted) {
+      g_booted = true;
+      boot_all();
+      g_native_input.open();
+    }
 
     int mouse_vx = 960, mouse_vy = 540;
     while (!g_shutdown.load()) {
@@ -1816,6 +1835,7 @@ struct tiramisu_host
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
+      if (g_input_focused && g_native_input.poll()) launcher_click();
       apply_web_controls();
 
       // ---- controller & keyboard launcher navigation ----
