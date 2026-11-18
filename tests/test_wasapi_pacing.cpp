@@ -180,6 +180,18 @@ int main() {
   u32 buffer_frames = 0;
   ((GetBufferSize_t)cvt[4])(client, &buffer_frames);
   CHECK(buffer_frames >= 4800, "GetBufferSize reports the 100ms buffer");
+  using initialize_t = i32(TRT_GUEST_ABI*)(void*, u32, u32, i64, i64,
+                                           const void*, const void*);
+  const auto initialize = reinterpret_cast<initialize_t>(cvt[3]);
+  const i64 very_long_duration = 0x7fffffffffffffffLL;
+  const int bounded_hr = initialize(client, 0, 0, very_long_duration, 0,
+                                    nullptr, nullptr);
+  ((GetBufferSize_t)cvt[4])(client, &buffer_frames);
+  CHECK(bounded_hr == 0 && buffer_frames == 96000,
+        "Oversized audio duration is limited to two seconds");
+  CHECK(initialize(client, 0, 0, 1000000, 0, nullptr, nullptr) == 0,
+        "Normal buffer size can be restored");
+  ((GetBufferSize_t)cvt[4])(client, &buffer_frames);
 
   // ---- test 1: padding reflects the submit immediately and decays in
   // real time; reading padding does not consume it ----

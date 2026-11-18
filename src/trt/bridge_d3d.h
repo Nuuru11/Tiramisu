@@ -44,7 +44,9 @@ typedef struct trt_gpu_hooks {
                                           void* const* queues, u32 num_queues,
                                           u32 node_mask, void** out_device,
                                           void** out_ctx, u32* out_level);
-  int (TRT_GUEST_ABI *set_d3d11_swapchain_format)(u32 format);
+  int (TRT_GUEST_ABI *configure_d3d11_swapchain)(u32 format, u32 buffer_count);
+  int (TRT_GUEST_ABI *get_d3d11_backbuffer)(u32 index, const void* iid, void** out);
+  void (TRT_GUEST_ABI *prepare_d3d11_present)(void);
 } trt_gpu_hooks;
 
 void trt_gpu_set_hooks(const trt_gpu_hooks* hooks);

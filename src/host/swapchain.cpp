@@ -35,6 +35,7 @@ winrt::com_ptr<ID3D11DeviceContext1> g_ctx;
 winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
+winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer;
 winrt::com_ptr<IDXGIFactory2> g_factory;
 winrt::com_ptr<IDXGIFactory6> g_factory6;
 winrt::com_ptr<ID3D12Device> g_d3d12_device;
@@ -162,6 +163,64 @@ int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
   return hr;
 }
 
+int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
+  if (!g_swap || !g_device) return E_FAIL;
+  const HRESULT hr = set_d3d11_swapchain_format(format);
+  if (FAILED(hr)) return hr;
+
+  const bool single_buffer = buffer_count == 1 ||
+                             (buffer_count == 0 && g_guest_backbuffer);
+  if (!single_buffer) {
+    g_guest_backbuffer = nullptr;
+    return S_OK;
+  }
+
+  // Desktop swap-effects can expose one stable buffer. UWP needs at
+  // least two flip buffers. Keep the desktop render target stable and
+  // copy its pixels into the CoreWindow buffer before each flip.
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  if (FAILED(g_swap->GetDesc1(&desc))) return E_FAIL;
+  const bool srgb = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                    format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+  DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : desc.Format;
+  if (g_guest_backbuffer) {
+    D3D11_TEXTURE2D_DESC current{};
+    g_guest_backbuffer->GetDesc(&current);
+    if (format == DXGI_FORMAT_UNKNOWN) guest_format = current.Format;
+    if (current.Width == desc.Width && current.Height == desc.Height &&
+        current.Format == guest_format)
+      return S_OK;
+  }
+  D3D11_TEXTURE2D_DESC texture{};
+  texture.Width = desc.Width;
+  texture.Height = desc.Height;
+  texture.MipLevels = 1;
+  texture.ArraySize = 1;
+  texture.Format = guest_format;
+  texture.SampleDesc.Count = 1;
+  texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  winrt::com_ptr<ID3D11Texture2D> target;
+  const HRESULT created = g_device->CreateTexture2D(&texture, nullptr, target.put());
+  if (FAILED(created)) return created;
+  g_guest_backbuffer = std::move(target);
+  log_line("d3d: using a single guest backbuffer over the CoreWindow flip chain");
+  return S_OK;
+}
+
+int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
+  if (!g_guest_backbuffer) return E_NOTIMPL;
+  if (out) *out = nullptr;
+  if (index != 0 || !out || !iid) return DXGI_ERROR_INVALID_CALL;
+  return g_guest_backbuffer->QueryInterface(*static_cast<const IID*>(iid), out);
+}
+
+void TRT_GUEST_ABI prepare_d3d11_present() {
+  if (!g_guest_backbuffer || !g_swap || !g_ctx) return;
+  winrt::com_ptr<ID3D11Texture2D> back;
+  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
+    g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
+}
+
 void publish_gpu_hooks() {
   trt_gpu_hooks hooks{};
   hooks.device = g_device.get();
@@ -202,7 +261,9 @@ void publish_gpu_hooks() {
     return S_OK;
   };
   hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
-  hooks.set_d3d11_swapchain_format = &set_d3d11_swapchain_format;
+  hooks.configure_d3d11_swapchain = &configure_d3d11_swapchain;
+  hooks.get_d3d11_backbuffer = &get_d3d11_backbuffer;
+  hooks.prepare_d3d11_present = &prepare_d3d11_present;
   hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,
                               u32 count, void* const* queues, u32 num_queues,
                               u32 node_mask, void** out_dev, void** out_ctx,
@@ -311,6 +372,7 @@ void swapchain_restore_d3d11() {
 }
 
 void swapchain_restore_launcher_format() {
+  g_guest_backbuffer = nullptr;
   set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM);
 }
 
@@ -391,6 +453,7 @@ void swapchain_shutdown() {
   vk_rt::shutdown();
   g_d3d12_swap = nullptr;
   g_d3d12_device = nullptr;
+  g_guest_backbuffer = nullptr;
   g_rtv = nullptr;
   g_swap3 = nullptr;
   g_swap = nullptr;

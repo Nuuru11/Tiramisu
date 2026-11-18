@@ -232,6 +232,9 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
   void* sc = active_sc();
   void* slot = real_sc_slot(8);
   if (slot && sc) {
+    if (!g_sc_is_d3d12 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
+        g_hooks.prepare_d3d11_present)
+      g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
     const int hr = ((fn_t)slot)(sc, sync, safe_flags);
     if (hr == 0 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
@@ -249,6 +252,10 @@ int TRT_GUEST_ABI fake_sc_GetBuffer(void* self, u32 buffer, const void* riid, vo
   (void)self;
   void* sc = active_sc();
   void* slot = real_sc_slot(9);
+  if (!g_sc_is_d3d12 && g_hooks.get_d3d11_backbuffer) {
+    const int hr = g_hooks.get_d3d11_backbuffer(buffer, riid, out);
+    if (hr != TRT_E_NOTIMPL) return hr;
+  }
   if (slot && sc) {
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, const void*, void**);
     return ((fn_t)slot)(sc, buffer, riid, out);
@@ -299,8 +306,8 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
 }
 int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32 fmt, u32 flags) {
   (void)self;
-  if (!g_sc_is_d3d12 && g_hooks.set_d3d11_swapchain_format)
-    return g_hooks.set_d3d11_swapchain_format(fmt);
+  if (!g_sc_is_d3d12 && g_hooks.configure_d3d11_swapchain)
+    return g_hooks.configure_d3d11_swapchain(fmt, count);
   void* sc = active_sc();
   void* slot = real_sc_slot(13);
   int hr = 0;
@@ -414,6 +421,9 @@ int TRT_GUEST_ABI fake_sc_Present1(void* self, u32 sync, u32 flags, const void* 
   void* sc = active_sc();
   void* slot = real_sc_slot(22);
   if (slot && sc) {
+    if (!g_sc_is_d3d12 && !(flags & 1u /*DXGI_PRESENT_TEST*/) &&
+        g_hooks.prepare_d3d11_present)
+      g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, const void*);
     return ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
   }
@@ -1076,8 +1086,8 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
     return 0;
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
-  if (g_hooks.set_d3d11_swapchain_format) {
-    const int hr = g_hooks.set_d3d11_swapchain_format(fmt);
+  if (g_hooks.configure_d3d11_swapchain) {
+    const int hr = g_hooks.configure_d3d11_swapchain(fmt, count);
     if (hr < 0) {
       *swapchain = nullptr;
       return hr;

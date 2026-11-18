@@ -146,9 +146,20 @@ extern "C" void* g_fake_adapter;
 extern "C" TRT_GUEST_ABI int fake_generic_hr(void*, void*, void*, void*) { return 0; }
 
 static u32 g_requested_swapchain_format;
+static u32 g_requested_swapchain_buffers;
+static unsigned g_prepare_presents;
+static int TRT_GUEST_ABI get_alternate_backbuffer(u32 index, const void*, void** out) {
+  if (!out || index != 0) return (int)0x887a0001u;
+  *out = g_fake_rtv;
+  return 0;
+}
+static void TRT_GUEST_ABI prepare_present() {
+  ++g_prepare_presents;
+}
 static int g_swapchain_format_result;
-static int TRT_GUEST_ABI set_swapchain_format(u32 format) {
+static int TRT_GUEST_ABI set_swapchain_format(u32 format, u32 buffer_count) {
   g_requested_swapchain_format = format;
+  g_requested_swapchain_buffers = buffer_count;
   return g_swapchain_format_result;
 }
 
@@ -489,17 +500,32 @@ int main(int argc, char** argv) {
             "IDXGISwapChain::ResizeBuffers handles fixed CoreWindow cleanly");
       CHECK(((pres_t)svt[8])(proxy_sc, 0, 0x200u) == 0 && g_presented == 2,
             "IDXGISwapChain::Present strips ALLOW_TEARING and forwards");
-      hooks.set_d3d11_swapchain_format = &set_swapchain_format;
+      hooks.configure_d3d11_swapchain = &set_swapchain_format;
       trt_gpu_set_hooks(&hooks);
       const u32 rgba_srgb = 29;
-      CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, rgba_srgb, 0) == 0 &&
-                g_requested_swapchain_format == rgba_srgb,
-            "D3D11 ResizeBuffers forwards the requested format to the host");
+      CHECK(((rb_t)svt[13])(proxy_sc, 1, 1920, 1080, rgba_srgb, 0) == 0 &&
+                g_requested_swapchain_format == rgba_srgb &&
+                g_requested_swapchain_buffers == 1,
+            "D3D11 ResizeBuffers forwards the format and buffer count");
+      hooks.get_d3d11_backbuffer = &get_alternate_backbuffer;
+      hooks.prepare_d3d11_present = &prepare_present;
+      trt_gpu_set_hooks(&hooks);
+      using get_buffer_t = int (TRT_GUEST_ABI *)(void*, u32, const void*, void**);
+      void* guest_backbuffer = nullptr;
+      CHECK(((get_buffer_t)svt[9])(proxy_sc, 0, nullptr, &guest_backbuffer) == 0 &&
+                guest_backbuffer == g_fake_rtv,
+            "D3D11 GetBuffer uses the host-provided guest texture");
+      ((pres_t)svt[8])(proxy_sc, 0, 1u);
+      CHECK(g_prepare_presents == 0, "Present test skips the host copy");
+      ((pres_t)svt[8])(proxy_sc, 0, 0);
+      CHECK(g_prepare_presents == 1, "Present copies from the guest texture");
       g_swapchain_format_result = (int)0x80070057u;
       CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, rgba_srgb, 0) ==
                 g_swapchain_format_result,
             "D3D11 ResizeBuffers preserves a host format error");
-      hooks.set_d3d11_swapchain_format = nullptr;
+      hooks.configure_d3d11_swapchain = nullptr;
+      hooks.get_d3d11_backbuffer = nullptr;
+      hooks.prepare_d3d11_present = nullptr;
       trt_gpu_set_hooks(&hooks);
     }
   }

@@ -35,11 +35,13 @@
 - **Notes:** Runs healthy for 10s under mock-d3d11. Plain-GPU path dies in the
   Unity CrashReporter insights-crash-report.json write (CreateFileW fails on the
   CrashReporter dir — guest never calls CreateDirectoryW). Named gap.
-- **[XBOX] Series S, Tiramisu 0.2.1.7:** Native D3D11 resource creation
+- **[XBOX] Series S, Tiramisu 0.2.1.9:** Native D3D11 resource creation
   progresses after preserving native DLL TLS during guest execution. The
-  CoreWindow backbuffer accepts the requested sRGB view format and Unity
-  submits a frame. The console shows a black screen before Unity posts
-  `WM_QUIT` and returns to Tiramisu with exit code 0. Sustained play is open.
+  CoreWindow backbuffer accepts the requested sRGB view format. The guest
+  uses one stable render target and the host copies it into the Xbox flip
+  chain. Hardware captures show the animated Doraccoon splash without
+  alternating black frames. Unity then posts `WM_QUIT` and returns to
+  Tiramisu with exit code 0. Sustained play is open.
 - **Gaps:** Reason for Unity's clean exit on Xbox and the CrashReporter
   insights JSON write path.
 
