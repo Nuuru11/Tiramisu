@@ -43,6 +43,7 @@
 #include <dwrite.h>
 #include <d3d11.h>
 #include <xinput.h>
+#include <winrt/Windows.UI.Input.h>
 #include "native_gameinput.h"
 
 #include <algorithm>
@@ -1582,6 +1583,10 @@ struct tiramisu_host
       feed_core_pointer(sender, point.Position());
       trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
     });
+    m_input_enabled = window.InputEnabled([](CoreWindow const&, InputEnabledEventArgs const& a) {
+      longan::log_line(a.InputEnabled() ? "input: CoreWindow input enabled"
+                                       : "input: CoreWindow input disabled");
+    });
     m_focus = window.Activated([](CoreWindow const&, WindowActivatedEventArgs const& a) {
       const bool focused = a.WindowActivationState() != CoreWindowActivationState::Deactivated;
       longan::log_line(focused ? "input: CoreWindow activated" : "input: CoreWindow deactivated");
@@ -1820,14 +1825,64 @@ struct tiramisu_host
     g_setup_done = true;  // A press on the finished screen opens the shelf
   }
 
+  void enable_keyboard_interceptor() {
+    // Xbox can reserve system keyboard processing even while this app has focus.
+    // The foreground interceptor routes raw physical key events here instead of
+    // CoreWindow.KeyDown/Up and lets the Win32 guest receive the same key stream.
+    namespace wui = winrt::Windows::UI::Input;
+    try {
+      m_keyboard_interceptor = wui::KeyboardDeliveryInterceptor::GetForCurrentView();
+      if (m_keyboard_interceptor) {
+        m_keyboard_interceptor.IsInterceptionEnabledWhenInForeground(true);
+        m_ikd = m_keyboard_interceptor.KeyDown(
+            [](wui::KeyboardDeliveryInterceptor const&, KeyEventArgs const& a) {
+          const auto status = a.KeyStatus();
+          const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
+                                                  (u16)status.ScanCode,
+                                                  status.IsExtendedKey);
+          trt_input_key_event2(vk, true, (u16)status.ScanCode,
+                               status.IsExtendedKey ? 1 : 0, status.WasKeyDown ? 1 : 0);
+          a.Handled(true);
+          static bool logged = false;
+          if (!logged) {
+            logged = true;
+            longan::log_line("input: foreground keyboard event received");
+          }
+        });
+        m_iku = m_keyboard_interceptor.KeyUp(
+            [](wui::KeyboardDeliveryInterceptor const&, KeyEventArgs const& a) {
+          const auto status = a.KeyStatus();
+          const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
+                                                  (u16)status.ScanCode,
+                                                  status.IsExtendedKey);
+          trt_input_key_event2(vk, false, (u16)status.ScanCode,
+                               status.IsExtendedKey ? 1 : 0, 0);
+          a.Handled(true);
+        });
+        longan::log_line(m_keyboard_interceptor.IsInterceptionEnabledWhenInForeground()
+                             ? "input: foreground keyboard interception enabled"
+                             : "input: foreground keyboard interception unavailable");
+      } else {
+        longan::log_line("input: foreground keyboard interceptor unavailable");
+      }
+    } catch (...) {
+      longan::log_line("input: foreground keyboard interception denied");
+    }
+  }
+
   void Run() {
     g_ui_tid = GetCurrentThreadId();
-    CoreWindow::GetForCurrentThread().Activate();
+    auto active_window = CoreWindow::GetForCurrentThread();
+    active_window.Activate();
     if (!g_booted) {
       g_booted = true;
       boot_all();
       g_native_input.open();
     }
+    longan::log_line(active_window.IsInputEnabled()
+                         ? "input: CoreWindow initially enabled"
+                         : "input: CoreWindow initially disabled");
+    enable_keyboard_interceptor();
 
     int mouse_vx = 960, mouse_vy = 540;
     while (!g_shutdown.load()) {
@@ -2334,8 +2389,9 @@ struct tiramisu_host
 
   bool m_web_keys[256]{};
   bool m_web_buttons[5]{};
+  winrt::Windows::UI::Input::KeyboardDeliveryInterceptor m_keyboard_interceptor{nullptr};
   winrt::event_token m_kd{}, m_ku{}, m_cr{}, m_pp{}, m_pr{}, m_pm{}, m_pw{},
-      m_mm{}, m_focus{};
+      m_mm{}, m_focus{}, m_input_enabled{}, m_ikd{}, m_iku{};
 };
 
 } // namespace
