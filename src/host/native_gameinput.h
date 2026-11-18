@@ -68,7 +68,7 @@ class native_gameinput {
     const ULONGLONG now = GetTickCount64();
     if (now - last_logged < 5000) return;
     last_logged = now;
-    char line[160]{};
+    char line[192]{};
     const auto sequence = reading ? reading->GetSequenceNumber(kind) : 0;
     if (kind == GameInputKindKeyboard) {
       std::array<GameInputKeyState, 256> states{};
@@ -81,9 +81,14 @@ class native_gameinput {
       GameInputMouseState state{};
       const bool available = reading && reading->GetMouseState(&state);
       std::snprintf(line, sizeof(line),
-          "input: GameInput mouse hr=0x%08lx seq=%llu state=%u buttons=0x%02x",
+          "input: GameInput mouse hr=0x%08lx seq=%llu state=%u x=%lld y=%lld wx=%lld wy=%lld buttons=0x%02x",
           static_cast<unsigned long>(result), static_cast<unsigned long long>(sequence),
-          available ? 1u : 0u, available ? state.buttons : 0u);
+          available ? 1u : 0u,
+          static_cast<long long>(available ? state.positionX : 0),
+          static_cast<long long>(available ? state.positionY : 0),
+          static_cast<long long>(available ? state.wheelX : 0),
+          static_cast<long long>(available ? state.wheelY : 0),
+          available ? state.buttons : 0u);
     }
     log_line(line);
   }
@@ -155,17 +160,23 @@ class native_gameinput {
       last = std::move(next);
       advanced = true;
     }
-    if (!advanced || current_sequence > last->GetSequenceNumber(kind)) {
-      if (!advanced && current_sequence > last->GetSequenceNumber(kind)) {
+    const auto last_sequence = last->GetSequenceNumber(kind);
+    const bool sequence_missing = current_sequence == 0 || last_sequence == 0;
+    if (!advanced || sequence_missing || current_sequence > last_sequence) {
+      if (!advanced && (sequence_missing || current_sequence > last_sequence)) {
         bool& reported = kind == GameInputKindKeyboard
             ? keyboard_snapshot_reported_ : mouse_snapshot_reported_;
         if (!reported) {
           reported = true;
           log_line(kind == GameInputKindKeyboard
                        ? "input: native keyboard uses latest readings"
-                       : "input: native mouse uses latest readings");
+                       : "input: native mouse uses sequence-less latest readings");
         }
       }
+      // Xbox runtimes may return zero sequence numbers for mouse readings.
+      // In that case GetNextReading cannot prove whether the snapshot advanced,
+      // so always compare/apply the current cumulative state. update_mouse only
+      // forwards actual position and button deltas, making repeated snapshots safe.
       apply(*current);
       last = std::move(current);
     }
