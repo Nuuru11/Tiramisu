@@ -82,14 +82,16 @@ void log_soft_level(u64 committed, const char* pct) {
 // caller must then fail the guest allocation with 1455).
 int charge_common(const char* what, u64 bytes) {
   const u64 budget = budget_bytes_once();
-  const u64 before = g_committed.fetch_add(bytes);
-  const u64 after = before + bytes;
-  if (after > budget) {
-    g_committed.fetch_sub(bytes);
-    log_refusal(what, bytes);
-    trt_SetLastError(1455);  // ERROR_COMMITMENT_LIMIT
-    return -1;
-  }
+  u64 before = g_committed.load();
+  u64 after;
+  do {
+    if (before > budget || bytes > budget - before) {
+      log_refusal(what, bytes);
+      trt_SetLastError(1455);  // ERROR_COMMITMENT_LIMIT
+      return -1;
+    }
+    after = before + bytes;
+  } while (!g_committed.compare_exchange_weak(before, after));
   u64 p = g_peak.load();
   while (after > p && !g_peak.compare_exchange_weak(p, after)) {}
   if (after >= (budget / 10) * 9 && !g_soft90.exchange(true)) {
@@ -98,6 +100,11 @@ int charge_common(const char* what, u64 bytes) {
     log_soft_level(after, "80%");
   }
   return 0;
+}
+
+void discharge(std::atomic<u64>& counter, u64 bytes) {
+  u64 before = counter.load();
+  while (!counter.compare_exchange_weak(before, before > bytes ? before - bytes : 0)) {}
 }
 
 }  // namespace
@@ -111,8 +118,7 @@ int trt_mem_budget_charge_commit(u64 bytes) {
 
 void trt_mem_budget_discharge_commit(u64 bytes) {
   if (!bytes) return;
-  const u64 before = g_committed.load();
-  g_committed.store(before > bytes ? before - bytes : 0);
+  discharge(g_committed, bytes);
 }
 
 int trt_mem_budget_charge_map(u64 bytes) {
@@ -124,8 +130,7 @@ int trt_mem_budget_charge_map(u64 bytes) {
 
 void trt_mem_budget_discharge_map(u64 bytes) {
   if (!bytes) return;
-  const u64 m = g_mapped.load();
-  g_mapped.store(m > bytes ? m - bytes : 0);
+  discharge(g_mapped, bytes);
   trt_mem_budget_discharge_commit(bytes);
 }
 
