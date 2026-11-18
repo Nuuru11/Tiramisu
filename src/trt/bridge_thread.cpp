@@ -1159,7 +1159,45 @@ u32 TRT_STDCALL trt_GetThreadId(u64 thread) {
 // object; foreign/main threads are adopted (pthread_self captured).
 u64 trt_thread_handle_for_current(void) {
 #if defined(_WIN32)
-  return 0;
+  // ADOPT the current real host thread: match by real TID first (threads the
+  // bridge created already have a win_handle), otherwise duplicate our own
+  // real handle via the HOST kernel32 (NOT the guest bridge — recursion).
+  // Without this, DuplicateHandle(GetCurrentThread()) on the console handed
+  // the GC the -2 pseudo-handle itself; the collector then failed its
+  // SuspendThread loop -> "Fatal error in GC" -> 0x80000003 (RACCOIN).
+  const DWORD self_tid = ::GetCurrentThreadId();
+  {
+    std::lock_guard<std::mutex> lk(g_obj_mu);
+    for (u32 i = 0; i < g_objects.size(); ++i) {
+      sync_object& o = g_objects[i];
+      if (o.kind == OBJ_THREAD && o.tid == self_tid &&
+          o.alive.load(std::memory_order_acquire)) {
+        o.handle_refs++;
+        return make_handle(i, o.generation);
+      }
+    }
+  }
+  HANDLE real = nullptr;
+  if (!::DuplicateHandle(::GetCurrentProcess(), ::GetCurrentThread(),
+                         ::GetCurrentProcess(), &real, 0, FALSE,
+                         DUPLICATE_SAME_ACCESS)) {
+    return 0;
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_obj_mu);  // alloc_object_locked expects
+    const u64 h = alloc_object_locked(OBJ_THREAD);  // the caller to hold it
+    if (!h) {
+      ::CloseHandle(real);
+      return 0;
+    }
+    sync_object* o = object_for_locked(h);
+    o->win_handle = real;
+    o->tid = self_tid;
+    o->started = true;
+    o->alive.store(true, std::memory_order_release);
+    o->handle_refs++;  // we hand this back to the caller
+    return h;
+  }
 #else
   const pthread_t self = pthread_self();
   std::lock_guard<std::mutex> lk(g_obj_mu);
@@ -1244,13 +1282,37 @@ u32 TRT_STDCALL trt_SuspendThread(u64 thread) {
       return (u32)-1;
     }
     h = o->win_handle;
-    o->suspend_count.fetch_add(1, std::memory_order_acq_rel);
   }
   if (!h) {
     trt_SetLastError(6);
     return (u32)-1;
   }
-  return ::SuspendThread(h);
+  // SAFE SUSPEND: SuspendThread can park a guest thread while it holds our
+  // registry mutex (g_obj_mu) — the collector's NEXT suspend would deadlock
+  // on that mutex forever (the flaky-crash class). Boehm-style loop: park,
+  // verify the registry is takeable, resume+retry if not. Converges because
+  // bridge critical sections are microsecond-scale; a fresh non-suspended
+  // holder also releases in microseconds. The returned value IS the real
+  // previous suspend count (from the host), so the object counter stays
+  // driven by ResumeThread only.
+  unsigned iter = 0;
+  while (true) {
+    const DWORD src = ::SuspendThread(h);
+    if (src == (DWORD)-1) {
+      trt_SetLastError(::GetLastError() ? (u32)::GetLastError() : 5u);
+      return (u32)-1;
+    }
+    if (g_obj_mu.try_lock()) {
+      g_obj_mu.unlock();
+      return (u32)src;  // parked cleanly; registry reachable
+    }
+    ::ResumeThread(h);  // target (or a peer) holds the registry — retry
+    if (++iter > 2000u) {
+      trt_SetLastError(5);  // named: registry held too long under suspension
+      return (u32)-1;
+    }
+    std::this_thread::yield();
+  }
 #else
   ensure_sigusr2_installed();
   std::lock_guard<std::mutex> slk(g_suspend_op_mu);

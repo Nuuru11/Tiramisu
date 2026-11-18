@@ -13,6 +13,9 @@ namespace longan {
 // LocalState directory (UTF-8) for later use (drive_c mount), empty on fail.
 std::string log_open(const std::string& package_path);
 void log_line(const char* line);
+// Read the last bytes of the on-disk log (tiramisu.log) — evidence that
+// survives a crash. Returns the byte count written to out (0 = no file).
+size_t log_read_disk_tail(char* out, size_t cap);
 void log_close();
 
 // In-memory ring of recent log lines (UI dashboard + web /api/logs use it).

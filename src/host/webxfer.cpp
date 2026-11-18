@@ -1132,16 +1132,32 @@ void listener_thread() {
     sock_t c = accept(g_listener, nullptr, nullptr);
     if (c == kBadSock) {
       if (g_stop) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
+    // SOCKET TIMEOUTS: a half-open client (a timed-out poller, a phone that
+    // walked away) must not park a worker in recv() forever. Measured death
+    // spiral: stuck workers piled up, the overflow path ran handle_client
+    // INLINE on the listener, and one blocked request killed the whole
+    // dashboard while the UI kept rendering. handle_client's sock_guard
+    // closes the socket, so the worker only unregisters.
+#ifdef _WIN32
+    const DWORD to_ms = 30000;  // 30s
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_ms, sizeof(to_ms));
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to_ms, sizeof(to_ms));
+#else
+    struct timeval to_tv = {30, 0};
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_tv, sizeof(to_tv));
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (const char*)&to_tv, sizeof(to_tv));
+#endif
     if (g_workers.load() < 16) {
       g_workers.fetch_add(1);
       std::thread([c]() {
-        handle_client(c);
+        handle_client(c);  // sock_guard closes c
         g_workers.fetch_sub(1);
       }).detach();
     } else {
-      handle_client(c);
+      sock_close(c);  // busy: refuse instead of blocking the listener
     }
   }
 }
@@ -1307,6 +1323,28 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
 std::string webxfer_start(const std::string& local_state, int display_w) {
   (void)display_w;
   return webxfer_start_port(local_state, 9127);
+}
+
+bool webxfer_find_game(const char* name, char* out_exe, size_t cap) {
+  if (!name || !name[0] || !out_exe || cap == 0) return false;
+  out_exe[0] = 0;
+  std::lock_guard<std::mutex> lk(g_mu);
+  std::vector<dir_ent> ents;
+  list_dir_entries(g_games_dir, &ents);
+  const std::string sep(1, XFER_SEP);
+  for (const auto& d : ents) {
+    if (!d.is_dir || d.name != name) continue;
+    const std::string gdir = g_games_dir + sep + d.name;
+    std::vector<std::string> exes;
+    std::string exe;
+    scan_game_exes(gdir, d.name, &exes, &exe);
+    if (exe.empty()) return false;
+    const size_t need = exe.size() + 1;
+    if (need > cap) return false;
+    memcpy(out_exe, exe.c_str(), need);
+    return true;
+  }
+  return false;
 }
 
 bool webxfer_poll_launch(std::string* out_name) {

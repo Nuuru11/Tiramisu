@@ -1347,6 +1347,18 @@ bool edit_setting_row(int dir) {
 }
 
 // ---------------- the app ----------------
+// BUILTIN provider for tiramisu_host.dll (guest-importable host surface).
+// BOTH exports must be here: guest_hello imports LogU32 AND QueryBuild —
+// a missing one fails the whole import bind (rc=IMPORT on the console).
+static void TRT_GUEST_ABI host_builtin_log_u32(unsigned tag, unsigned value) {
+  char line[64];
+  snprintf(line, sizeof(line), "guest marker: tag=%u value=%u", tag, value);
+  longan::log_line(line);
+}
+static unsigned TRT_GUEST_ABI host_builtin_query_build(void) {
+  return 0x00020000u;  // runtime build 0.2.0
+}
+
 struct tiramisu_host
     : implements<tiramisu_host, IFrameworkViewSource, IFrameworkView> {
   CoreWindow m_window{nullptr};
@@ -1531,7 +1543,16 @@ struct tiramisu_host
                  L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);
 
-    // builtin self-test: proves the whole pipeline on hardware
+    // builtin self-test: proves the whole pipeline on hardware.
+    // guest_hello imports tiramisu_host.dll!TiramisuHostLogU32 — the BUILTIN
+    // provider must be registered or the selftest fails rc=IMPORT on console
+    // (the offline tests register their own; the host app never did).
+    static const trt_named_fn k_host_builtin_fns[] = {
+        {"TiramisuHostLogU32", (void*)&host_builtin_log_u32},
+        {"TiramisuHostQueryBuild", (void*)&host_builtin_query_build},
+    };
+    trt_module_register("tiramisu_host.dll", TRT_ROUTE_BUILTIN,
+                        k_host_builtin_fns, 2);
     const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
     snprintf(line, sizeof(line), "selftest: rc=%s (%s)", trt_errstr(gr.map_rc),
              gr.detail);
@@ -1849,6 +1870,36 @@ struct tiramisu_host
         if (!g_pending_launch.empty()) {
           const std::string want = g_pending_launch;
           g_pending_launch.clear();
+          bool shelf_hit = false;
+          for (const auto& ge : g_games)
+            if (ge.name == want) { shelf_hit = true; break; }
+          if (!shelf_hit) {
+            // console reality: the shelf's FindFirstFileA scan can come up
+            // empty while the web dashboard's enumeration lists the game —
+            // fall back to the webxfer's own list so a web launch NEVER
+            // drops silently
+            char wexe[1024] = {};
+            if (longan::webxfer_find_game(want.c_str(), wexe, sizeof(wexe))) {
+              std::string dir_rel = want;
+              for (char& c : dir_rel) if (c == '/') c = '\\';
+              game_entry fge;
+              fge.name = want;
+              fge.exe = wexe;
+              fge.exes.push_back(wexe);
+              fge.dir = g_games_dir + std::string(1, '\\') + dir_rel;
+              fge.input_mode = "auto";
+              char found_line[192];
+              snprintf(found_line, sizeof(found_line),
+                       "shelf: %s -> %s (web list fallback)", want.c_str(), wexe);
+              longan::log_line(found_line);
+              g_games.push_back(std::move(fge));
+            } else {
+              char drop[160];
+              snprintf(drop, sizeof(drop),
+                       "launch %s: game not found on shelf or web list", want.c_str());
+              longan::log_line(drop);
+            }
+          }
           for (const auto& ge : g_games) {
             if (ge.name == want) {
               if (g_guest_thread.joinable()) g_guest_thread.join();

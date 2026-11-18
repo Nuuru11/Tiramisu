@@ -36,6 +36,12 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
 
 // Poll from the host loop: consume launch / stop / rescan requests.
 bool webxfer_poll_launch(std::string* out_name);
+// Find an uploaded game by folder name using the webxfer's OWN enumeration
+// (the one /games serves). Returns true and fills out_exe with the exe path
+// RELATIVE to the games root ("raccoin\RACCOIN.exe"). The shelf scan and
+// this must agree; the shelf can come up empty on the console while /games
+// works, so the launcher falls back to this.
+bool webxfer_find_game(const char* name, char* out_exe, size_t cap);
 bool webxfer_poll_stop();
 bool webxfer_poll_rescan();
 void webxfer_set_running_game(const std::string& name);
