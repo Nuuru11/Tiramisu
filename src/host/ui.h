@@ -49,6 +49,9 @@ void ui_set_quick_menu(bool visible);            // RetroArch-style in-game menu
 void ui_set_fps(float fps);                      // FPS counter for overlay
 void ui_set_sysinfo(const std::wstring& info);   // CPU/GPU/RAM string
 void ui_set_log_tail(const std::vector<std::wstring>& lines);
+enum class ui_click_type { none, tab, open_home, play, select_game, select_setting };
+struct ui_click { ui_click_type type; int index; };
+ui_click ui_hit_test(int x, int y);
 void ui_render();
 
 } // namespace longan

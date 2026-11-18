@@ -3,6 +3,7 @@
 // everything positioned from the 1920x1080 design grid scaled to the
 // swapchain size.
 #include "ui.h"
+#include <algorithm>
 #include "settings.h"
 
 #include <d2d1_1.h>
@@ -374,6 +375,46 @@ void draw_lan_link(float m) {
            (L"LAN LINK  " + url).c_str(), g_teal);
 }
 
+ui_click ui_hit_test(int x, int y) {
+  const float m = g_h * 0.06f;
+  const auto hits = [x, y](float left, float top, float width, float height) {
+    return x >= left && y >= top && x < left + width && y < top + height;
+  };
+  if (g_first_run) {
+    if (g_setup_finished && hits(m, g_h * 0.89f, (g_w - 3 * m) * 0.55f,
+                                 g_h * 0.05f))
+      return {ui_click_type::open_home, 0};
+    return {ui_click_type::none, 0};
+  }
+  if (g_screen == UI_QUICKMENU) return {ui_click_type::none, 0};
+  const float tab_w = g_w * 0.11f;
+  for (int i = 0; i < UI_TAB_COUNT; ++i) {
+    if (hits(m + i * (tab_w + g_w * 0.012f), g_h * 0.045f, tab_w, g_h * 0.05f))
+      return {ui_click_type::tab, i};
+  }
+  if (g_screen == UI_SETTINGS) {
+    const int count = static_cast<int>(g_set_rows.size());
+    const int start = count > 12 ? std::clamp(g_set_selected - 6, 0, count - 12) : 0;
+    const float row_h = g_h * 0.058f;
+    for (int i = start; i < count && i < start + 12; ++i) {
+      if (hits(m, g_h * 0.26f + (i - start) * row_h, g_w * 0.72f, row_h))
+        return {ui_click_type::select_setting, i};
+    }
+  }
+  if (g_screen == UI_SHELF && !g_games.empty()) {
+    const float width = g_w - 2 * m - (g_qr_size > 0 ? g_h * 0.30f : 0);
+    if (hits(m, g_h * 0.15f, width, g_h * 0.26f))
+      return {ui_click_type::play, g_selected};
+    const int start = g_selected >= 4 ? g_selected - 3 : 0;
+    const float row_h = g_h * 0.057f;
+    for (int i = start; i < static_cast<int>(g_games.size()) && i < start + 4; ++i) {
+      if (hits(m, g_h * 0.492f + (i - start) * row_h, width, row_h - 7))
+        return {ui_click_type::select_game, i};
+    }
+  }
+  return {ui_click_type::none, 0};
+}
+
 void ui_render() {
   if (!g_ctx || !g_swap) return;
   // bind this frame's backbuffer as the D2D target
@@ -428,7 +469,7 @@ void ui_render() {
       draw_qr_overlay(m + 20);
       if (g_setup_finished) {
         text_out(g_small, m, g_h * 0.89f, left, g_h * 0.05f,
-                 g_first_run ? L"A  Open Home" : L"LB  Live Log    RB  Home", g_teal);
+                 g_first_run ? L"Enter / A  Open Home" : L"LB  Live Log    RB  Home", g_teal);
       }
       g_ctx->EndDraw();
       bmp->Release();
@@ -489,7 +530,7 @@ void ui_render() {
              selected ? g_games[g_selected].exe.c_str() :
              L"Open Setup to transfer your first game.", g_dim);
     text_out(g_text, m + 30, y + g_h * 0.205f, width - 60, g_h * 0.045f,
-             selected ? L"A  Play      Left / Right  Choose executable" :
+             selected ? L"Click or press Enter to play      Left / Right  Choose executable" :
                         L"LB  Setup", g_teal);
 
     y += hero_h + g_h * 0.03f;

@@ -13,6 +13,10 @@
 extern "C" {
 int TRT_STDCALL trt_RegisterRawInputDevices(const void*, u32, u32);
 u32 TRT_STDCALL trt_GetRawInputData(void*, u32, void*, u32*, u32);
+u32 TRT_STDCALL trt_GetRawInputBuffer(void*, u32*, u32);
+int TRT_STDCALL trt_EnableMouseInPointer(int);
+int TRT_STDCALL trt_IsMouseInPointerEnabled(void);
+int TRT_STDCALL trt_GetPointerInfo(u32, void*);
 u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 int TRT_STDCALL trt_ToUnicode(u32 vk, u32 scan, const u8* ks, u16* buf,
                               int cap, u32 flags);
@@ -137,12 +141,101 @@ int main() {
     // size query form
     u32 q = 0;
     CHECK(trt_GetRawInputData((void*)(uintptr_t)t.lparam, 0x10000003, nullptr,
-                              &q, 24) == 48,
-          "GetRawInputData size query");
+                              &q, 24) == 0 && q == 48,
+          "GetRawInputData size query writes the required size");
     // stale handle -> -1 (0xFFFFFFFF), no crash
     CHECK(trt_GetRawInputData((void*)(uintptr_t)0xdeadbeef, 0x10000003, buf,
                               &sz, 24) == 0xFFFFFFFFu,
           "stale hRawInput -> -1");
+  }
+
+  // Unity drains one WM_INPUT and then asks for the remaining raw messages.
+  {
+    trt_msg t{};
+    while (trt_msg_peek(&t, true)) {}
+    trt_input_mouse_button(0, true);
+    trt_input_key_event2('Q', true, 0x10, 0, 0);
+    trt_input_mouse_button(0, false);
+
+    u32 bytes = 0;
+    CHECK(trt_GetRawInputBuffer(nullptr, &bytes, 24) == 0 && bytes == 48,
+          "raw buffer size query leaves the first record queued");
+    alignas(u64) u8 packet[136]{};
+    bytes = 8;
+    CHECK(trt_GetRawInputBuffer(packet, &bytes, 24) == 0xFFFFFFFFu && bytes == 48,
+          "short raw buffer leaves the first record queued");
+    bytes = sizeof(packet);
+    CHECK(trt_GetRawInputBuffer(packet, &bytes, 24) == 3,
+          "raw buffer returns mouse, keyboard and mouse in order");
+    u16 flags = 0;
+    memcpy(&flags, packet + 28, sizeof(flags));
+    CHECK(flags == 1, "buffered mouse down flags");
+    memcpy(&flags, packet + 48 + 24, sizeof(flags));
+    CHECK(flags == 0x10, "buffered key keeps scan code");
+    memcpy(&flags, packet + 88 + 28, sizeof(flags));
+    CHECK(flags == 2, "buffered mouse up flags");
+    CHECK(trt_msg_peek_range(&t, 0x0100, 0x0101, true) &&
+              t.message == 0x0100 && t.wparam == 'Q' && (t.lparam & 0xFFFF) == 1,
+          "filtered key read skips mouse messages and keeps repeat count");
+    CHECK(trt_msg_peek(&t, true) && t.message == 0x0201 &&
+              trt_msg_peek(&t, true) && t.message == 0x0202 && !trt_msg_pending(),
+          "buffered raw read preserves standard mouse messages");
+
+    trt_input_release_all();
+    CHECK(!trt_key_down('Q'), "focus loss clears held key state");
+    trt_input_reset_cursor_mode(false);
+    CHECK(trt_input_show_cursor(false) == -1 &&
+              !trt_cursor_snapshot(&x, &y) &&
+              trt_input_show_cursor(true) == 0 &&
+              trt_cursor_snapshot(&x, &y),
+          "ShowCursor counter hides and restores the cursor");
+    trt_input_reset_cursor_mode(true);
+    CHECK(trt_input_show_cursor(false) == -1 && trt_cursor_snapshot(&x, &y),
+          "forced console pointer stays visible when the guest hides its cursor");
+    trt_input_reset_cursor_mode(false);
+  }
+
+  // Win32 pointer messages carry the button state at the time of the event.
+  {
+    trt_msg msg{};
+    while (trt_msg_peek(&msg, true)) {}
+    CHECK(trt_EnableMouseInPointer(1) && trt_IsMouseInPointerEnabled(),
+          "EnableMouseInPointer requests pointer messages");
+    trt_input_mouse_move(640, 400);
+    trt_input_mouse_button(0, true);
+    trt_input_mouse_button(0, false);
+    CHECK(trt_msg_peek_range(&msg, 0x0246, 0x0246, true),
+          "WM_POINTERDOWN is queued");
+    trt_input_accept_pointer(&msg, 0x1234, 17);
+    alignas(u64) u8 info[96]{};
+    CHECK(trt_GetPointerInfo(1, info), "GetPointerInfo returns mouse event");
+    u32 type, flags, change;
+    int px, py;
+    memcpy(&type, info, 4);
+    memcpy(&flags, info + 12, 4);
+    memcpy(&px, info + 32, 4);
+    memcpy(&py, info + 36, 4);
+    memcpy(&change, info + 88, 4);
+    CHECK(type == 4 && (flags & 0x10010u) == 0x10010u &&
+              px == 640 && py == 400 && change == 1,
+          "pointer down snapshots position and pressed button after release");
+    CHECK(trt_msg_peek_range(&msg, 0x0247, 0x0247, true),
+          "WM_POINTERUP is queued");
+    trt_input_accept_pointer(&msg, 0x1234, 18);
+    trt_mouse_pointer release{};
+    CHECK(trt_input_get_mouse_pointer(1, &release) &&
+              (release.flags & 0x40010u) == 0x40000u && release.change == 2,
+          "pointer up snapshots released button");
+    while (trt_msg_peek(&msg, true)) {}
+    trt_input_mouse_button(0, true);
+    trt_input_mouse_button(1, true);
+    trt_input_mouse_move(641, 401);
+    CHECK(trt_msg_peek_range(&msg, 0x0245, 0x0245, true) && msg.pointer_change == 3,
+          "motion never overwrites a second button transition");
+    trt_input_mouse_button(1, false);
+    trt_input_mouse_button(0, false);
+    CHECK(trt_EnableMouseInPointer(0) && !trt_IsMouseInPointerEnabled(),
+          "disabling pointer messages restores legacy mouse messages");
   }
 
   // RawInput keyboard layout (MakeCode +24, Flags +26, VKey +30) & RIDEV_REMOVE

@@ -13,6 +13,8 @@
 #include "../trt/bridge_d3d.h"
 #include "../trt/bridge_d3d12.h"
 #include "../trt/bridge_d3dx.h"
+#include "../trt/input.h"
+#include <algorithm>
 
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -214,11 +216,51 @@ int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
   return g_guest_backbuffer->QueryInterface(*static_cast<const IID*>(iid), out);
 }
 
+// Paint a small arrow on the presentation surface. ClearView writes just
+// these rectangles and leaves the guest's shaders and bindings intact.
+void draw_pointer(bool launcher) {
+  if (!g_ctx || !g_rtv || !g_w || !g_h) return;
+  int x, y;
+  if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
+  const int scale = g_h >= 900 ? 2 : 1;
+  static constexpr const char* rows[] = {
+      "#", "##", "#o#", "#oo#", "#ooo#", "#oooo#", "#ooooo#", "#oooooo#",
+      "#ooooooo#", "#oooooooo#", "#ooooooooo#", "#ooooo#####",
+      "#oo#oo#", "#o##oo#", "##..#oo#", "#...#oo#", ".....###",
+  };
+  D3D11_RECT dark[64], light[64];
+  unsigned n_dark = 0, n_light = 0;
+  for (unsigned row = 0; row < sizeof(rows) / sizeof(rows[0]); ++row) {
+    const int top = y + static_cast<int>(row) * scale;
+    if (top < 0 || top >= static_cast<int>(g_h)) continue;
+    const char* pixels = rows[row];
+    for (int col = 0; pixels[col];) {
+      const int first = col;
+      const char color = pixels[col++];
+      while (pixels[col] == color) ++col;
+      if (color == '.') continue;
+      const int left = std::max(0, x + first * scale);
+      const int right = std::min(static_cast<int>(g_w), x + col * scale);
+      if (left >= right) continue;
+      const D3D11_RECT rect{left, top, right, std::min(top + scale, (int)g_h)};
+      if (color == '#') dark[n_dark++] = rect;
+      else light[n_light++] = rect;
+    }
+  }
+  const float black[4] = {0.015f, 0.015f, 0.015f, 1.f};
+  const float white[4] = {1.f, 1.f, 1.f, 1.f};
+  if (n_dark) g_ctx->ClearView(g_rtv.get(), black, dark, n_dark);
+  if (n_light) g_ctx->ClearView(g_rtv.get(), white, light, n_light);
+}
+
 void TRT_GUEST_ABI prepare_d3d11_present() {
-  if (!g_guest_backbuffer || !g_swap || !g_ctx) return;
-  winrt::com_ptr<ID3D11Texture2D> back;
-  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
-    g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
+  if (!g_swap || !g_ctx) return;
+  if (g_guest_backbuffer) {
+    winrt::com_ptr<ID3D11Texture2D> back;
+    if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
+      g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
+  }
+  draw_pointer(false);
 }
 
 void publish_gpu_hooks() {
@@ -318,6 +360,7 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   }
   r.width = g_w;
   r.height = g_h;
+  trt_input_display_size(static_cast<int>(g_w), static_cast<int>(g_h));
   winrt::copy_from_abi(g_window, winrt::get_abi(w));
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -441,6 +484,7 @@ void swapchain_present() {
     }
   }
   last_present = now;
+  draw_pointer(true);
   g_swap->Present(vsync ? 1 : 0, 0);
 }
 

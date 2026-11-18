@@ -210,6 +210,20 @@ inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
   return vk;
 }
 
+void feed_core_pointer(CoreWindow const& window,
+                       winrt::Windows::Foundation::Point point) {
+  // Once Xbox delivers relative motion, the drawn cursor owns the position.
+  // Absolute events can still report a system pointer stuck at a screen edge.
+  if (g_uwp_raw_mouse.load()) return;
+  const auto bounds = window.Bounds();
+  if (bounds.Width <= 0 || bounds.Height <= 0) return;
+  int w, h;
+  trt_display_size(&w, &h);
+  const int x = std::clamp(static_cast<int>(point.X * w / bounds.Width), 0, w - 1);
+  const int y = std::clamp(static_cast<int>(point.Y * h / bounds.Height), 0, h - 1);
+  trt_input_pointer_move(x, y, false);
+}
+
 inline int host_mouse_btn_for_press(winrt::Windows::UI::Input::PointerUpdateKind k) {
   using PUK = winrt::Windows::UI::Input::PointerUpdateKind;
   if (k == PUK::LeftButtonPressed) return 0;
@@ -1002,8 +1016,15 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
       "\\Windows\\System32",
       "\\Windows\\Temp",
   };
-  for (const char* sub : c_dirs) {
-    CreateDirectoryA((drive_c + sub).c_str(), nullptr);
+  for (const char* sub : c_dirs)
+    trt_vfs_mkdir_p((drive_c + sub).c_str());
+  if (_stricmp(name.c_str(), "raccoin") == 0) {
+    // The game's offline Steam profile is the default guest account.
+    const auto save = drive_c +
+        "\\Users\\Player\\AppData\\LocalLow\\DoraccoonGames\\RACCOIN\\SaveData"
+        "\\76561197960265729";
+    if (trt_vfs_mkdir_p(save.c_str()) != 0)
+      longan::log_line("profile: RACCOIN save directory could not be created");
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
@@ -1480,8 +1501,15 @@ struct tiramisu_host
     longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v,
                     longan::swapchain_dxgi());
     longan::swapchain_bind_d3d9();
+    trt_input_set_cursor_pos(static_cast<int>(sc.width / 2),
+                             static_cast<int>(sc.height / 2));
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        longan::log_line("input: physical keyboard event received");
+      }
       const auto s = a.KeyStatus();
       const u16 vk = disambiguate_modifier_vk((u16)a.VirtualKey(),
                                               (u16)s.ScanCode,
@@ -1501,39 +1529,109 @@ struct tiramisu_host
         [](CoreWindow const&, CharacterReceivedEventArgs const& a) {
           trt_input_char_event((u32)a.KeyCode());
         });
-    m_pp = window.PointerPressed([](CoreWindow const&,
+    m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
-      const int btn = host_mouse_btn_for_press(
-          a.CurrentPoint().Properties().PointerUpdateKind());
-      if (btn >= 0) trt_input_mouse_button(btn, true);
+      const auto point = a.CurrentPoint();
+      feed_core_pointer(sender, point.Position());
+      const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
+      if (btn >= 0) {
+        static bool logged = false;
+        if (!logged) {
+          logged = true;
+          longan::log_line("input: physical mouse button received");
+        }
+        trt_input_mouse_button(btn, true);
+      }
     });
-    m_pr = window.PointerReleased([](CoreWindow const&,
-                                     PointerEventArgs const& a) {
-      const int btn = host_mouse_btn_for_release(
-          a.CurrentPoint().Properties().PointerUpdateKind());
-      if (btn >= 0) trt_input_mouse_button(btn, false);
-    });
-    m_pm = window.PointerMoved([](CoreWindow const&,
-                                  PointerEventArgs const& a) {
-      const auto p = a.CurrentPoint().Position();
-      trt_input_pointer_move((int)p.X, (int)p.Y, g_uwp_raw_mouse.load());
-    });
-    m_pw = window.PointerWheelChanged([](CoreWindow const&,
+    m_pr = window.PointerReleased([this](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      trt_input_wheel(
-          (i32)a.CurrentPoint().Properties().MouseWheelDelta());
+      const auto point = a.CurrentPoint();
+      feed_core_pointer(sender, point.Position());
+      const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
+      if (btn >= 0) trt_input_mouse_button(btn, false);
+      if (btn == 0) launcher_click();
+    });
+    m_pm = window.PointerMoved([](CoreWindow const& sender,
+                                  PointerEventArgs const& a) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        longan::log_line("input: physical pointer motion received");
+      }
+      feed_core_pointer(sender, a.CurrentPoint().Position());
+    });
+    m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
+                                         PointerEventArgs const& a) {
+      const auto point = a.CurrentPoint();
+      feed_core_pointer(sender, point.Position());
+      trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
+    });
+    m_focus = window.Activated([](CoreWindow const&, WindowActivatedEventArgs const& a) {
+      const bool focused = a.WindowActivationState() != CoreWindowActivationState::Deactivated;
+      if (!focused) trt_input_release_all();
+      if (g_guest_running.load()) {
+        trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, focused ? 1 : 0, 0);
+        trt_msg_post(0x0006u /*WM_ACTIVATE*/, focused ? 1 : 0, 0);
+        trt_msg_post(focused ? 0x0007u /*WM_SETFOCUS*/ : 0x0008u /*WM_KILLFOCUS*/, 0, 0);
+      }
     });
 
-    // REAL relative mouse deltas — the Xbox UWP mouse API. The virtual
-    // cursor clamps at screen edges; this stream does not, which is what
-    // FPS/mouse-look games need. Falls back gracefully to pointer-diff.
+    // Relative events reach the guest even when PointerMoved stops at a screen edge.
     namespace wdi = winrt::Windows::Devices::Input;
-    m_mm = wdi::MouseDevice::GetForCurrentView().MouseMoved(
-        [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
-          g_uwp_raw_mouse.store(true);
+    try {
+      if (const auto mouse = wdi::MouseDevice::GetForCurrentView()) {
+        m_mm = mouse.MouseMoved([](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
+          if (!g_uwp_raw_mouse.exchange(true))
+            longan::log_line("input: physical relative mouse motion received");
           const auto d = a.MouseDelta();
-          trt_input_mouse_delta_raw((i32)d.X, (i32)d.Y);
+          trt_input_mouse_delta_raw(static_cast<i32>(d.X), static_cast<i32>(d.Y));
         });
+      }
+    } catch (...) {
+      longan::log_line("input: CoreWindow pointer events active");
+    }
+  }
+
+  void launcher_click() {
+    if (g_guest_running.load()) return;
+    int x, y;
+    trt_mouse_pos(&x, &y);
+    const auto hit = longan::ui_hit_test(x, y);
+    switch (hit.type) {
+      case longan::ui_click_type::open_home:
+        if (g_setup_active && g_setup_done) {
+          g_setup_active = false;
+          longan::ui_dismiss_first_run();
+        }
+        break;
+      case longan::ui_click_type::tab:
+        if (g_setup_active) break;
+        g_screen = static_cast<longan::ui_screen>(hit.index);
+        longan::ui_set_screen(g_screen);
+        if (g_screen == longan::UI_SETTINGS) {
+          sync_settings_rows();
+          longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+        }
+        break;
+      case longan::ui_click_type::select_game:
+        if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size()))
+          g_selected = hit.index;
+        break;
+      case longan::ui_click_type::play:
+        if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size()))
+          g_pending_launch = g_games[hit.index].name;
+        break;
+      case longan::ui_click_type::select_setting:
+        if (hit.index >= 0 && hit.index < g_set_count) {
+          g_set_selected = hit.index;
+          if (g_set_rows[hit.index].is_bool && edit_setting_row(1))
+            apply_settings_rows();
+          longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+        }
+        break;
+      case longan::ui_click_type::none:
+        break;
+    }
   }
 
   void boot_all() {
@@ -1644,10 +1742,10 @@ struct tiramisu_host
 
     int mouse_vx = 960, mouse_vy = 540;
     while (!g_shutdown.load()) {
+      trt_input_frame_begin();
       CoreWindow::GetForCurrentThread()
           .Dispatcher()
           .ProcessEvents(CoreProcessEventsOption::ProcessAllIfPresent);
-      trt_input_frame_begin();
 
       // ---- controller & keyboard launcher navigation ----
       XINPUT_STATE xs{};
@@ -1733,6 +1831,8 @@ struct tiramisu_host
           vm_hold_ticks = 0;
           longan::webxfer_poll_stop();
           if (guest_was_running) {
+            trt_input_release_all();
+            trt_input_reset_cursor_mode(false);
             g_mouse_mode = false;
             longan::webxfer_set_running_game("");
           }
@@ -1983,6 +2083,10 @@ struct tiramisu_host
               } else if (ge.input_mode == "controller") {
                 g_mouse_mode = false;
               }
+              trt_input_release_all();
+              // RACCOIN hides its native cursor. Its menu still needs a
+              // visible pointer on the console when using a physical mouse.
+              trt_input_reset_cursor_mode(_stricmp(want.c_str(), "raccoin") == 0);
               longan::webxfer_set_running_game(want);
               g_guest_running.store(true);
               const std::string exe = ge.exe;
@@ -2138,7 +2242,7 @@ struct tiramisu_host
   }
 
   winrt::event_token m_kd{}, m_ku{}, m_cr{}, m_pp{}, m_pr{}, m_pm{}, m_pw{},
-      m_mm{};
+      m_mm{}, m_focus{};
 };
 
 } // namespace

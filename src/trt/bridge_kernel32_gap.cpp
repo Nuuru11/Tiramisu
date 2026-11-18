@@ -33,7 +33,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #ifdef _WIN32
-#  include <io.h>       // _chsize_s
+#  include <io.h>       // _chsize_s, _get_osfhandle
+#  include <windows.h>
 #else
 #  include <unistd.h>   // ftruncate
 #endif
@@ -2481,6 +2482,41 @@ int TRT_STDCALL trt_Beep(u32 freq, u32 dur) {
 }
 
 // ---- Byte-range File Locking (SQLite / Qt / Python / Save integrity) ----
+#ifdef _WIN32
+using file_overlapped = OVERLAPPED;
+#else
+struct file_overlapped {
+  u64 Internal;
+  u64 InternalHigh;
+  u32 Offset;
+  u32 OffsetHigh;
+  u64 event;
+};
+#endif
+
+#ifdef _WIN32
+// Keep the FILE alive while the OS uses its underlying handle. Native
+// byte-range locks are shared across independent opens of the same file
+// and are released when the underlying handle closes.
+int file_range_lock(void* h, u32 flags, u32 bytes_lo, u32 bytes_hi,
+                    void* overlapped, bool unlock) {
+  if (!overlapped) { trt_SetLastError(ERROR_INVALID_PARAMETER); return 0; }
+  if (!trt_file_retain(h)) { trt_SetLastError(ERROR_INVALID_HANDLE); return 0; }
+  FILE* file = trt_file_os(h);
+  const intptr_t native = file ? _get_osfhandle(_fileno(file)) : -1;
+  DWORD error = ERROR_INVALID_HANDLE;
+  if (native != -1) {
+    HANDLE handle = reinterpret_cast<HANDLE>(native);
+    auto* ov = static_cast<OVERLAPPED*>(overlapped);
+    const BOOL ok = unlock ? ::UnlockFileEx(handle, 0, bytes_lo, bytes_hi, ov)
+                           : ::LockFileEx(handle, flags, 0, bytes_lo, bytes_hi, ov);
+    error = ok ? ERROR_SUCCESS : ::GetLastError();
+  }
+  trt_file_release(h);
+  if (error != ERROR_SUCCESS) trt_SetLastError(error);
+  return error == ERROR_SUCCESS;
+}
+#else
 struct file_lock_entry {
   FILE* osf;
   u64 start;
@@ -2489,16 +2525,21 @@ struct file_lock_entry {
 };
 std::mutex g_flocks_mu;
 std::vector<file_lock_entry> g_flocks;
+#endif
 
 int TRT_STDCALL trt_LockFileEx(void* h, u32 flags, u32 reserved,
                                u32 bytes_lo, u32 bytes_hi, void* overlapped) {
   (void)reserved;
+#ifdef _WIN32
+  return file_range_lock(h, flags, bytes_lo, bytes_hi, overlapped, false);
+#else
   FILE* osf = trt_file_os(h);
   if (!osf) { trt_SetLastError(6); return 0; }
   u64 off = 0;
   if (overlapped) {
-    const u32* ov = (const u32*)overlapped;
-    off = ((u64)ov[3] << 32) | (u64)ov[2];
+    file_overlapped ov;
+    memcpy(&ov, overlapped, sizeof(ov));
+    off = ((u64)ov.OffsetHigh << 32) | (u64)ov.Offset;
   }
   const u64 len = ((u64)bytes_hi << 32) | (u64)bytes_lo;
   if (len == 0) return 1;
@@ -2515,17 +2556,22 @@ int TRT_STDCALL trt_LockFileEx(void* h, u32 flags, u32 reserved,
   }
   g_flocks.push_back({osf, off, end, excl});
   return 1;
+#endif
 }
 
 int TRT_STDCALL trt_UnlockFileEx(void* h, u32 reserved, u32 bytes_lo,
                                  u32 bytes_hi, void* overlapped) {
   (void)reserved;
+#ifdef _WIN32
+  return file_range_lock(h, 0, bytes_lo, bytes_hi, overlapped, true);
+#else
   FILE* osf = trt_file_os(h);
   if (!osf) { trt_SetLastError(6); return 0; }
   u64 off = 0;
   if (overlapped) {
-    const u32* ov = (const u32*)overlapped;
-    off = ((u64)ov[3] << 32) | (u64)ov[2];
+    file_overlapped ov;
+    memcpy(&ov, overlapped, sizeof(ov));
+    off = ((u64)ov.OffsetHigh << 32) | (u64)ov.Offset;
   }
   const u64 len = ((u64)bytes_hi << 32) | (u64)bytes_lo;
   const u64 end = (len > ~0ULL - off) ? ~0ULL : (off + len);
@@ -2540,22 +2586,23 @@ int TRT_STDCALL trt_UnlockFileEx(void* h, u32 reserved, u32 bytes_lo,
   }
   trt_SetLastError(158);  // ERROR_NOT_LOCKED
   return 0;
+#endif
 }
 
 int TRT_STDCALL trt_LockFile(void* h, u32 off_lo, u32 off_hi,
                              u32 bytes_lo, u32 bytes_hi) {
-  u32 ov[8] = {};
-  ov[2] = off_lo;
-  ov[3] = off_hi;
-  return trt_LockFileEx(h, 0x2u | 0x1u, 0, bytes_lo, bytes_hi, ov);
+  file_overlapped ov{};
+  ov.Offset = off_lo;
+  ov.OffsetHigh = off_hi;
+  return trt_LockFileEx(h, 0x2u | 0x1u, 0, bytes_lo, bytes_hi, &ov);
 }
 
 int TRT_STDCALL trt_UnlockFile(void* h, u32 off_lo, u32 off_hi,
                                u32 bytes_lo, u32 bytes_hi) {
-  u32 ov[8] = {};
-  ov[2] = off_lo;
-  ov[3] = off_hi;
-  return trt_UnlockFileEx(h, 0, bytes_lo, bytes_hi, ov);
+  file_overlapped ov{};
+  ov.Offset = off_lo;
+  ov.OffsetHigh = off_hi;
+  return trt_UnlockFileEx(h, 0, bytes_lo, bytes_hi, &ov);
 }
 
 // ---- Process / NUMA / Pipe / Console / Snapshot / DirectStorage IoRing ----

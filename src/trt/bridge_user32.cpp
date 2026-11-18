@@ -242,6 +242,13 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
   log_line(msg);
   trt_msg_post(0x0001, 0, (i64)(uintptr_t)cs_ptr);  // WM_CREATE
   trt_msg_post(0x0018, 1, 0);                        // WM_SHOWWINDOW
+  if (!parent && !(style & 0x40000000u /*WS_CHILD*/)) {
+    // The console view already owns input focus. Deliver the activation
+    // messages a desktop game receives for its foreground top-level window.
+    trt_msg_post(0x001Cu /*WM_ACTIVATEAPP*/, 1, 0);
+    trt_msg_post(0x0006u /*WM_ACTIVATE*/, 1 /*WA_ACTIVE*/, 0);
+    trt_msg_post(0x0007u /*WM_SETFOCUS*/, 0, 0);
+  }
   return (void*)(uintptr_t)hwnd;
 }
 
@@ -325,14 +332,7 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
     log_line("user32: GetMessageW/PeekMessageW -> message pump entered");
   }
   trt_msg t;
-  bool want_peek = trt_msg_peek(&t, (min == 0 && max == 0) ? remove : false);
-  if (want_peek) {
-    if (!msg_in_range(t.message, min, max)) {
-      want_peek = false;
-    } else if (remove && (min != 0 || max != 0)) {
-      want_peek = trt_msg_peek(&t, true);
-    }
-  }
+  const bool want_peek = trt_msg_peek_range(&t, min, max, remove);
   if (want_peek) {
     if (remove && t.message == 0x0012u) {
       g_quit_pending = false;
@@ -349,6 +349,7 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
       m->wParam = t.wparam;
       m->lParam = t.lparam;
       m->time = now_ticks();
+      if (remove) trt_input_accept_pointer(&t, m->hwnd, m->time);
       m->pt[0] = px;
       m->pt[1] = py;
     }
@@ -507,14 +508,26 @@ int TRT_STDCALL trt_RegisterRawInputDevices(const void* devices, u32 count,
 
 u32 TRT_STDCALL trt_GetRawInputData(void* hraw, u32 cmd, void* out,
                                     u32* out_size, u32 header_size) {
-  if (!out_size) return (u32)-1;
-  const u8* blob = nullptr;
+  extern void TRT_STDCALL trt_SetLastError(u32);
+  if (!out_size || header_size != 24 ||
+      (cmd != 0x10000003u /*RID_INPUT*/ && cmd != 0x10000005u /*RID_HEADER*/)) {
+    trt_SetLastError(87);
+    return (u32)-1;
+  }
+  u8 blob[48];
   u32 blob_size = 0;
-  if (!trt_raw_blob((u64)(uintptr_t)hraw, &blob, &blob_size))
-    return (u32)-1;  // stale/unknown handle: real Windows also -1s this
-  if (cmd != 0x10000003 /*RID_INPUT*/) return (u32)-1;
-  if (!out) return blob_size;  // size query
-  if (*out_size < blob_size || header_size != 24) return (u32)-1;
+  if (!trt_raw_copy((u64)(uintptr_t)hraw, blob, &blob_size)) {
+    trt_SetLastError(6);
+    return (u32)-1;
+  }
+  if (cmd == 0x10000005u) blob_size = header_size;
+  const u32 capacity = out ? *out_size : 0;
+  *out_size = blob_size;
+  if (!out) return 0;
+  if (capacity < blob_size) {
+    trt_SetLastError(122);
+    return (u32)-1;
+  }
   memcpy(out, blob, blob_size);
   return blob_size;
 }
@@ -706,11 +719,7 @@ u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type) {
 }
 
 int TRT_STDCALL trt_ShowCursor(int show) {
-  static int counter = 0;
-  counter += show >= 0 ? 1 : -1;
-  if (counter < 0) counter = 0;
-  trt_set_cursor_visible(counter > 0);
-  return counter;
+  return trt_input_show_cursor(show != 0);
 }
 
 void* TRT_STDCALL trt_SetCapture(void* hwnd) {
@@ -784,11 +793,10 @@ int TRT_STDCALL trt_IsWindowVisible(void* hwnd) { return hwnd ? 1 : 0; }
 int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect) {
   (void)hwnd;
   if (!rect) return 0;
-  u32* r = (u32*)rect;
-  r[0] = 0;       // left
-  r[1] = 0;       // top
-  r[2] = 1920;    // right
-  r[3] = 1080;    // bottom
+  auto* r = static_cast<int*>(rect);
+  r[0] = 0;
+  r[1] = 0;
+  trt_display_size(&r[2], &r[3]);
   return 1;
 }
 

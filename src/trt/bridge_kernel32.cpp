@@ -212,6 +212,19 @@ void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   return p;
 }
 
+int TRT_STDCALL trt_HeapSetInformation(void* heap, u32 info_class,
+                                       const void* info, u64 info_size) {
+  // Guest heaps use backend allocations. Never forward their synthetic
+  // handles to the OS heap manager. In particular, the static MSVC CRT
+  // requests low fragmentation (class 0) on its private heap at startup.
+  (void)heap;
+  (void)info_class;
+  (void)info;
+  (void)info_size;
+  set_err_for_current_thread(50);  // ERROR_NOT_SUPPORTED
+  return 0;
+}
+
 int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
   size_t freed = 0;
@@ -1501,7 +1514,11 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                                   void* tmpl) {
   (void)share; (void)sa; (void)flags; (void)tmpl;
   if (!name) return (void*)(uintptr_t)-1;
-  const bool write = (access & 0x40000000u) != 0 || (access & 0x2u) != 0;
+  // All write access masks need a writable VFS target, including
+  // FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES and GENERIC_ALL.
+  const u32 write_access = 0x40000000u | 0x10000000u | 0x00000002u |
+                           0x00000004u | 0x00000010u | 0x00000100u;
+  const bool write = (access & write_access) != 0;
   // disposition: 1 CREATE_NEW, 2 CREATE_ALWAYS, 3 OPEN_EXISTING,
   // 4 OPEN_ALWAYS, 5 TRUNCATE_EXISTING
   const u32 disp = disposition ? disposition : 3;
@@ -1599,7 +1616,9 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
     char plog[1100];
-    snprintf(plog, sizeof(plog), "  path was: %s", host);
+    snprintf(plog, sizeof(plog),
+             "  path was: %s (access=0x%08x disposition=%u write=%d)",
+             host, access, disp, write);
     trt_core_log(plog);
     return (void*)(uintptr_t)-1;
   }
@@ -6947,6 +6966,7 @@ void TRT_STDCALL trt_RtlFillMemory(void* dst, u64 n, u8 fill) {
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
   {"HeapCreate", (void*)&trt_HeapCreate},
+  {"HeapSetInformation", (void*)&trt_HeapSetInformation},
   {"HeapAlloc", (void*)&trt_HeapAlloc},
   {"HeapFree", (void*)&trt_HeapFree},
   {"VirtualAlloc", (void*)&trt_VirtualAlloc},

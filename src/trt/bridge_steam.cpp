@@ -183,9 +183,9 @@ static u64 TRT_GUEST_ABI steam_noop_zero(void) { return 0; }
 
 static const void* g_steam_safe_vtbl[64] = {Z16, Z16, Z16, Z16};
 
-static unsigned char g_steam_ifaces[24][64] = {};
+static unsigned char g_steam_ifaces[25][64] = {};
 static void* steam_get_iface(int idx) {
-  if (idx < 0 || idx >= 24) idx = 0;
+  if (idx < 0 || idx >= 25) idx = 0;
   void** vptr = (void**)&g_steam_ifaces[idx][0];
   if (!*vptr) *vptr = (void*)g_steam_safe_vtbl;
   return (void*)&g_steam_ifaces[idx][0];
@@ -726,8 +726,9 @@ static void* TRT_GUEST_ABI st_client_GetISteamAppList(void*, int, int, const cha
 static void* TRT_GUEST_ABI st_client_GetISteamMusic(void*, int, int, const char*) {
   return steam_get_iface(8);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamMusicRemote(void*, int, int, const char*) {
-  return steam_get_iface(15);
+static void* TRT_GUEST_ABI st_client_GetISteamMusicRemote(void*, int, int,
+                                                        const char*) {
+  return steam_get_iface(24);  // Stable empty interface; all operations return false.
 }
 static void* TRT_GUEST_ABI st_client_GetISteamHTMLSurface(void*, int, int, const char*) {
   return steam_get_iface(12);
@@ -833,6 +834,9 @@ void* TRT_GUEST_ABI trt_SteamInternal_CreateInterface(const char* version) {
   if (strncmp(version, "SteamRemoteStorage", 18) == 0 ||
       strncmp(version, "STEAMREMOTESTORAGE_INTERFACE_VERSION", 36) == 0)
     return &g_steam_rs_obj;
+  if (strncmp(version, "SteamMusicRemote", 16) == 0 ||
+      strncmp(version, "STEAMMUSICREMOTE_INTERFACE_VERSION", 34) == 0)
+    return steam_get_iface(24);
   if (strncmp(version, "SteamInput", 10) == 0 ||
       strncmp(version, "STEAMINPUT_INTERFACE_VERSION", 28) == 0 ||
       strncmp(version, "SteamController", 15) == 0 ||
@@ -895,7 +899,7 @@ STEAM_IFACE_FN(1)  STEAM_IFACE_FN(2)  STEAM_IFACE_FN(3)  STEAM_IFACE_FN(5)
 STEAM_IFACE_FN(6)  STEAM_IFACE_FN(7)  STEAM_IFACE_FN(8)  STEAM_IFACE_FN(9)
 STEAM_IFACE_FN(11) STEAM_IFACE_FN(12) STEAM_IFACE_FN(13) STEAM_IFACE_FN(14)
 STEAM_IFACE_FN(15) STEAM_IFACE_FN(16) STEAM_IFACE_FN(17) STEAM_IFACE_FN(18)
-STEAM_IFACE_FN(19) STEAM_IFACE_FN(20)
+STEAM_IFACE_FN(19) STEAM_IFACE_FN(20) STEAM_IFACE_FN(24)
 #undef STEAM_IFACE_FN
 static void* TRT_GUEST_ABI steam_apps_obj_ptr(void) {
   return &g_steam_apps_obj;
@@ -1007,6 +1011,7 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamAPI_SteamNetworking_v006", (void*)steam_iface_6},
     {"SteamAPI_SteamScreenshots_v003", (void*)steam_iface_7},
     {"SteamAPI_SteamMusic_v001", (void*)steam_iface_8},
+    {"SteamAPI_SteamMusicRemote_v001", (void*)steam_iface_24},
     {"SteamAPI_SteamHTTP_v003", (void*)steam_iface_9},
     {"SteamAPI_SteamController_v007", (void*)steam_input_obj_ptr},
     {"SteamAPI_SteamController_v008", (void*)steam_input_obj_ptr},
@@ -1053,6 +1058,7 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamAPI_ISteamClient_GetISteamUGC", (void*)st_client_GetISteamUGC},
     {"SteamAPI_ISteamClient_GetISteamAppList", (void*)st_client_GetISteamAppList},
     {"SteamAPI_ISteamClient_GetISteamMusic", (void*)st_client_GetISteamMusic},
+    {"SteamAPI_ISteamClient_GetISteamMusicRemote", (void*)st_client_GetISteamMusicRemote},
     {"SteamAPI_ISteamClient_GetISteamHTMLSurface", (void*)st_client_GetISteamHTMLSurface},
     {"SteamAPI_ISteamClient_GetISteamInventory", (void*)st_client_GetISteamInventory},
     {"SteamAPI_ISteamClient_GetISteamVideo", (void*)st_client_GetISteamVideo},
