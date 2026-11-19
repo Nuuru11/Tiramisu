@@ -135,8 +135,17 @@ so the CLI path never runs; the live session ran it via import (see
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
 - (none — wave 5 (items 24/25/30/29/35/46-remainder) is complete and verified;
-  next: console M0 when DP credentials arrive, or the command-list recording
-  surface (item 27 remainder) on request.)
+  M0 passed 2026-11-19; next is M1 — God of War's interactive front end plus
+  RACCOIN soak/frame-time, or the command-list recording surface (item 27
+  remainder) on request.)
+
+**M0 PLAYABLE (2026-11-19):** RACCOIN reaches its real main menu and plays a
+run on console — coin physics, HUD, score/round progression — captured in
+`docs/proof/raccoin-main-menu.png`, `raccoin-gameplay.png` and the 7.2 s
+`raccoin-gameplay.mp4`. God of War boots and renders the opening forest across
+four independent boots (`docs/proof/gow-forest-01..04.webp`). Next gate:
+God of War's interactive front-end/menu layer and sustained gameplay; RACCOIN soak
+and frame-time capture.
 
 **M0 CONSOLE FINDINGS (first real hardware run, 2026-11-17):**
 - The MSIX **installed, activated, and ran** on the Xbox Series S (OS 26100.9662):

@@ -59,6 +59,15 @@ without an artifact.
 | **Guest C++ EH end-to-end: RACCOIN.exe (real Unity IL2CPP Steam game) BOOTS** | v0.35 (ehfix9–19, 2026-11-15): `CORPUS-EXE: 1 booted, 0 failed` — full 7/7 depth ladder REACHED (CRT-STARTUP / WINMAIN / **UNITYMAIN2** / WINDOW / D3D11 DEVICE / PUMP ENTERED / PUMP QUIT), then a clean self-shutdown (`SetFullscreenState(0) -> S_OK` → `TerminateProcess(0)`). Evidence: `/tmp/opencode/raccoin-ehfix19.log`. Machinery: Win64 `.pdata` pass-1 personality search + `RtlUnwindEx` pass-2 with resume records for rethrow-inside-funclet (MSVC catch funclets run on the unwound stack; the pass-2 callout clobbers the frame's return slot — measured `0x488f3e`), stale-record purge (geometric: a live rethrow throws BELOW every record's rsp_lo; an unrelated throw ABOVE), per-guest-call retirement (records die when their `trt_call_guest` returns), and the boundary-escape swallow — a guest C++ exception (`0xe06d7363`, magic `0x19930520`) that leaves the guest images longjmps to a per-thread setjmp pad in `trt_call_guest_img` (UnityPlayer native wrapper-catch emulation; synthetic 0 return; gated on the splice signature so genuinely-unhandled main-thread exceptions still terminate). `UNITYMAIN2 CALLED` is proven by an IAT probe: the harness patches the EXE's UnityPlayer IAT slot with a naked asm shim (flag store + tail-jump; a C shim's prologue corrupts the guest return address — measured ehfix18 SIGSEGV); Go Next demo.exe reaches UNITYMAIN2 through the same probe. Locked by fixtures: `tests/test_guest_eh.cpp` funclet-rethrow (outer catch, 0x60) + funclet-rethrow-escape (boundary reports 0), ALL PASS |
 | ISO/disc-image games boot read-only with lazy per-file extraction | ISO subsystem gate PASS (44 checks): VFS image layer mounts `.iso` as a read-only drive, `run_game(..., image)` mounts at `D:`, host shelf `[disc]` tag; 5 GB console budget honored by lazy per-file extraction (only files the game opens are materialized) |
 
+## Proven on CONSOLE (2026-11-19) — this project's own run
+
+| Claim | Artifact |
+|---|---|
+| **RACCOIN is fully playable on Xbox Dev Mode** | `docs/proof/raccoin-main-menu.png` (main menu, Unity UI, v1.0.15), `docs/proof/raccoin-gameplay.png` (live run: Round 8/15, score 392, combo 35), `docs/proof/raccoin-gameplay.gif` + `.mp4` (7.2 s of continuous play, 36 frames; Current 116 → 392, top-right counter 221 → 250, combo 35). The menu and run are guest-rendered frames through Tiramisu's D3D11 swapchain, not launcher mock-ups. |
+| **God of War boots, runs and renders the opening forest scene** | `docs/proof/gow-forest-01.webp` … `-04.webp` — four independent console boots in improvement order. Boot 1 shows large occluders and missing geometry; boot 2 resolves character/materials; boot 3 restores foliage/lighting; boot 4 composites the forest with god rays, foliage, character and axe. Stills are 256×144 preview captures. |
+| **Two engine classes through one runtime** | RACCOIN (Unity 6 IL2CPP) reaches a playable loop; God of War (AAA in-house D3D11) reaches an in-engine scene. The same loader, bridge table, D3D11 passthrough and exception path carry both. |
+| **Fail-visible progression, not a cherry-picked frame** | The earlier God of War boot died with a named `0xc0000005` before the four captures; the four-boot sequence shows rendering gaps being removed class by class rather than hidden. |
+
 ## Proven on CONSOLE by the reference projects (we inherit the envelope, not the code)
 
 - A UWP `IFrameworkView` app with `TargetDeviceFamily=Windows.Universal`
@@ -77,14 +86,14 @@ without an artifact.
 - No ETW on console: LocalState log files + crash dumps are the only diagnosis
   (Device Portal /api/etw/* 404).
 
-## Assumed until the console run (M0 acceptance)
+## Still assumed beyond the console PoC
 
-- AppContainer alloc behavior under `VirtualAllocFromApp` matches the test
-  backend's semantics (fixed bases unavailable — loader handles via relocs).
-- XInput poll works in this app shape (xinput.lib -> XINPUTUAP.dll).
-- `LoadLibraryW`+`GetProcAddress` resolves the SYSTEM-route DLLs in-package.
-- The guest's return value and log lines land in `tiramisu.log` pullable via
-  Device Portal.
+- Long-session stability and frame pacing at scale (the RACCOIN clip is 7.2 s;
+  God of War has not yet been driven through its interactive front end).
+- The full SYSTEM-route DLL surface beyond the families RACCOIN and God of War
+  exercise.
+- 32-bit x86 (PE32), D3D12-only AAA and anti-cheat titles — unchanged
+  exclusions or unproven paths.
 
 ## Known name history
 

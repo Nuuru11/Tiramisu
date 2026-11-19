@@ -7,7 +7,8 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-![Status](https://img.shields.io/badge/status-real%20Steam%20games%20boot%20%2B%20render--loop%20proven-brightgreen)
+![Status](https://img.shields.io/badge/status-console--proven-brightgreen)
+![Proof](https://img.shields.io/badge/proof-RACCOIN%20playable%20%7C%20God%20of%20War%20forest-blue)
 ![Gates](https://img.shields.io/badge/offline%20gates-49%2F49%20pass-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
 ![Guests](https://img.shields.io/badge/guest-PE64%20%2B%20Unity%20%2B%20Godot%204%20%2B%20PyInstaller-blue)
@@ -16,7 +17,7 @@ Wine's job, targeting UWP instead of POSIX.
 ![Language](https://img.shields.io/badge/C%2B%2B-17%20%2F%20clang--cl-00599C?logo=cplusplus&logoColor=white)
 ![DRM](https://img.shields.io/badge/DRM%20bypass-none%2C%20ever-red)
 
-[How it works](#-how-it-works) · [Status](#-status-honest) · [Build](#-build-linux-all-cross) · [Deploy](#-deploy-console) · [Evidence](docs/03-evidence.md) · [Gap map](GAP-MAP.md)
+[How it works](#-how-it-works) · [Proof](#-proof--console-run-2026-11-19) · [What this proves](#-what-this-proves) · [Status](#-status-honest) · [Build](#-build-linux-all-cross) · [Deploy](#-deploy-console) · [Evidence](docs/03-evidence.md) · [Gap map](GAP-MAP.md)
 
 **[⬇ Download the release](https://github.com/xanstomper/tiramisu/releases)** · **[🎮 Compatibility](#-what-boots-today)**
 
@@ -51,6 +52,107 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
         ├── budget governor  one 5 GB ledger for VirtualAlloc commit + heap + mapped views
         └── async I/O        overlapped reads → GQCS packets, mmap fast path (TRT_IO_MMAP_MIN)
 ```
+
+## 🏆 Proof — console run (2026-11-19)
+
+This is the milestone the project was built for: **two commercial 64-bit
+Windows games, running in-process on Xbox Dev Mode, through the signed
+Tiramisu UWP host.** No CPU emulation, no streaming, no Linux PC in the loop.
+
+| Game | Engine / class | Console result |
+|---|---|---|
+| **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **Fully playable** — main menu, a live run, coin physics, HUD, score/round progression |
+| **God of War** (PC) | AAA in-house engine, x64, D3D11 | **Boots, runs, renders** — the opening forest scene, four independent boots, each one closer than the last |
+
+### 🦝 RACCOIN — main menu → playable run
+
+<table>
+<tr>
+<td width="50%"><img src="docs/proof/raccoin-main-menu.png" width="100%" alt="RACCOIN main menu rendered on Xbox through Tiramisu"/><br/>
+<sub><b>Main menu.</b> Unity UI composited through the guest's D3D11 swapchain:
+Play Game, Collection, Profile, Quit, version 1.0.15. This is a real frame,
+not a launcher mock-up.</sub></td>
+<td width="50%"><img src="docs/proof/raccoin-gameplay.png" width="100%" alt="RACCOIN gameplay with a live coin bed, round counter, score and combo"/><br/>
+<sub><b>Gameplay.</b> Round 8/15, Current 392, target 10,000, combo 35, a full
+coin bed. The simulation, HUD and renderer are all live at once.</sub></td>
+</tr>
+</table>
+
+[![RACCOIN gameplay — 7.2 s live capture](docs/proof/raccoin-gameplay.gif)](docs/proof/raccoin-gameplay.mp4)
+
+<sub>7.2 seconds of continuous play (36 frames; 1280×720 MP4, inline GIF
+800×450). The board runs from Current 116 to 392 and the top-right counter
+from 221 to 250 (combo 35, Round 8/15) — the same run as the gameplay still.
+The coin bed moves, the multipliers update, and the sequence never drops to a
+static frame. **[▶ Open the MP4](docs/proof/raccoin-gameplay.mp4)**</sub>
+
+### 🪓 God of War — the forest renders
+
+Four separate boot attempts, in order. Each one cleared a different class of
+failure; the scene converges instead of producing one lucky frame.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/proof/gow-forest-01.webp" width="100%" alt="God of War forest scene, first boot: heavy occlusion and missing geometry"/><br/>
+<sub><b>Boot 1 — the scene appears.</b> Kratos and the forest are recognizable,
+but large black occluders, missing foliage and broken texture/material regions
+still dominate the frame.</sub></td>
+<td width="50%"><img src="docs/proof/gow-forest-02.webp" width="100%" alt="God of War forest scene, second boot: character and materials resolve"/><br/>
+<sub><b>Boot 2 — materials resolve.</b> Skin, cloth, the axe, the yellow
+handprint and the tree bark come through; the scene is stable enough to read
+as the opening forest.</sub></td>
+</tr>
+<tr>
+<td width="50%"><img src="docs/proof/gow-forest-03.webp" width="100%" alt="God of War forest scene, third boot: foliage and depth return"/><br/>
+<sub><b>Boot 3 — depth returns.</b> Foliage density, tree layering, sky and
+lighting composite; the frame gains the depth and silhouette of the real
+scene.</sub></td>
+<td width="50%"><img src="docs/proof/gow-forest-04.webp" width="100%" alt="God of War forest scene, fourth boot: full composite with god rays and character detail"/><br/>
+<sub><b>Boot 4 — full composite.</b> God rays, layered trees, alpha-tested
+foliage, character skinning, the axe and the handprint all render together.
+This is the forest scene end-to-end.</sub></td>
+</tr>
+</table>
+
+<sub>God of War captures are preview-resolution stills (256×144); they prove the
+scene composition and the render path, not final output resolution or frame
+pacing. The interactive front-end/menu layer and sustained gameplay are the next
+gate.</sub>
+
+## 🔬 What this proves
+
+| Evidence | What it proves |
+|---|---|
+| RACCOIN main menu | The PE64 loader, Unity IL2CPP startup, D3D11 device/swapchain and guest UI all work together on console. |
+| RACCOIN gameplay + clip | The managed game loop, input, simulation, HUD and renderer run **together, live** — not a synthetic render loop. |
+| God of War forest | A second, much heavier AAA D3D11 renderer boots and draws a real scene: large assets, shaders, lighting, post-processing, character rendering. |
+| Four God of War boots | The renderer is **converging across independent boots**; fixes remove named failure classes one at a time. |
+| Same runtime for both | The loader/bridge model is engine-agnostic: Unity IL2CPP and a AAA in-house engine through one host. |
+
+**The important part is what is no longer in question.** Before this run, the
+project had proven the loader, the bridges, the render loop and the exception
+handling in isolation. Now a real game reaches its own menu, starts a run and
+keeps playing; a second real game reaches an in-engine scene that looks like
+the game. The remaining work is compatibility breadth and polish — front ends,
+sustained play, audio, performance, saves — not "can this run a PC game on the
+console at all?"
+
+It also validates the project's **fail-visible** method. The earlier God of War
+boot failed with a named `0xc0000005`; the next boots did not hide the
+corruption, they removed it class by class (geometry, materials, foliage,
+lighting). That is slower than claiming success, and it is why the screenshots
+can be trusted.
+
+### What this does **not** prove
+
+- **Not universal compatibility.** Two titles prove two engine classes, not
+  every game. The compatibility DB is still the source of truth.
+- **God of War is not "playable" yet.** The forest renders; the interactive
+  front-end/menu layer and sustained gameplay are still being brought up.
+- **RACCOIN's clip is 7.2 seconds.** It proves live play, not hours of
+  stability or a frame-time target. Soak testing is next.
+- **No DRM bypass, ever.** These are games the user owns. Anti-cheat titles,
+  32-bit x86 games and D3D12-only AAA remain out of scope or unproven.
 
 ## ⚙️ How it works
 
@@ -128,16 +230,22 @@ RACCOIN.exe (real Unity IL2CPP Steam game) — offline boot ladder:
 
 | Game (corpus, gitignored) | Type | Result |
 |---|---|---|
-| **RACCOIN** | Unity IL2CPP Steam game | **7/7 ladder — boots, render loop spins, clean self-shutdown** |
-| **Ultra Pool** | Godot 4.3 + GodotSteam (Vulkan) | **Full lifecycle — scene load → pump → Godot's own quit chain, exit(0)** |
+| **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **CONSOLE-PROVEN — fully playable.** Main menu → live run → coin physics → HUD/score/round progression; 7.2 s capture. [Proof](#-proof--console-run-2026-11-19) |
+| **God of War** (PC) | AAA in-house engine, x64, D3D11 | **CONSOLE-PROVEN — boots, runs, renders.** Four independent boots converge on the opening forest scene; interactive front-end/menu layer next. [Proof](#-proof--console-run-2026-11-19) |
+| **Ultra Pool** | Godot 4.3 + GodotSteam (Vulkan) | **Full lifecycle** — scene load → pump → Godot's own quit chain, exit(0) |
 | **Go Next (demo)** | Unity IL2CPP | boots, reaches `UNITYMAIN2` |
 | OrTMM | PyInstaller / commercial | full CRT→WinMain→window→pump lifecycle |
 | BotW-Native (launcher + recomp exe) | BOTW Wii U static recomp | whole MinGW/SDL3/OpenSSL/glslang binary set loads + `DllMain` clean |
-| GoWLauncher | Win32 launcher | loads 1/0 |
+| GoWLauncher | Win32 launcher | loads 1/0 — launcher only, not the game above |
+
+The console rows are the ones that matter: RACCOIN's 7/7 offline ladder,
+2.7M-call mock-render gate and the playable capture are three independent
+proofs of the same path; God of War adds a second, much heavier engine class.
 
 **Engine classes covered:** Unity IL2CPP + **mono** (the W^X two-phase JIT
-fallback enables runtime JIT), Godot 4.x (Vulkan), PyInstaller/Python,
-static-recomp ports, Win32 launchers, GDI+ UI apps, FMOD-audio games.
+fallback enables runtime JIT), **AAA in-house D3D11 (God of War)**, Godot 4.x
+(Vulkan), PyInstaller/Python, static-recomp ports, Win32 launchers, GDI+ UI
+apps, FMOD-audio games.
 
 **Not yet:** 32-bit x86 (PE32) games — needs the M7 x86 engine; D3D12 AAA
 titles offline (console D3D12 path exists, hardware-verification pending);
@@ -207,8 +315,8 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 |---|---|
 | Offline loader (real PE guest executed on Linux) | **PASS** — mapping, DIR64/HIGHLOW reloc, import binding, delay imports, W^X seal, entry execution |
 | Win64 C++ EH (SEH) | **PASS** — pass-1 personality search, RtlUnwindEx pass-2, funclet rethrow splice, geometric purge, VEH, boundary swallow pad |
-| Real-game corpus | **PASS** — 29 PEs load; RACCOIN/UltraPool/GoNext/OrTMM boot; **render loop proven (2.7M GPU calls)** |
-| D3D11/DXGI guest | **BUILT** — real console device + CoreWindow swapchain handed to the guest; full swapchain proxy |
+| Real-game corpus | **PASS** — 29 PEs load; **RACCOIN playable on console**; **God of War renders the forest on console**; UltraPool/GoNext/OrTMM boot; render loop proven (2.7M GPU calls) |
+| D3D11/DXGI guest | **PASS on console** — real device + CoreWindow swapchain handed to RACCOIN and God of War; full swapchain proxy |
 | D3D9/D3D8/DDraw → D3D11 bridges | **BUILT** — SDK-exact vtables |
 | Vulkan 1.0–1.3 ICD (SPIR-V→HLSL→D3D11) | **BUILT** — Godot 4.3 boots through it |
 | Audio (XAudio2 / DirectSound / WASAPI / OpenAL / winmm / **FMOD**) | **BUILT** — one real XAudio2 2.8 sink; FMOD WAV/OGG decode for real |
@@ -217,8 +325,8 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Registry, COM/OLEAUT, shell, COMCTL, GDI, **GDI+** | **BUILT** |
 | Steam | **BUILT (auth only)** — QR login; `BIsSubscribedApp` answers 0 (no DRM bypass) |
 | ISO / disc images | **BUILT** — `.iso` → read-only `D:` drive, lazy per-file extraction |
-| Input (keyboard/mouse/gamepad, DInput8, XInput, Raw Input) | **BUILT** — CoreWindow events → guest getters + pump; pad-as-mouse |
-| Console run | **PENDING** — MSIX built+signed (v0.2.0); deploy script ready; needs Device Portal creds |
+| Input (keyboard/mouse/gamepad, DInput8, XInput, Raw Input) | **PASS (RACCOIN)** — CoreWindow events → guest getters + pump; pad-as-mouse; menu and run are interactive |
+| Console run | **PASS (2026-11-19)** — signed MSIX deploys; RACCOIN fully playable; God of War boots/renders the forest; front end + sustained play next |
 | 32-bit x86 (PE32) | **not supported** — needs an x86 engine; see GAP-MAP W5 |
 
 <details>
@@ -250,9 +358,12 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 
 ## 🗺️ Roadmap
 
-- **M0 console PoC** — deploy → TV screenshot + `tiramisu.log` pull → JIT
-  W^X probe → RACCOIN on the TV *(MSIX v0.2.0 built and signed; awaiting
-  Device Portal creds)*
+- **M0 console PoC — DONE (2026-11-19).** Signed MSIX deploys; RACCOIN
+  reaches its menu, starts a run and plays; God of War boots and renders the
+  forest. Evidence: [Proof](#-proof--console-run-2026-11-19).
+- **M1 front end + sustained play — in progress.** God of War's normal
+  front-end/menu path; RACCOIN soak test and frame-time capture; audio and
+  save validation.
 - **Any-game breadth** — x86-32 PE32 loader + translator ladder; streaming
   maps; IOCP/dstorage; D3D12 (see [GAP-MAP.md](GAP-MAP.md))
 - **Audio breadth** — MP3/ADPCM/FSB decoders for FMOD; Wwise; Miles
@@ -272,6 +383,7 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Doc | Contents |
 |---|---|
 | [docs/03-evidence.md](docs/03-evidence.md) | what is proven vs assumed — every fix traces to a measurement |
+| [docs/proof/](docs/proof/) | console capture evidence — RACCOIN menu/gameplay/clip, God of War four-boot forest ladder |
 | [GAP-MAP.md](GAP-MAP.md) | live gap table, W-lanes, dependency order, triggers |
 | [docs/](docs/) | architecture notes, stage logs, console playbook |
 
