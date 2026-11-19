@@ -64,6 +64,37 @@ Tiramisu UWP host.** No CPU emulation, no streaming, no Linux PC in the loop.
 | **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **Fully playable** — main menu, a live run, coin physics, HUD, score/round progression |
 | **God of War** (PC) | AAA in-house engine, x64, D3D11 | **Boots, runs, renders** — the opening forest scene, four independent boots, each one closer than the last |
 
+The rest of this section is the detailed evidence: what each capture contains,
+which runtime stage it closes, how the four God of War boots fit together, and
+what the images still do not prove. The short version is below; the full
+argument starts at [What this proves](#-what-this-proves).
+
+### Milestone timeline
+
+| Date | Milestone |
+|---|---|
+| **2026-11-15** | Offline RACCOIN reaches the full 7/7 boot ladder; the mock-render gate counts **2.7M device-context calls / ~268k DrawIndexed** in 10 s |
+| **2026-11-17** | First real hardware run on the **Series S** development console (OS 26100.9662): the MSIX installs and activates; **70,501 UnityPlayer relocations** are fixed at a non-preferred base; Unity's GC suspend loop is found and fixed |
+| **2026-11-19** | RACCOIN reaches its own menu and plays a live run; God of War boots and renders the forest across four independent boots |
+
+### Capture manifest
+
+| Capture | File | Format | What it is |
+|---|---|---|---|
+| RACCOIN main menu | `docs/proof/raccoin-main-menu.png` | 1280×720 PNG | The game's own Unity menu: Play Game, Collection, Profile, Quit, version 1.0.15, newsletter panel |
+| RACCOIN gameplay | `docs/proof/raccoin-gameplay.png` | 1280×720 PNG | A live run at Round 8/15: Current 392, Combo 35, a full coin bed and populated HUD |
+| RACCOIN gameplay clip | `docs/proof/raccoin-gameplay.gif` | 800×450 GIF, 36 frames / 7.2 s | The same run in motion, downscaled for inline README playback |
+| RACCOIN gameplay clip | `docs/proof/raccoin-gameplay.mp4` | 1280×720 MP4, 36 frames / 7.2 s | Full-quality capture of the same run; click the GIF to open it |
+| God of War, boot 1 | `docs/proof/gow-forest-01.webp` | 256×144 WebP | First forest render: scene recognizable, large black occluders, missing foliage and broken material regions |
+| God of War, boot 2 | `docs/proof/gow-forest-02.webp` | 256×144 WebP | Character and materials resolve: skin, tattoo, cloth, handprint, bark; equipment and foliage still sparse |
+| God of War, boot 3 | `docs/proof/gow-forest-03.webp` | 256×144 WebP | More geometry and depth: leather belt/skirt, axe in hand, denser layered trees and foliage |
+| God of War, boot 4 | `docs/proof/gow-forest-04.webp` | 256×144 WebP | Full forest composite: god rays, layered foliage, full character, axe and handprint together |
+
+The RACCOIN stills and clip are from the **same run**: the last frame of the
+clip matches the gameplay still (Current 392, Combo 35, Round 8/15). The four
+God of War images are **four different boots**, ordered by increasing render
+coverage — not four frames from one sequence.
+
 ### 🦝 RACCOIN — main menu → playable run
 
 <table>
@@ -121,27 +152,250 @@ gate.</sub>
 
 ## 🔬 What this proves
 
-| Evidence | What it proves |
-|---|---|
-| RACCOIN main menu | The PE64 loader, Unity IL2CPP startup, D3D11 device/swapchain and guest UI all work together on console. |
-| RACCOIN gameplay + clip | The managed game loop, input, simulation, HUD and renderer run **together, live** — not a synthetic render loop. |
-| God of War forest | A second, much heavier AAA D3D11 renderer boots and draws a real scene: large assets, shaders, lighting, post-processing, character rendering. |
-| Four God of War boots | The renderer is **converging across independent boots**; fixes remove named failure classes one at a time. |
-| Same runtime for both | The loader/bridge model is engine-agnostic: Unity IL2CPP and a AAA in-house engine through one host. |
+The short version: the project has crossed from *"the runtime can execute
+pieces of a game"* to *"real games complete their own boot and draw their own
+frames."* The claim ledger below is deliberately narrow; the rest of this
+section explains the chain behind each row and the limits of the evidence.
 
-**The important part is what is no longer in question.** Before this run, the
-project had proven the loader, the bridges, the render loop and the exception
-handling in isolation. Now a real game reaches its own menu, starts a run and
-keeps playing; a second real game reaches an in-engine scene that looks like
-the game. The remaining work is compatibility breadth and polish — front ends,
-sustained play, audio, performance, saves — not "can this run a PC game on the
-console at all?"
+### Claim ledger
 
-It also validates the project's **fail-visible** method. The earlier God of War
-boot failed with a named `0xc0000005`; the next boots did not hide the
-corruption, they removed it class by class (geometry, materials, foliage,
-lighting). That is slower than claiming success, and it is why the screenshots
-can be trusted.
+| Claim | Evidence | Status |
+|---|---|---|
+| RACCOIN's own main menu renders on console | 1280×720 still with the game's UI, version 1.0.15 | **Proven** |
+| RACCOIN is playable | Live-run still + 36-frame clip; HUD state changes while the coin bed moves | **Proven for the captured session** |
+| God of War boots and runs | Four independent boots, each reaching the forest scene | **Proven** |
+| God of War renders a real composite scene | Boot 4 shows character, equipment, foliage, lighting and god rays together | **Proven at preview resolution** |
+| God of War is playable | No menu/gameplay input evidence yet | **Not claimed** |
+| Audio works for either title | No audio artifact in this set | **Not demonstrated** |
+| Frame rate is acceptable | Capture is 5 fps; no frame-time data | **Not measured** |
+| Long-session stability | 7.2 s clip; no soak test | **Not yet** |
+
+### The proof chain, stage by stage
+
+| Stage | Offline evidence | Console evidence |
+|---|---|---|
+| Signed UWP host | `pack.sh` makemsix + osslsigncode verify; host self-test | MSIX installs, activates and serves the dashboard; both games launch |
+| PE64 load + relocation | 49-suite gate, loader fuzzer, real PE guests | **70,501 UnityPlayer relocations** fixed at a non-preferred base; RACCOIN and God of War boot |
+| Import binding + guest DLLs | module table, `test_libload`, real corpus STUBs 0 | UnityPlayer, GameAssembly (96 MB IL2CPP) and game-shipped DLLs load recursively; both engines initialize |
+| Win64 EH | `test_guest_eh`: funclet rethrow + boundary escape | RACCOIN's Unity/IL2CPP startup and managed-exception path do not terminate the process |
+| D3D11 device + swapchain | `test_d3d` gets the host device/swapchain; D3D9/8/DDraw tests | RACCOIN menu/gameplay frames and God of War forest frames reach the TV |
+| Render loop | mock-render gate: **2.7M device-context calls / ~268k DrawIndexed in 10 s** | 36-frame clip with a changing HUD; a composite God of War scene |
+| Input | `test_input` (17 checks) + `test_dinput` | RACCOIN menu selection and live run interaction |
+| Memory governor | suite 41, one 5 GB ledger | two commercial titles load and render inside the Game package |
+| VFS / file I/O | real directory enumeration, async I/O, mmap, ISO tests | game data loads; save/profile round-trip not yet shown |
+| Audio | XAudio2/DirectSound/OpenAL/FMOD sink tests | **not demonstrated by this capture set** |
+
+### What had to be fixed along the way
+
+These are the console-path fixes that turned the offline boot ladder into
+visible frames. They are worth naming because each one maps to a failure a
+normal compatibility layer would hide behind a black screen:
+
+- **Native TLS preservation during guest execution.** Without it, RACCOIN's
+  native D3D11 resource creation stalled and the splash alternated with black
+  frames. Preserving native TLS lets the guest's graphics path keep its
+  per-thread state while Tiramisu runs its own code.
+- **Stable render target + host flip copy.** The CoreWindow backbuffer accepts
+  the guest's requested sRGB view format, the guest renders into one stable
+  target, and the host copies that target into the Xbox flip chain. This is
+  what removed the alternating-black-frame failure mode.
+- **GC thread adoption / safe suspend.** Unity's Boehm-class collector needs to
+  suspend guest threads. The first console run died with *"Fatal error in GC:
+  SuspendThread loop failed"* because the runtime handed the collector a
+  pseudo-handle. The fix adopts the real current thread and uses a
+  Boehm-style park/verify/resume loop so the collector can suspend safely.
+- **Native GameInput path.** Xbox keyboard/mouse input reaches foreground
+  guests through the native GameInput path instead of a desktop-only input
+  assumption.
+- **Memory-budget bridge + host manifest tweaks.** The God of War debug line
+  exercised the 5 GB ledger and host manifest changes needed to keep a larger
+  title inside the Game-package envelope.
+
+The point is not the individual patches; it is that none of them were papered
+over. The failure was named, the smallest layer was fixed, and the next boot
+showed the difference.
+
+### RACCOIN: what the menu frame had to do
+
+The menu is not a splash screen. Before that frame can be presented, the
+runtime has already:
+
+1. Activated the signed UWP host, created the CoreWindow and the flip chain.
+2. Mapped `RACCOIN.exe`, applied relocations, bound its imports, run TLS
+   callbacks and executed `DllMain(PROCESS_ATTACH)`.
+3. Recursively loaded the Unity engine (`UnityPlayer.dll`), the 96 MB IL2CPP
+   assembly (`GameAssembly.dll`) and the rest of the game's shipped DLLs.
+4. Initialized IL2CPP metadata, managed threads, the garbage collector and the
+   Win64 exception path Unity uses when managed code throws through native
+   frames.
+5. Created the D3D11 device and swapchain, then built the UI pipelines,
+   textures and buffers the menu needs.
+6. Delivered input events so the menu can be navigated — the pointer is over
+   **Play Game**, and the game is not sitting on a static title card.
+7. Presented the frame through the host swapchain to the TV.
+
+The screenshot itself carries the game's own proof of life: **version 1.0.15**,
+the **Play Game / Collection / Profile / Quit** menu, the **Newsletter
+Sign-ups** panel and the social icons. Those are RACCOIN's assets, drawn by
+RACCOIN's UI, through Tiramisu — not a launcher mock-up.
+
+### RACCOIN: what the gameplay frame and clip add
+
+The gameplay still is a different class of proof: the menu proves *boot and
+UI*, while the run proves **the game loop is actually running**. The HUD is
+populated with live run state:
+
+| HUD element | Value in the still | What it shows |
+|---|---|---|
+| Round | 8/15 | the run has advanced through multiple rounds |
+| Current | 392 | the score/progress counter is populated |
+| Target | 10,000 | the game's goal state is initialized |
+| Combo | 35 | the combo system is tracking live play |
+| Top 1 | 61 | a run statistic has changed from its starting value |
+| Score Rate | 2.8 | the multiplier is active, not a static label |
+| Hand In | 19 | the held-coin/queue state is live |
+| Spin | 16 / 8 | the spin counters are populated |
+| Prizes / Run Data / Exchange | visible | the game's own panels and controls are composited |
+
+The exact rules do not matter for the proof. What matters is that these are
+**values from the game's state machine**, rendered by the game's HUD, while the
+coin bed is being simulated underneath.
+
+The clip turns that into motion. Across its 36 frames (7.2 s at a 5 fps
+capture cadence):
+
+| Counter | First frame | Last frame |
+|---|---|---|
+| Current | 116 | 392 |
+| Top-right counter | 221 | 250 |
+| Top 1 | 22 | 61 |
+| Hand In | 44 | 19 |
+| Score Rate | 1.0 | 2.8 |
+
+The last frame also shows **Combo 35**, which matches the gameplay still — the
+still and the clip are the same run. The coin bed moves, coins cascade, the
+multipliers update and the HUD advances while the frame keeps presenting.
+That is the difference between a render-loop harness and a game.
+
+**The 5 fps number is the capture cadence, not the game's frame rate.** The clip
+is evidence of live state changes, not a performance benchmark; frame-time
+capture is still on the list.
+
+### God of War: what the forest frame had to do
+
+The forest is a composite scene, not a clear screen and not a single triangle.
+For that frame to exist, the runtime had to carry the game through:
+
+- mapping and relocating a large x64 executable plus its shipped DLLs;
+- binding the game's import surface;
+- starting the engine's worker threads and file/asset path;
+- creating the D3D11 device and swapchain through the host proxies;
+- creating textures, buffers, samplers, shaders and render targets;
+- issuing the draw calls for terrain, trees, alpha-tested foliage, the
+  character, cloth, the axe and the handprint;
+- compositing lighting and atmosphere — visible as the light shafts and depth
+  layering in boot 4;
+- presenting the result through the console flip chain.
+
+The four images are the same scene at four different levels of render
+coverage. That is why they are more useful than a single "it works" screenshot:
+they show *which* classes of work were still missing.
+
+### The four-boot ladder, frame by frame
+
+| Boot | What is visible | What it indicates | What is still missing |
+|---|---|---|---|
+| **1** | Kratos and the forest are recognizable, but large black occluders, patchy handprint texture, missing foliage cards and broken bark/rock regions dominate | The scene graph and some draws are live; the render path is reaching the TV | Most materials, foliage coverage, equipment and lighting |
+| **2** | Skin, red tattoo, cloth, crisp yellow handprint and tree bark resolve; the character reads clearly | Character textures/materials and key scene materials are bound | Equipment meshes, foliage density, depth and atmosphere |
+| **3** | Leather belt/skirt, the axe in hand, denser foliage, layered trees and a readable sky appear | More geometry/material coverage, alpha foliage and equipment are online | Final lighting/atmosphere and full scene density |
+| **4** | God rays, layered foliage, full character detail, the axe and the handprint all render together | The composite scene is working end-to-end | Interactive front end, gameplay, audio and performance validation |
+
+The visual difference between boots is consistent with progressive render-path
+fixes — missing surfaces, then materials, then geometry/foliage, then lighting.
+It is not a controlled A/B experiment: each boot is a separate test with its
+own fix set. That is exactly why the sequence is credible — the scene
+**converges** instead of producing one lucky frame.
+
+### Why four boots is stronger than one frame
+
+- A single frame can be a cached shader, a lucky asset state or a screenshot
+  from a different build. Four boots are four independent runs.
+- Each boot removes a different visible failure class. The later frames are not
+  just "prettier"; they contain geometry, materials and lighting that were
+  absent earlier.
+- The sequence shows the renderer is **repeatable enough to iterate on**: the
+  same scene comes back each time, with the fix visible in the next capture.
+- It also demonstrates the project's **fail-visible** method. The earlier God
+  of War boot died with a named `0xc0000005`; the next boots did not hide the
+  corruption, they removed it class by class. That is slower than claiming
+  success, and it is why the captures are trustworthy.
+
+### How to read the evidence like a reviewer
+
+1. **RACCOIN menu:** check the version string (`1.0.15`), the four menu items,
+   the newsletter panel and the pointer over **Play Game**. A generic launcher
+   mock-up would not carry the game's own UI version and newsletter panel.
+2. **RACCOIN gameplay:** check the HUD values against the still. Round 8/15,
+   Current 392, Combo 35 and a full coin bed are game state, not painted-on
+   labels.
+3. **RACCOIN clip:** compare the first and last frames. Current 116 → 392,
+   Top 1 22 → 61, Hand In 44 → 19. A static image or a frozen build would not
+   change those values.
+4. **God of War:** compare boots 1 → 4 in order. Watch the handprint, the axe,
+   the foliage cards, the tree depth and the light shafts. Each later boot adds
+   visible coverage rather than repeating the previous frame.
+5. **Resolution caveat:** the God of War stills are 256×144 preview captures.
+   They are enough to identify the scene and the progression, but they are not
+   evidence of final output resolution, HDR or frame pacing.
+
+### Reproduce the proof
+
+The console path is the same one in [Quick start](#-quick-start-console):
+
+```sh
+tools/build-test.sh                       # offline gates, real PE guests
+tools/build-host.sh                       # UWP host cross-build
+tools/pack.sh                             # makemsix pack + sign + verify
+
+DP_HOST=<console-ip> DP_PASS=<portal-pass> \
+  tools/deploy.sh install out/Tiramisu.msix out/dev.cer
+
+# upload the owned game folder/zip through the TV dashboard, pick the exe,
+# launch, then capture the TV:
+tools/deploy.sh screenshot tv.png
+```
+
+Re-capturing will not produce pixel-identical frames — the coin bed and the
+forest are live scenes — but it should reproduce the same classes of frame:
+RACCOIN's menu and a populated run, and God of War's forest at successively
+higher render coverage as the remaining fixes land.
+
+### What is still missing
+
+**God of War**
+
+- **Interactive front end / menu layer.** The forest scene renders; the normal
+  menu/title flow and its input/focus handling are the next gate.
+- **Sustained gameplay.** Camera, combat, animation blending, streaming and
+  save/profile behavior are not exercised by these stills.
+- **Audio.** No audio artifact in this set.
+- **Performance.** Frame time, GPU/CPU utilization, memory headroom under the
+  5 GB Game-package budget and shader-compile stutter are unmeasured.
+- **Output quality.** The captures are 256×144; 720p/4K/HDR output is not
+  qualified.
+- **Stability.** No soak test, no crash-loop test, no long-session memory data.
+
+**RACCOIN**
+
+- **Soak test.** The clip is 7.2 s; hours-long stability is not yet measured.
+- **Frame-time capture.** The 5 fps clip is a capture cadence, not a game
+  frame-rate measurement.
+- **Audio verification.** The game is playable; audio is not demonstrated in
+  this evidence set.
+- **Save/profile round-trip.** The menu exposes Profile and Collection; those
+  flows still need a persistence check.
+- **Shutdown hygiene.** The offline CrashReporter shutdown gap is named in the
+  compatibility DB; it does not block the playable run but remains cleanup.
 
 ### What this does **not** prove
 
@@ -151,6 +405,9 @@ can be trusted.
   front-end/menu layer and sustained gameplay are still being brought up.
 - **RACCOIN's clip is 7.2 seconds.** It proves live play, not hours of
   stability or a frame-time target. Soak testing is next.
+- **A still image is not a frame-rate or audio measurement.** The claim rests
+  on the console run path, the changing HUD across the clip and the four
+  independent God of War boots — not on the images alone.
 - **No DRM bypass, ever.** These are games the user owns. Anti-cheat titles,
   32-bit x86 games and D3D12-only AAA remain out of scope or unproven.
 
