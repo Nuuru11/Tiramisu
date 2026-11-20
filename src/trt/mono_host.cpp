@@ -140,9 +140,15 @@ void assembly_load_hook_uwp(MonoAssembly* assembly, void* user_data) {
   // FNA3D is exported from the exe itself (FNA3DAPI __declspec(dllexport)
   // under _WIN32): map it to __Internal so Mono resolves the P/Invokes
   // via GetProcAddress on the main module. Installed into EVERY image,
-  // before any P/Invoke in it can resolve. (FAudio is NOT mapped: it is
-  // not compiled into the host yet — a later step.)
+  // before any P/Invoke in it can resolve. FAudio is mapped the same way
+  // (Path B step 6): the FAudio core + the Tiramisu UWP platform layer
+  // (XAudio2 output, third_party/faudio/uwp/) are compiled into the host
+  // by tools/build-host.sh, and FAUDIOAPI is __declspec(dllexport) under
+  // _WIN32, so stock FNA managed code finds FAudio with no managed-code
+  // changes. (The Linux path keeps resolving FAudio by soname from
+  // third_party/faudio/out via the config dllmaps.)
   mono_dllmap_insert(image, "FNA3D", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "FAudio", nullptr, "__Internal", nullptr);
   if (!g_hook_dllmaps_uwp || g_hook_dllmap_count_uwp <= 0) return;
   for (int i = 0; i < g_hook_dllmap_count_uwp; ++i) {
     mono_dllmap_insert(image, g_hook_dllmaps_uwp[i].module, nullptr,
