@@ -40,15 +40,20 @@ std::atomic<bool> g_soft80{false};
 std::atomic<bool> g_soft90{false};
 
 u64 budget_bytes_once() {
-  const char* env = getenv("TRT_MEM_BUDGET_MB");
-  u64 mb = 5120;  // the console Game-package allocation
-  if (env && *env) {
-    const long long v = atoll(env);
-    if (v > 0) mb = (u64)v;
-  }
-  if (mb < 1) mb = 1;
-  if (mb > 16384) mb = 16384;
-  return mb * 1024ULL * 1024ULL;
+  // read once per process (function-local static: thread-safe init) — the
+  // old code ran getenv+atoll on every charge/discharge/report call
+  static const u64 budget = [] {
+    const char* env = getenv("TRT_MEM_BUDGET_MB");
+    u64 mb = 5120;  // the console Game-package allocation
+    if (env && *env) {
+      const long long v = atoll(env);
+      if (v > 0) mb = (u64)v;
+    }
+    if (mb < 1) mb = 1;
+    if (mb > 16384) mb = 16384;
+    return mb * 1024ULL * 1024ULL;
+  }();
+  return budget;
 }
 
 // Rate-limited refusal log: the first refusal always logs; after that, one
@@ -113,6 +118,28 @@ void trt_mem_budget_discharge_commit(u64 bytes) {
   if (!bytes) return;
   const u64 before = g_committed.load();
   g_committed.store(before > bytes ? before - bytes : 0);
+  if (before < bytes) {
+    // accounting tripwire: a discharge larger than the ledger means a
+    // caller freed bytes it never charged (or freed twice)
+    char line[256];
+    snprintf(line, sizeof(line),
+             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
+             "exceeds committed %llu — clamped to 0 (over-discharge, "
+             "caller bug)",
+             "commit", (unsigned long long)bytes, (unsigned long long)before);
+    trt_core_log(line);
+  }
+  // dropping back below a soft level re-arms its warning: a game that
+  // streams (alloc/free cycles near the ceiling) must warn again on the
+  // next climb, not once per process
+  const u64 budget = budget_bytes_once();
+  const u64 committed = g_committed.load();
+  if (committed < (budget / 10) * 8) {
+    g_soft80.store(false);
+    g_soft90.store(false);
+  } else if (committed < (budget / 10) * 9) {
+    g_soft90.store(false);
+  }
 }
 
 int trt_mem_budget_charge_map(u64 bytes) {
@@ -126,6 +153,17 @@ void trt_mem_budget_discharge_map(u64 bytes) {
   if (!bytes) return;
   const u64 m = g_mapped.load();
   g_mapped.store(m > bytes ? m - bytes : 0);
+  if (m < bytes) {
+    // accounting tripwire: a discharge larger than the ledger means a
+    // caller freed bytes it never charged (or freed twice)
+    char line[256];
+    snprintf(line, sizeof(line),
+             "[trt] mem: BUDGET ACCOUNTING: %s discharge of %llu bytes "
+             "exceeds committed %llu — clamped to 0 (over-discharge, "
+             "caller bug)",
+             "mapped view", (unsigned long long)bytes, (unsigned long long)m);
+    trt_core_log(line);
+  }
   trt_mem_budget_discharge_commit(bytes);
 }
 

@@ -56,7 +56,7 @@ typedef struct trt_resolver {
 } trt_resolver;
 
 // ---- mapped image ----
-#define TRT_MAX_TLS_CALLBACKS 64
+#define TRT_MAX_TLS_CALLBACKS 256
 
 typedef struct trt_image {
   u8*  base;              // actual load base

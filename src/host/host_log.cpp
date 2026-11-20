@@ -85,12 +85,12 @@ size_t log_read_disk_tail(char* out, size_t cap) {
   const std::string path = g_local_state + "\\\\tiramisu.log";
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return 0;
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
+  _fseeki64(f, 0, SEEK_END);
+  long long sz = _ftelli64(f);
   if (sz < 0) sz = 0;
-  long off = 0;
-  if ((size_t)sz > cap - 1) off = sz - (long)(cap - 1);  // tail only
-  fseek(f, off, SEEK_SET);
+  long long off = 0;
+  if ((size_t)sz > cap - 1) off = sz - (long long)(cap - 1);  // tail only
+  _fseeki64(f, off, SEEK_SET);
   size_t n = fread(out, 1, (size_t)(sz - off), f);
   out[n] = 0;
   fclose(f);

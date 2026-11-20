@@ -526,24 +526,42 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     if (tls_va + sizeof(trt_tls_directory64) > size_of_image)
       return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls dir out of image");
     const trt_tls_directory64* tls = (const trt_tls_directory64*)(img.base + tls_va);
-    // callbacks array is addressed by VA; after relocation it points at the
-    // RUNTIME image (new base + rva), so translate through the actual base —
-    // NOT the preferred ImageBase. Subtracting `preferred` only worked when
-    // the image loaded at its preferred base (delta==0); the first relocated
-    // TLS-bearing DLL (baselib.dll inside GameAssembly's run) produced a
-    // huge bogus rva and died TLS_BOUNDS. STAGE 6 run-depth found it.
-    const u64 arr_rva =
-        (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
-    if (arr_rva + 8 > size_of_image)
-      return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
-    for (u64 c = arr_rva; c + 8 <= size_of_image &&
-                          img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 8) {
-      const u64 cb = rd64(img.base + c);
-      if (cb == 0) break;
-      const u64 cb_rva = cb - (u64)(uintptr_t)img.base;
-      if (cb_rva >= size_of_image)
-        return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback out of image");
-      img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
+    // A TLS directory with AddressOfCallbacks == 0 is legal (TLS data, no
+    // callbacks): zero callbacks, NOT a load failure. Without this guard
+    // the VA math below underflows to a huge rva and dies TLS_BOUNDS.
+    if (tls->address_of_callbacks == 0) {
+      img.tls_callback_count = 0;
+      logf_be(be, "trt: tls dir: AddressOfCallbacks==0, no callbacks");
+    } else {
+      // callbacks array is addressed by VA; after relocation it points at the
+      // RUNTIME image (new base + rva), so translate through the actual base —
+      // NOT the preferred ImageBase. Subtracting `preferred` only worked when
+      // the image loaded at its preferred base (delta==0); the first relocated
+      // TLS-bearing DLL (baselib.dll inside GameAssembly's run) produced a
+      // huge bogus rva and died TLS_BOUNDS. STAGE 6 run-depth found it.
+      const u64 arr_rva =
+          (u64)tls->address_of_callbacks - (u64)(uintptr_t)img.base;
+      if (arr_rva + 8 > size_of_image)
+        return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback array out of image");
+      u64 c = arr_rva;
+      for (; c + 8 <= size_of_image &&
+             img.tls_callback_count < TRT_MAX_TLS_CALLBACKS; c += 8) {
+        const u64 cb = rd64(img.base + c);
+        if (cb == 0) break;
+        const u64 cb_rva = cb - (u64)(uintptr_t)img.base;
+        if (cb_rva >= size_of_image)
+          return fail(&img, be, TRT_ERR_TLS_BOUNDS, "tls callback out of image");
+        img.tls_callback_rvas[img.tls_callback_count++] = cb_rva;
+      }
+      // the cap is a real limit, not a silent drop: say so when entries remain
+      if (img.tls_callback_count >= TRT_MAX_TLS_CALLBACKS &&
+          c + 8 <= size_of_image && rd64(img.base + c) != 0) {
+        char capline[128];
+        snprintf(capline, sizeof(capline),
+                 "trt: tls callbacks truncated at cap=%d (more entries present)",
+                 TRT_MAX_TLS_CALLBACKS);
+        logf_be(be, capline);
+      }
     }
     char line[96];
     snprintf(line, sizeof(line), "trt: tls callbacks=%d", img.tls_callback_count);

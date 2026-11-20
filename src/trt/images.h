@@ -37,7 +37,10 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
 // ---- registry ----
 trt_image* trt_images_find(const char* name);      // case-insensitive
 trt_image* trt_images_by_handle(void* handle);
-trt_image* trt_images_first(void);                  // first loaded guest image
+trt_image* trt_images_first(void);                  // the main guest image
+                                                 // (the exe); falls back to
+                                                 // the first loaded image
+                                                 // when no main registered
 // ---- enumeration (the psapi bridge exposes this as the REAL guest module
 // list: K32EnumProcessModules / EnumProcesses / MiniDumpWriteDump module
 // table all read from here) ----
@@ -54,7 +57,9 @@ void* trt_images_synthetic_handle(const char* module_name);
 int trt_images_is_synthetic(void* handle);
 const char* trt_images_synth_name(void* handle);
 // Register the main guest image (the exe mapped directly via trt_map_pe, not
-// through trt_load_pe) so the psapi/dbghelp module list includes it.
+// through trt_load_pe) so the psapi/dbghelp module list includes it, and so
+// trt_images_first() (GetModuleHandle(NULL), FindResource(NULL)) answers
+// with the exe rather than whichever image registered first.
 void trt_images_register_main(trt_image* img, const char* guest_name);
 
 // ---- loading ----

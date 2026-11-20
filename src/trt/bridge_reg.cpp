@@ -292,6 +292,54 @@ void write_hive() {
   g_hive_dirty = false;
 }
 
+// ---- well-known key seeds ------------------------------------------------
+// Games probe a few keys at startup and treat FILE_NOT_FOUND as "Steam /
+// DirectX / Windows is broken" (or worse, as a signal to install things).
+// Seed them with plausible values; the persisted hive (loaded after this)
+// overwrites any seed the user or a game already set for real, and a seed
+// never overwrites a value already present.
+void seed_sz(reg_key* key, const char* name, const char* utf8) {
+  if (!key || find_value(key, name)) return;
+  // REG_SZ is stored as raw UTF-16LE bytes incl. the terminating NUL
+  u16 w[256];
+  size_t n = 0;
+  for (; utf8[n] && n + 1 < sizeof(w) / sizeof(w[0]); ++n)
+    w[n] = (u16)(u8)utf8[n];
+  w[n] = 0;
+  set_value(key, name, TRT_REG_SZ, w, (u32)((n + 1) * 2));
+}
+
+void seed_binary(reg_key* key, const char* name, const u8* data, u32 size) {
+  if (!key || find_value(key, name)) return;
+  set_value(key, name, TRT_REG_BINARY, data, size);
+}
+
+void seed_registry() {
+  reg_key* hklm = &g_roots[2];  // HKEY_LOCAL_MACHINE
+  // Valve\Steam: the install path every Steamworks game probes first
+  reg_key* steam = open_path(hklm, "SOFTWARE\\Valve\\Steam", true);
+  seed_sz(steam, "InstallPath", "C:\\Program Files (x86)\\Steam");
+  seed_sz(steam, "SteamPath", "C:\\Program Files (x86)\\Steam");
+  seed_sz(steam, "Language", "english");
+  // Windows\CurrentVersion: matches the GetVersionExW personality (10.0.19045)
+  reg_key* cv =
+      open_path(hklm, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", true);
+  seed_sz(cv, "ProductName", "Windows 10 Pro");
+  seed_sz(cv, "CurrentVersion", "6.3");
+  seed_sz(cv, "CurrentBuild", "19045");
+  seed_sz(cv, "DisplayVersion", "22H2");
+  seed_sz(cv, "ProgramFilesDir", "C:\\Program Files");
+  seed_sz(cv, "ProgramFilesDir (x86)", "C:\\Program Files (x86)");
+  seed_sz(cv, "CommonFilesDir", "C:\\Program Files\\Common Files");
+  seed_sz(cv, "CommonFilesDir (x86)", "C:\\Program Files (x86)\\Common Files");
+  // DirectX: the 9.0c version stamp D3D9-era engines check
+  reg_key* dx = open_path(hklm, "SOFTWARE\\Microsoft\\DirectX", true);
+  seed_sz(dx, "Version", "4.09.00.0904");
+  const u8 installed_version[8] = {0, 0, 0, 9, 0, 0, 0, 0};
+  seed_binary(dx, "InstalledVersion", installed_version,
+              sizeof(installed_version));
+}
+
 void load_hive() {
   if (g_hive_loaded) return;
   g_hive_loaded = true;
@@ -300,6 +348,7 @@ void load_hive() {
     snprintf(g_roots[i].name, sizeof(g_roots[i].name), "%s", g_root_names[i]);
     g_roots[i].is_root = true;
   }
+  seed_registry();  // before the persisted hive: real values win over seeds
   char host[512];
   host_path_of_hive(host, sizeof(host));
   if (!host[0]) return;

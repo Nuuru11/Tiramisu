@@ -24,6 +24,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <sys/stat.h>  // _stat64 for upload verification
   #pragma comment(lib, "ws2_32.lib")
   using sock_t = SOCKET;
   static const sock_t kBadSock = INVALID_SOCKET;
@@ -42,6 +43,17 @@
   using sock_t = int;
   static const sock_t kBadSock = -1;
   #define XFER_SEP '/'
+#endif
+
+// 64-bit file positioning: plain fseek/ftell use 32-bit long on Windows and
+// break past 2 GB (tiramisu.log grows past that on long sessions). On LP64
+// Linux long is already 64-bit, so plain fseek/ftell are correct there.
+#if defined(_WIN32)
+  #define xfer_fseek _fseeki64
+  #define xfer_ftell _ftelli64
+#else
+  #define xfer_fseek fseek
+  #define xfer_ftell ftell
 #endif
 
 #include "vendor/miniz.h"
@@ -229,14 +241,14 @@ bool write_or_clear_text(const std::string& p, const std::string& val) {
 std::string read_log_tail(const std::string& p, size_t max_bytes = 16384) {
   FILE* f = fopen(p.c_str(), "rb");
   if (!f) return "(no logs yet)";
-  fseek(f, 0, SEEK_END);
-  long sz = ftell(f);
+  xfer_fseek(f, 0, SEEK_END);
+  const int64_t sz = (int64_t)xfer_ftell(f);
   if (sz <= 0) {
     fclose(f);
     return "(log empty)";
   }
-  long off = (sz > (long)max_bytes) ? (sz - (long)max_bytes) : 0;
-  fseek(f, off, SEEK_SET);
+  int64_t off = (sz > (int64_t)max_bytes) ? (sz - (int64_t)max_bytes) : 0;
+  xfer_fseek(f, off, SEEK_SET);
   std::string out((size_t)(sz - off), '\0');
   size_t n = fread(&out[0], 1, out.size(), f);
   out.resize(n);
@@ -729,24 +741,61 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
   FILE* f = fopen(path, "wb");
   if (!f) return 0;
   uint64_t got = 0;
+  bool write_ok = true;
   if (pre && pre_len) {
     size_t wr = std::min<size_t>(pre_len, (size_t)std::min<uint64_t>(len, pre_len));
     if (wr) {
-      fwrite(pre, 1, wr, f);
-      got += wr;
-      g_upload_done += wr;
+      if (fwrite(pre, 1, wr, f) != wr) {
+        write_ok = false;  // short write (disk full): never count it
+      } else {
+        got += wr;
+        g_upload_done += wr;
+      }
     }
   }
   char buf[65536];
-  while (got < len && !g_stop) {
+  while (write_ok && got < len && !g_stop) {
     const int want = (int)std::min<uint64_t>(len - got, sizeof(buf));
     const int n = recv(s, buf, want, 0);
     if (n <= 0) break;
-    fwrite(buf, 1, (size_t)n, f);
+    if (fwrite(buf, 1, (size_t)n, f) != (size_t)n) {
+      write_ok = false;
+      break;
+    }
     got += (uint64_t)n;
     g_upload_done += (uint64_t)n;
   }
-  fclose(f);
+  if (fclose(f) != 0) write_ok = false;  // buffered data lost on flush
+  if (!write_ok) {
+    char line[320];
+    snprintf(line, sizeof(line),
+             "webxfer: upload write failed for %s (disk full or I/O error)",
+             path);
+    log_line(line);
+    return 0;  // caller removes the partial file + 500s
+  }
+  if (got != len) return 0;  // short read (client disconnect); caller cleans up
+  // verify the bytes actually landed on disk before reporting success: a
+  // truncated filesystem write must never come back ok:true
+#if defined(_WIN32)
+  struct _stat64 st {};
+  const bool stat_ok = _stat64(path, &st) == 0;
+#else
+  struct stat st {};
+  const bool stat_ok = stat(path, &st) == 0;
+#endif
+  const uint64_t disk_size = stat_ok ? (uint64_t)st.st_size : 0;
+  if (!stat_ok || disk_size != len) {
+    char line[384];
+    snprintf(line, sizeof(line),
+             "webxfer: upload verify failed for %s (on-disk %llu bytes, "
+             "expected %llu) — removed",
+             path, (unsigned long long)disk_size,
+             (unsigned long long)len);
+    log_line(line);
+    remove(path);
+    return 0;
+  }
   return got;
 }
 
@@ -838,12 +887,15 @@ void handle_client(sock_t s) {
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
     std::lock_guard<std::mutex> lk(g_mu);
-    char buf[512];
+    char buf[640];
     snprintf(buf, sizeof(buf),
-             "{\"running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
+             "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
              "\"last_upload\":\"%s\",\"last_error\":\"%s\","
              "\"upload_done\":%llu,\"upload_total\":%llu}",
              g.running ? "true" : "false",
+             // running = the server is listening; guest_running = a guest is
+             // actually launched (running_game is set on launch, cleared on exit)
+             !g.running_game.empty() ? "true" : "false",
              json_escape(g.running_game).c_str(),
              json_escape(g.url).c_str(),
              json_escape(g.last_upload).c_str(),
@@ -1059,7 +1111,13 @@ void handle_client(sock_t s) {
       g.last_error.clear();
       g.rescan_requested = true;
     }
-    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    {
+      // got == content_len here AND the on-disk size was verified equal
+      char okj[64];
+      snprintf(okj, sizeof(okj), "{\"ok\":true,\"size\":%llu}",
+               (unsigned long long)got);
+      respond(s, "200 OK", "application/json", okj);
+    }
     return;
   }
   if (strcmp(method, "PUT") == 0 && url_path.rfind("/upload/", 0) == 0) {
@@ -1417,7 +1475,7 @@ bool webxfer_find_game(const char* name, char* out_exe, size_t cap) {
   list_dir_entries(g_games_dir, &ents);
   const std::string sep(1, XFER_SEP);
   for (const auto& d : ents) {
-    if (!d.is_dir || d.name != name) continue;
+    if (!d.is_dir || !xfer_ieq(d.name, name)) continue;
     const std::string gdir = g_games_dir + sep + d.name;
     std::vector<std::string> exes;
     std::string exe;

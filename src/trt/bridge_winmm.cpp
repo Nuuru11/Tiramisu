@@ -19,6 +19,15 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(_WIN32)
+// timeBeginPeriod/timeEndPeriod are desktop-partition in the SDK headers
+// (not declared under WINAPI_FAMILY_APP), but the functions are callable
+// from the AppContainer at runtime — declare them directly.
+extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
+extern "C" unsigned int __stdcall timeEndPeriod(unsigned int uPeriod);
+#  pragma comment(lib, "winmm.lib")
+#endif
+
 namespace {
 
 // timeGetTime: ms since boot, wrapping at 2^32 like Windows.
@@ -42,11 +51,24 @@ u32 TRT_GUEST_ABI trt_timeGetTime(void) { return now_ms(); }
 u32 TRT_GUEST_ABI trt_timeBeginPeriod(u32 period_ms) {
   if (period_ms && (g_min_period == 0 || period_ms < g_min_period))
     g_min_period = period_ms;
-  // TIMERR_NOERROR
-  return 0;
+#if defined(_WIN32)
+  // forward to the real host API: the guest's Sleep(1) / timer granularity
+  // actually becomes 1ms instead of the default ~15.6ms
+  return (u32)::timeBeginPeriod(period_ms);  // TIMERR_NOERROR == 0
+#else
+  // no host timer API on the Linux harness: record-and-return
+  return 0;  // TIMERR_NOERROR
+#endif
 }
 
-u32 TRT_GUEST_ABI trt_timeEndPeriod(u32) { return 0; }
+u32 TRT_GUEST_ABI trt_timeEndPeriod(u32 period_ms) {
+#if defined(_WIN32)
+  return (u32)::timeEndPeriod(period_ms);
+#else
+  (void)period_ms;
+  return 0;  // TIMERR_NOERROR
+#endif
+}
 
 u32 TRT_GUEST_ABI trt_timeGetDevCaps(void* caps, u32 size) {
   if (!caps || size < 8) return 2 /* TIMERR_STRUCT */;

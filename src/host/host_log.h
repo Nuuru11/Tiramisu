@@ -18,7 +18,8 @@ void log_line(const char* line);
 size_t log_read_disk_tail(char* out, size_t cap);
 void log_close();
 
-// In-memory ring of recent log lines (UI dashboard + web /api/logs use it).
+// In-memory ring of recent log lines (the UI dashboard uses it; web
+// /api/logs reads the on-disk file, not the ring).
 // Lines longer than 220 chars are truncated; oldest fall off at the cap.
 void log_get_recent(char* out, size_t cap);
 unsigned log_recent_count();

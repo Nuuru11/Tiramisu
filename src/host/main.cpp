@@ -44,6 +44,12 @@
 #include <d3d11.h>
 #include <xinput.h>
 
+// timeBeginPeriod is desktop-partition in the SDK headers (not declared
+// under WINAPI_FAMILY_APP), but callable from the AppContainer at runtime —
+// declared directly. winmm.lib is pulled in by the #pragma comment(lib) in
+// src/trt/bridge_winmm.cpp.
+extern "C" unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1478,6 +1484,11 @@ struct tiramisu_host
              install.c_str(), g_local_state.c_str());
     longan::log_line(line);
 
+    // 1ms host timer resolution for the session: guest Sleep(1) and frame
+    // pacing need it (the Windows default is ~15.6ms).
+    ::timeBeginPeriod(1);
+    longan::log_line("tiramisu boot: host timer resolution 1ms (timeBeginPeriod)");
+
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
     snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
@@ -1864,7 +1875,7 @@ struct tiramisu_host
           }
           bool found = false;
           for (const auto& ge : g_games)
-            if (ge.name == webname) { found = true; break; }
+            if (_stricmp(ge.name.c_str(), webname.c_str()) == 0) { found = true; break; }
           if (!found) rescan_games();
         }
         if (!g_pending_launch.empty()) {
@@ -1872,7 +1883,7 @@ struct tiramisu_host
           g_pending_launch.clear();
           bool shelf_hit = false;
           for (const auto& ge : g_games)
-            if (ge.name == want) { shelf_hit = true; break; }
+            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) { shelf_hit = true; break; }
           if (!shelf_hit) {
             // console reality: the shelf's FindFirstFileA scan can come up
             // empty while the web dashboard's enumeration lists the game —
@@ -1901,7 +1912,7 @@ struct tiramisu_host
             }
           }
           for (const auto& ge : g_games) {
-            if (ge.name == want) {
+            if (_stricmp(ge.name.c_str(), want.c_str()) == 0) {
               if (g_guest_thread.joinable()) g_guest_thread.join();
               set_guest_status("running " + ge.name + "…");
               if (ge.input_mode == "pad2kbm" || ge.input_mode == "kbm") {

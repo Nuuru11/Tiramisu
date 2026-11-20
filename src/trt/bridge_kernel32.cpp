@@ -2029,11 +2029,36 @@ int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
 }
 
 u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
-  (void)mod;
-  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_exepath); trt_core_log(st_line); }
+  // Honor the handle: NULL (or the exe's own handle) -> the exe path; a
+  // guest DLL handle -> the game's directory + the DLL's file name; a
+  // synthetic system-module handle -> System32 + the module name. The old
+  // code ignored the handle and always returned the exe path.
+  char path[512];
+  const char* value = g_exepath;
+  if (mod) {
+    trt_image* img = trt_images_by_handle(mod);
+    if (img && img != trt_images_first()) {
+      const char* nm = trt_images_name(mod);
+      if (nm && nm[0]) {
+        const char* slash = strrchr(g_exepath, '\\');
+        const size_t dirlen = slash ? (size_t)(slash - g_exepath) : 0;
+        if (dirlen > 0 && dirlen + 1 + strlen(nm) < sizeof(path)) {
+          snprintf(path, sizeof(path), "%.*s\\%s", (int)dirlen, g_exepath, nm);
+          value = path;
+        }
+      }
+    } else if (!img && trt_images_is_synthetic(mod)) {
+      const char* nm = trt_images_synth_name(mod);
+      if (nm && nm[0]) {
+        snprintf(path, sizeof(path), "C:\\Windows\\System32\\%s", nm);
+        value = path;
+      }
+    }
+  }
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, value); trt_core_log(st_line); }
   if (!buf || !len) return 0;
   u32 i = 0;
-  for (; g_exepath[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_exepath[i];
+  for (; value[i] && i < len - 1; ++i) buf[i] = (u16)(u8)value[i];
   buf[i] = 0;
   return i;
 }
@@ -2747,7 +2772,22 @@ void fill_startup_info_w(void* si) {
 }
 
 void fill_startup_info_a(void* si) {
-  fill_startup_info_w(si);
+  if (!si) return;
+  memset(si, 0, 104);
+  ((u32*)si)[0] = 104;  // cb (STARTUPINFOA is 104 bytes on x64, like W)
+  // ANSI strings: the old code reused the W fill, leaving UTF-16 pointers
+  // in an ANSI struct (an ANSI reader sees "W\0i\0n\0..." = "W").
+  // Static storage: the struct holds pointers, so stack buffers would dangle.
+  static char desktop_buf_a[] = "WinSta0\\Default";
+  static char title_buf_a[260];
+  // Full path, not basename: GoW strrchrs lpTitle for a backslash;
+  // a bare basename returns NULL and its pointer math faults at -1.
+  size_t ti = 0;
+  for (; g_exepath[ti] && ti < 258; ++ti) title_buf_a[ti] = g_exepath[ti];
+  title_buf_a[ti] = 0;
+  ((char**)si)[2] = desktop_buf_a;  // lpDesktop @16
+  ((char**)si)[3] = title_buf_a;    // lpTitle @24
+  { char st_line[320]; snprintf(st_line, sizeof(st_line), "strtrace: GetStartupInfoA -> lpDesktop=%p \"%s\" lpTitle=%p \"%.128s\"", (void*)desktop_buf_a, desktop_buf_a, (void*)title_buf_a, title_buf_a); trt_core_log(st_line); }
   boot_log("kernel32: GetStartupInfoA -> zeroed STARTUPINFOA (no console)");
 }
 
@@ -3350,10 +3390,14 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   size_t old = 0;
   heap_rec_find(p, &old);
   const size_t want = (size_t)(bytes ? bytes : 1);
-  if (trt_mem_budget_charge_commit((u64)want) != 0) return nullptr;  // 1455
+  // charge only the DELTA: the old code charged the full new size up front
+  // (then discharged the old size after success), so a realloc that grew a
+  // block by a few bytes near the budget ceiling spuriously refused 1455
+  const size_t delta = want > old ? want - old : 0;
+  if (delta && trt_mem_budget_charge_commit((u64)delta) != 0) return nullptr;  // 1455
   u8* np = (u8*)g_be.alloc(want, 0);
   if (!np) {
-    trt_mem_budget_discharge_commit((u64)want);
+    if (delta) trt_mem_budget_discharge_commit((u64)delta);
     set_err_for_current_thread(8);
     return nullptr;
   }
@@ -3365,7 +3409,7 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   heap_rec_del(p);
   heap_rec_add(np, want);
   g_be.release(p, 0);
-  if (old) trt_mem_budget_discharge_commit((u64)old);
+  if (old > want) trt_mem_budget_discharge_commit((u64)(old - want));  // shrink
   return np;
 }
 
