@@ -61,7 +61,8 @@ enum {
   TRT_ERR_SEAL = 13,          // final protect() failed
   TRT_ERR_DELAY_IMPORT = 14,  // delay-load dir present (unprocessed in v0)
   TRT_ERR_BAD_ARGS = 15,
-  TRT_ERR_MANAGED = 16  // .NET assembly (COM descriptor present); no CLR here
+  TRT_ERR_MANAGED = 16,  // .NET assembly (COM descriptor present); no CLR here
+  TRT_ERR_MONO = 17          // Mono embedding failure (see trt_mono_last_error)
 };
 
 // min/max PE32/PE64 header offsets/sizes we rely on (SDK-free constants)

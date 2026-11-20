@@ -1,0 +1,63 @@
+# Steamworks functions with hand-written stubs in steam_overrides.c.
+# Each returns a value that gates boot progress (Init/IsSteamRunning must be
+# true or Celeste aborts 'Steam not found!'), a string the wrapper reads
+# (language/name/IP country), a specific ID (SteamID/AppID), or has a
+# struct-by-value return (Controller data) that a generated stub cannot
+# express. Every other implmap entry gets a generated default stub
+# (bool true, fake non-NULL pointer, numeric 0). One name per line; must
+# match the native name in steamworks.implmap exactly.
+Init
+IsSteamRunning
+RestartAppIfNecessary
+ISteamGameServer_WasRestartRequested
+ISteamRemoteStorage_FileExists
+ISteamRemoteStorage_FilePersisted
+GetHSteamPipe_
+GetHSteamUser_
+Steam_GetHSteamUserCurrent_
+GameServer_GetHSteamPipe
+GameServer_GetHSteamUser
+GameServer_GetSteamID
+ISteamGameServer_GetSteamID
+ISteamUser_GetSteamID
+ISteamUtils_GetAppID
+ISteamGameServerUtils_GetAppID
+ISteamApps_GetCurrentGameLanguage
+ISteamApps_GetAvailableGameLanguages
+ISteamApps_GetLaunchQueryParam
+ISteamUtils_GetSteamUILanguage
+ISteamGameServerUtils_GetSteamUILanguage
+ISteamUtils_GetIPCountry
+ISteamGameServerUtils_GetIPCountry
+ISteamFriends_GetPersonaName
+ISteamFriends_GetFriendPersonaName
+ISteamFriends_GetPlayerNickname
+ISteamFriends_GetClanName
+ISteamFriends_GetClanTag
+ISteamFriends_GetFriendPersonaNameHistory
+ISteamFriends_GetFriendRichPresence
+ISteamFriends_GetFriendRichPresenceKeyByIndex
+ISteamFriends_GetFriendsGroupName
+ISteamController_GetGlyphForActionOrigin
+ISteamController_GetStringForActionOrigin
+ISteamMatchmaking_GetLobbyData
+ISteamMatchmaking_GetLobbyMemberData
+ISteamUserStats_GetAchievementDisplayAttribute
+ISteamUserStats_GetAchievementName
+ISteamUserStats_GetLeaderboardName
+ISteamUser_GetUserDataFolder
+ISteamFriends_GetPersonaState
+ISteamMusic_GetVolume
+ISteamUtils_GetConnectedUniverse
+ISteamGameServerUtils_GetConnectedUniverse
+ISteamUtils_GetCurrentBatteryPower
+ISteamGameServerUtils_GetCurrentBatteryPower
+ISteamClient_CreateSteamPipe
+ISteamClient_ConnectToGlobalUser
+ISteamClient_CreateLocalUser
+ISteamController_GetDigitalActionData
+ISteamController_GetAnalogActionData
+ISteamController_GetMotionData
+SteamEncryptedAppTicket_BUserIsVacBanned
+SteamEncryptedAppTicket_GetTicketAppID
+SteamEncryptedAppTicket_GetTicketSteamID

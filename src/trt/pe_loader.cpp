@@ -518,6 +518,7 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_ERR_SEAL: return "SEAL (final protect failed)";
     case TRT_ERR_DELAY_IMPORT: return "DELAY_IMPORT (delay-load directory not processed in v0)";
     case TRT_ERR_MANAGED: return "MANAGED (.NET assembly: CLR header present, no .NET Framework CLR on console)";
+    case TRT_ERR_MONO: return "MONO (Mono embedding failure; see trt_mono_last_error)";
     default: return "UNKNOWN";
   }
 }

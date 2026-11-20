@@ -25,7 +25,7 @@ mkdir -p "$objdir"
 printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-$(nproc)}" -I{} bash -c '
   f="$1"
   base="$(basename "$f" .cpp)"
-  clang++ -std=c++20 -O2 -Wall -fno-pie -c "$f" -o "'"$objdir"'/${base}.o"
+  clang++ -std=c++20 -O2 -Wall -fno-pie -Ithird_party/mono/usr/include/mono-2.0 -c "$f" -o "'"$objdir"'/${base}.o"
 ' _ {}
 clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
 clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
@@ -799,3 +799,28 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_fuzz_loader.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_fuzz_loader"
 "$out/test_fuzz_loader"
+
+# --- 45. Mono embedding: Celeste.exe boots to the title screen under the
+#         embedded Mono runtime + FNA (Path B step 1). SKIP when the game
+#         is absent (other machines have no Celeste) or no Xvfb exists. ---
+MONO_CELESTE_EXE="$HOME/celeste-xbox/Celeste/Celeste.exe"
+if [[ -f "$MONO_CELESTE_EXE" ]]; then
+  if command -v xvfb-run >/dev/null; then
+    bash third_party/build-fna-stack.sh
+    clang++ -std=c++20 -O2 -Wall -no-pie \
+      tests/test_mono_celeste.cpp "$out/libtrt.a" -ldl -lpthread \
+      -o "$out/test_mono_celeste"
+    # FNA's dllmap resolves FNA3D/FAudio by soname; the stubs + libmono
+    # are passed by absolute path and need no LD_LIBRARY_PATH.
+    LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    xvfb-run -a "$out/test_mono_celeste" "$MONO_CELESTE_EXE" \
+      "$here/third_party/fna/out" \
+      "$here/third_party/fna-stubs/out/libfmod-stub.so" \
+      "$here/third_party/fna-stubs/out/libcsteamworks-stub.so" \
+      "$here/third_party/mono/usr/lib/libmono-2.0.so.1" 90
+  else
+    echo "SKIP mono/celeste: xvfb-run not found (no virtual display)"
+  fi
+else
+  echo "SKIP mono/celeste: no game at $MONO_CELESTE_EXE"
+fi

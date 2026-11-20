@@ -12,6 +12,7 @@
 #include "webxfer.h"
 #include "settings.h"
 #include "../trt/trt.h"
+#include "../trt/mono_host.h"
 #include "../trt/bridge_res.h"
 #include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
@@ -1172,6 +1173,23 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
            buf.size());
   longan::log_line(line);
+
+  // Managed (.NET) games don't go through the native PE loader: their
+  // entry point is mscoree!_CorExeMain and their code is IL. Route them
+  // to the embedded Mono runtime instead (Path B). On UWP this fails
+  // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
+  // offline it runs the game under Mono + the FNA stack.
+  if (trt_pe_is_managed(buf.data(), buf.size())) {
+    longan::log_line("trt: managed exe detected, routing to Mono");
+    trt_mono_config mcfg = {};
+    mcfg.exe_path = exe_path.c_str();
+    mcfg.log = [](const char* l) { longan::log_line(l); };
+    r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
+    if (r.map_rc != TRT_OK) {
+      strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
+    }
+    return r;
+  }
 
   trt_image* img = nullptr;
   r.map_rc = trt_map_pe(&be, runtime_rs, buf.data(), buf.size(), &img);
