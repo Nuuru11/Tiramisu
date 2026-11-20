@@ -10,6 +10,12 @@
 #include "../src/trt/spirv_hlsl.h"
 #include "../src/trt/bridge_vulkan.h"
 
+// Real Vulkan header (present on the Linux dev host) for the Features2 /
+// vkCreateDevice validation tests; those checks are skipped without it.
+#if __has_include(<vulkan/vulkan_core.h>)
+#include <vulkan/vulkan_core.h>
+#endif
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -546,6 +552,7 @@ int main(int argc, char** argv) {
         "vkQueueSubmit2KHR",
         "vkCmdPipelineBarrier2KHR",
         "vkGetSemaphoreCounterValueKHR",
+        "vkCmdPushDescriptorSetKHR",
     };
     bool all_procs_ok = true;
     for (const char* p : req_procs) {
@@ -554,7 +561,7 @@ int main(int argc, char** argv) {
         all_procs_ok = false;
       }
     }
-    CHECK(all_procs_ok, "All 56 Vulkan 1.0/1.1/1.2/KHR core & Unity procs resolve non-NULL");
+    CHECK(all_procs_ok, "All 57 Vulkan 1.0/1.1/1.2/KHR core & Unity procs resolve non-NULL");
 
     using VkImgFmtProps_t = i32(TRT_GUEST_ABI*)(void*, u32, u32, u32, u32, u32, void*);
     struct { u32 w, h, d, mips, layers, samples; u64 max_sz; } ifp{};
@@ -661,6 +668,260 @@ int main(int argc, char** argv) {
           "vkCmdUpdateBuffer + vkCmdExecuteCommands + vkCmdDispatchIndirect ran with gx=7");
     CHECK(g_obs.draws == 1 && g_obs.last_draw_verts == 12u,
           "vkCmdDrawIndirect read indirect VertexCount=12 from buffer memory");
+
+    // --- 2c. Vulkan completion batch 1: honest Features2, vkCreateDevice
+    // validation, VK_KHR_push_descriptor, fail-visible pipeline creation ---
+    using VkEnumDevExt_t = i32(TRT_GUEST_ABI*)(void*, const char*, u32*, void*);
+    u32 ext_cnt = 0;
+    ((VkEnumDevExt_t)gipa(inst, "vkEnumerateDeviceExtensionProperties"))(gpu, nullptr, &ext_cnt, nullptr);
+    // Each entry is {char name[256]; u32 specVersion} = 260 bytes.
+    std::vector<u8> ext_buf((size_t)ext_cnt * 260);
+    ((VkEnumDevExt_t)gipa(inst, "vkEnumerateDeviceExtensionProperties"))(gpu, nullptr, &ext_cnt, ext_buf.data());
+    bool have_push_ext = false;
+    for (u32 e = 0; e < ext_cnt; ++e) {
+      const char* nm = (const char*)ext_buf.data() + (size_t)e * 260;
+      if (strcmp(nm, "VK_KHR_push_descriptor") == 0) have_push_ext = true;
+    }
+    CHECK(have_push_ext, "vkEnumerateDeviceExtensionProperties advertises VK_KHR_push_descriptor");
+
+#if __has_include(<vulkan/vulkan_core.h>)
+    using VkGetFeat2_t = void(TRT_GUEST_ABI*)(void*, void*);
+    VkPhysicalDeviceVulkan11Features f11{};
+    f11.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    VkPhysicalDeviceVulkan12Features f12{};
+    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    VkPhysicalDeviceVulkan13Features f13{};
+    f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceDescriptorIndexingFeatures fdi{};
+    fdi.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    VkPhysicalDeviceBufferDeviceAddressFeatures fbda{};
+    fbda.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &f11; f11.pNext = &f12; f12.pNext = &f13; f13.pNext = &fdi; fdi.pNext = &fbda;
+    ((VkGetFeat2_t)gipa(inst, "vkGetPhysicalDeviceFeatures2"))(gpu, &f2);
+    CHECK(f2.features.geometryShader == 0 && f2.features.tessellationShader == 0 &&
+              f2.features.fragmentStoresAndAtomics == 0 &&
+              f2.features.vertexPipelineStoresAndAtomics == 0 &&
+              f2.features.shaderImageGatherExtended == 0 &&
+              f2.features.multiViewport == 0 && f2.features.occlusionQueryPrecise == 0 &&
+              f2.features.pipelineStatisticsQuery == 0,
+          "Features2 base: geometry/tessellation/atomics/gather/multiViewport/queries honestly FALSE");
+    CHECK(f2.features.imageCubeArray != 0 && f2.features.independentBlend != 0,
+          "Features2 base: imageCubeArray/independentBlend stay TRUE");
+    CHECK(f12.drawIndirectCount != 0 && f12.timelineSemaphore != 0 &&
+              f12.samplerMirrorClampToEdge != 0,
+          "Vulkan12Features: drawIndirectCount/timelineSemaphore/mirrorClamp TRUE");
+    CHECK(f12.descriptorIndexing == 0 && f12.bufferDeviceAddress == 0 &&
+              f12.runtimeDescriptorArray == 0 && f12.shaderFloat16 == 0,
+          "Vulkan12Features: descriptorIndexing/bufferDeviceAddress honestly FALSE");
+    CHECK(f13.dynamicRendering != 0 && f13.synchronization2 != 0,
+          "Vulkan13Features: dynamicRendering/synchronization2 TRUE");
+    CHECK(f13.inlineUniformBlock == 0 && f13.privateData == 0 &&
+              f13.shaderDemoteToHelperInvocation == 0,
+          "Vulkan13Features: inlineUniformBlock/privateData/demote honestly FALSE");
+    CHECK(f11.shaderDrawParameters == 0 && f11.samplerYcbcrConversion == 0 &&
+              f11.multiview == 0,
+          "Vulkan11Features: drawParameters/ycbcr/multiview honestly FALSE");
+    CHECK(fdi.runtimeDescriptorArray == 0 && fdi.descriptorBindingPartiallyBound == 0,
+          "DescriptorIndexingFeatures: all FALSE");
+    CHECK(fbda.bufferDeviceAddress == 0 && fbda.bufferDeviceAddressCaptureReplay == 0,
+          "BufferDeviceAddressFeatures: all FALSE");
+#endif
+
+    // vkCreateDevice validation: unknown extension, unsupported feature,
+    // and the consistency rule (reported-supported => accepted).
+    const char* bad_ext = "VK_KHR_does_not_exist";
+    struct { u32 sType; const void* pNext; u32 flags; u32 qcc; const void* pqc; u32 lc; const void* pl; u32 ec; const void* pe; const void* pf; } dci_bad{3u, nullptr, 0, 1, &dq, 0, nullptr, 1, &bad_ext, nullptr};
+    void* dev_bad = nullptr;
+    i32 rc_bad = ((VkCreateDev_t)fn("vkCreateDevice"))(gpu, &dci_bad, nullptr, &dev_bad);
+    CHECK(rc_bad == -7 && dev_bad == nullptr,
+          "vkCreateDevice rejects unknown extension with VK_ERROR_EXTENSION_NOT_PRESENT");
+#if __has_include(<vulkan/vulkan_core.h>)
+    VkPhysicalDeviceFeatures feat_geo{};
+    feat_geo.geometryShader = VK_TRUE;
+    struct { u32 sType; const void* pNext; u32 flags; u32 qcc; const void* pqc; u32 lc; const void* pl; u32 ec; const void* pe; const void* pf; } dci_geo{3u, nullptr, 0, 1, &dq, 0, nullptr, 0, nullptr, &feat_geo};
+    void* dev_geo = nullptr;
+    i32 rc_geo = ((VkCreateDev_t)fn("vkCreateDevice"))(gpu, &dci_geo, nullptr, &dev_geo);
+    CHECK(rc_geo == -8 && dev_geo == nullptr,
+          "vkCreateDevice rejects geometryShader with VK_ERROR_FEATURE_NOT_PRESENT");
+    VkPhysicalDeviceDynamicRenderingFeatures fdr{};
+    fdr.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+    fdr.dynamicRendering = VK_TRUE;
+    struct { u32 sType; const void* pNext; u32 flags; u32 qcc; const void* pqc; u32 lc; const void* pl; u32 ec; const void* pe; const void* pf; } dci_dr{3u, &fdr, 0, 1, &dq, 0, nullptr, 0, nullptr, nullptr};
+    void* dev_dr = nullptr;
+    i32 rc_dr = ((VkCreateDev_t)fn("vkCreateDevice"))(gpu, &dci_dr, nullptr, &dev_dr);
+    CHECK(rc_dr == 0 && dev_dr != nullptr,
+          "vkCreateDevice accepts dynamicRendering (reported supported)");
+    if (dev_dr) ((VkDestroyDev_t)fn("vkDestroyDevice"))(dev_dr, nullptr);
+    VkPhysicalDeviceDescriptorIndexingFeatures fdi_req{};
+    fdi_req.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+    fdi_req.runtimeDescriptorArray = VK_TRUE;
+    struct { u32 sType; const void* pNext; u32 flags; u32 qcc; const void* pqc; u32 lc; const void* pl; u32 ec; const void* pe; const void* pf; } dci_di{3u, &fdi_req, 0, 1, &dq, 0, nullptr, 0, nullptr, nullptr};
+    void* dev_di = nullptr;
+    i32 rc_di = ((VkCreateDev_t)fn("vkCreateDevice"))(gpu, &dci_di, nullptr, &dev_di);
+    CHECK(rc_di == -8 && dev_di == nullptr,
+          "vkCreateDevice rejects descriptor indexing with VK_ERROR_FEATURE_NOT_PRESENT");
+#endif
+    const char* push_ext = "VK_KHR_push_descriptor";
+    struct { u32 sType; const void* pNext; u32 flags; u32 qcc; const void* pqc; u32 lc; const void* pl; u32 ec; const void* pe; const void* pf; } dci_push{3u, nullptr, 0, 1, &dq, 0, nullptr, 1, &push_ext, nullptr};
+    void* dev_push = nullptr;
+    i32 rc_push_dev = ((VkCreateDev_t)fn("vkCreateDevice"))(gpu, &dci_push, nullptr, &dev_push);
+    CHECK(rc_push_dev == 0 && dev_push != nullptr,
+          "vkCreateDevice accepts VK_KHR_push_descriptor");
+    if (dev_push) ((VkDestroyDev_t)fn("vkDestroyDevice"))(dev_push, nullptr);
+
+    // Fail-visible pipeline creation: garbage SPIR-V (bad magic) must fail
+    // the call and return VK_NULL_HANDLE, never a stage-less pipeline.
+    const u32 bad_spv[5] = {0, 0, 0, 0, 0};
+    struct { u32 sType; const void* pNext; u32 flags; size_t sz; const u32* code; } bad_smci{15u, nullptr, 0, sizeof(bad_spv), bad_spv};
+    u64 bad_mod = 0;
+    ((VkCreateSm_t)fn("vkCreateShaderModule"))(dev, &bad_smci, nullptr, &bad_mod);
+    CHECK(bad_mod != 0, "garbage shader module created (translation is deferred to pipeline creation)");
+    int pipes_before = g_obs.pipes_created;
+    struct { u32 sType; const void* pNext; u32 flags; u32 stage; u64 module; const char* pName; const void* pSpec; } bad_stage{18u, nullptr, 0, 0x1u, bad_mod, "main", nullptr};
+    struct { u32 sType; const void* pNext; u32 flags; u32 stageCount; const void* pStages; const void* pvi, *pia, *pt, *pv, *pr, *pm, *pds, *pcb, *pdy; u64 layout, rp; u32 sp; u64 bh; i32 bi; } bad_gpci{28u, nullptr, 0, 1u, &bad_stage};
+    u64 bad_pipe = 0xDEADu;
+    i32 rc_bad_pipe = ((VkCreateGp_t)gdpa(dev, "vkCreateGraphicsPipelines"))(dev, 0, 1, &bad_gpci, nullptr, &bad_pipe);
+    CHECK(rc_bad_pipe != 0 && bad_pipe == 0,
+          "vkCreateGraphicsPipelines fails visibly on untranslatable SPIR-V");
+    CHECK(g_obs.pipes_created == pipes_before,
+          "failed graphics pipeline never reaches the backend hook");
+    int comp_before = g_obs.comp_pipes_created;
+    struct { u32 sType; const void* pNext; u32 flags; struct { u32 s; const void* pn; u32 fl; u32 stg; u64 m; const char* nm; const void* sp; } stage; u64 layout, base; i32 bidx; } bad_cci{29u, nullptr, 0, {18u, nullptr, 0, 0x20u, bad_mod, "main", nullptr}};
+    u64 bad_cpipe = 0xDEADu;
+    i32 rc_bad_cpipe = ((VkCreateCp_t)fn("vkCreateComputePipelines"))(dev, 0, 1, &bad_cci, nullptr, &bad_cpipe);
+    CHECK(rc_bad_cpipe != 0 && bad_cpipe == 0,
+          "vkCreateComputePipelines fails visibly on untranslatable SPIR-V");
+    CHECK(g_obs.comp_pipes_created == comp_before,
+          "failed compute pipeline never reaches the backend hook");
+
+    // Push descriptors: VS reads a UBO (set 0, binding 0); the push must
+    // feed that binding into the draw with no descriptor set bound.
+    spv_builder pb;
+    pb.begin();
+    u32 p_fn = pb.id(), p_inPos = pb.id(), p_outPos = pb.id(), p_ubo = pb.id();
+    u32 p_tVoid = pb.id(), p_tFn = pb.id(), p_tF32 = pb.id(), p_tV4 = pb.id(), p_tU32 = pb.id();
+    u32 p_c0 = pb.id(), p_tUbo = pb.id(), p_tPtrUbo = pb.id(), p_tPtrUboV = pb.id();
+    u32 p_tPtrIn = pb.id(), p_tPtrOut = pb.id(), p_lbl = pb.id(), p_gep = pb.id();
+    u32 p_vPos = pb.id(), p_vOff = pb.id(), p_vSum = pb.id();
+    pb.emit(17 /*OpCapability*/, {1u});
+    pb.emit(14 /*OpMemoryModel*/, {0u, 1u});
+    pb.emit_str(15 /*OpEntryPoint*/, {0u /*Vertex*/, p_fn}, "main", {p_inPos, p_outPos});
+    pb.emit(71 /*OpDecorate*/, {p_inPos, 30u /*Location*/, 0u});
+    pb.emit(71 /*OpDecorate*/, {p_outPos, 11u /*BuiltIn*/, 0u /*Position*/});
+    pb.emit(71 /*OpDecorate*/, {p_ubo, 34u /*DescriptorSet*/, 0u});
+    pb.emit(71 /*OpDecorate*/, {p_ubo, 33u /*Binding*/, 0u});
+    pb.emit(71 /*OpDecorate*/, {p_tUbo, 2u /*Block*/});
+    pb.emit(72 /*OpMemberDecorate*/, {p_tUbo, 0u, 35u /*Offset*/, 0u});
+    pb.emit(19, {p_tVoid});
+    pb.emit(33, {p_tFn, p_tVoid});
+    pb.emit(22, {p_tF32, 32u});
+    pb.emit(23, {p_tV4, p_tF32, 4u});
+    pb.emit(21, {p_tU32, 32u, 0u});
+    pb.emit(43, {p_tU32, p_c0, 0u});
+    pb.emit(30, {p_tUbo, p_tV4});
+    pb.emit(32, {p_tPtrUbo, 2u /*Uniform*/, p_tUbo});
+    pb.emit(32, {p_tPtrUboV, 2u, p_tV4});
+    pb.emit(32, {p_tPtrIn, 1u, p_tV4});
+    pb.emit(32, {p_tPtrOut, 3u, p_tV4});
+    pb.emit(59, {p_tPtrUbo, p_ubo, 2u});
+    pb.emit(59, {p_tPtrIn, p_inPos, 1u});
+    pb.emit(59, {p_tPtrOut, p_outPos, 3u});
+    pb.emit(54, {p_tVoid, p_fn, 0u, p_tFn});
+    pb.emit(248, {p_lbl});
+    pb.emit(65, {p_tPtrUboV, p_gep, p_ubo, p_c0});
+    pb.emit(61, {p_tV4, p_vPos, p_inPos});
+    pb.emit(61, {p_tV4, p_vOff, p_gep});
+    pb.emit(129 /*OpFAdd*/, {p_tV4, p_vSum, p_vPos, p_vOff});
+    pb.emit(62, {p_outPos, p_vSum});
+    pb.emit(253, {});
+    pb.emit(56, {});
+    pb.finish();
+    spirv_compile_result rpush_vs = spirv_to_hlsl(pb.w.data(), (u32)pb.w.size(),
+                                                  SPV_STAGE_VERTEX, "main");
+    CHECK(rpush_vs.ok && rpush_vs.bindings.size() == 1 &&
+              rpush_vs.bindings[0].kind == SPV_BIND_CBV,
+          "push-descriptor test VS reflects UBO as one CBV binding");
+    spv_builder qb;
+    qb.begin();
+    u32 q_fn = qb.id(), q_out = qb.id();
+    u32 q_tVoid = qb.id(), q_tFn = qb.id(), q_tF32 = qb.id(), q_tV4 = qb.id();
+    u32 q_tPtrOut = qb.id(), q_c0 = qb.id(), q_c1 = qb.id(), q_cCol = qb.id(), q_lbl = qb.id();
+    qb.emit(17, {1u});
+    qb.emit(14, {0u, 1u});
+    qb.emit_str(15, {4u /*Fragment*/, q_fn}, "main", {q_out});
+    qb.emit(16, {q_fn, 7u /*OriginUpperLeft*/});
+    qb.emit(71, {q_out, 30u, 0u});
+    qb.emit(19, {q_tVoid});
+    qb.emit(33, {q_tFn, q_tVoid});
+    qb.emit(22, {q_tF32, 32u});
+    qb.emit(23, {q_tV4, q_tF32, 4u});
+    qb.emit(43, {q_tF32, q_c0, 0x00000000u});
+    qb.emit(43, {q_tF32, q_c1, 0x3F800000u});
+    qb.emit(44 /*OpConstantComposite*/, {q_tV4, q_cCol, q_c1, q_c0, q_c0, q_c1});
+    qb.emit(32, {q_tPtrOut, 3u, q_tV4});
+    qb.emit(59, {q_tPtrOut, q_out, 3u});
+    qb.emit(54, {q_tVoid, q_fn, 0u, q_tFn});
+    qb.emit(248, {q_lbl});
+    qb.emit(62, {q_out, q_cCol});
+    qb.emit(253, {});
+    qb.emit(56, {});
+    qb.finish();
+    spirv_compile_result rpush_ps = spirv_to_hlsl(qb.w.data(), (u32)qb.w.size(),
+                                                  SPV_STAGE_FRAGMENT, "main");
+    CHECK(rpush_ps.ok, "push-descriptor test PS compiles");
+    using VkCreatePl_t = i32(TRT_GUEST_ABI*)(void*, const void*, const void*, u64*);
+    u64 push_layout = 0;
+    ((VkCreatePl_t)fn("vkCreatePipelineLayout"))(dev, nullptr, nullptr, &push_layout);
+    struct { u32 sType; const void* pNext; u32 flags; size_t sz; const u32* code; } vs_smci{15u, nullptr, 0, pb.w.size() * 4, pb.w.data()};
+    struct { u32 sType; const void* pNext; u32 flags; size_t sz; const u32* code; } ps_smci{15u, nullptr, 0, qb.w.size() * 4, qb.w.data()};
+    u64 vs_mod = 0, ps_mod = 0;
+    ((VkCreateSm_t)fn("vkCreateShaderModule"))(dev, &vs_smci, nullptr, &vs_mod);
+    ((VkCreateSm_t)fn("vkCreateShaderModule"))(dev, &ps_smci, nullptr, &ps_mod);
+    struct { u32 sType; const void* pNext; u32 flags; u32 stage; u64 module; const char* pName; const void* pSpec; } push_stages[2] = {
+        {18u, nullptr, 0, 0x1u, vs_mod, "main", nullptr},
+        {18u, nullptr, 0, 0x10u, ps_mod, "main", nullptr}};
+    struct { u32 sType; const void* pNext; u32 flags; u32 stageCount; const void* pStages; const void* pvi, *pia, *pt, *pv, *pr, *pm, *pds, *pcb, *pdy; u64 layout, rp; u32 sp; u64 bh; i32 bi; } push_gpci{28u, nullptr, 0, 2u, push_stages, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, push_layout};
+    u64 push_pipe = 0;
+    i32 rc_push_pipe = ((VkCreateGp_t)gdpa(dev, "vkCreateGraphicsPipelines"))(dev, 0, 1, &push_gpci, nullptr, &push_pipe);
+    CHECK(rc_push_pipe == 0 && push_pipe != 0, "push-descriptor test graphics pipeline created");
+    using VkPushDesc_t = void(TRT_GUEST_ABI*)(void*, u32, u64, u32, u32, const void*);
+    using VkDraw_t = void(TRT_GUEST_ABI*)(void*, u32, u32, u32, u32);
+    void* push_fn = gdpa(dev, "vkCmdPushDescriptorSetKHR");
+    CHECK(push_fn != nullptr, "vkCmdPushDescriptorSetKHR resolves via vkGetDeviceProcAddr");
+    struct { u64 buffer; u64 offset; u64 range; } push_bi{stg, 0, 64};
+    struct { u32 sType; const void* pNext; u64 dstSet; u32 dstBinding; u32 dstArrayElement; u32 descriptorCount; u32 descriptorType; const void* pImageInfo; const void* pBufferInfo; const void* pTexelBufferView; } push_w{0u, nullptr, 0, 0u, 0u, 1u, 6u /*UNIFORM_BUFFER*/, nullptr, &push_bi, nullptr};
+    int draws_before = g_obs.draws;
+    ((VkBeginCb_t)fn("vkBeginCommandBuffer"))(cb, &cbbi);
+    ((VkBindPipe_t)fn("vkCmdBindPipeline"))(cb, 0u, push_pipe);
+    if (push_fn) ((VkPushDesc_t)push_fn)(cb, 0u, push_layout, 0u, 1u, &push_w);
+    ((VkDraw_t)fn("vkCmdDraw"))(cb, 3u, 1u, 0u, 0u);
+    ((VkEndCb_t)fn("vkEndCommandBuffer"))(cb);
+    struct { u32 sType; const void* pNext; u32 wc; const void* pw, *ps; u32 cbc; void* const* pcb; u32 sc; const void* psig; } push_subi{4u, nullptr, 0, nullptr, nullptr, 1, &cb};
+    ((VkSubmit_t)fn("vkQueueSubmit"))(q, 1, &push_subi, 0);
+    CHECK(g_obs.draws == draws_before + 1 && g_obs.last_binding_count == 1u,
+          "vkCmdPushDescriptorSetKHR feeds the pushed UBO into the draw");
+    // Binding a (never-updated) real set over the pushed set replaces it.
+    using VkCreateDp_t = i32(TRT_GUEST_ABI*)(void*, const void*, const void*, u64*);
+    using VkAllocDs_t = i32(TRT_GUEST_ABI*)(void*, const void*, u64*);
+    using VkBindDs_t = void(TRT_GUEST_ABI*)(void*, u32, u64, u32, u32, const u64*, u32, const u32*);
+    u64 dpool = 0;
+    ((VkCreateDp_t)fn("vkCreateDescriptorPool"))(dev, nullptr, nullptr, &dpool);
+    u64 dset = 0;
+    const u64 lay1 = push_layout;
+    struct { u32 sType; const void* pNext; u64 pool; u32 cnt; const u64* layouts; } dsai{30u, nullptr, dpool, 1u, &lay1};
+    ((VkAllocDs_t)fn("vkAllocateDescriptorSets"))(dev, &dsai, &dset);
+    int draws_before2 = g_obs.draws;
+    ((VkBeginCb_t)fn("vkBeginCommandBuffer"))(cb, &cbbi);
+    ((VkBindPipe_t)fn("vkCmdBindPipeline"))(cb, 0u, push_pipe);
+    if (push_fn) ((VkPushDesc_t)push_fn)(cb, 0u, push_layout, 0u, 1u, &push_w);
+    ((VkBindDs_t)fn("vkCmdBindDescriptorSets"))(cb, 0u, push_layout, 0u, 1u, &dset, 0u, nullptr);
+    ((VkDraw_t)fn("vkCmdDraw"))(cb, 3u, 1u, 0u, 0u);
+    ((VkEndCb_t)fn("vkEndCommandBuffer"))(cb);
+    ((VkSubmit_t)fn("vkQueueSubmit"))(q, 1, &push_subi, 0);
+    CHECK(g_obs.draws == draws_before2 + 1 && g_obs.last_binding_count == 0u,
+          "binding a descriptor set replaces the pushed set");
 
     ((VkDestroyDev_t)fn("vkDestroyDevice"))(dev, nullptr);
     ((VkDestroyInst_t)fn("vkDestroyInstance"))(inst, nullptr);
