@@ -1,0 +1,3 @@
+LIBRARY guest_delay32
+EXPORTS
+    Delay32Fn

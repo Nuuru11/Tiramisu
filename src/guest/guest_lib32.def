@@ -1,0 +1,3 @@
+LIBRARY guest_lib32
+EXPORTS
+    Lib32Add

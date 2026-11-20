@@ -541,8 +541,11 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       snprintf(g.name, sizeof(g.name), "%s", base);
       snprintf(g.path, sizeof(g.path), "%s", host_path);
       g.img = img;
-      // STAGE 7: HMODULE == image base (see trt_images_register_main)
-      g.handle = (void*)(uintptr_t)img->base;
+      // STAGE 7: HMODULE == image base (see trt_images_register_main).
+      // M7 Phase 1: a 32-bit HMODULE must be a 32-bit-safe value — the guest
+      // VA base, not the 64-bit host pointer (a 32-bit slot cannot hold it).
+      g.handle = img->is_pe32 ? (void*)(uintptr_t)img->guest_base
+                              : (void*)(uintptr_t)img->base;
       g.is_dll = true;
       ++g_image_count;
     }
@@ -555,14 +558,27 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
+  // M7 Phase 1: 32-bit code cannot run natively (no x86 engine yet).
+  // A PE32 image's TLS callbacks / DllMain are collected at map time
+  // and deferred to the Phase 2 emulator — calling them through
+  // trt_call_guest_img (a 64-bit call) would execute 32-bit bytes as
+  // 64-bit code. Skip, loudly; load-only in Phase 1.
+  if (img->is_pe32) {
+    char line[320];
+    snprintf(line, sizeof(line),
+             "trt: %s is PE32: entry/TLS deferred to the M7 emulator "
+             "(Phase 2); load-only in Phase 1",
+             base);
+    trt_core_log(line);
+  }
   // TLS callbacks, then the entry point (DllMain for a DLL) — skipped in
   // load-only mode (corpus dry-run proves binding without executing code)
-  if (g_run_image_code)
+  if (!img->is_pe32 && g_run_image_code)
     for (int i = 0; i < img->tls_callback_count; ++i) {
       void* cb = img->base + img->tls_callback_rvas[i];
       trt_call_guest_img(cb, img, (u64)(uintptr_t)img->base, 1, 0, 0);
     }
-  if (run_entry && g_run_image_code && img->entry_rva) {
+  if (!img->is_pe32 && run_entry && g_run_image_code && img->entry_rva) {
     void* handle = trt_images_handle(img);
     char line[320];
     snprintf(line, sizeof(line),
@@ -625,6 +641,7 @@ void trt_images_notify_thread(int reason) {
     for (int i = 0; i < snap_count; ++i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
+      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       for (int t = 0; t < img->tls_callback_count; ++t) {
         trt_call_guest_img(img->base + img->tls_callback_rvas[t], img,
                            (u64)(uintptr_t)img->base, 2, 0, 0);
@@ -638,6 +655,7 @@ void trt_images_notify_thread(int reason) {
     for (int i = snap_count - 1; i >= 0; --i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
+      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       if (snap[i].call_entry) {
         trt_call_guest_img(img->base + img->entry_rva, img,
                            (u64)(uintptr_t)snap[i].handle, 3, 0, 0);
@@ -655,6 +673,11 @@ void trt_images_notify_thread(int reason) {
 void trt_set_image_code_run(int enable) { g_run_image_code = enable ? 1 : 0; }
 
 void trt_images_reset(void) {
+  // M7 Phase 1: the guest-VA reservations belong to the registry's images;
+  // a reset orphans those images, so their guest ranges become free again.
+  // (The trap registry is NOT reset: trap addresses in already-mapped IATs
+  // stay valid for the process lifetime.)
+  trt_pe32_guest_reset();
   std::lock_guard<std::mutex> lk(g_img_mu);
   g_image_count = 0;
   g_main_image = nullptr;

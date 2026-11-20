@@ -1,9 +1,13 @@
 // tiramisu/src/trt/pe_exports.cpp
-// PE64 export directory parsing.
+// PE32/PE64 export directory parsing.
 //
 // Two callers need this:
 //   1. GetProcAddress on a DLL the guest loaded itself
 //   2. binding an import from another guest DLL (engine.dll -> utils.dll)
+// M7 Phase 1: the export directory offset differs by width (PE32 dirs at
+// optional + 96, PE32+ at + 112), so the directory is located through
+// trt_pe_directories() after reading the magic. The export directory
+// itself is width-agnostic (all RVAs are u32).
 //
 // Structure (IMAGE_EXPORT_DIRECTORY, 40 bytes):
 //   +0  Characteristics          +12 Name              (RVA of the DLL name)
@@ -39,9 +43,12 @@ bool read_export_dir(const trt_image* img, export_dir* out) {
   if (!img || !img->base) return false;
   const u8* base = img->base;
   const u32 lfanew = rd32(base + 0x3C);
-  if (lfanew + sizeof(trt_nt_headers64) > img->size_of_image) return false;
-  const trt_nt_headers64* nt = (const trt_nt_headers64*)(base + lfanew);
-  const trt_data_directory* dir = &nt->optional_header.directories[TRT_PE_DIR_EXPORT];
+  if (lfanew + 24 + 2 > img->size_of_image) return false;
+  const u8* opt = base + lfanew + 24;
+  const u16 magic = rd16(opt);
+  if (magic != TRT_PE_OPT64_MAGIC && magic != TRT_PE_OPT32_MAGIC) return false;
+  const trt_data_directory* dir =
+      trt_pe_directories(opt, magic) + TRT_PE_DIR_EXPORT;
   if (!dir->virtual_address || !dir->size) return false;
   if (dir->virtual_address + dir->size > img->size_of_image) return false;
   const u8* ed = base + dir->virtual_address;

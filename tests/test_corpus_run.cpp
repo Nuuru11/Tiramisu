@@ -229,11 +229,20 @@ static void hang_kill(int, siginfo_t*, void* uctx_v) {
   _exit(43);
 }  // 43 = watchdog, distinct from 42
 
-// 45 = SKIP verdict (32-bit x86 guest: the M7 x86 engine is not on this path)
-static void print_x86_skip(const char* path) {
+// 45 = SKIP verdict (a machine that is neither PE64 nor PE32: the loader
+// has no path for it at all)
+// 46 = LOAD-ONLY verdict (M7 Phase 1: a 32-bit guest mapped + sealed, but
+// its DllMain/entry cannot execute without the Phase 2 x86 emulator)
+static void print_x86_skip(const char* path, u16 machine) {
   const char* name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
-  printf("SKIP %s: x86 guest (machine=0x14c) — DllMain execution needs the "
-         "M7 x86 engine, not this PE64 path\n", name);
+  printf("SKIP %s: unsupported machine 0x%04x (neither PE64 nor PE32)\n",
+         name, machine);
+}
+
+static void print_pe32_load_only(const char* path, const char* what) {
+  const char* name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+  printf("%s LOAD-ONLY %s: mapped+sealed (M7 Phase 1; execution needs the "
+         "Phase 2 x86 emulator)\n", what, name);
 }
 
 // ---------------------------------------------------------------------------
@@ -935,8 +944,23 @@ int child_run(const char* path) {
         ((unsigned)hdr[0x3e] << 16) | ((unsigned)hdr[0x3f] << 24);
     if (nt_off + 8 > got) { printf("RUN FAILED %s: e_lfanew out of file\n", name); return 44; }
     const u16 machine = (u16)(hdr[nt_off + 4] | (hdr[nt_off + 5] << 8));
+    if (machine == 0x014c) {
+      // M7 Phase 1: load-only — map + seal, never run the 32-bit entry.
+      // Code-run is forced OFF for this child (the loader's own PE32 guard
+      // in images.cpp is the backstop) and run_entry=0.
+      trt_set_image_code_run(0);
+      trt_image* img32 = trt_load_pe(path, name, 0);
+      if (!img32) {
+        printf("RUN FAILED %s: PE32 map/seal (see [trt] lines — the named loader gap)\n", name);
+        fflush(stdout);
+        return 44;
+      }
+      print_pe32_load_only(path, "RUN");
+      fflush(stdout);
+      return 46;
+    }
     if (machine != 0x8664) {
-      print_x86_skip(path);
+      print_x86_skip(path, machine);
       return 45;
     }
   }
@@ -999,7 +1023,7 @@ int main(int argc, char** argv) {
 
   // EXE phase: one forked boot per EXE, same isolation contract
   if (exe_mode) {
-    int n_ok = 0, n_failed = 0, n_skipped = 0;
+    int n_ok = 0, n_failed = 0, n_skipped = 0, n_load_only = 0;
     for (int a = first; a < argc; ++a) {
       const char* path = argv[a];
       const char* name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
@@ -1021,8 +1045,10 @@ int main(int argc, char** argv) {
         } else if (code == 43) {
           printf("BOOT FAILED %s: watchdog exit 43\n", name);
           ++n_failed;
-        } else if (code == 44 || code == 45) {
-          if (code == 45) ++n_skipped; else ++n_failed;  // named by the child
+        } else if (code == 44 || code == 45 || code == 46) {
+          if (code == 45) ++n_skipped;
+          else if (code == 46) ++n_load_only;  // PE32 mapped, no execution yet
+          else ++n_failed;  // named by the child
         } else {
           printf("BOOT EXITED %s: child exit %d\n", name, code);
           ++n_ok;  // an ExitProcess-shaped exit is a NAMED boot outcome
@@ -1034,13 +1060,13 @@ int main(int argc, char** argv) {
         ++n_failed;
       } else { printf("BOOT FAILED %s: unknown wait state\n", name); ++n_failed; }
     }
-    printf("\nCORPUS-EXE: %d booted, %d failed, %d skipped (x86)\n",
-           n_ok, n_failed, n_skipped);
+    printf("\nCORPUS-EXE: %d booted, %d failed, %d skipped, %d load-only (PE32)\n",
+           n_ok, n_failed, n_skipped, n_load_only);
     printf("the depth ladder + named blockers above are the deliverable.\n");
     return n_failed ? 1 : 0;
   }
 
-  int n_ok = 0, n_failed = 0, n_no_verdict = 0, n_skipped = 0;
+  int n_ok = 0, n_failed = 0, n_no_verdict = 0, n_skipped = 0, n_load_only = 0;
   for (int a = first; a < argc; ++a) {
     const char* path = argv[a];
     const char* name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
@@ -1073,7 +1099,9 @@ int main(int argc, char** argv) {
       } else if (code == 44) {
         ++n_failed;  // map/seal failure, named by the child
       } else if (code == 45) {
-        ++n_skipped;  // x86 guest — named frontier, not a failure
+        ++n_skipped;  // unsupported machine — named frontier, not a failure
+      } else if (code == 46) {
+        ++n_load_only;  // PE32 mapped+sealed, no execution yet (M7 Phase 1)
       } else {
         printf("RUN FAILED %s: child exit %d (unnamed)\n", name, code);
         ++n_no_verdict;
@@ -1090,8 +1118,8 @@ int main(int argc, char** argv) {
     }
   }
 
-  printf("\nCORPUS-RUN: %d run ok, %d run failed, %d skipped (x86), %d no-verdict\n",
-         n_ok, n_failed, n_skipped, n_no_verdict);
+  printf("\nCORPUS-RUN: %d run ok, %d run failed, %d skipped, %d load-only (PE32), %d no-verdict\n",
+         n_ok, n_failed, n_skipped, n_load_only, n_no_verdict);
   printf("run-depth verdicts are the work list: a RUN FAILED names the bridge\n"
          "surface real code hit last; fix it, add its own test, run again.\n");
   // Faults are legitimate discovery outcomes: the gate is "every PE got a
@@ -1593,8 +1621,22 @@ int child_boot(const char* path) {
                           ((unsigned)hdr[0x3e] << 16) | ((unsigned)hdr[0x3f] << 24);
   if (nt_off + 8 > got) { printf("BOOT FAILED %s: e_lfanew out of file\n", name); return 44; }
   const u16 machine = (u16)(hdr[nt_off + 4] | (hdr[nt_off + 5] << 8));
+  if (machine == 0x014c) {
+    // M7 Phase 1: load-only — map + seal, never run the 32-bit entry.
+    trt_set_image_code_run(0);
+    trt_image* img32 = trt_load_pe(path, name, 0);
+    if (!img32) {
+      printf("BOOT FAILED %s: PE32 map/seal (see [trt] lines — the named loader gap)\n",
+             name);
+      fflush(stdout);
+      return 44;
+    }
+    print_pe32_load_only(path, "BOOT");
+    fflush(stdout);
+    return 46;
+  }
   if (machine != 0x8664) {
-    print_x86_skip(path);
+    print_x86_skip(path, machine);
     return 45;
   }
 

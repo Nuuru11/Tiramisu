@@ -58,6 +58,38 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 
 "$out/test_pe_loader" "$out/guest_hello.exe" "$out/guest_hello_reloc.exe"
 
+# --- 3b. PE32 guest + loader test (M7 Phase 1: load-only, no execution) ---
+# x86 import libs from the .def files (kernel32.def lists the same names
+# the 64-bit guest uses; the 32-bit guest declares them cdecl so the
+# imports are undecorated, like real PE32 files).
+"$LLD_LINK" /lib /def:src/guest/kernel32.def /out:"$out/kernel32_32.lib" /machine:x86 /noentry
+"$LLD_LINK" /lib /def:src/guest/guest_lib32.def /out:"$out/guest_lib32.lib" /machine:x86 /noentry
+"$LLD_LINK" /lib /def:src/guest/guest_delay32.def /out:"$out/guest_delay32.lib" /machine:x86 /noentry
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_hello32.c -o "$out/guest_hello32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_data32.c -o "$out/guest_data32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_lib32.c -o "$out/guest_lib32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_delay32.c -o "$out/guest_delay32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/delayimp32.c -o "$out/delayimp32.obj"
+"$LLD_LINK" "$out/guest_lib32.obj" /DLL /NODEFAULTLIB /NOENTRY /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /OUT:"$out/guest_lib32.dll"
+"$LLD_LINK" "$out/guest_delay32.obj" /DLL /NODEFAULTLIB /NOENTRY /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /OUT:"$out/guest_delay32.dll"
+"$LLD_LINK" "$out/guest_hello32.obj" "$out/guest_data32.obj" "$out/delayimp32.obj" \
+  "$out/kernel32_32.lib" "$out/guest_lib32.lib" "$out/guest_delay32.lib" \
+  /NODEFAULTLIB /ENTRY:guest32_main /SUBSYSTEM:WINDOWS /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /DELAYLOAD:guest_delay32.dll \
+  /OUT:"$out/guest_hello32.exe"
+file "$out/guest_hello32.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_pe32.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_pe32"
+"$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll"
+
 # --- 4. input bridge test (user32 surface the guests consume) ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_input.cpp "$out/libtrt.a" \

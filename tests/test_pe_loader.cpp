@@ -9,8 +9,11 @@
 //   6. negative: corrupt DOS header -> TRT_ERR_BAD_DOS, no crash
 //   7. negative: managed (.NET) PE64 (COM descriptor set) -> TRT_ERR_MANAGED
 //      with the CLR gap named in the log; the boot audit agrees
-//   8. negative: 32-bit managed PE (Celeste.exe's shape) -> TRT_ERR_NOT_PE64
-//      with the managed detail; plain PE32 gets the generic bitness line
+//   8. negative: 32-bit PE fixture (Celeste.exe's shape, but SizeOfImage=0,
+//      so genuinely malformed) -> TRT_ERR_SIZE_OVERFLOW. M7 supersedes the
+//      old PE32 rejection: PE32 now routes to trt_map_pe32 and maps
+//      (managed PE32 load-only via the mscoree STUB); the fixture fails on
+//      its malformed SizeOfImage, not on bitness.
 // Console runs the identical loader through the UWP backend.
 #include "../src/trt/trt.h"
 
@@ -262,9 +265,11 @@ int main(int argc, char** argv) {
     free(managed);
   }
 
-  // negative: 32-bit managed PE — Celeste.exe's shape (PE32, COM
-  // descriptor, sole import mscoree.dll!_CorExeMain). Bitness is the
-  // verdict, but the log must name the managed part too.
+  // negative: 32-bit PE — Celeste.exe's shape (PE32, COM descriptor, sole
+  // import mscoree.dll!_CorExeMain). M7 supersedes the old PE32 rejection
+  // by design: PE32 now routes to trt_map_pe32 (managed PE32 maps load-only
+  // via the mscoree STUB), so this fixture — SizeOfImage=0, genuinely
+  // malformed — fails on its size, not on its bitness.
   {
     u8 pe32[512];
     memset(pe32, 0, sizeof(pe32));
@@ -286,18 +291,18 @@ int main(int argc, char** argv) {
     trt_resolver rs = {nullptr, &test_resolve};
     trt_image* img = nullptr;
     const int rc = trt_map_pe(&be, &rs, pe32, sizeof(pe32), &img);
-    CHECK(rc == TRT_ERR_NOT_PE64, "PE32 managed -> TRT_ERR_NOT_PE64");
+    CHECK(rc == TRT_ERR_SIZE_OVERFLOW, "PE32 managed -> TRT_ERR_SIZE_OVERFLOW (malformed fixture: SizeOfImage=0)");
     CHECK(img == nullptr, "no image leaked on PE32 error");
-    CHECK(strstr(g_cap_log, "32-bit managed .NET assembly") != nullptr,
-          "PE32 managed failure names both blockers in the log");
-    // same fixture without the COM descriptor: the generic bitness line
+    CHECK(strstr(g_cap_log, "SIZE_OVERFLOW") != nullptr,
+          "PE32 managed failure names the size problem in the log");
+    // same fixture without the COM descriptor: same size failure
     const u32 zero = 0;
     memcpy(pe32 + 0x98 + 96 + 14 * 8, &zero, 4);
     g_cap_log[0] = 0;
     const int rc2 = trt_map_pe(&be, &rs, pe32, sizeof(pe32), &img);
-    CHECK(rc2 == TRT_ERR_NOT_PE64, "plain PE32 -> TRT_ERR_NOT_PE64");
-    CHECK(strstr(g_cap_log, "32-bit PE (0x014c/0x010b)") != nullptr,
-          "plain PE32 failure keeps the bitness-only detail");
+    CHECK(rc2 == TRT_ERR_SIZE_OVERFLOW, "plain PE32 -> TRT_ERR_SIZE_OVERFLOW");
+    CHECK(strstr(g_cap_log, "SizeOfImage/alignment insane") != nullptr,
+          "plain PE32 failure keeps the size detail");
   }
 
   free(file2);
