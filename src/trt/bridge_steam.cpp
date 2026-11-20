@@ -144,6 +144,7 @@ int TRT_GUEST_ABI trt_SteamAPI_BIsDlcInstalled(u32 dlc_id) {
   return 0;
 }
 const char* TRT_GUEST_ABI trt_SteamAPI_GetCurrentGameLanguage(void) {
+  { const char* st_v = "english"; char st_line[160]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_GetCurrentGameLanguage -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
   return "english";
 }
 
@@ -172,7 +173,8 @@ void TRT_GUEST_ABI trt_SteamAPI_ManualDispatch_FreeLastCallback(int pipe) { (voi
 void* TRT_GUEST_ABI trt_SteamInternal_CreateInterface(const char* version);
 
 namespace {
-struct fake_steam_iface { const void** vtbl; };
+// fake_steam_iface lives in bridge_steam.h (the Mono door
+// needs the type to reference the g_steam_*_obj globals).
 
 static const char* TRT_GUEST_ABI steam_empty_str(void) { return ""; }
 static u64 TRT_GUEST_ABI steam_noop_zero(void) { return 0; }
@@ -199,8 +201,8 @@ int TRT_GUEST_ABI st_apps_BIsSubscribed(void*) {
 int TRT_GUEST_ABI st_apps_BIsLowViolence(void*) { return 0; }
 int TRT_GUEST_ABI st_apps_BIsCybercafe(void*) { return 0; }
 int TRT_GUEST_ABI st_apps_BIsVACBanned(void*) { return 0; }
-const char* TRT_GUEST_ABI st_apps_GetLang(void*) { return "english"; }
-const char* TRT_GUEST_ABI st_apps_GetAvailLangs(void*) { return "english"; }
+const char* TRT_GUEST_ABI st_apps_GetLang(void*) { { const char* st_v = "english"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamApps.GetCurrentGameLanguage -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "english"; }
+const char* TRT_GUEST_ABI st_apps_GetAvailLangs(void*) { { const char* st_v = "english"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamApps.GetAvailableGameLanguages -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "english"; }
 int TRT_GUEST_ABI st_apps_BIsSubscribedApp(void*, u32 app_id) {
   return trt_SteamAPI_BIsSubscribedApp(app_id);
 }
@@ -213,15 +215,28 @@ u32 TRT_GUEST_ABI st_apps_GetAppInstallDir(void*, u32, char* pchFolder, u32 cap)
     pchFolder[1] = ':';
     pchFolder[2] = '\\';
     pchFolder[3] = '\0';
+    { char st_line[200]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamApps.GetAppInstallDir -> buf=%p cap=%u value=\"%.128s\"", (void*)pchFolder, cap, pchFolder); trt_core_log(st_line); }
     return 3;
   }
   if (pchFolder && cap > 0) pchFolder[0] = '\0';
   return 0;
 }
 const char* TRT_GUEST_ABI st_apps_GetLaunchQueryParam(void*, const char*) {
+  { const char* st_v = ""; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamApps.GetLaunchQueryParam -> ptr=%p \"%.128s\" (empty, non-NULL)", (const void*)st_v, st_v); trt_core_log(st_line); }
   return "";
 }
 int TRT_GUEST_ABI st_apps_GetAppBuildId(void*) { return 1; }
+// ISteamApps slot 13: bool GetCurrentBetaName(char* pchName, int cchNameBuffer).
+// Was steam_noop_zero (false, buffer untouched). Honest answer: not in a
+// beta branch -> empty name + false, with the buffer filled so no caller
+// ever reads uninitialised stack as a string.
+int TRT_GUEST_ABI st_apps_GetCurrentBetaName(void*, char* pchName, int cchNameBuffer) {
+  if (pchName && cchNameBuffer > 0) pchName[0] = '\0';
+  char line[192];
+  snprintf(line, sizeof(line), "strtrace: ISteamApps.GetCurrentBetaName -> buf=%p size=%d value=\"\" (not in beta)", (void*)pchName, cchNameBuffer);
+  trt_core_log(line);
+  return 0;
+}
 const void* g_steam_apps_vtbl[64] = {
     (const void*)&st_apps_BIsSubscribed,       // 0
     (const void*)&st_apps_BIsLowViolence,      // 1
@@ -236,7 +251,7 @@ const void* g_steam_apps_vtbl[64] = {
     (const void*)&steam_noop_zero,             // 10 InstallDLC
     (const void*)&steam_noop_zero,             // 11 UninstallDLC
     (const void*)&steam_noop_zero,             // 12 RequestAppProofOfPurchaseKey
-    (const void*)&steam_noop_zero,             // 13 GetCurrentBetaName
+    (const void*)&st_apps_GetCurrentBetaName,      // 13 GetCurrentBetaName
     (const void*)&steam_noop_zero,             // 14 MarkContentCorrupt
     (const void*)&steam_noop_zero,             // 15 GetInstalledDepots
     (const void*)&st_apps_GetAppInstallDir,    // 16 GetAppInstallDir
@@ -259,12 +274,37 @@ u64 TRT_GUEST_ABI st_user_GetSteamID(void*, u64* hidden_sret) {
   if (hidden_sret) *hidden_sret = id;
   return id;
 }
+// ISteamUser slot 4: bool GetUserDataFolder(char* buf, int size).
+// Real Steam fills buf with the per-user data folder. The previous
+// steam_noop_zero returned false and left buf untouched, so games that
+// build save/config paths from it got an empty path.
+int TRT_GUEST_ABI st_user_GetUserDataFolder(void* self, char* buf, int size) {
+  const char* folder = "C:\\users\\player\\Saved Games";
+  int result = 0;
+  if (buf && size > 0) {
+    size_t n = strlen(folder);
+    if ((int)n >= size) n = (size_t)(size - 1);
+    memcpy(buf, folder, n);
+    buf[n] = '\0';
+    result = 1;
+  }
+  char line[192];
+  snprintf(line, sizeof(line), "trt: ISteamUser.GetUserDataFolder(self=%p buf=%p size=%d) -> %d",
+           self, (void*)buf, size, result);
+  trt_core_log(line);
+  { char st_line[256]; if (buf && result) { snprintf(st_line, sizeof(st_line), "strtrace: ISteamUser.GetUserDataFolder -> buf=%p size=%d value=\"%.128s\"", (void*)buf, size, buf); } else { snprintf(st_line, sizeof(st_line), "strtrace: ISteamUser.GetUserDataFolder -> buf=%p size=%d value=NULL (result=%d)", (void*)buf, size, result); } trt_core_log(st_line); }
+  return result;
+}
 const void* g_steam_user_vtbl[64] = {
     (const void*)&st_user_GetHSteamUser, // 0
     (const void*)&st_user_BLoggedOn,     // 1
     (const void*)&st_user_GetSteamID,    // 2
-    (const void*)&steam_noop_zero,       // 3
-    Z4, Z8, Z16, Z16, Z16,
+    (const void*)&steam_noop_zero,       // 3 TrackAppUsageEvent (void)
+    (const void*)&st_user_GetUserDataFolder, // 4 GetUserDataFolder
+    (const void*)&steam_noop_zero,       // 5 StartVoiceRecording (void)
+    (const void*)&steam_noop_zero,       // 6 StopVoiceRecording (void)
+    (const void*)&steam_noop_zero,       // 7 GetAvailableVoice
+    Z8, Z16, Z16, Z16,
 };
 fake_steam_iface g_steam_user_obj = {g_steam_user_vtbl};
 
@@ -273,9 +313,19 @@ u32 TRT_GUEST_ABI st_utils_GetSecondsSinceAppActive(void*) { return 1; }
 u32 TRT_GUEST_ABI st_utils_GetSecondsSinceComputerActive(void*) { return 1; }
 int TRT_GUEST_ABI st_utils_GetConnectedUniverse(void*) { return 1; }
 u32 TRT_GUEST_ABI st_utils_GetServerRealTime(void*) { return 1700000000u; }
-const char* TRT_GUEST_ABI st_utils_GetIPCountry(void*) { return "US"; }
+const char* TRT_GUEST_ABI st_utils_GetIPCountry(void*) { { const char* st_v = "US"; char st_line[160]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamUtils.GetIPCountry -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "US"; }
 unsigned char TRT_GUEST_ABI st_utils_GetCurrentBatteryPower(void*) { return 255; }
 u32 TRT_GUEST_ABI st_utils_GetAppID(void*) { return g_app_id; }
+// ISteamUtils slot 12: const char* GetSteamUILanguage(). Was steam_noop_zero
+// (NULL) while the flat export returns "english" - the vtable/flat mismatch
+// is the strongest NULL-string candidate for the GoW crash.
+const char* TRT_GUEST_ABI st_utils_GetSteamUILanguage(void*) {
+  const char* st_v = "english";
+  char st_line[192];
+  snprintf(st_line, sizeof(st_line), "strtrace: ISteamUtils.GetSteamUILanguage -> ptr=%p \"%.128s\"", (const void*)st_v, st_v);
+  trt_core_log(st_line);
+  return st_v;
+}
 const void* g_steam_utils_vtbl[64] = {
     (const void*)&st_utils_GetSecondsSinceAppActive,      // 0
     (const void*)&st_utils_GetSecondsSinceComputerActive, // 1
@@ -289,23 +339,164 @@ const void* g_steam_utils_vtbl[64] = {
     (const void*)&st_utils_GetAppID,                      // 9 GetAppID
     (const void*)&steam_noop_zero,                        // 10
     (const void*)&steam_noop_zero,                        // 11
-    Z4, Z16, Z16, Z16,
+    (const void*)&st_utils_GetSteamUILanguage,            // 12 GetSteamUILanguage
+    (const void*)&steam_noop_zero,                        // 13
+    (const void*)&steam_noop_zero,                        // 14
+    (const void*)&steam_noop_zero,                        // 15
+    Z16, Z16, Z16,
 };
 fake_steam_iface g_steam_utils_obj = {g_steam_utils_vtbl};
 
 // ---- ISteamFriends ----
 const char* TRT_GUEST_ABI st_friends_GetPersonaName(void*) {
+  { const char* st_v = "TiramisuPlayer"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamFriends.GetPersonaName -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
   return "TiramisuPlayer";
 }
 int TRT_GUEST_ABI st_friends_GetPersonaState(void*) { return 0; }
+// ISteamFriends slot 7: const char* GetFriendPersonaName(CSteamID).
+// Previously steam_noop_zero (NULL) - any caller passing the result to a
+// string function would fault on a null read.
+const char* TRT_GUEST_ABI st_friends_GetFriendPersonaName(void* self, u64 steam_id) {
+  char line[160];
+  snprintf(line, sizeof(line), "trt: ISteamFriends.GetFriendPersonaName(self=%p friend=%016llx) -> TiramisuPlayer",
+           self, (unsigned long long)steam_id);
+  trt_core_log(line);
+  { const char* st_v = "TiramisuPlayer"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamFriends.GetFriendPersonaName -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
+  return "TiramisuPlayer";
+}
+// ---- ISteamFriends string slots that were steam_noop_zero (NULL) ----
+// Per-slot traced wrappers returning "" (steam_empty_str value). Layout is
+// SteamFriends016/017 (GoW 2022, SDK 1.53-era): 9 GetFriendPersonaNameHistory,
+// 11 GetPlayerNickname, 14 GetFriendsGroupName, 20 GetClanName, 21 GetClanTag,
+// 45 GetFriendRichPresence, 46 GetFriendRichPresenceKeyByIndex.
+const char* TRT_GUEST_ABI st_friends_GetFriendPersonaNameHistory(void* self, u64 steam_id, int index) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetFriendPersonaNameHistory(self=%p friend=%016llx index=%d) -> \"\"", self, (unsigned long long)steam_id, index);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetPlayerNickname(void* self, u64 steam_id) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetPlayerNickname(self=%p player=%016llx) -> \"\"", self, (unsigned long long)steam_id);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetFriendsGroupName(void* self, u16 group_id) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetFriendsGroupName(self=%p group=%u) -> \"\"", self, (unsigned)group_id);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetClanName(void* self, u64 steam_id) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetClanName(self=%p clan=%016llx) -> \"\"", self, (unsigned long long)steam_id);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetClanTag(void* self, u64 steam_id) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetClanTag(self=%p clan=%016llx) -> \"\"", self, (unsigned long long)steam_id);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetFriendRichPresence(void* self, u64 steam_id, const char* key) {
+  char line[256];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetFriendRichPresence(self=%p friend=%016llx key=\"%.64s\") -> \"\"", self, (unsigned long long)steam_id, key ? key : "(null)");
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_friends_GetFriendRichPresenceKeyByIndex(void* self, u64 steam_id, int index) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamFriends.GetFriendRichPresenceKeyByIndex(self=%p friend=%016llx index=%d) -> \"\"", self, (unsigned long long)steam_id, index);
+  trt_core_log(line);
+  return steam_empty_str();
+}
 const void* g_steam_friends_vtbl[64] = {
     (const void*)&st_friends_GetPersonaName,  // 0 GetPersonaName
     (const void*)&steam_noop_zero,            // 1 SetPersonaName
     (const void*)&st_friends_GetPersonaState, // 2 GetPersonaState
     (const void*)&steam_noop_zero,            // 3 GetFriendCount
-    Z4, Z8, Z16, Z16, Z16,
+    (const void*)&steam_noop_zero,            // 4 GetFriendByIndex
+    (const void*)&steam_noop_zero,            // 5 GetFriendRelationship
+    (const void*)&steam_noop_zero,            // 6 GetFriendPersonaState
+    (const void*)&st_friends_GetFriendPersonaName, // 7 GetFriendPersonaName
+    (const void*)&steam_noop_zero,            // 8 GetFriendGamePlayed
+    (const void*)&st_friends_GetFriendPersonaNameHistory, // 9 GetFriendPersonaNameHistory
+    (const void*)&steam_noop_zero,            // 10 GetFriendSteamLevel
+    (const void*)&st_friends_GetPlayerNickname, // 11 GetPlayerNickname
+    (const void*)&steam_noop_zero,            // 12 GetFriendsGroupCount
+    (const void*)&steam_noop_zero,            // 13 GetFriendsGroupIDByIndex
+    (const void*)&st_friends_GetFriendsGroupName, // 14 GetFriendsGroupName
+    (const void*)&steam_noop_zero,            // 15 GetFriendsGroupMembersCount
+    (const void*)&steam_noop_zero,            // 16 GetFriendsGroupMembersList
+    (const void*)&steam_noop_zero,            // 17 HasFriend
+    (const void*)&steam_noop_zero,            // 18 GetClanCount
+    (const void*)&steam_noop_zero,            // 19 GetClanByIndex
+    (const void*)&st_friends_GetClanName,     // 20 GetClanName
+    (const void*)&st_friends_GetClanTag,      // 21 GetClanTag
+    (const void*)&steam_noop_zero,            // 22 GetClanActivityCounts
+    (const void*)&steam_noop_zero,            // 23 DownloadClanActivityCounts
+    (const void*)&steam_noop_zero,            // 24 GetFriendCountFromSource
+    (const void*)&steam_noop_zero,            // 25 GetFriendFromSourceByIndex
+    (const void*)&steam_noop_zero,            // 26 IsUserInSource
+    (const void*)&steam_noop_zero,            // 27 SetInGameVoiceSpeaking
+    (const void*)&steam_noop_zero,            // 28 ActivateGameOverlay
+    (const void*)&steam_noop_zero,            // 29 ActivateGameOverlayToUser
+    (const void*)&steam_noop_zero,            // 30 ActivateGameOverlayToWebPage
+    (const void*)&steam_noop_zero,            // 31 ActivateGameOverlayToStore
+    (const void*)&steam_noop_zero,            // 32 SetPlayedWith
+    (const void*)&steam_noop_zero,            // 33 ActivateGameOverlayInviteDialog
+    (const void*)&steam_noop_zero,            // 34 GetSmallFriendAvatar
+    (const void*)&steam_noop_zero,            // 35 GetMediumFriendAvatar
+    (const void*)&steam_noop_zero,            // 36 GetLargeFriendAvatar
+    (const void*)&steam_noop_zero,            // 37 RequestUserInformation
+    (const void*)&steam_noop_zero,            // 38 RequestClanOfficerList
+    (const void*)&steam_noop_zero,            // 39 GetClanOwner
+    (const void*)&steam_noop_zero,            // 40 GetClanOfficerCount
+    (const void*)&steam_noop_zero,            // 41 GetClanOfficerByIndex
+    (const void*)&steam_noop_zero,            // 42 GetUserRestrictions
+    (const void*)&steam_noop_zero,            // 43 SetRichPresence
+    (const void*)&steam_noop_zero,            // 44 ClearRichPresence
+    (const void*)&st_friends_GetFriendRichPresence, // 45 GetFriendRichPresence
+    (const void*)&st_friends_GetFriendRichPresenceKeyByIndex, // 46 GetFriendRichPresenceKeyByIndex
+    (const void*)&steam_noop_zero,            // 47 GetFriendRichPresenceKeyCount
+    Z16,
 };
 fake_steam_iface g_steam_friends_obj = {g_steam_friends_vtbl};
+
+// ---- ISteamUserStats (dedicated vtable; was the all-noop safe vtbl) ----
+// String slots 12/15/20 returned NULL via steam_noop_zero; they now return
+// "" (steam_empty_str value) with a per-slot trace. Other slots stay noop.
+const char* TRT_GUEST_ABI st_userstats_GetAchievementDisplayAttribute(void* self, const char* name, const char* key) {
+  char line[256];
+  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetAchievementDisplayAttribute(self=%p name=\"%.64s\" key=\"%.64s\") -> \"\"", self, name ? name : "(null)", key ? key : "(null)");
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_userstats_GetAchievementName(void* self, u32 index) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetAchievementName(self=%p index=%u) -> \"\"", self, index);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_userstats_GetLeaderboardName(void* self, u64 leaderboard) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetLeaderboardName(self=%p leaderboard=%016llx) -> \"\"", self, (unsigned long long)leaderboard);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+static const void* g_steam_userstats_vtbl[64] = {
+    Z8, Z4,                                            // 0-11
+    (const void*)&st_userstats_GetAchievementDisplayAttribute, // 12 GetAchievementDisplayAttribute
+    (const void*)&steam_noop_zero, (const void*)&steam_noop_zero, // 13-14
+    (const void*)&st_userstats_GetAchievementName,     // 15 GetAchievementName
+    Z4,                                                // 16-19
+    (const void*)&st_userstats_GetLeaderboardName,     // 20 GetLeaderboardName
+    Z16, Z16, Z8,                                      // 21-60
+    (const void*)&steam_noop_zero, (const void*)&steam_noop_zero,
+    (const void*)&steam_noop_zero,                     // 61-63
+};
+fake_steam_iface g_steam_userstats_obj = {g_steam_userstats_vtbl};
 
 // ---- ISteamRemoteStorage (VFS-backed local cloud saves) ----
 constexpr int kSteamCloudMaxFiles = 256;
@@ -432,7 +623,7 @@ static void rs_index_remove_locked(const char* norm) {
   }
 }
 
-static int TRT_GUEST_ABI st_rs_FileWrite(void*, const char* pchFile,
+int TRT_GUEST_ABI st_rs_FileWrite(void*, const char* pchFile,
                                          const void* pvData, i32 cubData) {
   if (cubData < 0 || cubData > kSteamCloudMaxBytes) return 0;
   if (cubData > 0 && !pvData) return 0;
@@ -449,7 +640,7 @@ static int TRT_GUEST_ABI st_rs_FileWrite(void*, const char* pchFile,
   return 1;
 }
 
-static i32 TRT_GUEST_ABI st_rs_FileRead(void*, const char* pchFile,
+i32 TRT_GUEST_ABI st_rs_FileRead(void*, const char* pchFile,
                                         void* pvData, i32 cubDataToRead) {
   if (!pvData || cubDataToRead <= 0) return 0;
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
@@ -464,9 +655,9 @@ static i32 TRT_GUEST_ABI st_rs_FileRead(void*, const char* pchFile,
   return (i32)got;
 }
 
-static int TRT_GUEST_ABI st_rs_FileForget(void*, const char*) { return 1; }
+int TRT_GUEST_ABI st_rs_FileForget(void*, const char*) { return 1; }
 
-static int TRT_GUEST_ABI st_rs_FileDelete(void*, const char* pchFile) {
+int TRT_GUEST_ABI st_rs_FileDelete(void*, const char* pchFile) {
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
   char norm[260], host[512];
   if (rs_resolve_host(pchFile, 1, norm, sizeof(norm), host, sizeof(host)) != 0)
@@ -476,7 +667,7 @@ static int TRT_GUEST_ABI st_rs_FileDelete(void*, const char* pchFile) {
   return rc;
 }
 
-static int TRT_GUEST_ABI st_rs_FileExists(void*, const char* pchFile) {
+int TRT_GUEST_ABI st_rs_FileExists(void*, const char* pchFile) {
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
   char norm[260], host[512];
   if (rs_resolve_host(pchFile, 0, norm, sizeof(norm), host, sizeof(host)) != 0)
@@ -489,11 +680,11 @@ static int TRT_GUEST_ABI st_rs_FileExists(void*, const char* pchFile) {
   return 0;
 }
 
-static int TRT_GUEST_ABI st_rs_FilePersisted(void* self, const char* pchFile) {
+int TRT_GUEST_ABI st_rs_FilePersisted(void* self, const char* pchFile) {
   return st_rs_FileExists(self, pchFile);
 }
 
-static i32 TRT_GUEST_ABI st_rs_GetFileSize(void*, const char* pchFile) {
+i32 TRT_GUEST_ABI st_rs_GetFileSize(void*, const char* pchFile) {
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
   char norm[260], host[512];
   if (rs_resolve_host(pchFile, 0, norm, sizeof(norm), host, sizeof(host)) != 0)
@@ -506,18 +697,18 @@ static i32 TRT_GUEST_ABI st_rs_GetFileSize(void*, const char* pchFile) {
   return 0;
 }
 
-static i64 TRT_GUEST_ABI st_rs_GetFileTimestamp(void* self, const char* pchFile) {
+i64 TRT_GUEST_ABI st_rs_GetFileTimestamp(void* self, const char* pchFile) {
   if (!st_rs_FileExists(self, pchFile)) return 0;
   return (i64)time(nullptr);
 }
 
-static i32 TRT_GUEST_ABI st_rs_GetFileCount(void*) {
+i32 TRT_GUEST_ABI st_rs_GetFileCount(void*) {
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
   rs_load_index_locked();
   return g_steam_rs_count;
 }
 
-static const char* TRT_GUEST_ABI st_rs_GetFileNameAndSize(void*, int iFile,
+const char* TRT_GUEST_ABI st_rs_GetFileNameAndSize(void*, int iFile,
                                                           int* pnSize) {
   std::lock_guard<std::mutex> lk(g_steam_rs_mu);
   rs_load_index_locked();
@@ -541,17 +732,17 @@ static const char* TRT_GUEST_ABI st_rs_GetFileNameAndSize(void*, int iFile,
   return s_name_ret;
 }
 
-static int TRT_GUEST_ABI st_rs_GetQuota(void*, u64* total, u64* avail) {
+int TRT_GUEST_ABI st_rs_GetQuota(void*, u64* total, u64* avail) {
   if (total) *total = 100ULL * 1024ULL * 1024ULL;
   if (avail) *avail = 100ULL * 1024ULL * 1024ULL;
   return 1;
 }
 
-static int TRT_GUEST_ABI st_rs_IsCloudEnabledForAccount(void*) { return 1; }
-static int TRT_GUEST_ABI st_rs_IsCloudEnabledForApp(void*) {
+int TRT_GUEST_ABI st_rs_IsCloudEnabledForAccount(void*) { return 1; }
+int TRT_GUEST_ABI st_rs_IsCloudEnabledForApp(void*) {
   return g_steam_cloud_enabled;
 }
-static void TRT_GUEST_ABI st_rs_SetCloudEnabledForApp(void*, int enabled) {
+void TRT_GUEST_ABI st_rs_SetCloudEnabledForApp(void*, int enabled) {
   g_steam_cloud_enabled = enabled ? 1 : 0;
 }
 
@@ -594,15 +785,15 @@ static int input_handle_to_idx(u64 handle, u32* out_idx) {
   return 1;
 }
 
-static int TRT_GUEST_ABI st_input_Init(void*, int /*bExplicitlyCallRunFrame*/) {
+int TRT_GUEST_ABI st_input_Init(void*, int /*bExplicitlyCallRunFrame*/) {
   return 1;
 }
-static int TRT_GUEST_ABI st_input_Shutdown(void*) {
+int TRT_GUEST_ABI st_input_Shutdown(void*) {
   for (u32 i = 0; i < 4; ++i) trt_pad_set_vibration(i, 0, 0);
   return 1;
 }
-static void TRT_GUEST_ABI st_input_RunFrame(void*, int /*bReserved*/) {}
-static int TRT_GUEST_ABI st_input_GetConnectedControllers(void*, u64* handles_out) {
+void TRT_GUEST_ABI st_input_RunFrame(void*, int /*bReserved*/) {}
+int TRT_GUEST_ABI st_input_GetConnectedControllers(void*, u64* handles_out) {
   int count = 0;
   for (u32 i = 0; i < 4; ++i) {
     if (trt_pad_connected(i)) {
@@ -612,23 +803,23 @@ static int TRT_GUEST_ABI st_input_GetConnectedControllers(void*, u64* handles_ou
   }
   return count;
 }
-static u64 TRT_GUEST_ABI st_input_GetControllerForGamepadIndex(void*, int index) {
+u64 TRT_GUEST_ABI st_input_GetControllerForGamepadIndex(void*, int index) {
   if (index < 0 || index >= 4) return 0;
   if (!trt_pad_connected((u32)index)) return 0;
   return kSteamInputHandleBase + (u64)index;
 }
-static int TRT_GUEST_ABI st_input_GetGamepadIndexForController(void*, u64 handle) {
+int TRT_GUEST_ABI st_input_GetGamepadIndexForController(void*, u64 handle) {
   u32 idx = 0;
   if (!input_handle_to_idx(handle, &idx)) return -1;
   return trt_pad_connected(idx) ? (int)idx : -1;
 }
-static int TRT_GUEST_ABI st_input_GetInputTypeForHandle(void*, u64 handle) {
+int TRT_GUEST_ABI st_input_GetInputTypeForHandle(void*, u64 handle) {
   u32 idx = 0;
   if (!input_handle_to_idx(handle, &idx)) return 0;
   // k_ESteamInputType_XBoxOneController = 3
   return trt_pad_connected(idx) ? 3 : 0;
 }
-static void TRT_GUEST_ABI st_input_TriggerVibration(void*, u64 handle,
+void TRT_GUEST_ABI st_input_TriggerVibration(void*, u64 handle,
                                                   u16 left_speed,
                                                   u16 right_speed) {
   u32 idx = 0;
@@ -636,9 +827,22 @@ static void TRT_GUEST_ABI st_input_TriggerVibration(void*, u64 handle,
     trt_pad_set_vibration(idx, left_speed, right_speed);
   }
 }
-static void TRT_GUEST_ABI st_input_TriggerVibrationExtended(
+void TRT_GUEST_ABI st_input_TriggerVibrationExtended(
     void* self, u64 handle, u16 left, u16 right, u16 /*lt*/, u16 /*rt*/) {
   st_input_TriggerVibration(self, handle, left, right);
+}
+// ISteamInput string getters (slots 19/23). Were steam_noop_zero (NULL).
+const char* TRT_GUEST_ABI st_input_GetStringForDigitalActionName(void* self, u64 action_handle) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamInput.GetStringForDigitalActionName(self=%p action=%016llx) -> \"\"", self, (unsigned long long)action_handle);
+  trt_core_log(line);
+  return steam_empty_str();
+}
+const char* TRT_GUEST_ABI st_input_GetStringForAnalogActionName(void* self, u64 action_handle) {
+  char line[224];
+  snprintf(line, sizeof(line), "strtrace: ISteamInput.GetStringForAnalogActionName(self=%p action=%016llx) -> \"\"", self, (unsigned long long)action_handle);
+  trt_core_log(line);
+  return steam_empty_str();
 }
 const void* g_steam_input_vtbl[64] = {
     (const void*)&st_input_Init,                        // 0
@@ -648,107 +852,146 @@ const void* g_steam_input_vtbl[64] = {
     (const void*)&steam_noop_zero,                      // 4 BWaitForData
     (const void*)&steam_noop_zero,                      // 5 BNewDataAvailable
     (const void*)&st_input_GetConnectedControllers,     // 6
-    Z8, Z16, Z16, Z16,
+    (const void*)&steam_noop_zero,                      // 7 GetActionSetHandle
+    (const void*)&steam_noop_zero,                      // 8 ActivateActionSet
+    (const void*)&steam_noop_zero,                      // 9 GetCurrentActionSet
+    (const void*)&steam_noop_zero,                      // 10 ActivateAllControllerActionSets
+    (const void*)&steam_noop_zero,                      // 11 GetActionSetLayer
+    (const void*)&steam_noop_zero,                      // 12 ActivateActionSetLayer
+    (const void*)&steam_noop_zero,                      // 13 DeactivateActionSetLayer
+    (const void*)&steam_noop_zero,                      // 14 DeactivateAllActionSetLayers
+    (const void*)&steam_noop_zero,                      // 15 GetActiveActionSetLayers
+    (const void*)&steam_noop_zero,                      // 16 GetDigitalActionHandle
+    (const void*)&steam_noop_zero,                      // 17 GetDigitalActionData
+    (const void*)&steam_noop_zero,                      // 18 GetDigitalActionOrigins
+    (const void*)&st_input_GetStringForDigitalActionName, // 19 GetStringForDigitalActionName
+    (const void*)&steam_noop_zero,                      // 20 GetAnalogActionHandle
+    (const void*)&steam_noop_zero,                      // 21 GetAnalogActionData
+    (const void*)&steam_noop_zero,                      // 22 GetAnalogActionOrigins
+    (const void*)&st_input_GetStringForAnalogActionName, // 23 GetStringForAnalogActionName
+    (const void*)&steam_noop_zero,                      // 24 StopAnalogActionMomentum
+    (const void*)&steam_noop_zero,                      // 25 GetMotionData
+    (const void*)&st_input_TriggerVibration,           // 26 TriggerVibration
+    (const void*)&st_input_TriggerVibrationExtended,   // 27 TriggerVibrationExtended
+    (const void*)&steam_noop_zero,                      // 28 TriggerSimpleHapticEvent
+    (const void*)&steam_noop_zero,                      // 29 SetLEDColor
+    (const void*)&steam_noop_zero,                      // 30 TriggerHapticPulse
+    (const void*)&steam_noop_zero,                      // 31 TriggerRepeatedHapticPulse
+    (const void*)&steam_noop_zero,                      // 32 Legacy_TriggerHapticPulse
+    (const void*)&steam_noop_zero,                      // 33 Legacy_TriggerRepeatedHapticPulse
+    (const void*)&st_input_GetGamepadIndexForController, // 34 GetGamepadIndexForController
+    (const void*)&st_input_GetControllerForGamepadIndex, // 35 GetControllerForGamepadIndex
+    (const void*)&st_input_GetInputTypeForHandle,       // 36 GetInputTypeForHandle
+    (const void*)&steam_noop_zero,                      // 37
+    (const void*)&steam_noop_zero,                      // 38
+    (const void*)&steam_noop_zero,                      // 39
+    (const void*)&steam_noop_zero,                      // 40
+    (const void*)&steam_noop_zero,                      // 41
+    (const void*)&steam_noop_zero,                      // 42
+    (const void*)&steam_noop_zero,                      // 43
+    (const void*)&steam_noop_zero,                      // 44
+    (const void*)&steam_noop_zero,                      // 45
+    (const void*)&steam_noop_zero,                      // 46
+    Z16,
 };
 fake_steam_iface g_steam_input_obj = {g_steam_input_vtbl};
 
 // ---- ISteamClient ----
-static int TRT_GUEST_ABI st_client_CreateSteamPipe(void*) { return 1; }
-static int TRT_GUEST_ABI st_client_BReleaseSteamPipe(void*, int /*pipe*/) { return 1; }
-static int TRT_GUEST_ABI st_client_ConnectToGlobalUser(void*, int /*pipe*/) { return 1; }
-static int TRT_GUEST_ABI st_client_CreateLocalUser(void*, int* pipe, int /*acct*/) {
+int TRT_GUEST_ABI st_client_CreateSteamPipe(void*) { return 1; }
+int TRT_GUEST_ABI st_client_BReleaseSteamPipe(void*, int /*pipe*/) { return 1; }
+int TRT_GUEST_ABI st_client_ConnectToGlobalUser(void*, int /*pipe*/) { return 1; }
+int TRT_GUEST_ABI st_client_CreateLocalUser(void*, int* pipe, int /*acct*/) {
   if (pipe) *pipe = 1;
   return 1;
 }
-static void TRT_GUEST_ABI st_client_ReleaseUser(void*, int, int) {}
-static void* TRT_GUEST_ABI st_client_GetISteamUser(void*, int, int, const char*) {
+void TRT_GUEST_ABI st_client_ReleaseUser(void*, int, int) {}
+void* TRT_GUEST_ABI st_client_GetISteamUser(void*, int, int, const char*) {
   return &g_steam_user_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamGameServer(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamGameServer(void*, int, int, const char*) {
   return steam_get_iface(19);
 }
-static void TRT_GUEST_ABI st_client_SetLocalIPBinding(void*, const void*, u16) {}
-static void* TRT_GUEST_ABI st_client_GetISteamFriends(void*, int, int, const char*) {
+void TRT_GUEST_ABI st_client_SetLocalIPBinding(void*, const void*, u16) {}
+void* TRT_GUEST_ABI st_client_GetISteamFriends(void*, int, int, const char*) {
   return &g_steam_friends_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamUtils(void*, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamUtils(void*, int, const char*) {
   return &g_steam_utils_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamMatchmaking(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamMatchmaking(void*, int, int, const char*) {
   return steam_get_iface(1);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamMatchmakingServers(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamMatchmakingServers(void*, int, int, const char*) {
   return steam_get_iface(2);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamGenericInterface(void*, int, int, const char* ver) {
+void* TRT_GUEST_ABI st_client_GetISteamGenericInterface(void*, int, int, const char* ver) {
   return trt_SteamInternal_CreateInterface(ver);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamUserStats(void*, int, int, const char*) {
-  return steam_get_iface(5);
+void* TRT_GUEST_ABI st_client_GetISteamUserStats(void*, int, int, const char*) {
+  return &g_steam_userstats_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamGameServerStats(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamGameServerStats(void*, int, int, const char*) {
   return steam_get_iface(21);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamApps(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamApps(void*, int, int, const char*) {
   return &g_steam_apps_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamNetworking(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamNetworking(void*, int, int, const char*) {
   return steam_get_iface(6);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamRemoteStorage(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamRemoteStorage(void*, int, int, const char*) {
   return &g_steam_rs_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamScreenshots(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamScreenshots(void*, int, int, const char*) {
   return steam_get_iface(7);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamGameSearch(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamGameSearch(void*, int, int, const char*) {
   return steam_get_iface(22);
 }
-static void TRT_GUEST_ABI st_client_RunFrame(void*) {}
-static u32 TRT_GUEST_ABI st_client_GetIPCCallCount(void*) { return 1; }
-static void TRT_GUEST_ABI st_client_SetWarningMessageHook(void*, void*) {}
-static int TRT_GUEST_ABI st_client_BShutdownIfAllPipesClosed(void*) { return 1; }
-static void* TRT_GUEST_ABI st_client_GetISteamHTTP(void*, int, int, const char*) {
+void TRT_GUEST_ABI st_client_RunFrame(void*) {}
+u32 TRT_GUEST_ABI st_client_GetIPCCallCount(void*) { return 1; }
+void TRT_GUEST_ABI st_client_SetWarningMessageHook(void*, void*) {}
+int TRT_GUEST_ABI st_client_BShutdownIfAllPipesClosed(void*) { return 1; }
+void* TRT_GUEST_ABI st_client_GetISteamHTTP(void*, int, int, const char*) {
   return steam_get_iface(9);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamUnifiedMessages(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamUnifiedMessages(void*, int, int, const char*) {
   return steam_get_iface(23);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamController(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamController(void*, int, int, const char*) {
   return &g_steam_input_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamUGC(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamUGC(void*, int, int, const char*) {
   return steam_get_iface(11);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamAppList(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamAppList(void*, int, int, const char*) {
   return steam_get_iface(14);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamMusic(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamMusic(void*, int, int, const char*) {
   return steam_get_iface(8);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamMusicRemote(void*, int, int,
-                                                        const char*) {
-  return steam_get_iface(24);  // Stable empty interface; all operations return false.
-}
-static void* TRT_GUEST_ABI st_client_GetISteamHTMLSurface(void*, int, int, const char*) {
-  return steam_get_iface(12);
-}
-static void* TRT_GUEST_ABI st_client_GetISteamInventory(void*, int, int, const char*) {
-  return steam_get_iface(13);
-}
-static void* TRT_GUEST_ABI st_client_GetISteamVideo(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamMusicRemote(void*, int, int, const char*) {
   return steam_get_iface(15);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamParentalSettings(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamHTMLSurface(void*, int, int, const char*) {
+  return steam_get_iface(12);
+}
+void* TRT_GUEST_ABI st_client_GetISteamInventory(void*, int, int, const char*) {
+  return steam_get_iface(13);
+}
+void* TRT_GUEST_ABI st_client_GetISteamVideo(void*, int, int, const char*) {
+  return steam_get_iface(15);
+}
+void* TRT_GUEST_ABI st_client_GetISteamParentalSettings(void*, int, int, const char*) {
   return steam_get_iface(16);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamInput(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamInput(void*, int, int, const char*) {
   return &g_steam_input_obj;
 }
-static void* TRT_GUEST_ABI st_client_GetISteamParties(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamParties(void*, int, int, const char*) {
   return steam_get_iface(3);
 }
-static void* TRT_GUEST_ABI st_client_GetISteamRemotePlay(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamRemotePlay(void*, int, int, const char*) {
   return steam_get_iface(17);
 }
 
@@ -824,7 +1067,7 @@ void* TRT_GUEST_ABI trt_SteamInternal_CreateInterface(const char* version) {
     return &g_steam_user_obj;
   if (strncmp(version, "SteamUserStats", 14) == 0 ||
       strncmp(version, "STEAMUSERSTATS_INTERFACE_VERSION", 32) == 0)
-    return steam_get_iface(5);
+    return &g_steam_userstats_obj;
   if (strncmp(version, "SteamUtils", 10) == 0 ||
       strncmp(version, "STEAMUTILS_INTERFACE_VERSION", 28) == 0)
     return &g_steam_utils_obj;
@@ -889,13 +1132,14 @@ int TRT_GUEST_ABI trt_SteamAPI_ISteamApps_BIsDlcInstalled(void*, u32 dlc_id) {
   return trt_SteamAPI_BIsDlcInstalled(dlc_id);
 }
 const char* TRT_GUEST_ABI trt_SteamAPI_ISteamApps_GetCurrentGameLanguage(void*) {
+  { const char* st_v = "english"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_ISteamApps_GetCurrentGameLanguage -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
   return "english";
 }
 u32 TRT_GUEST_ABI trt_SteamAPI_ISteamUtils_GetAppID(void*) { return g_app_id; }
 
 #define STEAM_IFACE_FN(idx) \
   static void* TRT_GUEST_ABI steam_iface_##idx(void) { return steam_get_iface(idx); }
-STEAM_IFACE_FN(1)  STEAM_IFACE_FN(2)  STEAM_IFACE_FN(3)  STEAM_IFACE_FN(5)
+STEAM_IFACE_FN(1)  STEAM_IFACE_FN(2)  STEAM_IFACE_FN(3)
 STEAM_IFACE_FN(6)  STEAM_IFACE_FN(7)  STEAM_IFACE_FN(8)  STEAM_IFACE_FN(9)
 STEAM_IFACE_FN(11) STEAM_IFACE_FN(12) STEAM_IFACE_FN(13) STEAM_IFACE_FN(14)
 STEAM_IFACE_FN(15) STEAM_IFACE_FN(16) STEAM_IFACE_FN(17) STEAM_IFACE_FN(18)
@@ -903,6 +1147,9 @@ STEAM_IFACE_FN(19) STEAM_IFACE_FN(20) STEAM_IFACE_FN(24)
 #undef STEAM_IFACE_FN
 static void* TRT_GUEST_ABI steam_apps_obj_ptr(void) {
   return &g_steam_apps_obj;
+}
+static void* TRT_GUEST_ABI steam_userstats_obj_ptr(void) {
+  return &g_steam_userstats_obj;
 }
 static void* TRT_GUEST_ABI steam_user_obj_ptr(void) {
   return &g_steam_user_obj;
@@ -953,8 +1200,8 @@ static const char* TRT_GUEST_ABI steam_friends_get_persona_name(void*) {
   return "TiramisuPlayer";
 }
 static int TRT_GUEST_ABI steam_friends_get_persona_state(void*) { return 0; }
-static const char* TRT_GUEST_ABI steam_const_english(void*) { return "english"; }
-static const char* TRT_GUEST_ABI steam_utils_get_ip_country(void*) { return "US"; }
+static const char* TRT_GUEST_ABI steam_const_english(void*) { { const char* st_v = "english"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_GetSteamUILanguage/GetAvailableGameLanguages(flat) -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "english"; }
+static const char* TRT_GUEST_ABI steam_utils_get_ip_country(void*) { { const char* st_v = "US"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_ISteamUtils_GetIPCountry(flat) -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "US"; }
 static unsigned char TRT_GUEST_ABI steam_utils_get_battery(void*) { return 255; }
 static u32 TRT_GUEST_ABI steam_utils_get_server_time(void*) { return 1700000000u; }
 static int TRT_GUEST_ABI steam_utils_get_universe(void*) { return 1; }
@@ -965,6 +1212,7 @@ static u32 TRT_GUEST_ABI steam_apps_get_install_dir(void*, u32 /*app_id*/,
     pchFolder[1] = ':';
     pchFolder[2] = '\\';
     pchFolder[3] = '\0';
+    { char st_line[200]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_ISteamApps_GetAppInstallDir(flat) -> buf=%p cap=%u value=\"%.128s\"", (void*)pchFolder, cap, pchFolder); trt_core_log(st_line); }
     return 3;
   }
   if (pchFolder && cap > 0) pchFolder[0] = '\0';
@@ -1005,9 +1253,9 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamAPI_SteamParties_v002", (void*)steam_iface_3},
     {"SteamAPI_SteamRemoteStorage_v014", (void*)steam_rs_obj_ptr},
     {"SteamAPI_SteamRemoteStorage_v016", (void*)steam_rs_obj_ptr},
-    {"SteamAPI_SteamUserStats_v011", (void*)steam_iface_5},
-    {"SteamAPI_SteamUserStats_v012", (void*)steam_iface_5},
-    {"SteamAPI_SteamUserStats_v013", (void*)steam_iface_5},
+    {"SteamAPI_SteamUserStats_v011", (void*)steam_userstats_obj_ptr},
+    {"SteamAPI_SteamUserStats_v012", (void*)steam_userstats_obj_ptr},
+    {"SteamAPI_SteamUserStats_v013", (void*)steam_userstats_obj_ptr},
     {"SteamAPI_SteamNetworking_v006", (void*)steam_iface_6},
     {"SteamAPI_SteamScreenshots_v003", (void*)steam_iface_7},
     {"SteamAPI_SteamMusic_v001", (void*)steam_iface_8},

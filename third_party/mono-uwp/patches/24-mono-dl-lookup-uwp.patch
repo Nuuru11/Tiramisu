@@ -1,0 +1,20 @@
+--- a/mono/utils/mono-dl-windows.c
++++ b/mono/utils/mono-dl-windows.c
+@@ -139,6 +139,17 @@
+ 	g_free (modules);
+ 	return NULL;
+ }
++#else
++/* EnumProcessModules is not available under UWP (APP), so the
++ * in-process module enumeration fallback cannot run. The primary
++ * path (GetProcAddress on the specified module / main module) in
++ * mono_dl_lookup_symbol is unaffected. */
++void*
++mono_dl_lookup_symbol_in_process (const char *symbol_name)
++{
++	(void) symbol_name;
++	return NULL;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ void*

@@ -2,10 +2,12 @@
 // The real-game corpus load matrix, hardware-free — with the STAGE 4
 // FILE-LEVEL DRY-RUN audit:
 //
-//   for every PE on argv: read the file bytes, check MZ + machine (x86
-//   guests are SKIPped), then DRY-RUN the import directory DIRECTLY FROM
-//   THE FILE (no mapping, no code execution): parse the PE import table
-//   in-place and bind-simulate every import:
+//   for every PE on argv: read the file bytes, check MZ + machine (PE64
+//   and PE32 both load — M7 Phase 1 maps 32-bit guests load-only, with
+//   trap-address import binding; anything else is SKIPped), then DRY-RUN
+//   the import directory DIRECTLY FROM THE FILE (no mapping, no code
+//   execution): parse the PE import table in-place and bind-simulate
+//   every import:
 //
 //     BUILTIN binds iff the symbol is registered  -> trt_module_query /
 //                                                   trt_module_query_ordinal
@@ -363,11 +365,16 @@ void route_label(const char* dll, char* out, size_t cap) {
 // ---------------------------------------------------------------------------
 
 // File PE header accessors through the packed trt_* structs (no raw offset
-// math — the struct layout IS the PE layout, pack(1)).
+// math — the struct layout IS the PE layout, pack(1)). M7 Phase 1: the
+// data directories live at different offsets in PE32 (+96) vs PE32+ (+112),
+// so file_pe_open resolves `dirs` through trt_pe_directories() and every
+// directory read goes through it — never through the 64-bit struct.
 struct file_pe {
   const u8* file; size_t size;
   const trt_nt_headers64* nt;
   const trt_section_header* secs; u32 nsec;
+  int is_pe32;
+  const trt_data_directory* dirs;
 };
 bool file_pe_open(const u8* file, size_t size, file_pe* out) {
   if (size < 0x40 + 8 || rd16b(file) != 0x5A4D) return false;
@@ -378,6 +385,10 @@ bool file_pe_open(const u8* file, size_t size, file_pe* out) {
   out->file = file;
   out->size = size;
   out->nt = (const trt_nt_headers64*)(file + nt_off);
+  const u16 magic = rd16b((const u8*)&out->nt->optional_header.magic);
+  if (magic != TRT_PE_OPT32_MAGIC && magic != TRT_PE_OPT64_MAGIC) return false;
+  out->is_pe32 = (magic == TRT_PE_OPT32_MAGIC);
+  out->dirs = trt_pe_directories(&out->nt->optional_header, magic);
   out->nsec = rd16b((const u8*)&out->nt->file_header.number_of_sections);
   if (out->nsec == 0 || out->nsec > 96) return false;
   out->secs = (const trt_section_header*)(
@@ -418,8 +429,7 @@ bool file_exports(const u8* file, size_t size, const u8* sec_base, u32 nsec,
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) return false;
   (void)sec_base; (void)nsec;
-  const trt_data_directory* dir =
-      &pe.nt->optional_header.directories[TRT_PE_DIR_EXPORT];
+  const trt_data_directory* dir = &pe.dirs[TRT_PE_DIR_EXPORT];
   if (!dir->virtual_address || !dir->size) return false;
   const u64 ed_off =
       rva_to_file(file, size, pe.secs, pe.nsec, dir->virtual_address);
@@ -526,22 +536,25 @@ void append_csv(char* dst, size_t cap, const char* item) {
   dst[len + ilen] = 0;
 }
 
-// dry-run one import descriptor's thunks (file offsets, not RVAs)
+// dry-run one import descriptor's thunks (file offsets, not RVAs).
+// is_pe32 selects 4-byte thunks (ordinal flag bit 31); otherwise 8-byte
+// thunks (ordinal flag bit 63).
 void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
                 u32 nsec, const char* dll_name, u64 int_off, u64 iat_off,
-                dry_result* out) {
+                dry_result* out, int is_pe32) {
   out->unresolved[0] = 0;
   out->first_gap[0] = 0;
-  if (!int_off || int_off + 8 > size) return;  // nothing readable to walk
-  for (u64 t = 0;; t += 8) {
+  const u64 stride = is_pe32 ? 4 : 8;
+  if (!int_off || int_off + stride > size) return;  // nothing readable to walk
+  for (u64 t = 0;; t += stride) {
     const u64 t_off = int_off + t;
-    if (t_off + 8 > size) break;
-    const u64 thunk = rd64b(file + t_off);
+    if (t_off + stride > size) break;
+    const u64 thunk = is_pe32 ? rd32b(file + t_off) : rd64b(file + t_off);
     if (thunk == 0) break;
     ++out->imports;
     const char* sym_name = nullptr;
     u16 ordinal = 0;
-    if (thunk >> 63) {
+    if (is_pe32 ? (thunk & 0x80000000u) : (thunk >> 63)) {
       ordinal = (u16)(thunk & 0xFFFF);
     } else {
       const u64 hn_off = rva_to_file(file, size, secs,
@@ -613,8 +626,7 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
     printf("  dry-run: PE HEADERS UNREADABLE\n");
     return;
   }
-  const trt_data_directory* imp_dir =
-      &pe.nt->optional_header.directories[TRT_PE_DIR_IMPORT];
+  const trt_data_directory* imp_dir = &pe.dirs[TRT_PE_DIR_IMPORT];
   const u32 imp_va = imp_dir->virtual_address;
   const u32 imp_sz = imp_dir->size;
   if (!imp_va || !imp_sz) {
@@ -647,7 +659,8 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
                                     oft ? oft : iat_rva);
     dry_result r;
     if (int_off) {
-      dry_thunks(file, size, pe.secs, pe.nsec, dll_name, int_off, 0, &r);
+      dry_thunks(file, size, pe.secs, pe.nsec, dll_name, int_off, 0, &r,
+                 pe.is_pe32);
     } else {
       r.imports = 0; r.bound = 0;
       r.unresolved[0] = 0; r.first_gap[0] = 0;
@@ -732,10 +745,14 @@ int run_corpus(int argc, char** argv) {
       ++n_failed; any_failed = true; free(file); continue;
     }
     const u16 machine = rd16b(file + nt_off + 4);
-    if (machine != 0x8664) {
-      printf("SKIP %s: x86 guest (M7 x86 engine not present)\n", name);
+    // M7 Phase 1: PE32 guests load (map + relocate + trap-bind, no
+    // execution) instead of SKIPping; only other machines SKIP.
+    if (machine != 0x8664 && machine != 0x014c) {
+      printf("SKIP %s: unsupported machine 0x%04x (neither PE64 nor PE32)\n",
+             name, machine);
       ++n_skipped; free(file); continue;
     }
+    const int is_pe32 = (machine == 0x014c);
 
     // ---- STAGE 4: the file-level dry-run audit runs BEFORE the live map
     // and produces the full per-DLL report even when the live load dies.
@@ -761,8 +778,13 @@ int run_corpus(int argc, char** argv) {
     const trt_nt_headers64* nt =
         (const trt_nt_headers64*)(img->base + dos->e_lfanew);
     const u64 size_of_image = img->size_of_image;
-    const u64 imp_va = rd32b((const u8*)&nt->optional_header.directories[1].virtual_address);
-    const u64 imp_sz = rd32b((const u8*)&nt->optional_header.directories[1].size);
+    // M7 Phase 1: the import directory offset differs by width — resolve
+    // it through trt_pe_directories(), never the 64-bit struct.
+    const u16 live_magic = rd16b((const u8*)&nt->optional_header.magic);
+    const trt_data_directory* live_dirs =
+        trt_pe_directories(&nt->optional_header, live_magic);
+    const u64 imp_va = rd32b((const u8*)&live_dirs[1].virtual_address);
+    const u64 imp_sz = rd32b((const u8*)&live_dirs[1].size);
 
     if (imp_va && imp_sz && imp_va + imp_sz <= size_of_image) {
       printf("  live (bound image import walk):\n");
@@ -785,18 +807,24 @@ int run_corpus(int argc, char** argv) {
         int imports = 0, n_unresolved = 0;
         char unresolved[512];
         unresolved[0] = 0;
-        for (u64 t = names_rva;; t += 8) {
-          if (t + 8 > size_of_image) break;
-          const u64 thunk = rd64b(img->base + t);
+        // M7 Phase 1: PE32 thunks are 4 bytes (ordinal flag bit 31) and
+        // the bound slot holds a trap address or a sibling guest VA —
+        // either way non-zero means bound.
+        const u64 live_stride = is_pe32 ? 4 : 8;
+        for (u64 t = names_rva;; t += live_stride) {
+          if (t + live_stride > size_of_image) break;
+          const u64 thunk =
+              is_pe32 ? rd32b(img->base + t) : rd64b(img->base + t);
           if (thunk == 0) break;
           ++imports;
           // bound check: the loader overwrote every IAT slot with a
-          // non-null address (real fn or fail-visible thunk)
+          // non-null address (real fn, fail-visible thunk, trap, guest VA)
           const u64 bound_slot =
-              rd64b(img->base + desc->first_thunk + (t - names_rva));
+              is_pe32 ? rd32b(img->base + desc->first_thunk + (t - names_rva))
+                      : rd64b(img->base + desc->first_thunk + (t - names_rva));
           if (!bound_slot) {
             char one[160];
-            if (thunk >> 63)
+            if (is_pe32 ? (thunk & 0x80000000u) : (thunk >> 63))
               snprintf(one, sizeof(one), "#%u", (unsigned)(thunk & 0xFFFF));
             else {
               const char* sym = (const char*)(img->base + thunk + 2);

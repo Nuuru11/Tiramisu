@@ -1,0 +1,34 @@
+--- a/mono/utils/mono-error-internals.h
++++ b/mono/utils/mono-error-internals.h
+@@ -295,6 +295,11 @@
+ 
+ #include <windows.h>
+ 
++/* __readgsdword/__writegsdword are declared in <intrin.h>. MSVC
++ * declares them implicitly, but clang-cl needs the header for the
++ * declarations. */
++#include <intrin.h>
++
+ // Single instruction inlinable form of GetLastError.
+ //
+ // Naming violation so can search disassembly for GetLastError.
+@@ -333,7 +338,19 @@
+ #if HOST_X86
+     __writefsdword (0x34, err);
+ #elif HOST_AMD64
++#ifdef __clang__
++    /* clang has no builtin for __writegsdword: even with <intrin.h> it
++     * emits an external call (and #pragma intrinsic warns that the
++     * name is not a recognized builtin), so the link fails on it.
++     * Write the TEB LastErrorValue slot directly instead -- this is
++     * exactly the instruction MSVC's __writegsdword(0x68, err)
++     * compiles to: mov %eax,%gs:0x68 (verified by disassembly).
++     * (The x86 __writefsdword branch above has the same latent clang
++     * gap; this build is x64-only, so it is left for MSVC.) */
++    __asm__ volatile ("movl %0, %%gs:0x68" :: "r" (err));
++#else
+     __writegsdword (0x68, err);
++#endif
+ #else
+ #error Unreachable, see above.
+ #endif

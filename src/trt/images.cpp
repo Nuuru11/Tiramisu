@@ -42,6 +42,11 @@ struct guest_image {
 
 guest_image g_images[TRT_MAX_GUEST_IMAGES];
 int g_image_count = 0;
+// the main guest image (the exe), recorded by trt_images_register_main:
+// GetModuleHandle(NULL) / FindResource(NULL) must answer with the EXE, not
+// whichever image happened to register first (a DLL can register before
+// the exe while the exe's own imports bind).
+trt_image* g_main_image = nullptr;
 std::mutex g_img_mu;
 
 const trt_backend* g_be = nullptr;
@@ -273,7 +278,8 @@ trt_image* trt_images_by_handle(void* handle) {
   // PE header pointer); fall back to the legacy synthetic tag
   const u64 v = (u64)(uintptr_t)handle;
   for (int i = 0; i < g_image_count; ++i)
-    if ((u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].img;
+    if (g_images[i].img &&
+        (u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].img;
   if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
   const int idx = (int)(v & 0xFFFFu);
   if (idx >= g_image_count) return nullptr;
@@ -281,6 +287,11 @@ trt_image* trt_images_by_handle(void* handle) {
 }
 
 trt_image* trt_images_first(void) {
+  // the MAIN image (the exe), not merely the first registered: a DLL can
+  // register before the exe while the exe's own imports bind, so slot 0
+  // is a DLL for those games. Fall back to slot 0 when no main was
+  // registered (corpus loads map DLLs only).
+  if (g_main_image) return g_main_image;
   return g_image_count > 0 ? g_images[0].img : nullptr;
 }
 
@@ -294,6 +305,7 @@ void trt_images_register_main(trt_image* img, const char* guest_name) {
   snprintf(g.name, sizeof(g.name), "%s", base);
   snprintf(g.path, sizeof(g.path), "<mapped>");
   g.img = img;
+  g_main_image = img;
   // STAGE 7: HMODULE == image base on Windows (guest code dereferences it:
   // UnityCrashHandler64's CRT does cmp $0x5a4d,(%rax) on the handle right
   // after GetModuleHandleW — a synthetic tag faults there)
@@ -336,7 +348,8 @@ const char* trt_images_name(void* handle) {
     // STAGE 7: HMODULE == image base; fall back to the legacy tag
     const u64 v = (u64)(uintptr_t)handle;
     for (int i = 0; i < g_image_count; ++i)
-      if ((u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].name;
+      if (g_images[i].img &&
+          (u64)(uintptr_t)g_images[i].img->base == v) return g_images[i].name;
     if ((v & 0xFFF00000u) != TRT_HANDLE_TAG) return nullptr;
     const int idx = (int)(v & 0xFFFFu);
     if (idx >= g_image_count) return nullptr;
@@ -428,7 +441,7 @@ static bool is_forced_builtin_module(const char* name) {
 
 // Try to load a DLL the game ships with us (from the game's directory).
 static trt_image* try_load_sibling(const char* module) {
-  if (!g_be || g_load_depth > 8) return nullptr;
+  if (!g_be || g_load_depth > 32) return nullptr;
   if (is_forced_builtin_module(module)) return nullptr;
   const char* base = base_name(module);
   char host[1024];
@@ -528,8 +541,11 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
       snprintf(g.name, sizeof(g.name), "%s", base);
       snprintf(g.path, sizeof(g.path), "%s", host_path);
       g.img = img;
-      // STAGE 7: HMODULE == image base (see trt_images_register_main)
-      g.handle = (void*)(uintptr_t)img->base;
+      // STAGE 7: HMODULE == image base (see trt_images_register_main).
+      // M7 Phase 1: a 32-bit HMODULE must be a 32-bit-safe value — the guest
+      // VA base, not the 64-bit host pointer (a 32-bit slot cannot hold it).
+      g.handle = img->is_pe32 ? (void*)(uintptr_t)img->guest_base
+                              : (void*)(uintptr_t)img->base;
       g.is_dll = true;
       ++g_image_count;
     }
@@ -542,14 +558,27 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
+  // M7 Phase 1: 32-bit code cannot run natively (no x86 engine yet).
+  // A PE32 image's TLS callbacks / DllMain are collected at map time
+  // and deferred to the Phase 2 emulator — calling them through
+  // trt_call_guest_img (a 64-bit call) would execute 32-bit bytes as
+  // 64-bit code. Skip, loudly; load-only in Phase 1.
+  if (img->is_pe32) {
+    char line[320];
+    snprintf(line, sizeof(line),
+             "trt: %s is PE32: entry/TLS deferred to the M7 emulator "
+             "(Phase 2); load-only in Phase 1",
+             base);
+    trt_core_log(line);
+  }
   // TLS callbacks, then the entry point (DllMain for a DLL) — skipped in
   // load-only mode (corpus dry-run proves binding without executing code)
-  if (g_run_image_code)
+  if (!img->is_pe32 && g_run_image_code)
     for (int i = 0; i < img->tls_callback_count; ++i) {
       void* cb = img->base + img->tls_callback_rvas[i];
       trt_call_guest_img(cb, img, (u64)(uintptr_t)img->base, 1, 0, 0);
     }
-  if (run_entry && g_run_image_code && img->entry_rva) {
+  if (!img->is_pe32 && run_entry && g_run_image_code && img->entry_rva) {
     void* handle = trt_images_handle(img);
     char line[320];
     snprintf(line, sizeof(line),
@@ -612,6 +641,7 @@ void trt_images_notify_thread(int reason) {
     for (int i = 0; i < snap_count; ++i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
+      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       for (int t = 0; t < img->tls_callback_count; ++t) {
         trt_call_guest_img(img->base + img->tls_callback_rvas[t], img,
                            (u64)(uintptr_t)img->base, 2, 0, 0);
@@ -625,6 +655,7 @@ void trt_images_notify_thread(int reason) {
     for (int i = snap_count - 1; i >= 0; --i) {
       trt_image* img = snap[i].img;
       if (!img) continue;
+      if (img->is_pe32) continue;  // M7 Phase 1: no 32-bit code runs natively
       if (snap[i].call_entry) {
         trt_call_guest_img(img->base + img->entry_rva, img,
                            (u64)(uintptr_t)snap[i].handle, 3, 0, 0);
@@ -642,8 +673,14 @@ void trt_images_notify_thread(int reason) {
 void trt_set_image_code_run(int enable) { g_run_image_code = enable ? 1 : 0; }
 
 void trt_images_reset(void) {
+  // M7 Phase 1: the guest-VA reservations belong to the registry's images;
+  // a reset orphans those images, so their guest ranges become free again.
+  // (The trap registry is NOT reset: trap addresses in already-mapped IATs
+  // stay valid for the process lifetime.)
+  trt_pe32_guest_reset();
   std::lock_guard<std::mutex> lk(g_img_mu);
   g_image_count = 0;
+  g_main_image = nullptr;
   g_set_dll_dir[0] = 0;
   memset(g_extra_dll_dirs, 0, sizeof(g_extra_dll_dirs));
   g_load_dir_depth = 0;

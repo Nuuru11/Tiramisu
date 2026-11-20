@@ -64,6 +64,8 @@
 // paths run instead of a platform kill. ----
 extern "C" int trt_mem_budget_charge_commit(u64 bytes);
 extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
+extern "C" int trt_mem_budget_charge_va(u64 bytes);
+extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
 
 #include <atomic>
@@ -99,27 +101,200 @@ extern "C" bool trt_settings_write_watch() __attribute__((weak));
 namespace {
 
 // ---- heap allocation registry: HeapSize/HeapReAlloc need the byte size of
-// every block HeapAlloc handed out. Uncapped thread-safe map.
+// every block HeapAlloc handed out, plus which backend owns it (pool slab
+// vs direct backend alloc). Uncapped thread-safe map. The high bit of the
+// recorded size marks a DIRECT block (backend alloc, charged per-alloc);
+// a clear high bit marks a POOL block (carved from a charged slab).
+// The _locked helpers assume g_heap_mu is held; the plain wrappers lock.
+constexpr size_t k_heap_direct_flag = (size_t)1 << (sizeof(size_t) * 8 - 1);
 std::mutex g_heap_mu;
 std::unordered_map<void*, size_t> g_heap_rec;
 
+bool heap_rec_find_locked(void* p, size_t* size_out, bool* direct_out) {
+  if (!p) return false;
+  auto it = g_heap_rec.find(p);
+  if (it == g_heap_rec.end()) return false;
+  if (size_out) *size_out = it->second & ~k_heap_direct_flag;
+  if (direct_out) *direct_out = (it->second & k_heap_direct_flag) != 0;
+  return true;
+}
+void heap_rec_add_locked(void* p, size_t n, bool direct) {
+  if (!p) return;
+  g_heap_rec[p] = (n & ~k_heap_direct_flag) | (direct ? k_heap_direct_flag : 0);
+}
+void heap_rec_del_locked(void* p) {
+  if (!p) return;
+  g_heap_rec.erase(p);
+}
 bool heap_rec_find(void* p, size_t* size_out) {
   if (!p) return false;
   std::lock_guard<std::mutex> lk(g_heap_mu);
-  auto it = g_heap_rec.find(p);
-  if (it == g_heap_rec.end()) return false;
-  if (size_out) *size_out = it->second;
-  return true;
+  return heap_rec_find_locked(p, size_out, nullptr);
 }
-void heap_rec_add(void* p, size_t n) {
+void heap_rec_add(void* p, size_t n, bool direct) {
   if (!p) return;
   std::lock_guard<std::mutex> lk(g_heap_mu);
-  g_heap_rec[p] = n;
+  heap_rec_add_locked(p, n, direct);
 }
-void heap_rec_del(void* p) {
-  if (!p) return;
-  std::lock_guard<std::mutex> lk(g_heap_mu);
-  g_heap_rec.erase(p);
+
+// forward: the backend singleton is defined below (after the handle
+// table); the slab pool reserves through it
+extern trt_backend g_be;
+
+// ---- heap slab pool ----
+// HeapAlloc used to cost one backend VirtualAlloc/mmap per guest alloc
+// (one syscall + one page commit per block, even for 16 bytes). The pool
+// carves small blocks out of 1 MB slabs reserved from the backend, so a
+// game doing thousands of small allocs pays one syscall per slab instead
+// of one per block. Budget accounting charges the SLAB reservation (1 MB
+// commit + 1 MB VA at slab creation, discharged when the slab is
+// released) — never per-block carving, so the ledger always equals real
+// committed memory. Blocks over 64 KB bypass the pool and go straight to
+// the backend, charged per-alloc exactly as before (the small-budget
+// probe's exact 10 MB ledger assertions depend on it).
+// Layout: a slab is 1 MB, page-aligned from the backend. Blocks start at
+// offset 256; each block is a 16-byte header (slab pointer + magic) plus
+// a class-sized payload, so every returned pointer is 16-aligned. The
+// free list links through the user area's first 8 bytes (dead while the
+// block is free). All pool state is guarded by g_heap_mu — the same mutex
+// as the registry, so there is no lock ordering to get wrong.
+constexpr size_t k_heap_slab_bytes = 1024 * 1024;  // 1 MB per slab
+constexpr size_t k_heap_slab_hdr = 256;            // slab header reservation
+constexpr size_t k_heap_pool_max = 65536;          // largest pooled class
+constexpr u64 k_heap_block_magic = 0x484541504F4F4C21ULL;  // "HEAPOOL!"
+constexpr u64 k_heap_slab_magic = 0x48454150534C4142ULL;   // "HEAPSLAB"
+constexpr size_t k_heap_classes[] = {16,   32,   64,   128,  256,  512, 1024,
+                                     2048, 4096, 8192, 16384, 32768, 65536};
+constexpr size_t k_heap_nclasses =
+    sizeof(k_heap_classes) / sizeof(k_heap_classes[0]);
+
+struct heap_slab {
+  u64 magic;          // k_heap_slab_magic
+  u32 class_idx;
+  u32 block_stride;   // 16 (header) + class size
+  u32 live;           // blocks currently handed out
+  u32 capacity;       // blocks the slab holds
+  u32 next_off;       // bump offset for carving (bytes from slab base)
+  void* free_list;    // singly-linked free blocks (link in user area)
+  heap_slab* next;    // next slab in this class
+};
+
+struct heap_block_hdr {
+  heap_slab* slab;
+  u64 magic;  // k_heap_block_magic
+};
+
+heap_slab* g_heap_slabs[k_heap_nclasses] = {};
+
+int heap_class_for(size_t n) {
+  for (size_t i = 0; i < k_heap_nclasses; ++i)
+    if (n <= k_heap_classes[i]) return (int)i;
+  return -1;
+}
+
+// Carve or reuse a block from the class's slabs; creates a slab (charged)
+// when every slab is full. Returns nullptr (with 1455/8 set) when the
+// budget refuses the slab reservation. g_heap_mu must be held.
+void* heap_pool_alloc_locked(size_t n) {
+  const int ci = heap_class_for(n);
+  if (ci < 0) return nullptr;
+  const size_t stride = 16 + k_heap_classes[ci];
+  for (heap_slab* s = g_heap_slabs[ci]; s; s = s->next) {
+    if (s->free_list) {
+      u8* blk = (u8*)s->free_list;
+      s->free_list = *(void**)(blk + 16);  // link lives in the user area
+      ++s->live;
+      return blk + 16;
+    }
+    if (s->next_off + stride <= k_heap_slab_bytes) {
+      u8* blk = (u8*)s + s->next_off;
+      s->next_off += (u32)stride;
+      heap_block_hdr* h = (heap_block_hdr*)blk;
+      h->slab = s;
+      h->magic = k_heap_block_magic;
+      ++s->live;
+      return blk + 16;
+    }
+  }
+  // no room anywhere in this class: reserve a fresh slab (charged 1 MB
+  // commit + 1 MB VA — the ledger charges the reservation, never the
+  // carving)
+  if (trt_mem_budget_charge_va((u64)k_heap_slab_bytes) != 0) return nullptr;
+  if (trt_mem_budget_charge_commit((u64)k_heap_slab_bytes) != 0) {
+    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
+    return nullptr;
+  }
+  u8* mem = (u8*)g_be.alloc(k_heap_slab_bytes, 0);
+  if (!mem) {
+    trt_mem_budget_discharge_commit((u64)k_heap_slab_bytes);
+    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
+    return nullptr;
+  }
+  heap_slab* ns = (heap_slab*)mem;
+  ns->magic = k_heap_slab_magic;
+  ns->class_idx = (u32)ci;
+  ns->block_stride = (u32)stride;
+  ns->live = 1;
+  ns->capacity = (u32)((k_heap_slab_bytes - k_heap_slab_hdr) / stride);
+  ns->next_off = (u32)(k_heap_slab_hdr + stride);
+  ns->free_list = nullptr;
+  ns->next = g_heap_slabs[ci];
+  g_heap_slabs[ci] = ns;
+  u8* blk = mem + k_heap_slab_hdr;
+  heap_block_hdr* h = (heap_block_hdr*)blk;
+  h->slab = ns;
+  h->magic = k_heap_block_magic;
+  return blk + 16;
+}
+
+// Return a pool block to its slab; releases the slab (and discharges its
+// reservation) when the last block goes. Returns 1 on a clean free, 0
+// when the block header is corrupt (fail-visible: the block leaks rather
+// than trusting a forged slab pointer). The owning slab is found by
+// range containment over the class's live slabs — the header's slab
+// pointer is never dereferenced untrusted. g_heap_mu must be held.
+int heap_pool_free_locked(void* p, size_t n) {
+  u8* blk = (u8*)p - 16;
+  heap_block_hdr* h = (heap_block_hdr*)blk;
+  if (h->magic != k_heap_block_magic) {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "kernel32: HeapFree corruption: block %p header magic mismatch "
+             "(not a pool block or heap overwritten) — leaked, not freed", p);
+    trt_core_log(line);
+    return 0;
+  }
+  const int ci = heap_class_for(n);
+  heap_slab* s = nullptr;
+  if (ci >= 0) {
+    for (heap_slab* c = g_heap_slabs[ci]; c; c = c->next) {
+      const uintptr_t lo = (uintptr_t)c;
+      const uintptr_t hi = lo + k_heap_slab_bytes;
+      if ((uintptr_t)blk >= lo && (uintptr_t)blk < hi) { s = c; break; }
+    }
+  }
+  if (!s || s->magic != k_heap_slab_magic) {
+    trt_core_log("kernel32: HeapFree corruption: pool block names no live "
+                 "slab — leaked, not freed");
+    return 0;
+  }
+  if (h->slab != s) {
+    trt_core_log("kernel32: HeapFree corruption: block header slab disagrees "
+                 "with the live slab list (proceeding with the live slab)");
+  }
+  *(void**)p = s->free_list;  // link into the free list via the user area
+  s->free_list = blk;
+  if (--s->live == 0) {
+    // last live block: release the slab and discharge its reservation
+    const u32 sci = s->class_idx;
+    heap_slab** pp = &g_heap_slabs[sci];
+    while (*pp && *pp != s) pp = &(*pp)->next;
+    if (*pp) *pp = s->next;
+    g_be.release(s, k_heap_slab_bytes);
+    trt_mem_budget_discharge_commit((u64)k_heap_slab_bytes);
+    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
+  }
+  return 1;
 }
 
 // ---- FLS (fiber-local storage; uncapped metadata + per-thread values) ----
@@ -201,14 +376,31 @@ void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   (void)heap;
   // backend alloc = RW memory; flags HEAP_ZERO_MEMORY = 0x8
   const size_t n = (size_t)(bytes ? bytes : 1);
-  if (trt_mem_budget_charge_commit((u64)n) != 0) return nullptr;  // 1455
-  u8* p = (u8*)g_be.alloc(n, 0);
-  if (!p) {
-    trt_mem_budget_discharge_commit((u64)n);
-    return nullptr;
+  void* p = nullptr;
+  if (n <= k_heap_pool_max) {
+    // small block: carve from a slab (the slab reservation is already
+    // charged; carving charges nothing)
+    std::lock_guard<std::mutex> lk(g_heap_mu);
+    p = heap_pool_alloc_locked(n);
+    if (p) heap_rec_add_locked(p, n, false);
+  } else {
+    // large block: bypass the pool — one backend alloc, charged exactly
+    // (commit + VA), as before
+    if (trt_mem_budget_charge_va((u64)n) != 0) return nullptr;  // 8
+    if (trt_mem_budget_charge_commit((u64)n) != 0) {
+      trt_mem_budget_discharge_va((u64)n);
+      return nullptr;  // 1455
+    }
+    p = g_be.alloc(n, 0);
+    if (!p) {
+      trt_mem_budget_discharge_commit((u64)n);
+      trt_mem_budget_discharge_va((u64)n);
+      return nullptr;
+    }
+    heap_rec_add(p, n, true);
   }
+  if (!p) return nullptr;  // slab charge refused: 1455/8 already set
   if (flags & 0x8) memset(p, 0, n);
-  heap_rec_add(p, n);  // HeapSize/HeapReAlloc need this
   return p;
 }
 
@@ -227,11 +419,31 @@ int TRT_STDCALL trt_HeapSetInformation(void* heap, u32 info_class,
 
 int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
-  size_t freed = 0;
-  heap_rec_find(p, &freed);
-  heap_rec_del(p);  // drop the size record (HeapSize honesty after free)
+  if (!p) return 1;
+  size_t n = 0;
+  bool direct = false;
+  bool known = false;
+  {
+    std::lock_guard<std::mutex> lk(g_heap_mu);
+    known = heap_rec_find_locked(p, &n, &direct);
+    if (known) {
+      heap_rec_del_locked(p);  // drop the size record (HeapSize honesty)
+      if (!direct) {
+        // pool block: back to its slab (the slab is released + discharged
+        // inside when its last block goes)
+        if (!heap_pool_free_locked(p, n)) return 0;  // corrupt: logged
+        return 1;
+      }
+    }
+  }
+  // direct block — or a foreign pointer HeapAlloc never recorded (the old
+  // code released those through the backend too, and the backend no-ops
+  // unknown addresses): release, then discharge what was charged
   if (p) g_be.release(p, 0);  // backend tracks size internally (mmap/UWP)
-  if (freed) trt_mem_budget_discharge_commit((u64)freed);
+  if (known && direct) {
+    trt_mem_budget_discharge_commit((u64)n);
+    trt_mem_budget_discharge_va((u64)n);
+  }
   return 1;
 }
 
@@ -252,6 +464,10 @@ struct va_region {
 std::mutex g_va_mu;
 std::vector<va_region> g_va;
 std::vector<va_extent> g_extra_pending_rx;
+// Scratch for va_split_and_set_locked: reusing one vector avoids a heap
+// allocation per VA call (every VirtualAlloc/Free/Query ran one). Every
+// caller holds g_va_mu, so a single shared scratch is safe.
+std::vector<va_extent> g_va_split_scratch;
 trt_vmem_reserve_fn g_vmem_reserve = nullptr;
 trt_vmem_commit_fn g_vmem_commit = nullptr;
 trt_vmem_decommit_fn g_vmem_decommit = nullptr;
@@ -276,7 +492,10 @@ void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
   if (s < r.base) s = r.base;
   if (e > rend) e = rend;
   if (s >= e) return;
-  std::vector<va_extent> next;
+  // reused scratch (guarded by g_va_mu, like every caller): no heap alloc
+  // per split
+  std::vector<va_extent>& next = g_va_split_scratch;
+  next.clear();
   next.reserve(r.extents.size() + 2);
   for (size_t i = 0; i < r.extents.size(); ++i) {
     const va_extent& ex = r.extents[i];
@@ -357,6 +576,25 @@ const va_extent* va_find_extent_locked(const va_region& r, uintptr_t addr) {
       return &r.extents[i];
   }
   return nullptr;
+}
+
+// Bytes in [s, e) currently in MEM_COMMIT state, from the region's
+// extents. Caller must hold g_va_mu. This is what makes commit charging
+// exact: a re-commit charges only the not-yet-committed bytes, and a
+// decommit discharges only the actually-committed bytes (the old code
+// charged/discharged the whole span either way, drifting the ledger in
+// both directions).
+size_t va_committed_in_locked(const va_region& r, uintptr_t s, uintptr_t e) {
+  size_t n = 0;
+  for (size_t i = 0; i < r.extents.size(); ++i) {
+    const va_extent& ex = r.extents[i];
+    if (ex.state != 0x1000u) continue;  // MEM_COMMIT only
+    const uintptr_t os = ex.start > s ? ex.start : s;
+    const uintptr_t oe =
+        ex.start + ex.size < e ? ex.start + ex.size : e;
+    if (os < oe) n += (size_t)(oe - os);
+  }
+  return n;
 }
 
 extern "C" void trt_set_vmem_hooks(trt_vmem_reserve_fn reserve_fn,
@@ -662,12 +900,17 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     const size_t span = (size_t)((raw - page) + (bytes ? bytes : 4096ULL));
     const size_t sz = (span + 4095ULL) & ~(size_t)4095ULL;
     bool ok = false;
+    // bytes in the range not yet committed — the only bytes this call may
+    // charge. Re-committing already-committed pages (Mono/Unity do this
+    // routinely) must not double-charge the ledger.
+    size_t fresh = 0;
     {
       std::lock_guard<std::mutex> lk(g_va_mu);
       const int idx = va_find_idx_locked(page);
       if (idx >= 0) {
         const va_region& r = g_va[(size_t)idx];
         ok = (sz <= r.size && (page - r.base) <= r.size - sz);
+        if (ok) fresh = sz - va_committed_in_locked(r, page, page + sz);
       }
     }
     if (!ok) {
@@ -685,7 +928,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     };
     u32 eff_prot = pclean;
     bool pending_rx = false;
-    if (trt_mem_budget_charge_commit(sz) != 0) return nullptr;  // 1455 set
+    if (trt_mem_budget_charge_commit((u64)fresh) != 0) return nullptr;  // 1455 set
     if (do_commit(tprot) != 0) {
       if (pclean == 0x40u || pclean == 0x80u) {
         if (do_commit(TRT_PROT_R | TRT_PROT_W) == 0) {
@@ -693,12 +936,12 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
           pending_rx = true;
           trt_core_log("kernel32: VirtualAlloc(COMMIT RWX) -> W^X two-phase JIT (armed RW, flips RX on FlushInstructionCache)");
         } else {
-          trt_mem_budget_discharge_commit(sz);
+          trt_mem_budget_discharge_commit((u64)fresh);
           set_err_for_current_thread(87);
           return nullptr;
         }
       } else {
-        trt_mem_budget_discharge_commit(sz);
+        trt_mem_budget_discharge_commit((u64)fresh);
         set_err_for_current_thread(87);
         return nullptr;
       }
@@ -707,8 +950,20 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
       std::lock_guard<std::mutex> lk(g_va_mu);
       const int idx = va_find_idx_locked(page);
       if (idx >= 0) {
+        // another thread may have committed part of the range between the
+        // charge and this record: only the bytes still RESERVE here are
+        // newly committed by THIS call — discharge the overlap so each
+        // byte is charged exactly once, by whichever thread records first
+        const size_t still_fresh =
+            sz - va_committed_in_locked(g_va[(size_t)idx], page, page + sz);
+        if (still_fresh < fresh)
+          trt_mem_budget_discharge_commit((u64)(fresh - still_fresh));
         va_split_and_set_locked(g_va[(size_t)idx], page, page + sz, 0x1000,
                                 eff_prot, pending_rx ? 1 : 0);
+      } else {
+        // region vanished mid-commit (released by another thread): the
+        // host commit is orphaned — discharge the whole charge
+        trt_mem_budget_discharge_commit((u64)fresh);
       }
     }
     return (void*)page;
@@ -722,12 +977,17 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
       std::lock_guard<std::mutex> lk(g_va_mu);
       rfn = g_vmem_reserve;
     }
+    // reserve-only: no commit, but the VA is consumed — charge the VA
+    // ledger (a reservation that never commits still exhausts address
+    // space, and the old code charged nothing at all here)
+    if (trt_mem_budget_charge_va((u64)sz) != 0) return nullptr;  // 8 set
     void* p = rfn ? rfn(sz, (u64)(uintptr_t)addr)
                   : g_be.alloc(sz, (u64)(uintptr_t)addr);
     if (!p && addr) {
       p = rfn ? rfn(sz, 0) : g_be.alloc(sz, 0);
     }
     if (!p) {
+      trt_mem_budget_discharge_va((u64)sz);
       set_err_for_current_thread(8);  // NOT_ENOUGH_MEMORY
       return nullptr;
     }
@@ -739,7 +999,12 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
     return p;
   }
 
-  if (trt_mem_budget_charge_commit(sz) != 0) return nullptr;  // 1455 set
+  // reserve+commit: the bytes are both reserved VA and committed memory
+  if (trt_mem_budget_charge_va((u64)sz) != 0) return nullptr;  // 8 set
+  if (trt_mem_budget_charge_commit(sz) != 0) {
+    trt_mem_budget_discharge_va((u64)sz);
+    return nullptr;  // 1455 set
+  }
   void* p = g_be.alloc(sz, (u64)(uintptr_t)addr);
   if (!p && addr) {
     // hint address unavailable: retry at any free base
@@ -747,6 +1012,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   }
   if (!p) {
     trt_mem_budget_discharge_commit(sz);
+    trt_mem_budget_discharge_va((u64)sz);
     set_err_for_current_thread(8);  // NOT_ENOUGH_MEMORY
     return nullptr;
   }
@@ -761,6 +1027,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
           trt_core_log("kernel32: VirtualAlloc(RWX) -> W^X two-phase JIT (armed RW, flips RX on FlushInstructionCache)");
         } else {
           trt_mem_budget_discharge_commit(sz);
+          trt_mem_budget_discharge_va((u64)sz);
           g_be.release(p, sz);
           set_err_for_current_thread(87);
           return nullptr;
@@ -770,6 +1037,7 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
           trt_core_log("kernel32: VirtualAlloc(EXEC) rejected by host backend");
         }
         trt_mem_budget_discharge_commit(sz);
+        trt_mem_budget_discharge_va((u64)sz);
         g_be.release(p, sz);
         set_err_for_current_thread(87);
         return nullptr;
@@ -788,6 +1056,11 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
   if (type == 0x4000u /*MEM_DECOMMIT*/) {
     const uintptr_t raw = (uintptr_t)addr;
     uintptr_t s = 0, e = 0;
+    // bytes in [s, e) actually committed — the only bytes this call may
+    // discharge. The old code discharged the whole span even when part of
+    // it was already decommitted (discharge-without-charge, drifting the
+    // ledger toward under-count and a platform kill).
+    size_t committed_here = 0;
     trt_vmem_decommit_fn dfn = nullptr;
     {
       std::lock_guard<std::mutex> lk(g_va_mu);
@@ -805,13 +1078,18 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
           e = s + sz;
           if (e > r.base + r.size) e = r.base + r.size;
         }
-        if (s < e) va_split_and_set_locked(r, s, e, 0x2000, 0x01u, 0);
+        if (s < e) {
+          committed_here = va_committed_in_locked(r, s, e);
+          va_split_and_set_locked(r, s, e, 0x2000, 0x01u, 0);
+        }
       }
     }
     if (s < e) {
       if (dfn) dfn((void*)s, e - s);
       else if (g_be.protect) g_be.protect((void*)s, e - s, 0);
-      trt_mem_budget_discharge_commit((u64)(e - s));
+      // VA is unchanged: the reservation survives the decommit
+      if (committed_here)
+        trt_mem_budget_discharge_commit((u64)committed_here);
       return 1;
     }
     return 0;
@@ -819,6 +1097,7 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
   if (type != 0x8000u /*MEM_RELEASE*/) return 0;
   size_t r_size = (size_t)bytes;
   u64 release_committed = 0;
+  u64 release_va = 0;
   {
     std::lock_guard<std::mutex> lk(g_va_mu);
     const int idx = va_find_idx_locked((uintptr_t)addr);
@@ -827,11 +1106,13 @@ int TRT_STDCALL trt_VirtualFree(void* addr, u64 bytes, u32 type) {
       for (const va_extent& ex : g_va[(size_t)idx].extents) {
         if (ex.state == 0x1000u) release_committed += (u64)ex.size;
       }
+      release_va = (u64)g_va[(size_t)idx].size;  // the whole reservation goes
       g_va[(size_t)idx].base = 0;
       g_va[(size_t)idx].extents.clear();
     }
   }
   if (release_committed) trt_mem_budget_discharge_commit(release_committed);
+  if (release_va) trt_mem_budget_discharge_va(release_va);
   g_be.release(addr, r_size);
   return 1;
 }
@@ -2021,6 +2302,7 @@ int TRT_STDCALL trt_SetCurrentDirectoryA(const char* name) {
 int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
   trt_vfs_get_cwd(g_cwd, sizeof(g_cwd));
   const u32 clen = (u32)strlen(g_cwd);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_cwd); trt_core_log(st_line); }
   if (!buf || len <= clen) return (int)(clen + 1);
   for (u32 i = 0; i <= clen; ++i) buf[i] = (u16)(u8)g_cwd[i];
   return (int)clen;
@@ -2028,18 +2310,18 @@ int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
 
 extern const u16* trt_gap_env_build_wblock(const char* const* defaults,
                                            size_t default_count);
+extern const char* const* trt_gap_env_defaults(size_t* count);
 extern int trt_gap_env_free_wblock(const u16* block);
 
 const u16* TRT_STDCALL trt_GetEnvironmentStringsW() {
-  const char* pairs[] = {
-    "PATH=C:\\Windows\\System32;Z:\\",
-    "TEMP=C:\\Temp", "TMP=C:\\Temp",
-    "USERPROFILE=C:\\Users\\Player",
-    "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
-    "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
-    "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
-  };
-  return trt_gap_env_build_wblock(pairs, sizeof(pairs) / sizeof(pairs[0]));
+  // 0.2.2.95: the full standard Windows env set, shared with the store seed
+  // (bridge_kernel32_gap.cpp kTrtDefaultEnv) so the advertised block and
+  // GetEnvironmentVariableW/_wgetenv agree.
+  size_t default_count = 0;
+  const char* const* pairs = trt_gap_env_defaults(&default_count);
+  const u16* st_blk = trt_gap_env_build_wblock(pairs, default_count);
+  { char st_tmp[136]; char st_line[256]; if (st_blk) { size_t st_o = 0; for (size_t st_i = 0; (st_blk[st_i] || st_blk[st_i + 1]) && st_o < 130; ++st_i) st_tmp[st_o++] = st_blk[st_i] ? (char)(st_blk[st_i] & 0x7f) : ';'; st_tmp[st_o] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> ptr=%p \"%.128s\"", (const void*)st_blk, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> NULL"); } trt_core_log(st_line); }
+  return st_blk;
 }
 
 int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
@@ -2047,10 +2329,36 @@ int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
 }
 
 u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
-  (void)mod;
+  // Honor the handle: NULL (or the exe's own handle) -> the exe path; a
+  // guest DLL handle -> the game's directory + the DLL's file name; a
+  // synthetic system-module handle -> System32 + the module name. The old
+  // code ignored the handle and always returned the exe path.
+  char path[512];
+  const char* value = g_exepath;
+  if (mod) {
+    trt_image* img = trt_images_by_handle(mod);
+    if (img && img != trt_images_first()) {
+      const char* nm = trt_images_name(mod);
+      if (nm && nm[0]) {
+        const char* slash = strrchr(g_exepath, '\\');
+        const size_t dirlen = slash ? (size_t)(slash - g_exepath) : 0;
+        if (dirlen > 0 && dirlen + 1 + strlen(nm) < sizeof(path)) {
+          snprintf(path, sizeof(path), "%.*s\\%s", (int)dirlen, g_exepath, nm);
+          value = path;
+        }
+      }
+    } else if (!img && trt_images_is_synthetic(mod)) {
+      const char* nm = trt_images_synth_name(mod);
+      if (nm && nm[0]) {
+        snprintf(path, sizeof(path), "C:\\Windows\\System32\\%s", nm);
+        value = path;
+      }
+    }
+  }
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, value); trt_core_log(st_line); }
   if (!buf || !len) return 0;
   u32 i = 0;
-  for (; g_exepath[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_exepath[i];
+  for (; value[i] && i < len - 1; ++i) buf[i] = (u16)(u8)value[i];
   buf[i] = 0;
   return i;
 }
@@ -2058,6 +2366,7 @@ u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
 int TRT_STDCALL trt_GetSystemDirectoryW(u16* buf, u32 len) {
   if (!buf || len < 18) return 18;
   const char* s = "C:\\Windows\\System32";
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetSystemDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, s); trt_core_log(st_line); }
   u32 i = 0;
   for (; s[i]; ++i) buf[i] = (u16)(u8)s[i];
   buf[i] = 0;
@@ -2230,6 +2539,13 @@ void* system_module_handle(const char* utf8_name) {
              "(system module, offline bridge surface)", base);
     trt_core_log(line);
   }
+  if (!h) {
+    char st_line[224];
+    snprintf(st_line, sizeof(st_line),
+             "modtrace: LoadLibrary/GetModuleHandle(%s) -> NULL (synthetic handle failed)",
+             base);
+    trt_core_log(st_line);
+  }
   return h;
 }
 } // namespace
@@ -2287,12 +2603,16 @@ static void* load_library_impl(const u16* path, u32 flags) {
 }
 
 void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
-  return load_library_impl(path, 0);
+  void* h = load_library_impl(path, 0);
+  { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
+  return h;
 }
 
 void* TRT_STDCALL trt_LoadLibraryExW(const u16* path, void* file, u32 flags) {
   (void)file;
-  return load_library_impl(path, flags);
+  void* h = load_library_impl(path, flags);
+  { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=%p", st_n, flags, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=NULL", st_n, flags); trt_core_log(st_line); }
+  return h;
 }
 
 int TRT_STDCALL trt_FreeLibrary(void* handle) {
@@ -2353,20 +2673,29 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
 }
 
 void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
+  void* h = nullptr;
+  const char* st_base = "(null)";
+  char st_u8[256];
   if (!name || !name[0]) {
     trt_image* first = trt_images_first();
-    return first ? trt_images_handle(first) : nullptr;
+    h = first ? trt_images_handle(first) : nullptr;
+  } else if (trt_utf16_to_utf8(name, st_u8, sizeof(st_u8)) != 0) {
+    h = nullptr;
+  } else {
+    st_base = path_basename(st_u8);
+    trt_image* img = trt_images_find(st_base);
+    if (img) {
+      h = trt_images_handle(img);
+    } else {
+      // STAGE 7 (OrTMM): the CRT boot asks for "kernel32.dll" (and apiset
+      // contract names) by handle before any file exists for them. A known
+      // SYSTEM/BUILTIN module name gets the synthetic handle — a NULL here
+      // failfasts the CRT before WinMain.
+      h = system_module_handle(st_base);
+    }
   }
-  char utf8[256];
-  if (trt_utf16_to_utf8(name, utf8, sizeof(utf8)) != 0) return nullptr;
-  const char* base = path_basename(utf8);
-  trt_image* img = trt_images_find(base);
-  if (img) return trt_images_handle(img);
-  // STAGE 7 (OrTMM): the CRT boot asks for "kernel32.dll" (and apiset
-  // contract names) by handle before any file exists for them. A known
-  // SYSTEM/BUILTIN module name gets the synthetic handle — a NULL here
-  // failfasts the CRT before WinMain.
-  return system_module_handle(base);
+  { char st_line[320]; if (h) snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=%p", st_base, h); else snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=NULL", st_base); trt_core_log(st_line); }
+  return h;
 }
 
 // ==================== console + child-process honesty =======================
@@ -2722,11 +3051,43 @@ void fill_startup_info_w(void* si) {
   if (!si) return;
   memset(si, 0, 104);
   ((u32*)si)[0] = 104;  // cb
+  // Real Windows fills lpDesktop ("WinSta0\Default") and lpTitle (full exe path
+  // GoW faults passing a NULL string to a CRT string function right
+  // after Steam init; a NULL lpTitle/lpDesktop is the live candidate.
+  // Static storage: the struct holds pointers, so stack buffers would dangle.
+  // u16 arrays (not L"..." literals): wchar_t is 32-bit on the Linux gate.
+  static u16 desktop_buf[] = {'W', 'i', 'n', 'S', 't', 'a', '0', '\\',
+                              'D', 'e', 'f', 'a', 'u', 'l', 't', 0};
+  static u16 title_buf[260];
+  // Full path, not basename: GoW strrchrs lpTitle for a backslash;
+  // a bare basename returns NULL and its pointer math faults at -1.
+  size_t ti = 0;
+  for (; g_exepath[ti] && ti < 258; ++ti) title_buf[ti] = (u16)(u8)g_exepath[ti];
+  title_buf[ti] = 0;
+  ((u16**)si)[2] = desktop_buf;  // lpDesktop @16
+  ((u16**)si)[3] = title_buf;    // lpTitle @24
+  { char st_dt[64]; char st_tt[136]; char st_line[320]; size_t st_i = 0; for (; desktop_buf[st_i] && st_i < 60; ++st_i) st_dt[st_i] = (char)(desktop_buf[st_i] & 0x7f); st_dt[st_i] = 0; st_i = 0; for (; title_buf[st_i] && st_i < 132; ++st_i) st_tt[st_i] = (char)(title_buf[st_i] & 0x7f); st_tt[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetStartupInfoW -> lpDesktop=%p \"%s\" lpTitle=%p \"%.128s\"", (void*)desktop_buf, st_dt, (void*)title_buf, st_tt); trt_core_log(st_line); }
   boot_log("kernel32: GetStartupInfoW -> zeroed STARTUPINFOW (no console)");
+  boot_log("kernel32: GetStartupInfoW lpDesktop/lpTitle filled");
 }
 
 void fill_startup_info_a(void* si) {
-  fill_startup_info_w(si);
+  if (!si) return;
+  memset(si, 0, 104);
+  ((u32*)si)[0] = 104;  // cb (STARTUPINFOA is 104 bytes on x64, like W)
+  // ANSI strings: the old code reused the W fill, leaving UTF-16 pointers
+  // in an ANSI struct (an ANSI reader sees "W\0i\0n\0..." = "W").
+  // Static storage: the struct holds pointers, so stack buffers would dangle.
+  static char desktop_buf_a[] = "WinSta0\\Default";
+  static char title_buf_a[260];
+  // Full path, not basename: GoW strrchrs lpTitle for a backslash;
+  // a bare basename returns NULL and its pointer math faults at -1.
+  size_t ti = 0;
+  for (; g_exepath[ti] && ti < 258; ++ti) title_buf_a[ti] = g_exepath[ti];
+  title_buf_a[ti] = 0;
+  ((char**)si)[2] = desktop_buf_a;  // lpDesktop @16
+  ((char**)si)[3] = title_buf_a;    // lpTitle @24
+  { char st_line[320]; snprintf(st_line, sizeof(st_line), "strtrace: GetStartupInfoA -> lpDesktop=%p \"%s\" lpTitle=%p \"%.128s\"", (void*)desktop_buf_a, desktop_buf_a, (void*)title_buf_a, title_buf_a); trt_core_log(st_line); }
   boot_log("kernel32: GetStartupInfoA -> zeroed STARTUPINFOA (no console)");
 }
 
@@ -3292,6 +3653,7 @@ const char* TRT_STDCALL trt_GetCommandLineA(void) {
   } else {
     snprintf(cmd_a, sizeof(cmd_a), "\"%s\"", g_exepath);
   }
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCommandLineA -> ptr=%p \"%.128s\"", (const void*)cmd_a, cmd_a); trt_core_log(st_line); }
   return cmd_a;
 }
 
@@ -3308,6 +3670,7 @@ const u16* TRT_STDCALL trt_GetCommandLineW(void) {
     }
   }
   cmd[i] = 0;
+  { char st_tmp[136]; char st_line[256]; size_t st_i = 0; for (; cmd[st_i] && st_i < 132; ++st_i) st_tmp[st_i] = (char)(cmd[st_i] & 0x7f); st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetCommandLineW -> ptr=%p \"%.128s\"", (const void*)cmd, st_tmp); trt_core_log(st_line); }
   return cmd;
 }
 
@@ -3325,24 +3688,79 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   (void)heap;
   if (!p) return trt_HeapAlloc(heap, flags, bytes);
   size_t old = 0;
-  heap_rec_find(p, &old);
+  bool old_direct = false;
+  bool known = false;
+  {
+    std::lock_guard<std::mutex> lk(g_heap_mu);
+    known = heap_rec_find_locked(p, &old, &old_direct);
+  }
   const size_t want = (size_t)(bytes ? bytes : 1);
-  if (trt_mem_budget_charge_commit((u64)want) != 0) return nullptr;  // 1455
-  u8* np = (u8*)g_be.alloc(want, 0);
+  const bool new_direct = want > k_heap_pool_max;
+  // Ledger delta for the transition (pool blocks ride on already-charged
+  // slabs, so only direct blocks move the ledger):
+  //   direct->direct: charge max(0, want-old) now, discharge on shrink later
+  //   pool->direct:   charge the full new size (new backend memory)
+  //   direct->pool:   no charge now; discharge the old size after the move
+  //   pool->pool:     no ledger change at all
+  // An unrecorded pointer (foreign to HeapAlloc) is treated as a direct
+  // block of size 0, as before: charge the full new size, release the old
+  // pointer through the backend, discharge nothing.
+  size_t charge_now = 0;
+  if (new_direct) {
+    if (!known) charge_now = want;
+    else if (old_direct) charge_now = want > old ? want - old : 0;
+    else charge_now = want;  // pool -> direct: the whole block is new memory
+  }
+  if (charge_now) {
+    if (trt_mem_budget_charge_va((u64)charge_now) != 0) return nullptr;  // 8
+    if (trt_mem_budget_charge_commit((u64)charge_now) != 0) {
+      trt_mem_budget_discharge_va((u64)charge_now);
+      return nullptr;  // 1455
+    }
+  }
+  void* np = nullptr;
+  if (!new_direct) {
+    std::lock_guard<std::mutex> lk(g_heap_mu);
+    np = heap_pool_alloc_locked(want);
+    if (np) heap_rec_add_locked(np, want, false);
+  } else {
+    np = g_be.alloc(want, 0);
+    if (np) heap_rec_add(np, want, true);
+  }
   if (!np) {
-    trt_mem_budget_discharge_commit((u64)want);
-    set_err_for_current_thread(8);
+    if (charge_now) {
+      trt_mem_budget_discharge_commit((u64)charge_now);
+      trt_mem_budget_discharge_va((u64)charge_now);
+    }
+    // a pool failure already carries 1455/8 from the slab charge; a
+    // backend failure needs the error set here
+    if (new_direct) set_err_for_current_thread(8);
     return nullptr;
   }
   const size_t copied = old ? (old < (size_t)bytes ? old : (size_t)bytes) : 0;
   if (copied) memcpy(np, p, copied);
   if ((flags & 0x8) && (size_t)bytes > copied) {
-    memset(np + copied, 0, (size_t)bytes - copied);
+    memset((u8*)np + copied, 0, (size_t)bytes - copied);
   }
-  heap_rec_del(p);
-  heap_rec_add(np, want);
-  g_be.release(p, 0);
-  if (old) trt_mem_budget_discharge_commit((u64)old);
+  // free the old block (the discharge side of the transition)
+  const bool old_was_pool = known && !old_direct;
+  {
+    std::lock_guard<std::mutex> lk(g_heap_mu);
+    if (known) heap_rec_del_locked(p);
+    if (old_was_pool) heap_pool_free_locked(p, old);
+  }
+  if (!old_was_pool) g_be.release(p, 0);
+  if (known && old_direct) {
+    if (!new_direct) {
+      // direct -> pool: the old backend block is gone
+      trt_mem_budget_discharge_commit((u64)old);
+      trt_mem_budget_discharge_va((u64)old);
+    } else if (old > want) {
+      // direct -> direct shrink
+      trt_mem_budget_discharge_commit((u64)(old - want));
+      trt_mem_budget_discharge_va((u64)(old - want));
+    }
+  }
   return np;
 }
 
@@ -5533,8 +5951,20 @@ int TRT_STDCALL trt_InitializeCriticalSectionEx(void* cs, u32 spin, u32 flags) {
 // ---- SRW locks + condition variables (real atomic + condvar wait/wake) ----
 // SRWLOCK layout: 8 bytes holding state word:
 //   0 = unlocked, -1 (0xFFFFFFFFu) = exclusively locked, >0 = shared reader count
+// Bit 31 (0x80000000) is the WRITER-WAITING flag: set by a writer that
+// could not acquire immediately, it makes new readers queue behind the
+// writer instead of starving it (the reader count is capped at 2^31-1,
+// which no game approaches). The flag clears when a writer acquires
+// (FLAG -> EXCLUSIVE).
+// Acquire spins briefly (256 tries) then blocks on WaitOnAddress — the old
+// code spun on Sleep(0) FOREVER, burning a full core under contention.
+// Every state change that can unblock a waiter is followed by a
+// WakeByAddressAll (WaitOnAddress does not wake on a bare value change;
+// the waker must call Wake). Waiters re-check the value at WaitOnAddress
+// entry, so a wake that lands before registration is not lost.
 namespace {
 constexpr u32 k_srw_exclusive = 0xFFFFFFFFu;
+constexpr u32 k_srw_writer_waiting = 0x80000000u;
 
 struct cv_slot {
   void* key;
@@ -5615,19 +6045,57 @@ void* TRT_STDCALL trt_TryAcquireSRWLockExclusive(void* srw) {
 
 void* TRT_STDCALL trt_AcquireSRWLockExclusive(void* srw) {
   if (!srw) return nullptr;
-  while (!trt_TryAcquireSRWLockExclusive(srw)) trt_Sleep(0);
-  return srw;
+  const u32 saved_err = err_for_current_thread();
+  for (int i = 0; i < 256; ++i) {
+    if (trt_TryAcquireSRWLockExclusive(srw)) {
+      set_err_for_current_thread(saved_err);
+      return srw;
+    }
+    trt_Sleep(0);
+  }
+  // set the writer-waiting flag so new readers queue behind this writer
+  // instead of starving it (a stream of arriving readers used to hold the
+  // lock forever against a waiting writer)
+  u32 cur = __atomic_load_n((u32*)srw, __ATOMIC_RELAXED);
+  while (cur != k_srw_exclusive && !(cur & k_srw_writer_waiting)) {
+    if (__atomic_compare_exchange_n((u32*)srw, &cur,
+                                    cur | k_srw_writer_waiting, false,
+                                    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+      break;
+    }
+  }
+  for (;;) {
+    cur = __atomic_load_n((u32*)srw, __ATOMIC_RELAXED);
+    if (cur == 0 || cur == k_srw_writer_waiting) {
+      u32 expect = cur;
+      if (__atomic_compare_exchange_n((u32*)srw, &expect, k_srw_exclusive,
+                                      false, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
+        set_err_for_current_thread(saved_err);
+        return srw;
+      }
+      continue;
+    }
+    // block until the state word changes (a release wakes us) — no more
+    // full-core Sleep(0) spin under contention
+    trt_WaitOnAddress(srw, &cur, 4, 0xFFFFFFFFu /*INFINITE*/);
+  }
 }
 
 void* TRT_STDCALL trt_ReleaseSRWLockExclusive(void* srw) {
-  if (srw) __atomic_store_n((u32*)srw, 0u, __ATOMIC_RELEASE);
+  if (srw) {
+    __atomic_store_n((u32*)srw, 0u, __ATOMIC_RELEASE);
+    trt_WakeByAddressAll(srw);  // wake reader + writer waiters
+  }
   return srw;
 }
 
 int TRT_STDCALL trt_TryAcquireSRWLockShared(void* srw) {
   if (!srw) return 0;
   u32 cur = __atomic_load_n((u32*)srw, __ATOMIC_RELAXED);
-  while (cur != k_srw_exclusive) {
+  // a waiting writer (flag) or an exclusive holder refuses new readers:
+  // writer preference, so a writer can never be starved by arriving readers
+  while (cur != k_srw_exclusive && !(cur & k_srw_writer_waiting)) {
     if (__atomic_compare_exchange_n((u32*)srw, &cur, cur + 1, false,
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       return 1;
@@ -5638,12 +6106,33 @@ int TRT_STDCALL trt_TryAcquireSRWLockShared(void* srw) {
 
 void* TRT_STDCALL trt_AcquireSRWLockShared(void* srw) {
   if (!srw) return nullptr;
-  while (!trt_TryAcquireSRWLockShared(srw)) trt_Sleep(0);
-  return srw;
+  const u32 saved_err = err_for_current_thread();
+  for (int i = 0; i < 256; ++i) {
+    if (trt_TryAcquireSRWLockShared(srw)) {
+      set_err_for_current_thread(saved_err);
+      return srw;
+    }
+    trt_Sleep(0);
+  }
+  for (;;) {
+    if (trt_TryAcquireSRWLockShared(srw)) {
+      set_err_for_current_thread(saved_err);
+      return srw;
+    }
+    u32 cur = __atomic_load_n((u32*)srw, __ATOMIC_RELAXED);
+    trt_WaitOnAddress(srw, &cur, 4, 0xFFFFFFFFu /*INFINITE*/);
+  }
 }
 
 void* TRT_STDCALL trt_ReleaseSRWLockShared(void* srw) {
-  if (srw) __atomic_sub_fetch((u32*)srw, 1u, __ATOMIC_RELEASE);
+  if (srw) {
+    const u32 after = __atomic_sub_fetch((u32*)srw, 1u, __ATOMIC_RELEASE);
+    // wake waiters only when the last reader left: a writer may now take
+    // it (state FLAG or 0). Waking on every release would thundering-herd
+    // under heavy reader traffic.
+    if (after == 0 || after == k_srw_writer_waiting)
+      trt_WakeByAddressAll(srw);
+  }
   return srw;
 }
 
@@ -6466,6 +6955,7 @@ u32 TRT_STDCALL trt_GetCurrentDirectoryA(u32 len, char* buf) {
   utf8[n] = 0;
   if (!buf || len < (u32)n + 1) return (u32)n + 1;
   memcpy(buf, utf8, (size_t)n + 1);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, utf8); trt_core_log(st_line); }
   return (u32)n;
 }
 
@@ -6488,6 +6978,7 @@ int TRT_STDCALL trt_GetComputerNameA(char* buf, u32* size) {
     return 0;
   }
   memcpy(buf, utf8, (size_t)n + 1);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetComputerNameA -> buf=%p value=\"%.128s\"", (void*)buf, utf8); trt_core_log(st_line); }
   *size = (u32)n;
   return 1;
 }
@@ -6521,6 +7012,7 @@ const char* TRT_STDCALL trt_GetEnvironmentStringsA(void) {
   for (int k = 0; k < 16; ++k) {
     if (!g_enva_blocks[k]) { g_enva_blocks[k] = out; break; }
   }
+  { char st_tmp[136]; char st_line[256]; if (out) { size_t st_o = 0; for (size_t st_i = 0; (out[st_i] || out[st_i + 1]) && st_o < 130; ++st_i) st_tmp[st_o++] = out[st_i] ? out[st_i] : ';'; st_tmp[st_o] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsA -> ptr=%p \"%.128s\"", (const void*)out, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsA -> NULL"); } trt_core_log(st_line); }
   return out;
 }
 

@@ -1,0 +1,34 @@
+--- a/mono/mini/mini-windows.c
++++ b/mono/mini/mini-windows.c
+@@ -399,6 +399,31 @@
+ 	CloseHandle (handle);
+ 	return TRUE;
+ }
++#else
++/* The sampling stat profiler needs winmm timers (timeSetEvent) and
++ * OpenThread, neither of which is available under UWP (APP). The
++ * profiler is never enabled there, so these are no-ops. */
++void
++mono_runtime_setup_stat_profiler (void)
++{
++}
++
++void
++mono_runtime_shutdown_stat_profiler (void)
++{
++}
++
++/* OpenThread/GetThreadContext are not available under UWP (APP), so
++ * another thread's context cannot be captured. The caller
++ * (mono_thread_state_init_from_handle) ignores the return value and
++ * leaves the unwind state invalid, which is the honest outcome. */
++gboolean
++mono_setup_thread_context(DWORD thread_id, MonoContext *mono_context)
++{
++	(void) thread_id;
++	(void) mono_context;
++	return FALSE;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ gboolean

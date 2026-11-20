@@ -575,6 +575,16 @@ const mod_default k_defaults[] = {
     {"xaudio2_0.dll", TRT_ROUTE_BUILTIN},
     {"x3daudio1_7.dll", TRT_ROUTE_BUILTIN},
     {"xapofx1_5.dll", TRT_ROUTE_BUILTIN},
+    // M7 Phase 1: mscoree.dll is the .NET CLR shim (_CorExeMain/_CorDllMain)
+    // — the ONLY import of Celeste.exe, Steamworks.NET.dll, and the pure-IL
+    // XNA assemblies. There is NO CLR host yet (that is the Phase 4 program:
+    // emulate the 32-bit CLR, or a 64-bit Mono host + XNA substitution).
+    // STUB here is the honest route, not a claim that .NET works: the bind
+    // lets 32-bit .NET images MAP load-only, and any call to _CorExeMain
+    // traps fail-visible (the Phase 2 dispatcher logs it) instead of the
+    // load dying on an import the loader cannot satisfy. When Phase 4 lands
+    // a real mscoree bridge, it registers BUILTIN and overrides this.
+    {"mscoree.dll", TRT_ROUTE_STUB},
     // Power / Telemetry / WER / Session (overridden BUILTIN by bridge_sys_extras)
     {"powrprof.dll", TRT_ROUTE_BUILTIN},
     {"pdh.dll", TRT_ROUTE_BUILTIN},

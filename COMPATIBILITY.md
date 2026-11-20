@@ -28,22 +28,31 @@
 - **Gaps:** None known. First candidate for sustained-play testing.
 
 ### RACCOIN (Unity 6 IL2CPP, Steam)
-- **Status:** Tier B (offline, mock-d3d11) / Tier C (plain --exe)
+- **Status:** **Tier S [XBOX] — fully playable**; Tier B (offline, mock-d3d11) / Tier C (plain --exe)
 - **Engine:** Unity 6000.3.0f1, IL2CPP, DirectX 11
+- **Depth (console):** main menu → live run → coin physics → HUD/score/round progression; 7.2 s capture
 - **Depth (mock-d3d11):** CRT ✓ WINMAIN ✓ UNITYMAIN2 ✓ WINDOW ✓ D3D11 ✓ PUMP ✓ QUIT ✓ EXIT(0) ✓
 - **Depth (plain --exe):** CRT ✓ WINMAIN ✓ UNITYMAIN2 ✓ WINDOW ✓ PUMP ✓ QUIT ✓ (dies in CrashReporter exception path during teardown)
-- **Notes:** Runs healthy for 10s under mock-d3d11. Plain-GPU path dies in the
-  Unity CrashReporter insights-crash-report.json write (CreateFileW fails on the
-  CrashReporter dir — guest never calls CreateDirectoryW). Named gap.
-- **[XBOX] Series S, Tiramisu 0.2.1.9:** Native D3D11 resource creation
-  progresses after preserving native DLL TLS during guest execution. The
-  CoreWindow backbuffer accepts the requested sRGB view format. The guest
-  uses one stable render target and the host copies it into the Xbox flip
-  chain. Hardware captures show the animated Doraccoon splash without
-  alternating black frames. Unity then posts `WM_QUIT` and returns to
-  Tiramisu with exit code 0. Sustained play is open.
-- **Gaps:** Reason for Unity's clean exit on Xbox and the CrashReporter
-  insights JSON write path.
+- **Notes:** Console build reaches the real Unity main menu and starts a
+  playable run through Tiramisu's D3D11 swapchain. Evidence:
+  `docs/proof/raccoin-main-menu.png`, `raccoin-gameplay.png`,
+  `raccoin-gameplay.gif`, `raccoin-gameplay.mp4`. Offline mock-d3d11 remains
+  healthy for 10s; plain-GPU path dies in the Unity CrashReporter
+  insights-crash-report.json write (CreateFileW fails on the CrashReporter
+  dir — guest never calls CreateDirectoryW). Named gap.
+- **Gaps:** sustained-session soak and frame-time capture; CrashReporter shutdown exception attribution; insights JSON write path (offline).
+
+### God of War (PC, AAA in-house engine)
+- **Status:** Tier A [XBOX] — boots and renders the opening forest; front-end/menu layer next
+- **Engine:** AAA in-house engine, x64, DirectX 11
+- **Depth (console):** boot → in-engine forest scene rendered across four independent boots
+- **Notes:** The four captures in `docs/proof/gow-forest-01.webp` …
+  `-04.webp` show a converging render path: first boot has large occluders and
+  missing geometry; later boots restore character/materials, foliage,
+  lighting and the full forest composite. The interactive front-end/menu layer and
+  sustained gameplay are not yet proven.
+- **Gaps:** interactive front-end/menu layer; sustained gameplay; performance
+  and audio validation.
 
 ### Go Next! Demo (Unity 6 IL2CPP, Steam)
 - **Status:** Tier C (offline) — named blocker, active investigation

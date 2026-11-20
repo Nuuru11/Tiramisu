@@ -1,0 +1,82 @@
+# 11: mono/metadata/w32process-win32.c — UWP stubs for the
+# System.Diagnostics.Process icalls, and unguard the
+# Microsoft.Win32.NativeMethods icalls.
+#
+# The four Process icalls (GetProcess/ShellExecuteEx/CreateProcess/
+# GetProcesses_internal) wrap desktop-only APIs (OpenProcess,
+# ShellExecuteEx, CreateProcess, EnumProcesses) and live in a classic-
+# gated region, but icall-def.h references them unconditionally — so
+# the UWP link failed on all four. They now get #else stubs reporting
+# NotSupported (Mono's own unsupported-API pattern). The nine
+# NativeMethods icalls in the same region are moved OUT of the classic
+# guard instead: every API they wrap is declared under the UWP (APP)
+# family and present in the UWP import libraries (verified by compile
+# test + llvm-nm against the xwin SDK), so the real implementations
+# link and work under UWP. The desktop path is unchanged.
+--- a/mono/metadata/w32process-win32.c
++++ b/mono/metadata/w32process-win32.c
+@@ -379,6 +379,58 @@
+ 	return procs;
+ }
+ 
++#else /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
++
++/* UWP: process creation/enumeration (OpenProcess, ShellExecuteEx,
++ * CreateProcess, EnumProcesses) are desktop-only, but the icall table
++ * (icall-def.h) references these unconditionally, so provide stubs
++ * that report NotSupported — the pattern Mono itself uses for
++ * unavailable Win32 APIs (cf. Unity-Technologies/mono). */
++HANDLE
++ves_icall_System_Diagnostics_Process_GetProcess_internal (guint32 pid, MonoError *error)
++{
++	g_unsupported_api ("OpenProcess");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "OpenProcess");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL;
++}
++
++MonoBoolean
++ves_icall_System_Diagnostics_Process_ShellExecuteEx_internal (MonoW32ProcessStartInfoHandle proc_start_info, MonoW32ProcessInfo *process_info, MonoError *error)
++{
++	g_unsupported_api ("ShellExecuteEx");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "ShellExecuteEx");
++	process_info->pid = (guint32)(-ERROR_NOT_SUPPORTED);
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++MonoBoolean
++ves_icall_System_Diagnostics_Process_CreateProcess_internal (MonoW32ProcessStartInfoHandle proc_start_info,
++	HANDLE stdin_handle, HANDLE stdout_handle, HANDLE stderr_handle, MonoW32ProcessInfo *process_info, MonoError *error)
++{
++	g_unsupported_api ("CreateProcess");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "CreateProcess");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++MonoArrayHandle
++ves_icall_System_Diagnostics_Process_GetProcesses_internal (MonoError *error)
++{
++	g_unsupported_api ("EnumProcesses");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "EnumProcesses");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL_HANDLE_ARRAY;
++}
++
++#endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
++
++/* The NativeMethods icalls below are NOT classic-gated: every Win32 API
++ * they wrap (CloseHandle, TerminateProcess, GetExitCodeProcess,
++ * Get/SetProcessWorkingSetSize, Get/SetPriorityClass, GetProcessTimes,
++ * GetCurrentProcess) is declared under the UWP (APP) WINAPI family and
++ * present in the UWP import libraries (verified against the xwin SDK). */
+ MonoBoolean
+ ves_icall_Microsoft_Win32_NativeMethods_CloseProcess (gpointer handle, MonoError *error)
+ {
+@@ -432,5 +484,3 @@
+ {
+ 	return GetCurrentProcess ();
+ }
+-
+-#endif

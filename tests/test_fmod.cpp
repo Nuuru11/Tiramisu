@@ -145,7 +145,7 @@ int main(void) {
   CHECK(fmod_Sound_GetLength(snd, &len, 1) == 0 && len >= 480 && len <= 560,
         "Sound_GetLength(ms) decodes to ~500ms");
   void* ch = nullptr;
-  CHECK(fmod_System_PlaySound(sys, nullptr, snd, 0, &ch) == 0 && ch,
+  CHECK(fmod_System_PlaySound(sys, snd, nullptr, 0, &ch) == 0 && ch,
         "PlaySound -> channel");
   CHECK(g_cap.count == 1 && g_cap.bytes == 22050u * 4u && g_cap.rate == 44100 &&
             g_cap.channels == 2 && g_cap.bps == 2,
@@ -165,7 +165,7 @@ int main(void) {
   u32 loop_mode = 0x00000002u;  // FMOD_LOOP_NORMAL
   CHECK(fmod_Sound_SetMode(snd, loop_mode) == 0, "Sound_SetMode(LOOP_NORMAL)");
   void* ch2 = nullptr;
-  CHECK(fmod_System_PlaySound(sys, nullptr, snd, 0, &ch2) == 0 && ch2,
+  CHECK(fmod_System_PlaySound(sys, snd, nullptr, 0, &ch2) == 0 && ch2,
         "looping PlaySound -> channel");
   CHECK(g_cap.count >= 2, "feeder re-pushed the loop");
   fmod_Channel_Stop(ch2);
@@ -180,17 +180,17 @@ int main(void) {
         "CreateSound(ogg memory) -> handle (named-silent path)");
   void* och = nullptr;
   const u32 pre_ogg = g_cap.count;
-  CHECK(fmod_System_PlaySound(sys, nullptr, osnd, 0, &och) == 0 && och,
+  CHECK(fmod_System_PlaySound(sys, osnd, nullptr, 0, &och) == 0 && och,
         "silent sound plays a real channel");
   CHECK(g_cap.count == pre_ogg, "no PCM submitted for the compressed sound");
   fmod_Channel_Stop(och);
 
   // --- handle discipline ---
   CHECK(fmod_Sound_Release(snd) == 0, "Sound_Release");
-  CHECK(fmod_System_PlaySound(sys, nullptr, snd, 0, &ch) != 0,
+  CHECK(fmod_System_PlaySound(sys, snd, nullptr, 0, &ch) != 0,
         "released sound handle is rejected (no use-after-free)");
-  CHECK(fmod_System_PlaySound(sys, nullptr, (void*)0x1234, 0, &ch) ==
-            5, /* FMOD_ERR_INVALID_HANDLE */
+  CHECK(fmod_System_PlaySound(sys, (void*)0x1234, nullptr, 0, &ch) ==
+            27, /* FMOD_ERR_INVALID_HANDLE (real SDK value) */
         "garbage handle rejected with FMOD_ERR_INVALID_HANDLE");
   CHECK(fmod_System_Release(sys) == 0, "System_Release");
 

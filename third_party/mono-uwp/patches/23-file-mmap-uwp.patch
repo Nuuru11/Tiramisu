@@ -1,0 +1,22 @@
+--- a/mono/metadata/file-mmap-windows.c
++++ b/mono/metadata/file-mmap-windows.c
+@@ -16,12 +16,18 @@
+ #include <config.h>
+ #include <glib.h>
+ #include <mono/utils/mono-compiler.h>
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) && defined(HOST_WIN32)
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT | HAVE_UWP_WINAPI_SUPPORT) && defined(HOST_WIN32)
+ 
+ #include <glib.h>
+ 
+ #include <mono/metadata/file-mmap.h>
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT) && !defined (HANDLE_FLAG_INHERIT)
++/* HANDLE_FLAG_INHERIT is not declared under the UWP (APP) WINAPI family
++ * (winnt.h gates it to desktop); its value is 0x00000001. */
++#define HANDLE_FLAG_INHERIT 0x00000001
++#endif
++
+ // These control the retry behaviour when lock violation errors occur during Flush:
+ #define MAX_FLUSH_WAITS 15  // must be <=30
+ #define MAX_FLUSH_RETIRES_PER_WAIT 20

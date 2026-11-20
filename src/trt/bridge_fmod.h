@@ -25,8 +25,9 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
                                           u32 mode, void* exinfo, void** out);
 int TRT_GUEST_ABI fmod_System_CreateStream(void* sys, const void* name_or_data,
                                            u32 mode, void* exinfo, void** out);
-int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* channel_or_index,
-                                        void* sound, int paused, void** out);
+int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* sound,
+                                        void* channelgroup, int paused,
+                                        void** out);
 int TRT_GUEST_ABI fmod_System_SetOutput(void* sys, u32 output);
 int TRT_GUEST_ABI fmod_System_SetSpeakerMode(void* sys, u32 mode);
 int TRT_GUEST_ABI fmod_System_SetDSPBufferSize(void* sys, u32 len, u32 num);
@@ -40,6 +41,17 @@ int TRT_GUEST_ABI fmod_Channel_GetVolume(void* ch, float* vol);
 int TRT_GUEST_ABI fmod_Channel_SetPaused(void* ch, int paused);
 int TRT_GUEST_ABI fmod_Channel_GetPaused(void* ch, int* paused);
 int TRT_GUEST_ABI fmod_Channel_IsPlaying(void* ch, int* playing);
+int TRT_GUEST_ABI fmod_Channel_SetFrequency(void* ch, float freq);
+int TRT_GUEST_ABI fmod_Channel_SetPosition(void* ch, u32 pos, u32 unit);
+int TRT_GUEST_ABI fmod_System_GetMasterChannelGroup(void* sys, void** out);
+int TRT_GUEST_ABI fmod_ChannelGroup_AddChannelGroup(void* grp, void* other);
+int TRT_GUEST_ABI fmod_ChannelGroup_SetVolume(void* grp, float vol);
+int TRT_GUEST_ABI fmod_System_Init2(void* sys, u32 maxch, u32 flags,
+                                    void* ex);
+int TRT_GUEST_ABI fmod_Memory_Initialize(void* pool, u32 size,
+                                         const void* funcs, u32 memtype);
+int TRT_GUEST_ABI fmod_Debug_Initialize(u32 flags, const char* filename,
+                                        int mode);
 
 #ifdef __cplusplus
 }

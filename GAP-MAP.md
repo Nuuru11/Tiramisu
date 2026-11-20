@@ -135,8 +135,42 @@ so the CLI path never runs; the live session ran it via import (see
 
 **In flight RIGHT NOW (orchestrated parallel agents, 2026-11-15 — do not duplicate):**
 - (none — wave 5 (items 24/25/30/29/35/46-remainder) is complete and verified;
-  next: console M0 when DP credentials arrive, or the command-list recording
-  surface (item 27 remainder) on request.)
+  M0 passed 2026-11-19; next is M1 — God of War's interactive front end plus
+  RACCOIN soak/frame-time, or the command-list recording surface (item 27
+  remainder) on request.)
+
+**M0 PLAYABLE (2026-11-19):** RACCOIN reaches its real main menu and plays a
+run on console — coin physics, HUD, score/round progression — captured in
+`docs/proof/raccoin-main-menu.png`, `raccoin-gameplay.png` and the 7.2 s
+`raccoin-gameplay.mp4`. God of War boots and renders the opening forest across
+four independent boots (`docs/proof/gow-forest-01..04.webp`). Next gate:
+God of War's interactive front-end/menu layer and sustained gameplay; RACCOIN soak
+and frame-time capture.
+
+**M0 CONSOLE FINDINGS (first real hardware run, 2026-11-17):**
+- The MSIX **installed, activated, and ran** on the Xbox Series S (OS 26100.9662):
+  the dashboard served on LAN, the capability probe ran (RWX denied / W->RX
+  ALLOWED — mono viable; dstorage MISSING; XAudio2 2.8 OK; gamepads=0).
+- **UnityPlayer.dll relocated on hardware**: 70,501 relocations fixed at a
+  non-preferred base — the reloc machinery is console-proven.
+- **RACCOIN boot reached Unity's GC**, then died: "Fatal error in GC:
+  SuspendThread loop failed" -> int3 (0x80000003). ROOT CAUSE: the console
+  build's trt_thread_handle_for_current() returned 0 under _WIN32, so
+  DuplicateHandle(GetCurrentThread()) handed the GC the -2 pseudo-handle
+  itself; the collector's SuspendThread loop then failed forever. FIXED:
+  real thread adoption (TID match, real DuplicateHandle) + a Boehm-style
+  safe-suspend loop (park -> verify the registry mutex is takeable ->
+  resume+retry, closing the suspend-while-holding-our-lock deadlock).
+- **Console activation blocker (0x80070002 "Please try again")**: the pack
+  carried the full 16-asset set (per-scale Square44x44 subdirs,
+  Square310x310, Wide310x150) — the console REFUSES activation of packages
+  with asset variants beyond the four-asset envelope. pack.sh now strips
+  to the proven envelope before packing.
+- **Selftest rc=IMPORT on console**: guest_hello imports TWO symbols
+  (TiramisuHostLogU32 AND TiramisuHostQueryBuild); only tests registered
+  them. main.cpp now registers both (build number 0.2.0).
+- Crash evidence path that works: log_line fflush's to LocalState\tiramisu.log
+  every line; /api/logs serves the DISK tail (survives the crash).
 
 **M0 CONSOLE FINDINGS (first real hardware run, 2026-11-17):**
 - The MSIX **installed, activated, and ran** on the Xbox Series S (OS 26100.9662):

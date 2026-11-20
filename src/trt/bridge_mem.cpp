@@ -23,6 +23,11 @@ extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 // the same ledger as VirtualAlloc/heap commit — over-budget maps refuse.
 extern "C" int trt_mem_budget_charge_map(u64 bytes);
 extern "C" void trt_mem_budget_discharge_map(u64 bytes);
+// the anonymous pagefile backing buffer is real committed memory too
+extern "C" int trt_mem_budget_charge_commit(u64 bytes);
+extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
+extern "C" int trt_mem_budget_charge_va(u64 bytes);
+extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 
 namespace {
 
@@ -200,6 +205,9 @@ void maybe_destroy_core_locked(mapping_core* core) {
   if (core->anon_buf) {
     free(core->anon_buf);
     core->anon_buf = nullptr;
+    trt_mem_budget_discharge_commit(core->anon_cap);
+    trt_mem_budget_discharge_va(core->anon_cap);
+    core->anon_cap = 0;
   }
   for (size_t i = 0; i < g_cores.size(); ++i) {
     if (g_cores[i] == core) {
@@ -585,8 +593,27 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   } else {
     // Lazily allocate shared pagefile backing for reasonable anonymous mappings
     if (!core->anon_buf && core->size <= (128ull << 20)) {
-      core->anon_buf = (u8*)calloc(1, (size_t)core->size);
-      if (core->anon_buf) core->anon_cap = core->size;
+      // the backing buffer is real committed memory: charge it (commit +
+      // VA); on refusal leave anon_buf null — the view still works, it
+      // just reads zeros instead of shared backing (existing graceful path)
+      const u64 sz = core->size;
+      bool charged = false;
+      if (trt_mem_budget_charge_va(sz) == 0) {
+        if (trt_mem_budget_charge_commit(sz) == 0) {
+          charged = true;
+        } else {
+          trt_mem_budget_discharge_va(sz);  // commit refused: roll VA back
+        }
+      }
+      if (charged) {
+        core->anon_buf = (u8*)calloc(1, (size_t)sz);
+        if (core->anon_buf) {
+          core->anon_cap = sz;
+        } else {
+          trt_mem_budget_discharge_commit(sz);
+          trt_mem_budget_discharge_va(sz);
+        }
+      }
     }
     if (core->anon_buf && offset < core->anon_cap) {
       size_t cp = (size_t)req_len;

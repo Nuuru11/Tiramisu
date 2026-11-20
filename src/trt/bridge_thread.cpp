@@ -48,6 +48,11 @@ extern "C" int trt_file_io_modes(void* file_handle);
 
 #if defined(_WIN32)
 #  include <windows.h>
+// TerminateThread is desktop-partition in the SDK headers (not declared
+// under WINAPI_FAMILY_APP), but callable from the AppContainer at runtime —
+// declared directly.
+extern "C" int __stdcall TerminateThread(void* hThread,
+                                         unsigned long dwExitCode);
 #else
 #  include <errno.h>
 #  include <fcntl.h>
@@ -61,6 +66,15 @@ extern "C" int trt_file_io_modes(void* file_handle);
 extern "C" u32 TRT_STDCALL trt_GetCurrentThreadId(void);
 extern "C" u32 trt_alloc_guest_thread_id(void);
 extern "C" void trt_bind_guest_thread_id(u32 tid);
+// VA ledger (bridge_membudget.cpp): thread stacks reserve VA for the
+// thread's lifetime
+extern "C" int trt_mem_budget_charge_va(u64 bytes);
+extern "C" void trt_mem_budget_discharge_va(u64 bytes);
+// WaitOnAddress/WakeByAddress (bridge_kernel32.cpp): the CS blocking wait
+extern "C" int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
+                                             u32 size, u32 ms);
+extern "C" void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr);
+extern "C" u32 TRT_STDCALL trt_GetLastError(void);
 
 namespace {
 
@@ -138,6 +152,13 @@ struct sync_object {
   u64 start_arg = 0;
   bool started = false;
 
+  // VA charged for this thread's stack reserve at creation (1 MB Windows
+  // default, 8 MB POSIX default, or the requested stack_size). Discharged
+  // exactly once when the thread exits — the field is zeroed on discharge
+  // so the trampoline, ExitThread, and TerminateThread paths can't
+  // double-discharge.
+  u64 stack_va_charge = 0;
+
   // IOCP queue
   std::deque<iocp_packet> iocp_queue;
   bool iocp_closed = false;
@@ -173,6 +194,7 @@ struct sync_object {
     start_routine = nullptr;
     start_arg = 0;
     started = false;
+    stack_va_charge = 0;
     iocp_queue.clear();
     iocp_closed = false;
 #if defined(_WIN32)
@@ -313,6 +335,16 @@ u64 alloc_object_locked(obj_kind kind) {
   o.kind = kind;
   o.handle_refs = 1;
   return make_handle(idx, next_gen);
+}
+
+// Discharge a thread's stack VA charge exactly once. Called wherever the
+// thread's alive flag flips to false (trampoline exit, ExitThread,
+// TerminateThread) — the zeroed field makes repeat calls no-ops. Must be
+// called with g_obj_mu held, like every other exit-path mutation.
+void discharge_thread_stack_locked(sync_object* o) {
+  if (!o || !o->stack_va_charge) return;
+  trt_mem_budget_discharge_va(o->stack_va_charge);
+  o->stack_va_charge = 0;
 }
 
 void maybe_reclaim_object_locked(u32 idx) {
@@ -541,9 +573,100 @@ void notify_thread_exit_once() {
 }
 
 #if defined(_WIN32)
+// Worker-thread faults used to die silent: the __except handler returned
+// the exception code as the thread exit code with no log line, while the
+// main thread's guest_seh_filter (host/main.cpp) logs code/address/regs/
+// stack. Mirror that format here so a worker crash is diagnosable from
+// the log. Runs inside the SEH filter, only for faults the VEHs declined.
+static void log_worker_fault(void* ep_v) {
+  PEXCEPTION_POINTERS ep = (PEXCEPTION_POINTERS)ep_v;
+  if (!ep || !ep->ExceptionRecord) return;
+  const EXCEPTION_RECORD& record = *ep->ExceptionRecord;
+  char where[192];
+  const uintptr_t pc = (uintptr_t)record.ExceptionAddress;
+  const char* module = "unknown";
+  uintptr_t offset = pc;
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (VirtualQuery((void*)pc, &mbi, sizeof(mbi))) {
+    offset = pc - (uintptr_t)mbi.AllocationBase;
+    const char* guest = trt_images_name(mbi.AllocationBase);
+    if (guest) module = guest;
+  }
+  snprintf(where, sizeof(where), "%s+0x%llx (pc=%p)", module,
+           (unsigned long long)offset, (void*)pc);
+  char line[320];
+  if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+      record.NumberParameters >= 2) {
+    const ULONG_PTR kind = record.ExceptionInformation[0];
+    snprintf(line, sizeof(line),
+             "guest fault [worker tid=%u]: 0x%08lx at %s, %s address %p",
+             current_tid(), (unsigned long)record.ExceptionCode, where,
+             kind == 0 ? "read" : kind == 1 ? "write" : "execute",
+             (void*)record.ExceptionInformation[1]);
+  } else {
+    snprintf(line, sizeof(line),
+             "guest fault [worker tid=%u]: 0x%08lx at %s",
+             current_tid(), (unsigned long)record.ExceptionCode, where);
+  }
+  trt_core_log(line);
+  if (!ep->ContextRecord) return;
+  const CONTEXT& c = *ep->ContextRecord;
+  snprintf(line, sizeof(line),
+           "guest fault [worker] regs: rip=%016llx rsp=%016llx rbp=%016llx rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx",
+           (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+           (unsigned long long)c.Rbp, (unsigned long long)c.Rax,
+           (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+           (unsigned long long)c.Rdx);
+  trt_core_log(line);
+  snprintf(line, sizeof(line),
+           "guest fault [worker] regs: rsi=%016llx rdi=%016llx r8=%016llx r9=%016llx r10=%016llx r11=%016llx r12=%016llx r13=%016llx r14=%016llx r15=%016llx eflags=%08lx",
+           (unsigned long long)c.Rsi, (unsigned long long)c.Rdi,
+           (unsigned long long)c.R8, (unsigned long long)c.R9,
+           (unsigned long long)c.R10, (unsigned long long)c.R11,
+           (unsigned long long)c.R12, (unsigned long long)c.R13,
+           (unsigned long long)c.R14, (unsigned long long)c.R15,
+           (unsigned long)c.EFlags);
+  trt_core_log(line);
+  // stack walk via .pdata unwind (same shape as the main-thread filter)
+  CONTEXT ctx = c;
+  int depth = 0;
+  __try {
+    while (ctx.Rip && depth < 32) {
+      if (depth > 0) {
+        const uintptr_t fpc = (uintptr_t)ctx.Rip;
+        const char* fmod = "unknown";
+        uintptr_t foff = fpc;
+        MEMORY_BASIC_INFORMATION fmbi{};
+        if (VirtualQuery((void*)fpc, &fmbi, sizeof(fmbi))) {
+          foff = fpc - (uintptr_t)fmbi.AllocationBase;
+          const char* fg = trt_images_name(fmbi.AllocationBase);
+          if (fg) fmod = fg;
+        }
+        snprintf(line, sizeof(line), "guest fault [worker] caller %d: %s+0x%llx (pc=%p)",
+                 depth, fmod, (unsigned long long)foff, (void*)fpc);
+        trt_core_log(line);
+      }
+      const DWORD64 prev_rsp = ctx.Rsp;
+      DWORD64 base = 0;
+      if (const auto fn = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr)) {
+        PVOID handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fn, &ctx,
+                         &handler_data, &establisher, nullptr);
+      } else {
+        ctx.Rip = *reinterpret_cast<const DWORD64*>(ctx.Rsp);
+        ctx.Rsp += sizeof(DWORD64);
+      }
+      if (ctx.Rsp <= prev_rsp) break;
+      ++depth;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static int win_thread_seh_filter(void* ep) {
-  return (trt_dispatch_win32_exception(ep) == -1) ? EXCEPTION_CONTINUE_EXECUTION
-                                                  : EXCEPTION_EXECUTE_HANDLER;
+  if (trt_dispatch_win32_exception(ep) == -1) return EXCEPTION_CONTINUE_EXECUTION;
+  log_worker_fault(ep);
+  return EXCEPTION_EXECUTE_HANDLER;
 }
 
 static u64 win_call_guest_seh(void* routine, u64 arg) {
@@ -587,6 +710,7 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
       o->alive.store(false, std::memory_order_release);
       o->signalled = true;
       o->thread_ref = false;
+      discharge_thread_stack_locked(o);
       g_sync_cv.notify_all();
       maybe_reclaim_object_locked(idx);
     }
@@ -653,6 +777,7 @@ void* thread_trampoline(void* raw) {
       o->suspend_count.store(0, std::memory_order_release);
       write_pipe_retry(o->wake_pipe[1], 'X');
       o->thread_ref = false;
+      discharge_thread_stack_locked(o);
       g_sync_cv.notify_all();
       maybe_reclaim_object_locked(idx);
     }
@@ -776,12 +901,17 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
   }
   ts->object = obj;
 
+  // the new thread's stack reserve is VA for the thread's lifetime (the
+  // requested stack_size, else the 1 MB Windows default / 8 MB POSIX
+  // pthread default): charge BEFORE creating the thread so a VA refusal
+  // fails the creation instead of leaking an uncharged thread
 #if defined(_WIN32)
-  DWORD win_tid = 0;
-  HANDLE t = ::CreateThread(nullptr, (SIZE_T)stack_size, &win_thread_trampoline,
-                            ts, suspended ? CREATE_SUSPENDED : 0u, &win_tid);
-  if (!t) {
-    const DWORD err = GetLastError();
+  const u64 stack_va = stack_size ? (u64)(uintptr_t)stack_size
+                                  : 1024ull * 1024ull;
+#else
+  const u64 stack_va = 8ull * 1024ull * 1024ull;  // pthread default stack
+#endif
+  if (trt_mem_budget_charge_va(stack_va) != 0) {
     free(ts);
     std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 idx = 0;
@@ -789,6 +919,31 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
     if (o) {
       o->thread_ref = false;
       o->handle_refs = 0;
+      maybe_reclaim_object_locked(idx);
+    }
+    return 0;  // 8 already set by the VA refusal
+  }
+  {
+    std::lock_guard<std::mutex> lk(g_obj_mu);
+    sync_object* o = object_for_locked(obj);
+    if (o) o->stack_va_charge = stack_va;
+  }
+
+#if defined(_WIN32)
+  DWORD win_tid = 0;
+  HANDLE t = ::CreateThread(nullptr, (SIZE_T)stack_size, &win_thread_trampoline,
+                            ts, suspended ? CREATE_SUSPENDED : 0u, &win_tid);
+  if (!t) {
+    const DWORD err = GetLastError();
+    free(ts);
+    trt_mem_budget_discharge_va(stack_va);
+    std::lock_guard<std::mutex> lk(g_obj_mu);
+    u32 idx = 0;
+    sync_object* o = object_for_locked(obj, &idx);
+    if (o) {
+      o->thread_ref = false;
+      o->handle_refs = 0;
+      o->stack_va_charge = 0;
       maybe_reclaim_object_locked(idx);
     }
     trt_SetLastError(err);
@@ -809,12 +964,14 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
   pthread_t th;
   if (pthread_create(&th, nullptr, &thread_trampoline, ts) != 0) {
     free(ts);
+    trt_mem_budget_discharge_va(stack_va);
     std::lock_guard<std::mutex> lk(g_obj_mu);
     u32 idx = 0;
     sync_object* o = object_for_locked(obj, &idx);
     if (o) {
       o->thread_ref = false;
       o->handle_refs = 0;
+      o->stack_va_charge = 0;
       maybe_reclaim_object_locked(idx);
     }
     trt_SetLastError(8);
@@ -849,6 +1006,7 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
         o.signalled = true;
         o.suspend_count.store(0, std::memory_order_release);
         o.thread_ref = false;
+        discharge_thread_stack_locked(&o);
         g_sync_cv.notify_all();
         maybe_reclaim_object_locked(i);
         break;
@@ -872,6 +1030,7 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
         o.suspend_count.store(0, std::memory_order_release);
         write_pipe_retry(o.wake_pipe[1], 'X');
         o.thread_ref = false;
+        discharge_thread_stack_locked(&o);
         g_sync_cv.notify_all();
         maybe_reclaim_object_locked(i);
         break;
@@ -884,19 +1043,27 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
 }
 
 int TRT_STDCALL trt_TerminateThread(u64 thread, u32 code) {
-  (void)code;
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(thread);
   if (!o || o->kind != OBJ_THREAD) return 0;
   o->alive.store(false, std::memory_order_release);
+  o->exit_code = code;  // the terminated thread's exit code IS the code
   o->signalled = true;
   o->suspend_count.store(0, std::memory_order_release);
+  discharge_thread_stack_locked(o);  // the stack is gone with the thread
 #if defined(_WIN32)
   if (o->win_handle) {
+    // actually terminate the OS thread (was: mark dead + close the handle,
+    // leaving the thread itself running)
+    ::TerminateThread(o->win_handle, (DWORD)code);
     CloseHandle(o->win_handle);
     o->win_handle = nullptr;
   }
 #else
+  // pthread_cancel is the POSIX analogue (deferred: the thread dies at its
+  // next cancellation point); the wake-pipe poke covers threads parked in
+  // our own waits
+  if (o->has_pthread) pthread_cancel(o->pthread_handle);
   write_pipe_retry(o->wake_pipe[1], 'T');
 #endif
   g_sync_cv.notify_all();
@@ -1802,11 +1969,19 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
     if (trt_TryEnterCriticalSection(cs)) return 1;
     std::this_thread::yield();
   }
-  long waits = 0;
+  // Contended: block on the lock word instead of Sleep(1) polling (which
+  // cost ~1 ms of handoff latency plus a wakeup per millisecond per
+  // waiter). The wait runs in 100 ms slices so the >3s stall probe below
+  // still fires, and so a lost wake self-heals at the next slice boundary
+  // instead of parking the waiter forever.
+  const u32 saved_err = trt_GetLastError();
+  long waited_ms = 0;
   bool stall_named = false;
+  u32 one = 1;  // the locked word's held value (WaitOnAddress comparand)
   while (!trt_TryEnterCriticalSection(cs)) {
-    trt_Sleep(1);
-    if (++waits >= 3000 && !stall_named) {
+    trt_WaitOnAddress(&c->locked, &one, 4, 100);
+    waited_ms += 100;
+    if (waited_ms >= 3000 && !stall_named) {
       stall_named = true;
       u32 owner_alive = 2;
       void* start = nullptr;
@@ -1848,6 +2023,9 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
       trt_cs_stall_probe_pause();
     }
   }
+  // WaitOnAddress timeouts set the thread's last error (1460): the wait is
+  // an internal detail, not the guest's error — restore it
+  trt_SetLastError(saved_err);
   return 1;
 }
 
@@ -1861,6 +2039,7 @@ int TRT_STDCALL trt_LeaveCriticalSection(void* cs) {
   c->recursion = 0;
   __atomic_store_n(&c->owner, 0u, __ATOMIC_RELAXED);
   __atomic_store_n(&c->locked, 0u, __ATOMIC_RELEASE);
+  trt_WakeByAddressSingle(&c->locked);  // wake one blocked waiter
   return 1;
 }
 

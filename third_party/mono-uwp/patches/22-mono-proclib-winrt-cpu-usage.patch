@@ -1,0 +1,27 @@
+# 22: mono/utils/mono-proclib-windows.c — UWP fallback for
+# mono_cpu_usage.
+#
+# The classic implementation uses GetSystemTimes (desktop-only), so
+# under UWP the function was compiled out — but the threadpool monitor
+# thread calls it unguarded (threadpool-worker-default.c) and the UWP
+# link failed on it. The UWP version reports 0 (idle); the monitor
+# treats that as spare capacity and grows the pool up to its max,
+# which is the safe direction for a game. The desktop path is
+# unchanged.
+--- a/mono/utils/mono-proclib-windows.c
++++ b/mono/utils/mono-proclib-windows.c
+@@ -70,5 +70,14 @@
+ 
+ 	return cpu_usage;
+ }
++#else /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
++gint32
++mono_cpu_usage (MonoCpuUsageState *prev)
++{
++	/* UWP: GetSystemTimes is desktop-only, so no CPU usage can be
++	 * measured. Report 0 (idle): the threadpool monitor treats it
++	 * as spare capacity and grows the pool up to its max. */
++	return 0;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ #endif /* HOST_WIN32*/

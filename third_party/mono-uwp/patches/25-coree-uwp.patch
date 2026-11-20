@@ -1,0 +1,107 @@
+--- a/mono/metadata/coree.c
++++ b/mono/metadata/coree.c
+@@ -144,6 +144,18 @@
+ 
+ 	return TRUE;
+ }
++#else
++/* Under UWP there is no ntdll CLR-hosting entry point: mixed-mode
++ * assembly loading via _CorDllMain does not happen (assemblies are
++ * opened by mono_image_open). This stub exists only so the
++ * ExportFixups table links; it is never called in the embedding path. */
++BOOL STDMETHODCALLTYPE _CorDllMain(HINSTANCE hInst, DWORD dwReason, LPVOID lpReserved)
++{
++	(void) hInst;
++	(void) dwReason;
++	(void) lpReserved;
++	return FALSE;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ /* Called by ntdll.dll reagardless of entry point after _CorValidateImage. */
+@@ -221,6 +233,12 @@
+ 	/* return does not terminate the process. */
+ 	ExitProcess (mono_environment_exitcode_get ());
+ }
++#else
++/* See _CorDllMain above: no ntdll CLR-hosting entry point under UWP. */
++__int32 STDMETHODCALLTYPE _CorExeMain(void)
++{
++	return 1;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ /* Called by msvcrt.dll when shutting down. */
+@@ -401,6 +419,14 @@
+ 
+ 	return STATUS_SUCCESS;
+ }
++#else
++/* See _CorDllMain above: no ntdll image validation under UWP. */
++STDAPI _CorValidateImage(PVOID *ImageBase, LPCWSTR FileName)
++{
++	(void) ImageBase;
++	(void) FileName;
++	return E_FAIL;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ /* Called by ntdll.dll. */
+@@ -423,7 +449,7 @@
+ 	return CorBindToRuntimeEx (pwszVersion, pwszBuildFlavor, 0, rclsid, riid, ppv);
+ }
+ 
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT | HAVE_UWP_WINAPI_SUPPORT)
+ HMODULE WINAPI MonoLoadImage(LPCWSTR FileName)
+ {
+ 	HANDLE FileHandle;
+@@ -436,13 +462,30 @@
+ #endif
+ 	HMODULE ModuleHandle;
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	/* CreateFile is not declared under the UWP (APP) WINAPI family;
++	 * CreateFileFromAppW is its UWP equivalent, same signature. */
++	FileHandle = CreateFileFromAppW (FileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++#else
+ 	FileHandle = CreateFile(FileName, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
++#endif
+ 	if (FileHandle == INVALID_HANDLE_VALUE)
+ 		return NULL;
+ 
+-	FileSize = GetFileSize(FileHandle, NULL); 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	/* GetFileSize is not declared under the UWP (APP) WINAPI family;
++	 * GetFileSizeEx is its UWP equivalent. Assemblies are < 4 GiB. */
++	{
++		LARGE_INTEGER file_size;
++		if (!GetFileSizeEx (FileHandle, &file_size) || file_size.HighPart != 0)
++			goto CloseFile;
++		FileSize = file_size.LowPart;
++	}
++#else
++	FileSize = GetFileSize(FileHandle, NULL);
+ 	if (FileSize == INVALID_FILE_SIZE)
+ 		goto CloseFile;
++#endif
+ 
+ 	MapHandle = CreateFileMapping(FileHandle, NULL, PAGE_READONLY, 0, 0, NULL);
+ 	if (MapHandle == NULL)
+@@ -916,6 +959,16 @@
+ 	if (handle != INVALID_HANDLE_VALUE)
+ 		ActivateActCtx_proc (handle, &cookie);
+ }
++#else
++/* Activation contexts (CreateActCtx/ActivateActCtx) are desktop-only;
++ * under UWP there is no SxS activation context to set. mono_load_coree
++ * calls this only on the mscoree hosting path, which the embedding
++ * flow does not use. */
++void
++mono_coree_set_act_ctx (const char* file_name)
++{
++	(void) file_name;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ void

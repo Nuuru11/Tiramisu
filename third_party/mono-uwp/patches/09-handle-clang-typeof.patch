@@ -1,0 +1,26 @@
+# 09: mono/metadata/handle.h — let clang-cl use the __typeof__ branch
+# of MONO_TYPEOF_CAST instead of the MSVC ternary trick.
+#
+# MONO_TYPEOF_CAST simulates gcc's typeof on MSVC with a ternary:
+# (0 ? (typeexpr) : (MonoTypeofCastHelper)(expr)). That only works
+# because MSVC (non-conformingly) types a ternary of two unrelated
+# non-void pointers as the type of the FIRST operand. clang-cl follows
+# the C standard instead and types it void* — so MONO_HANDLE_RAW
+# returned void* and every `->field` access on a handle failed with
+# "member reference base type 'void' is not a structure or union"
+# (755 errors across 141 files). clang defines __clang__ alongside
+# _MSC_VER, so exclude it from the MSVC branch: clang-cl takes the
+# __typeof__ branch, which it supports fully. Real MSVC and GCC are
+# unchanged. (This is a clang-cl fix, not a UWP fix — it would bite
+# any clang-cl build of Mono 6.8, desktop or UWP.)
+--- a/mono/metadata/handle.h
++++ b/mono/metadata/handle.h
+@@ -335,7 +335,7 @@
+ // yielding two unrelated non-void pointers is the type of the first, plus a warning.
+ // This can be used to simulate gcc typeof extension.
+ // Otherwise we are forced to evaluate twice, or use C++.
+-#ifdef _MSC_VER
++#if defined(_MSC_VER) && !defined(__clang__)
+ typedef struct _MonoTypeofCastHelper *MonoTypeofCastHelper; // a pointer type unrelated to anything else
+ #define MONO_TYPEOF_CAST(typeexpr, expr) __pragma(warning(suppress:4133))(0 ? (typeexpr) : (MonoTypeofCastHelper)(expr))
+ #else

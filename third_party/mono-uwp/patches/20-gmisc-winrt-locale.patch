@@ -1,0 +1,28 @@
+# 20: mono/eglib/gmisc-win32.c — provide g_win32_getlocale under UWP.
+#
+# The classic implementation uses GetThreadLocale/GetLocaleInfoA
+# (desktop-only), so under UWP the function was compiled out — but
+# locales.c calls it unguarded (CultureInfo detection) and the UWP
+# link failed on it. The UWP version uses GetUserDefaultLocaleName
+# (APP-available), which returns the same "en-US" form. The desktop
+# path is unchanged.
+--- a/mono/eglib/gmisc-win32.c
++++ b/mono/eglib/gmisc-win32.c
+@@ -108,6 +108,17 @@
+ 	ccBuf += GetLocaleInfoA(lcid, LOCALE_SISO3166CTRYNAME, buf + ccBuf, 9);
+ 	return g_strdup (buf);
+ }
++#else /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
++gchar*
++g_win32_getlocale (void)
++{
++	/* UWP: GetThreadLocale/GetLocaleInfoA are desktop-only; the
++	 * user's default locale name (e.g. "en-US") is the equivalent. */
++	gunichar2 locale_name [LOCALE_NAME_MAX_LENGTH];
++	if (GetUserDefaultLocaleName (locale_name, LOCALE_NAME_MAX_LENGTH) != 0)
++		return g_utf16_to_utf8 (locale_name, -1, NULL, NULL, NULL);
++	return g_strdup ("en-US");
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ gboolean

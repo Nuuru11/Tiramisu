@@ -224,6 +224,151 @@ typedef struct VkPhysicalDeviceProperties2 {
     VkPhysicalDeviceProperties properties;
 } VkPhysicalDeviceProperties2;
 
+// Vulkan 1.1/1.2/1.3 + KHR feature structs, for the Features2 pNext walk in
+// bridge_vulkan.cpp. Layouts copied verbatim from <vulkan/vulkan_core.h>
+// (1.3.275); sizes pinned by static_assert in bridge_vulkan.cpp under the
+// real header (V11=64, V12=208, V13=80, DI=96, BDA=32, DR/SYNC2/TS=24).
+// All fields after the sType/pNext header are VkBool32.
+typedef struct VkPhysicalDeviceVulkan11Features {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           storageBuffer16BitAccess;
+    VkBool32           uniformAndStorageBuffer16BitAccess;
+    VkBool32           storagePushConstant16;
+    VkBool32           storageInputOutput16;
+    VkBool32           multiview;
+    VkBool32           multiviewGeometryShader;
+    VkBool32           multiviewTessellationShader;
+    VkBool32           variablePointersStorageBuffer;
+    VkBool32           variablePointers;
+    VkBool32           protectedMemory;
+    VkBool32           samplerYcbcrConversion;
+    VkBool32           shaderDrawParameters;
+} VkPhysicalDeviceVulkan11Features;
+
+typedef struct VkPhysicalDeviceVulkan12Features {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           samplerMirrorClampToEdge;
+    VkBool32           drawIndirectCount;
+    VkBool32           storageBuffer8BitAccess;
+    VkBool32           uniformAndStorageBuffer8BitAccess;
+    VkBool32           storagePushConstant8;
+    VkBool32           shaderBufferInt64Atomics;
+    VkBool32           shaderSharedInt64Atomics;
+    VkBool32           shaderFloat16;
+    VkBool32           shaderInt8;
+    VkBool32           descriptorIndexing;
+    VkBool32           shaderInputAttachmentArrayDynamicIndexing;
+    VkBool32           shaderUniformTexelBufferArrayDynamicIndexing;
+    VkBool32           shaderStorageTexelBufferArrayDynamicIndexing;
+    VkBool32           shaderUniformBufferArrayNonUniformIndexing;
+    VkBool32           shaderSampledImageArrayNonUniformIndexing;
+    VkBool32           shaderStorageBufferArrayNonUniformIndexing;
+    VkBool32           shaderStorageImageArrayNonUniformIndexing;
+    VkBool32           shaderInputAttachmentArrayNonUniformIndexing;
+    VkBool32           shaderUniformTexelBufferArrayNonUniformIndexing;
+    VkBool32           shaderStorageTexelBufferArrayNonUniformIndexing;
+    VkBool32           descriptorBindingUniformBufferUpdateAfterBind;
+    VkBool32           descriptorBindingSampledImageUpdateAfterBind;
+    VkBool32           descriptorBindingStorageImageUpdateAfterBind;
+    VkBool32           descriptorBindingStorageBufferUpdateAfterBind;
+    VkBool32           descriptorBindingUniformTexelBufferUpdateAfterBind;
+    VkBool32           descriptorBindingStorageTexelBufferUpdateAfterBind;
+    VkBool32           descriptorBindingUpdateUnusedWhilePending;
+    VkBool32           descriptorBindingPartiallyBound;
+    VkBool32           descriptorBindingVariableDescriptorCount;
+    VkBool32           runtimeDescriptorArray;
+    VkBool32           samplerFilterMinmax;
+    VkBool32           scalarBlockLayout;
+    VkBool32           imagelessFramebuffer;
+    VkBool32           uniformBufferStandardLayout;
+    VkBool32           shaderSubgroupExtendedTypes;
+    VkBool32           separateDepthStencilLayouts;
+    VkBool32           hostQueryReset;
+    VkBool32           timelineSemaphore;
+    VkBool32           bufferDeviceAddress;
+    VkBool32           bufferDeviceAddressCaptureReplay;
+    VkBool32           bufferDeviceAddressMultiDevice;
+    VkBool32           vulkanMemoryModel;
+    VkBool32           vulkanMemoryModelDeviceScope;
+    VkBool32           vulkanMemoryModelAvailabilityVisibilityChains;
+    VkBool32           shaderOutputViewportIndex;
+    VkBool32           shaderOutputLayer;
+    VkBool32           subgroupBroadcastDynamicId;
+} VkPhysicalDeviceVulkan12Features;
+
+typedef struct VkPhysicalDeviceVulkan13Features {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           robustImageAccess;
+    VkBool32           inlineUniformBlock;
+    VkBool32           descriptorBindingInlineUniformBlockUpdateAfterBind;
+    VkBool32           pipelineCreationCacheControl;
+    VkBool32           privateData;
+    VkBool32           shaderDemoteToHelperInvocation;
+    VkBool32           shaderTerminateInvocation;
+    VkBool32           subgroupSizeControl;
+    VkBool32           computeFullSubgroups;
+    VkBool32           synchronization2;
+    VkBool32           textureCompressionASTC_HDR;
+    VkBool32           shaderZeroInitializeWorkgroupMemory;
+    VkBool32           dynamicRendering;
+    VkBool32           shaderIntegerDotProduct;
+    VkBool32           maintenance4;
+} VkPhysicalDeviceVulkan13Features;
+
+typedef struct VkPhysicalDeviceDescriptorIndexingFeatures {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           shaderInputAttachmentArrayDynamicIndexing;
+    VkBool32           shaderUniformTexelBufferArrayDynamicIndexing;
+    VkBool32           shaderStorageTexelBufferArrayDynamicIndexing;
+    VkBool32           shaderUniformBufferArrayNonUniformIndexing;
+    VkBool32           shaderSampledImageArrayNonUniformIndexing;
+    VkBool32           shaderStorageBufferArrayNonUniformIndexing;
+    VkBool32           shaderStorageImageArrayNonUniformIndexing;
+    VkBool32           shaderInputAttachmentArrayNonUniformIndexing;
+    VkBool32           shaderUniformTexelBufferArrayNonUniformIndexing;
+    VkBool32           shaderStorageTexelBufferArrayNonUniformIndexing;
+    VkBool32           descriptorBindingUniformBufferUpdateAfterBind;
+    VkBool32           descriptorBindingSampledImageUpdateAfterBind;
+    VkBool32           descriptorBindingStorageImageUpdateAfterBind;
+    VkBool32           descriptorBindingStorageBufferUpdateAfterBind;
+    VkBool32           descriptorBindingUniformTexelBufferUpdateAfterBind;
+    VkBool32           descriptorBindingStorageTexelBufferUpdateAfterBind;
+    VkBool32           descriptorBindingUpdateUnusedWhilePending;
+    VkBool32           descriptorBindingPartiallyBound;
+    VkBool32           descriptorBindingVariableDescriptorCount;
+    VkBool32           runtimeDescriptorArray;
+} VkPhysicalDeviceDescriptorIndexingFeatures;
+
+typedef struct VkPhysicalDeviceBufferDeviceAddressFeatures {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           bufferDeviceAddress;
+    VkBool32           bufferDeviceAddressCaptureReplay;
+    VkBool32           bufferDeviceAddressMultiDevice;
+} VkPhysicalDeviceBufferDeviceAddressFeatures;
+
+typedef struct VkPhysicalDeviceDynamicRenderingFeatures {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           dynamicRendering;
+} VkPhysicalDeviceDynamicRenderingFeatures;
+
+typedef struct VkPhysicalDeviceSynchronization2Features {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           synchronization2;
+} VkPhysicalDeviceSynchronization2Features;
+
+typedef struct VkPhysicalDeviceTimelineSemaphoreFeatures {
+    VkStructureType    sType;
+    void*              pNext;
+    VkBool32           timelineSemaphore;
+} VkPhysicalDeviceTimelineSemaphoreFeatures;
+
 typedef VkDeviceSize uint64_t;
 
 #endif // TIRAMISU_VULKAN_CORE_STUB_H

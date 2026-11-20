@@ -102,6 +102,69 @@ int env_find_locked(const char* name) {
   return -1;
 }
 
+// ---- the canonical guest environment (0.2.2.95) ---------------------------
+// One source of truth for the guest env block: GetEnvironmentStringsW/A
+// advertise exactly this set, and the store is seeded with it on first use
+// so GetEnvironmentVariableW/A and the bridged _wgetenv/getenv see the same
+// values (bridges audit #7: the advertised defaults used to be invisible to
+// GetEnvironmentVariableW). Values match the VFS layout the bridge presents
+// (C:\ paths, TIRAMISU host, Player user).
+static const char* kTrtDefaultEnv[] = {
+  "PATH=C:\\Windows\\System32;Z:\\",
+  "TEMP=C:\\Temp", "TMP=C:\\Temp",
+  "USERPROFILE=C:\\Users\\Player",
+  "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
+  "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
+  "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
+  "SystemRoot=C:\\Windows",
+  "SystemDrive=C:",
+  "windir=C:\\Windows",
+  "ComSpec=C:\\Windows\\System32\\cmd.exe",
+  "ProgramFiles=C:\\Program Files",
+  "ProgramFiles(x86)=C:\\Program Files (x86)",
+  "ProgramData=C:\\ProgramData",
+  "PUBLIC=C:\\Users\\Public",
+  "ALLUSERSPROFILE=C:\\ProgramData",
+  "HOMEDRIVE=C:",
+  "HOMEPATH=\\Users\\Player",
+  "OS=Windows_NT",
+  "PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC",
+  "NUMBER_OF_PROCESSORS=8",
+  "PROCESSOR_ARCHITECTURE=AMD64",
+  "PROCESSOR_IDENTIFIER=AMD64 Family 25 Model 33 Stepping 0, AuthenticAMD",
+  "PROCESSOR_LEVEL=25",
+  "PROCESSOR_REVISION=2100",
+  "SESSIONNAME=Console",
+  "LOGONSERVER=\\\\TIRAMISU",
+  "USERDOMAIN=TIRAMISU",
+};
+
+extern "C" const char* const* trt_gap_env_defaults(size_t* count) {
+  if (count) *count = sizeof(kTrtDefaultEnv) / sizeof(kTrtDefaultEnv[0]);
+  return kTrtDefaultEnv;
+}
+
+// Seed-once: insert any missing defaults into the store (caller holds
+// g_env_mu). Runs on the first env access of any kind, so a game that queries
+// GetEnvironmentVariableW before ever calling GetEnvironmentStringsW still
+// sees the full set. A variable the game later deletes stays deleted.
+bool g_env_seeded = false;
+
+void seed_defaults_locked() {
+  if (g_env_seeded) return;
+  g_env_seeded = true;
+  for (size_t i = 0; i < sizeof(kTrtDefaultEnv) / sizeof(kTrtDefaultEnv[0]);
+       ++i) {
+    const char* kv = kTrtDefaultEnv[i];
+    const char* eq = strchr(kv, '=');
+    if (!eq) continue;
+    std::string key(kv, (size_t)(eq - kv));
+    if (env_find_locked(key.c_str()) < 0) {
+      g_env_store.emplace_back(key, std::string(eq + 1));
+    }
+  }
+}
+
 std::string utf16_to_utf8_dyn(const u16* s) {
   std::string out;
   if (!s) return out;
@@ -121,6 +184,7 @@ extern "C" const char* trt_gap_env_get(const char* name) {
   if (!name) return nullptr;
   static thread_local std::string t_env_val;
   std::lock_guard<std::mutex> lk(g_env_mu);
+  seed_defaults_locked();
   const int idx = env_find_locked(name);
   if (idx < 0 || g_env_store[(size_t)idx].second.empty()) return nullptr;
   t_env_val = g_env_store[(size_t)idx].second;
@@ -147,6 +211,7 @@ extern "C" const u16* trt_gap_env_build_wblock(const char* const* defaults,
   std::vector<std::pair<std::string, std::string>> merged;
   {
     std::lock_guard<std::mutex> lk(g_env_mu);
+    seed_defaults_locked();
     for (size_t i = 0; i < default_count; ++i) {
       const char* kv = defaults[i];
       if (!kv) continue;
@@ -979,6 +1044,7 @@ u32 TRT_STDCALL trt_GetModuleFileNameA(void* mod, char* buf, u32 len) {
   u32 i = 0;
   for (; i < n && i + 1 < len; ++i) buf[i] = (char)(w[i] & 0x7Fu);
   buf[i] = 0;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, buf); trt_core_log(st_line); }
   if (i < n) trt_SetLastError(122);
   return i;
 }
@@ -988,6 +1054,7 @@ u32 TRT_STDCALL trt_GetSystemDirectoryA(char* buf, u32 len) {
   const int n = trt_GetSystemDirectoryW(w, 128);
   if (!buf || (int)len < n + 1) return (u32)n;
   for (int i = 0; i <= n; ++i) buf[i] = (char)(w[i] & 0x7Fu);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetSystemDirectoryA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, buf); trt_core_log(st_line); }
   return (u32)n;
 }
 
@@ -1062,11 +1129,12 @@ u16 TRT_STDCALL trt_RtlCaptureStackBackTrace(u32 skip, u32 capture, void** bt,
 
 u32 TRT_STDCALL trt_GetEnvironmentVariableA(const char* name, char* buf,
                                             u32 size) {
-  if (!name) { trt_SetLastError(87); return 0; }
+  if (!name) { trt_core_log("strtrace: GetEnvironmentVariableA -> name=NULL value=NULL"); trt_SetLastError(87); return 0; }
   const char* val = trt_gap_env_get(name);
   if (!val) val = getenv(name);
-  if (!val) { trt_SetLastError(203); return 0; }
+  if (!val) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableA -> name=\"%.64s\" value=NULL", name); trt_core_log(st_line); trt_SetLastError(203); return 0; }
   const size_t n = strlen(val);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableA -> name=\"%.64s\" buf=%p value=\"%.128s\"", name, (void*)buf, val); trt_core_log(st_line); }
   if (!buf || size <= n) return (u32)(n + 1);
   memcpy(buf, val, n + 1);
   return (u32)n;
@@ -1207,6 +1275,7 @@ u32 TRT_STDCALL trt_GetShortPathNameW(const u16* src, u16* dst, u32 cch) {
 u32 TRT_STDCALL trt_GetTempPathA(u32 len, char* buf) {
   const char* tmp = "C:\\Temp\\";
   const u32 n = 8;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetTempPathA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, tmp); trt_core_log(st_line); }
   if (!buf || len <= n) return n + 1;
   memcpy(buf, tmp, n + 1);
   return n;

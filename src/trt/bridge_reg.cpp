@@ -292,6 +292,54 @@ void write_hive() {
   g_hive_dirty = false;
 }
 
+// ---- well-known key seeds ------------------------------------------------
+// Games probe a few keys at startup and treat FILE_NOT_FOUND as "Steam /
+// DirectX / Windows is broken" (or worse, as a signal to install things).
+// Seed them with plausible values; the persisted hive (loaded after this)
+// overwrites any seed the user or a game already set for real, and a seed
+// never overwrites a value already present.
+void seed_sz(reg_key* key, const char* name, const char* utf8) {
+  if (!key || find_value(key, name)) return;
+  // REG_SZ is stored as raw UTF-16LE bytes incl. the terminating NUL
+  u16 w[256];
+  size_t n = 0;
+  for (; utf8[n] && n + 1 < sizeof(w) / sizeof(w[0]); ++n)
+    w[n] = (u16)(u8)utf8[n];
+  w[n] = 0;
+  set_value(key, name, TRT_REG_SZ, w, (u32)((n + 1) * 2));
+}
+
+void seed_binary(reg_key* key, const char* name, const u8* data, u32 size) {
+  if (!key || find_value(key, name)) return;
+  set_value(key, name, TRT_REG_BINARY, data, size);
+}
+
+void seed_registry() {
+  reg_key* hklm = &g_roots[2];  // HKEY_LOCAL_MACHINE
+  // Valve\Steam: the install path every Steamworks game probes first
+  reg_key* steam = open_path(hklm, "SOFTWARE\\Valve\\Steam", true);
+  seed_sz(steam, "InstallPath", "C:\\Program Files (x86)\\Steam");
+  seed_sz(steam, "SteamPath", "C:\\Program Files (x86)\\Steam");
+  seed_sz(steam, "Language", "english");
+  // Windows\CurrentVersion: matches the GetVersionExW personality (10.0.19045)
+  reg_key* cv =
+      open_path(hklm, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion", true);
+  seed_sz(cv, "ProductName", "Windows 10 Pro");
+  seed_sz(cv, "CurrentVersion", "6.3");
+  seed_sz(cv, "CurrentBuild", "19045");
+  seed_sz(cv, "DisplayVersion", "22H2");
+  seed_sz(cv, "ProgramFilesDir", "C:\\Program Files");
+  seed_sz(cv, "ProgramFilesDir (x86)", "C:\\Program Files (x86)");
+  seed_sz(cv, "CommonFilesDir", "C:\\Program Files\\Common Files");
+  seed_sz(cv, "CommonFilesDir (x86)", "C:\\Program Files (x86)\\Common Files");
+  // DirectX: the 9.0c version stamp D3D9-era engines check
+  reg_key* dx = open_path(hklm, "SOFTWARE\\Microsoft\\DirectX", true);
+  seed_sz(dx, "Version", "4.09.00.0904");
+  const u8 installed_version[8] = {0, 0, 0, 9, 0, 0, 0, 0};
+  seed_binary(dx, "InstalledVersion", installed_version,
+              sizeof(installed_version));
+}
+
 void load_hive() {
   if (g_hive_loaded) return;
   g_hive_loaded = true;
@@ -300,6 +348,7 @@ void load_hive() {
     snprintf(g_roots[i].name, sizeof(g_roots[i].name), "%s", g_root_names[i]);
     g_roots[i].is_root = true;
   }
+  seed_registry();  // before the persisted hive: real values win over seeds
   char host[512];
   host_path_of_hive(host, sizeof(host));
   if (!host[0]) return;
@@ -435,12 +484,13 @@ int TRT_GUEST_ABI trt_RegQueryValueExW(u64 hkey, const u16* name, u32* reserved,
   trt_core_log(line);
   if (!key) return REG_ERROR_INVALID_HANDLE;
   reg_value* v = find_value(key, vname);
-  if (!v) return REG_ERROR_FILE_NOT_FOUND;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" value=NULL (not found)", vname); trt_core_log(st_line); return REG_ERROR_FILE_NOT_FOUND; }
   if (type) *type = v->type;
   if (cbDataOut) *cbDataOut = v->size;
   if (!data) return REG_SUCCESS;
   if (cbData < v->size) return REG_ERROR_MORE_DATA;
   memcpy(data, v->data, v->size);
+  { char st_tmp[136]; char st_line[256]; if (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) { const u16* st_w = (const u16*)v->data; size_t st_n = v->size / 2; if (st_n > 132) st_n = 132; size_t st_i = 0; for (; st_i < st_n && st_w[st_i]; ++st_i) st_tmp[st_i] = (char)(st_w[st_i] & 0x7f); st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u value=\"%.128s\"", vname, v->type, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u size=%u (non-string)", vname, v->type, v->size); } trt_core_log(st_line); }
   return REG_SUCCESS;
 }
 
@@ -995,7 +1045,7 @@ int TRT_GUEST_ABI trt_RegQueryValueExA(u64 hkey, const char* name, u32* reserved
   if (!key) return REG_ERROR_INVALID_HANDLE;
   const char* vname = (name && name[0]) ? name : "(Default)";
   reg_value* v = find_value(key, vname);
-  if (!v) return REG_ERROR_FILE_NOT_FOUND;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" value=NULL (not found)", vname); trt_core_log(st_line); return REG_ERROR_FILE_NOT_FOUND; }
   if (type) *type = v->type;
   const bool conv_sz = (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) &&
                        bytes_look_utf16_sz(v->data, v->size);
@@ -1009,6 +1059,7 @@ int TRT_GUEST_ABI trt_RegQueryValueExA(u64 hkey, const char* name, u32* reserved
   } else if (v->size) {
     memcpy(data, v->data, v->size);
   }
+  { char st_tmp[136]; char st_line[256]; if (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) { size_t st_n = need; if (st_n > 132) st_n = 132; size_t st_i = 0; for (; st_i < st_n && data[st_i]; ++st_i) st_tmp[st_i] = (char)data[st_i]; st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" type=%u value=\"%.128s\"", vname, v->type, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" type=%u size=%u (non-string)", vname, v->type, v->size); } trt_core_log(st_line); }
   return REG_SUCCESS;
 }
 
@@ -1091,6 +1142,7 @@ int TRT_GUEST_ABI trt_GetUserNameW(u16* buf, u32* cch) {
     return 0;
   }
   for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)k_user[i];
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameW -> buf=%p value=\"%.128s\"", (void*)buf, k_user); trt_core_log(st_line); }
   *cch = need;
   return 1;
 }
@@ -1105,6 +1157,7 @@ int TRT_GUEST_ABI trt_GetUserNameA(char* buf, u32* cch) {
     return 0;
   }
   memcpy(buf, k_user, need);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameA -> buf=%p value=\"%.128s\"", (void*)buf, k_user); trt_core_log(st_line); }
   *cch = need;
   return 1;
 }

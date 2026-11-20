@@ -1,0 +1,31 @@
+# 19: mono/utils/mono-dl-windows.c — unguard
+# mono_dl_current_error_string.
+#
+# It uses only GetLastError + FormatMessage + LocalFree, all declared
+# under the UWP (APP) family (verified by compile test), but it was
+# classic-gated while mono-dl.c calls it unguarded on every load
+# failure — the UWP link failed on it. The guard is removed; the body
+# is unchanged. (mono_dl_lookup_symbol_in_process stays classic-gated:
+# it uses EnumProcessModules and nothing calls it.)
+--- a/mono/utils/mono-dl-windows.c
++++ b/mono/utils/mono-dl-windows.c
+@@ -165,7 +165,10 @@
+ 	return 0;
+ }
+ 
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++/* FormatMessage/LocalFree are available in both the classic and UWP
++ * (APP) WINAPI families, so this is unguarded. (It was classic-
++ * gated; mono-dl.c calls it on every load failure and the UWP link
++ * failed on it.) */
+ char*
+ mono_dl_current_error_string (void)
+ {
+@@ -183,7 +186,6 @@
+ 	}
+ 	return ret;
+ }
+-#endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ int
+ mono_dl_get_executable_path (char *buf, int buflen)

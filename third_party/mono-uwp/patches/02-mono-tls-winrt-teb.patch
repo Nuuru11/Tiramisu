@@ -1,0 +1,43 @@
+# 02: mono/utils/mono-tls.h — fall back to a local TEB definition when
+# <winternl.h> is not available.
+#
+# Stock 6.8 includes <winternl.h> unconditionally on Windows to get PTEB
+# for mono_native_tls_get_value (the TEB fast path, which preserves
+# LastError where TlsGetValue would clobber it). Under the UWP (APP)
+# WINAPI family the SDK's winternl.h is empty — its entire content is
+# gated to the desktop partition — so PTEB is undeclared and ~1370
+# errors cascade through every file that includes mono-tls.h.
+#
+# The fallback typedef is copied verbatim from the Unity mono fork
+# (Unity-Technologies/mono, mono/utils/mono-tls.h, MIT — same license
+# as stock Mono), which carries exactly this #ifdef HAVE_WINTERNL_H /
+# #else structure. NtCurrentTeb() itself is declared in winnt.h with no
+# WINAPI partition guard, so it resolves under APP; only the TEB type
+# was missing. Patch 03 makes winconfig.h define HAVE_WINTERNL_H only
+# under the classic (desktop) family, so desktop builds keep the
+# <winternl.h> include and UWP builds take this fallback.
+--- a/mono/utils/mono-tls.h
++++ b/mono/utils/mono-tls.h
+@@ -53,7 +53,22 @@
+ #define mono_native_tls_free TlsFree
+ #define mono_native_tls_set_value TlsSetValue
+ 
++#ifdef HAVE_WINTERNL_H
+ #include <winternl.h>
++#else
++typedef struct _TEB {
++	PVOID Reserved1[12];
++	PVOID ProcessEnvironmentBlock;
++	PVOID Reserved2[399];
++	BYTE Reserved3[1952];
++	PVOID TlsSlots[64];
++	BYTE Reserved4[8];
++	PVOID Reserved5[26];
++	PVOID ReservedForOle;
++	PVOID Reserved6[4];
++	PVOID TlsExpansionSlots;
++} TEB, *PTEB;
++#endif
+ 
+ // TlsGetValue always writes 0 to LastError. Which can cause problems. This never changes LastError.
+ //

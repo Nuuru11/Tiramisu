@@ -25,7 +25,7 @@ mkdir -p "$objdir"
 printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-$(nproc)}" -I{} bash -c '
   f="$1"
   base="$(basename "$f" .cpp)"
-  clang++ -std=c++20 -O2 -Wall -fno-pie -c "$f" -o "'"$objdir"'/${base}.o"
+  clang++ -std=c++20 -O2 -Wall -fno-pie -Ithird_party/mono/usr/include/mono-2.0 -c "$f" -o "'"$objdir"'/${base}.o"
 ' _ {}
 clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
 clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
@@ -57,6 +57,38 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_pe_loader"
 
 "$out/test_pe_loader" "$out/guest_hello.exe" "$out/guest_hello_reloc.exe"
+
+# --- 3b. PE32 guest + loader test (M7 Phase 1: load-only, no execution) ---
+# x86 import libs from the .def files (kernel32.def lists the same names
+# the 64-bit guest uses; the 32-bit guest declares them cdecl so the
+# imports are undecorated, like real PE32 files).
+"$LLD_LINK" /lib /def:src/guest/kernel32.def /out:"$out/kernel32_32.lib" /machine:x86 /noentry
+"$LLD_LINK" /lib /def:src/guest/guest_lib32.def /out:"$out/guest_lib32.lib" /machine:x86 /noentry
+"$LLD_LINK" /lib /def:src/guest/guest_delay32.def /out:"$out/guest_delay32.lib" /machine:x86 /noentry
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_hello32.c -o "$out/guest_hello32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_data32.c -o "$out/guest_data32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_lib32.c -o "$out/guest_lib32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/guest_delay32.c -o "$out/guest_delay32.obj"
+"$CLANG" --target=i686-pc-windows-msvc -O2 -ffreestanding -fno-builtin \
+  -c src/guest/delayimp32.c -o "$out/delayimp32.obj"
+"$LLD_LINK" "$out/guest_lib32.obj" /DLL /NODEFAULTLIB /NOENTRY /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /OUT:"$out/guest_lib32.dll"
+"$LLD_LINK" "$out/guest_delay32.obj" /DLL /NODEFAULTLIB /NOENTRY /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /OUT:"$out/guest_delay32.dll"
+"$LLD_LINK" "$out/guest_hello32.obj" "$out/guest_data32.obj" "$out/delayimp32.obj" \
+  "$out/kernel32_32.lib" "$out/guest_lib32.lib" "$out/guest_delay32.lib" \
+  /NODEFAULTLIB /ENTRY:guest32_main /SUBSYSTEM:WINDOWS /MACHINE:X86 \
+  /DYNAMICBASE /BASE:0x10000000 /DELAYLOAD:guest_delay32.dll \
+  /OUT:"$out/guest_hello32.exe"
+file "$out/guest_hello32.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_pe32.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_pe32"
+"$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll"
 
 # --- 4. input bridge test (user32 surface the guests consume) ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
@@ -761,9 +793,87 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_fmod"
 "$out/test_fmod"
 
+# --- 43b. FMOD Studio engine: real bank parsing (RIFF/FEV + FSB5 Vorbis),
+#          event graph, VCA/bus state, real PCM through the voice hook
+#          (Path B step 4). SKIP when the game banks are absent. ---
+MONO_CELESTE_BANKS="$HOME/celeste-xbox/Celeste/Content/FMOD/Desktop"
+if [[ -f "$MONO_CELESTE_BANKS/sfx.bank" ]]; then
+  clang++ -std=c++20 -O2 -Wall -no-pie \
+    tests/test_fmod_studio.cpp "$out/libtrt.a" -lpthread \
+    -o "$out/test_fmod_studio"
+  "$out/test_fmod_studio"
+else
+  echo "SKIP fmod/studio: no game banks at $MONO_CELESTE_BANKS"
+fi
+
 # --- 44. loader fuzzer: malformed PEs must fail NAMED, never crash the host
 #         (the launch path reads untrusted game files) ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_fuzz_loader.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_fuzz_loader"
 "$out/test_fuzz_loader"
+
+# --- 45. Mono embedding: Celeste.exe boots to the title screen under the
+#         embedded Mono runtime + FNA (Path B step 1), with the REAL FMOD
+#         + Steamworks dllmaps (Path B step 4 — the old spike-parity stubs
+#         are gone). The door test runs first: it dlopens both .so files
+#         and proves the real bridges answer (markers, real bank event
+#         counts, bridged Steam ID). SKIP when the game is absent (other
+#         machines have no Celeste) or no Xvfb exists. ---
+MONO_CELESTE_EXE="$HOME/celeste-xbox/Celeste/Celeste.exe"
+if [[ -f "$MONO_CELESTE_EXE" ]]; then
+  if command -v xvfb-run >/dev/null; then
+    bash third_party/build-fna-stack.sh
+    # Door test: flat door calls through dlopen (no Mono needed).
+    clang++ -std=c++20 -O2 -Wall -no-pie \
+      tests/test_mono_doors.cpp -ldl -lpthread \
+      -o "$out/test_mono_doors"
+    "$out/test_mono_doors" \
+      "$here/third_party/mono-bridges/out/libfmod-real.so" \
+      "$here/third_party/mono-bridges/out/libcsteamworks-real.so" \
+      "$MONO_CELESTE_BANKS"
+    clang++ -std=c++20 -O2 -Wall -no-pie \
+      tests/test_mono_celeste.cpp "$out/libtrt.a" -ldl -lpthread \
+      -o "$out/test_mono_celeste"
+    # FNA's dllmap resolves FNA3D/FAudio by soname; the real bridges +
+    # libmono are passed by absolute path and need no LD_LIBRARY_PATH.
+    LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    xvfb-run -a "$out/test_mono_celeste" "$MONO_CELESTE_EXE" \
+      "$here/third_party/fna/out" \
+      "$here/third_party/mono-bridges/out/libfmod-real.so" \
+      "$here/third_party/mono-bridges/out/libcsteamworks-real.so" \
+      "$here/third_party/mono/usr/lib/libmono-2.0.so.1" 90
+  else
+    echo "SKIP mono/celeste: xvfb-run not found (no virtual display)"
+  fi
+else
+  echo "SKIP mono/celeste: no game at $MONO_CELESTE_EXE"
+fi
+
+# --- 46. FNA platform backend: Tiramisu_FNAPlatform initializes headless
+#         under embedded Mono and reports a fully populated function
+#         table (Path B step 2). The probe needs no game files and no
+#         display (headless by design); it runs twice, once per backend
+#         selection path (trt_mono_config.fna_platform, then the raw
+#         TIRAMISU_FNA_PLATFORM env var). SKIP when mcs or libmono is
+#         missing. Section 45 above still proves the SDL2 path. ---
+MONO_LIB="$here/third_party/mono/usr/lib/libmono-2.0.so.1"
+if command -v mcs >/dev/null && [[ -f "$MONO_LIB" ]]; then
+  bash third_party/build-fna-stack.sh
+  mcs -out:"$out/probe_fna_platform.exe" \
+    -r:"$here/third_party/fna/out/Microsoft.Xna.Framework.dll" \
+    tests/probe_fna_platform.cs
+  clang++ -std=c++20 -O2 -Wall -no-pie \
+    tests/test_fna_platform.cpp "$out/libtrt.a" -ldl -lpthread \
+    -o "$out/test_fna_platform"
+  # FNA's dllmap resolves FNA3D/FAudio by soname for the log hook; the
+  # probe itself never creates a graphics device.
+  LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$out/test_fna_platform" "$out/probe_fna_platform.exe" \
+    "$here/third_party/fna/out" "$MONO_LIB" config
+  LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$out/test_fna_platform" "$out/probe_fna_platform.exe" \
+    "$here/third_party/fna/out" "$MONO_LIB" env
+else
+  echo "SKIP fna/platform: mcs or libmono missing"
+fi

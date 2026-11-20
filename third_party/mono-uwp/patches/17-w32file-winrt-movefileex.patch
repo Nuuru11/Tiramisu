@@ -1,0 +1,37 @@
+# 17: mono/metadata/w32file-win32.c — move files with MoveFileExW
+# under UWP.
+#
+# mono_w32file_move was gated on HAVE_API_SUPPORT_WIN32_MOVE_FILE
+# (classic-only) and called MoveFileW, which is not declared under the
+# UWP (APP) family — but w32file.c calls it unguarded (File.Move) and
+# the UWP link failed on it. The function is now gated on
+# HAVE_API_SUPPORT_WIN32_MOVE_FILE_EX (which w32subset.h already marks
+# UWP-available) and uses MoveFileExW with MOVEFILE_COPY_ALLOWED under
+# UWP, which is behaviour-identical to MoveFileW (including
+# cross-volume moves). The desktop path is unchanged.
+--- a/mono/metadata/w32file-win32.c
++++ b/mono/metadata/w32file-win32.c
+@@ -432,7 +432,7 @@
+ 	return res;
+ }
+ 
+-#if HAVE_API_SUPPORT_WIN32_MOVE_FILE
++#if HAVE_API_SUPPORT_WIN32_MOVE_FILE_EX
+ gboolean
+ mono_w32file_move (const gunichar2 *path, const gunichar2 *dest, gint32 *error)
+ {
+@@ -440,7 +440,14 @@
+ 
+ 	MONO_ENTER_GC_SAFE;
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	/* MoveFileW is not declared under the UWP (APP) WINAPI family;
++	 * MoveFileExW with MOVEFILE_COPY_ALLOWED is its equivalent
++	 * (same cross-volume behaviour as MoveFileW). */
++	result = MoveFileExW (path, dest, MOVEFILE_COPY_ALLOWED);
++#else
+ 	result = MoveFileW (path, dest);
++#endif
+ 	if (!result)
+ 		*error = GetLastError ();
+ 

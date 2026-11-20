@@ -44,7 +44,7 @@ stb_vorbis* stb_vorbis_open_memory(const unsigned char* data, int len,
 void stb_vorbis_close(stb_vorbis* f);
 stb_vorbis_info stb_vorbis_get_info(stb_vorbis* f);
 int stb_vorbis_get_frame_short_interleaved(stb_vorbis* f, int num_c,
-                                           short** data);
+                                           short* buffer, int num_shorts);
 }
 #include <stdlib.h>
 #include <string.h>
@@ -58,11 +58,17 @@ static void line(const char* s) { trt_core_log(s); }
 namespace {
 
 // ---- FMOD result codes (public constants) ----
+// FMOD_RESULT values (FMOD Studio 2.02 public enum, fmod_common.h).
+// The old values here (INVALID_HANDLE=5, UNSUPPORTED=35,
+// FILE_NOT_FOUND=22, INVALID_PARAM=3) were invented and did not match the
+// SDK; the managed wrapper compares against the real enum (notably
+// ERR_EVENT_NOTFOUND=70), so wrong values corrupt error handling.
+// Fixed 2026-11-20 (dllmap1).
 constexpr int FMOD_OK_ = 0;
-constexpr int FMOD_ERR_INVALID_PARAM_ = 3;
-constexpr int FMOD_ERR_INVALID_HANDLE_ = 5;
-constexpr int FMOD_ERR_FILE_NOT_FOUND_ = 22;
-constexpr int FMOD_ERR_UNSUPPORTED_ = 35;
+constexpr int FMOD_ERR_INVALID_PARAM_ = 28;
+constexpr int FMOD_ERR_INVALID_HANDLE_ = 27;
+constexpr int FMOD_ERR_FILE_NOT_FOUND_ = 15;
+constexpr int FMOD_ERR_UNSUPPORTED_ = 64;
 constexpr int FMOD_ERR_NOTREADY_ = 43;
 
 // ---- FMOD mode flags (subset the bridge reads) ----
@@ -306,12 +312,13 @@ int ogg_decode(const u8* data, u32 size, fmod_sound* out) {
   u32 cap_frames = 1u << 16;
   short* pcm = (short*)malloc((size_t)cap_frames * info.channels * sizeof(short));
   u32 total = 0;
-  short* chans[2] = {nullptr, nullptr};
+  short frame_buf[8192 * 2];
   int n;
-  while ((n = stb_vorbis_get_frame_short_interleaved(v, info.channels, chans)) > 0) {
+  while ((n = stb_vorbis_get_frame_short_interleaved(v, info.channels,
+                                                     frame_buf, 8192 * 2)) > 0) {
     const u32 need = (total + (u32)n) * info.channels;
-    if (need > cap_frames) {
-      while (need > cap_frames) cap_frames <<= 1;
+    if (need > cap_frames * (u32)info.channels) {
+      while (need > cap_frames * (u32)info.channels) cap_frames <<= 1;
       short* np = (short*)realloc(pcm, (size_t)cap_frames * info.channels * sizeof(short));
       if (!np) {
         free(pcm);
@@ -320,7 +327,7 @@ int ogg_decode(const u8* data, u32 size, fmod_sound* out) {
       }
       pcm = np;
     }
-    memcpy(pcm + total * info.channels, chans[0],
+    memcpy(pcm + total * info.channels, frame_buf,
            (size_t)n * info.channels * sizeof(short));
     total += (u32)n;
   }
@@ -578,8 +585,13 @@ int TRT_GUEST_ABI fmod_Sound_GetLength(void* snd, u32* len, u32 unit) {
 }
 
 // ---- channels ----
-int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* channel_or_index,
-                                        void* sound, int paused, void** out) {
+// NOTE (dllmap1): the parameter order here used to be (sys,
+// channel_or_index, sound) — swapped vs the real FMOD C API
+// (sys, sound, channelgroup). Fixed to the real order; the Mono door and
+// native games both pass sound second.
+int TRT_GUEST_ABI fmod_System_PlaySound(void* sys, void* sound,
+                                        void* channelgroup, int paused,
+                                        void** out) {
   (void)sys;
   if (!out) return FMOD_ERR_INVALID_PARAM_;
   *out = nullptr;

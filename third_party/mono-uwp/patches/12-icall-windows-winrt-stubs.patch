@@ -1,0 +1,57 @@
+# 12: mono/metadata/icall-windows.c — UWP fallbacks for the three
+# per-API-gated Windows icalls.
+#
+# SHGetFolderPath, SendMessageTimeout and WaitForInputIdle are all
+# desktop-only (w32subset.h: 0 under UWP), so their implementations
+# were compiled out — but icall.c / icall-def.h reference them
+# unconditionally and the UWP link failed on all three. The fallbacks
+# follow the pattern Unity-Technologies/mono uses for the same three
+# functions: GetWindowsFolderPath returns an empty string,
+# BroadcastSettingChange reports NotSupported, WaitForInputIdle
+# returns WAIT_TIMEOUT ("did not become idle").
+--- a/mono/metadata/icall-windows.c
++++ b/mono/metadata/icall-windows.c
+@@ -173,6 +173,14 @@
+ 	}
+ 	return mono_string_new_handle (mono_domain_get (), "", error);
+ }
++#else
++MonoStringHandle
++mono_icall_get_windows_folder_path (int folder, MonoError *error)
++{
++	error_init (error);
++	g_unsupported_api ("SHGetFolderPath");
++	return mono_string_new_handle (mono_domain_get (), "", error);
++}
+ #endif
+ 
+ #if HAVE_API_SUPPORT_WIN32_SEND_MESSAGE_TIMEOUT
+@@ -181,6 +189,14 @@
+ {
+ 	SendMessageTimeout (HWND_BROADCAST, WM_SETTINGCHANGE, (WPARAM)NULL, (LPARAM)L"Environment", SMTO_ABORTIFHUNG, 2000, 0);
+ }
++#else
++ICALL_EXPORT void
++ves_icall_System_Environment_BroadcastSettingChange (MonoError *error)
++{
++	g_unsupported_api ("SendMessageTimeout");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "SendMessageTimeout");
++	SetLastError (ERROR_NOT_SUPPORTED);
++}
+ #endif
+ 
+ #if HAVE_API_SUPPORT_WIN32_WAIT_FOR_INPUT_IDLE
+@@ -189,6 +205,13 @@
+ {
+ 	return WaitForInputIdle (handle, milliseconds);
+ }
++#else
++gint32
++mono_icall_wait_for_input_idle (gpointer handle, gint32 milliseconds)
++{
++	g_unsupported_api ("WaitForInputIdle");
++	return WAIT_TIMEOUT;
++}
+ #endif
+ 
+ void

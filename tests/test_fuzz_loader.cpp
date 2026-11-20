@@ -48,13 +48,26 @@ static bool load_ok(const std::vector<u8>& bytes) {
   return rc == TRT_OK;
 }
 
+// same, but returns the loader's (named) error code for assertions
+static int load_rc(const std::vector<u8>& bytes, trt_image** img_out) {
+  trt_backend be = {&fuzz_alloc, &fuzz_protect, &fuzz_release, &fuzz_log,
+                    nullptr};
+  trt_resolver rs = {nullptr, &fuzz_resolve};
+  trt_image* img = nullptr;
+  const int rc = trt_map_pe(&be, &rs, bytes.data(), bytes.size(), &img);
+  if (img_out) *img_out = img;
+  else if (img) trt_unmap(&be, img);
+  return rc;
+}
+
 int main(int argc, char** argv) {
   printf("=== test_fuzz_loader: malformed PEs must fail named, never crash ===\n");
 
   // seed corpus: the real guests (mutated below)
   std::vector<std::vector<u8>> seeds;
   const char* paths[] = {"tests/out/guest_hello.exe", "tests/out/guest_game.exe",
-                         "tests/out/guest_realload.exe"};
+                         "tests/out/guest_realload.exe",
+                         "tests/out/guest_hello32.exe"};
   for (const char* p : paths) {
     FILE* f = fopen(p, "rb");
     if (!f) continue;
@@ -157,6 +170,105 @@ int main(int argc, char** argv) {
     printf("  PASS %s (host survived)\n", c.name);
   }
 
+  // ---- PE32 structural cases (M7 Phase 1): the 32-bit parser must fail
+  // named on every malformed input, never crash. Applied to the PE32 seed
+  // only (found by machine 0x14c); skipped (not failed) when the PE32
+  // guest was not built.
+  const std::vector<u8>* pe32_seed = nullptr;
+  for (const auto& s : seeds) {
+    if (s.size() > 0x40 && s[0] == 'M' && s[1] == 'Z') {
+      u32 nt_off = 0;
+      memcpy(&nt_off, s.data() + 0x3C, 4);
+      if ((u64)nt_off + 6 <= s.size()) {
+        u16 machine = 0;
+        memcpy(&machine, s.data() + nt_off + 4, 2);
+        if (machine == 0x014c) { pe32_seed = &s; break; }
+      }
+    }
+  }
+  // Held PE32 image (see below): occupies the seed's preferred guest base
+  // so later PE32 maps relocate; unmapped at the end of main.
+  trt_backend be_hold = {&fuzz_alloc, &fuzz_protect, &fuzz_release,
+                         &fuzz_log, nullptr};
+  trt_image* held_pe32 = nullptr;
+  if (pe32_seed) {
+    // Hold one mapped PE32 image for the rest of the test: it occupies the
+    // seed's preferred guest base (0x10000000), so every later PE32 map
+    // relocates (delta != 0) and the reloc pass actually runs on the
+    // mutated inputs below (and in the mutation storm).
+    CHECK(load_rc(*pe32_seed, &held_pe32) == TRT_OK,
+          "unmutated PE32 seed loads");
+    CHECK(held_pe32 && held_pe32->is_pe32 == 1, "PE32 seed maps as PE32");
+    auto pe32_dir_off = [](const std::vector<u8>& s, int dir) -> u32 {
+      u32 nt_off = 0;
+      memcpy(&nt_off, s.data() + 0x3C, 4);
+      return nt_off + 24 + 96 + (u32)dir * 8;  // PE32 dirs at opt + 96
+    };
+    {
+      // truncated mid-optional-header
+      std::vector<u8> m = *pe32_seed;
+      u32 nt_off = 0;
+      memcpy(&nt_off, m.data() + 0x3C, 4);
+      m.resize(nt_off + 100);
+      CHECK(load_rc(m, nullptr) == TRT_ERR_BAD_DOS,
+            "PE32 truncated headers -> TRT_ERR_BAD_DOS");
+    }
+    {
+      // PE32+ magic on a 32-bit machine: neither path accepts it
+      std::vector<u8> m = *pe32_seed;
+      u32 nt_off = 0;
+      memcpy(&nt_off, m.data() + 0x3C, 4);
+      m[nt_off + 24] = 0x0b; m[nt_off + 25] = 0x02;
+      CHECK(load_rc(m, nullptr) == TRT_ERR_NOT_PE64,
+            "PE32 machine + PE32+ magic -> TRT_ERR_NOT_PE64");
+    }
+    {
+      // insane import directory RVA
+      std::vector<u8> m = *pe32_seed;
+      const u32 off = pe32_dir_off(m, 1);
+      const u32 big = 0x7FFFFFF0u;
+      if (off + 4 <= m.size()) memcpy(m.data() + off, &big, 4);
+      const int rc = load_rc(m, nullptr);
+      CHECK(rc == TRT_ERR_IMPORT, "PE32 insane import RVA -> TRT_ERR_IMPORT");
+    }
+    {
+      // insane reloc directory RVA (reloc pass runs: the seed's preferred
+      // guest base is taken by the earlier unmutated load in this process)
+      std::vector<u8> m = *pe32_seed;
+      const u32 off = pe32_dir_off(m, 5);
+      const u32 big = 0x7FFFFFF0u;
+      if (off + 4 <= m.size()) memcpy(m.data() + off, &big, 4);
+      const int rc = load_rc(m, nullptr);
+      CHECK(rc == TRT_ERR_RELOC_BOUNDS,
+            "PE32 insane reloc RVA -> TRT_ERR_RELOC_BOUNDS");
+    }
+    {
+      // insane TLS directory RVA (guest has no TLS dir; setting one must
+      // fail TLS_BOUNDS, not read out of the image)
+      std::vector<u8> m = *pe32_seed;
+      const u32 off = pe32_dir_off(m, 9);
+      const u32 big = 0x7FFFFFF0u, sz = 24;
+      if (off + 8 <= m.size()) {
+        memcpy(m.data() + off, &big, 4);
+        memcpy(m.data() + off + 4, &sz, 4);
+      }
+      CHECK(load_rc(m, nullptr) == TRT_ERR_TLS_BOUNDS,
+            "PE32 insane TLS RVA -> TRT_ERR_TLS_BOUNDS");
+    }
+    {
+      // absurd section count
+      std::vector<u8> m = *pe32_seed;
+      u32 nt_off = 0;
+      memcpy(&nt_off, m.data() + 0x3C, 4);
+      m[nt_off + 6] = 200; m[nt_off + 7] = 0;
+      CHECK(load_rc(m, nullptr) == TRT_ERR_NO_SECTIONS,
+            "PE32 section count 200 -> TRT_ERR_NO_SECTIONS");
+    }
+    printf("  PASS PE32 structural cases (host survived, all named)\n");
+  } else {
+    printf("  PASS PE32 structural cases (no PE32 seed built — skipped)\n");
+  }
+
   // ---- random mutation storm: 4000 mutations across seeds ----
   u32 survived = 0, rejected = 0, accepted = 0;
   for (u32 iter = 0; iter < 4000; ++iter) {
@@ -178,6 +290,8 @@ int main(int argc, char** argv) {
   }
   (void)rejected; (void)accepted;
   CHECK(survived == 4000, "4000 random mutations: host survived all");
+
+  if (held_pe32) trt_unmap(&be_hold, held_pe32);
 
   printf("RESULT: %s (%d failures)\n", failures ? "FAILURES" : "ALL PASS",
          failures);

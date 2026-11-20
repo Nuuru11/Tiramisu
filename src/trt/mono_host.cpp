@@ -1,0 +1,641 @@
+// tiramisu/src/trt/mono_host.cpp
+// Mono embedding for managed (.NET) games — Path B (Celeste).
+// See mono_host.h for the contract. The Linux path below embeds via a
+// dlopen'd libmono-2.0; the Windows/UWP path embeds the statically
+// linked Mono built by third_party/mono-uwp (same 6.8.0.105 runtime,
+// interpreter mode forced — the AppContainer blocks JIT code
+// generation). Main is entered via mono_jit_exec — the same entry the mono
+// CLI uses — because it sets the entry assembly: invoking Main by hand
+// via mono_runtime_invoke leaves Assembly.GetEntryAssembly() NULL, and
+// Celeste's Engine static constructor dereferences it (NRE in
+// Monocle.Engine..cctor). The AppDomain base directory is set to the
+// game's directory so content and relative paths resolve like the CLI.
+//
+// FNA PLATFORM: before Main runs, trt_mono_run applies
+// cfg->fna_platform as environment variables (the FNA dispatch reads
+// them in its static constructor) and registers the Tiramisu backend's
+// native internal calls (fna_platform.cpp) with the runtime, so the
+// backend's ProgramInit finds its native bridge.
+#include "mono_host.h"
+
+#include "fna_platform.h"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace {
+
+// ---- logging + last error (platform-independent) ----
+void (*g_log)(const char* line) = nullptr;
+
+void mono_log(const char* line) {
+  if (g_log) {
+    g_log(line);
+  } else {
+    std::fprintf(stderr, "mono: %s\n", line);
+  }
+}
+
+char g_last_error[512] = "";
+
+int fail(const char* detail) {
+  std::snprintf(g_last_error, sizeof(g_last_error), "%s", detail);
+  char line[600];
+  std::snprintf(line, sizeof(line), "FAIL %s", detail);
+  mono_log(line);
+  return TRT_ERR_MONO;
+}
+
+// ---- PE parsing helpers (platform-independent) ----
+u16 rd16(const u8* p) {
+  return (u16)((u16)p[0] | ((u16)p[1] << 8));
+}
+u32 rd32(const u8* p) {
+  return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+}
+
+}  // namespace
+
+extern "C" const char* trt_mono_last_error(void) { return g_last_error; }
+
+extern "C" int trt_pe_is_managed(const u8* file, size_t file_size) {
+  // DOS header: MZ + e_lfanew.
+  if (!file || file_size < 64) return 0;
+  if (rd16(file) != 0x5A4D) return 0;
+  const u32 pe_off = rd32(file + 0x3C);
+  // PE signature + COFF header (20 bytes) + optional-header magic.
+  if ((size_t)pe_off + 24 + 2 > file_size) return 0;
+  if (std::memcmp(file + pe_off, "PE\0\0", 4) != 0) return 0;
+  const u8* coff = file + pe_off + 4;
+  const u16 opt_size = rd16(coff + 16);
+  const u8* opt = coff + 20;
+  if ((size_t)pe_off + 24 + opt_size > file_size) return 0;
+  if (opt_size < 2) return 0;
+  const u16 magic = rd16(opt);
+  // Data-directory count lives at different offsets in PE32 (0x5C) vs
+  // PE32+ (0x6C); directory 14 (COM descriptor) follows the count.
+  size_t dd_base;
+  if (magic == 0x10B) {  // PE32
+    if (opt_size < 0x60 + 8 * 15) return 0;
+    dd_base = 0x60;
+  } else if (magic == 0x20B) {  // PE32+
+    if (opt_size < 0x70 + 8 * 15) return 0;
+    dd_base = 0x70;
+  } else {
+    return 0;
+  }
+  const u8* dd = opt + dd_base + 14 * 8;
+  const u32 clr_rva = rd32(dd);
+  const u32 clr_size = rd32(dd + 4);
+  return clr_rva != 0 && clr_size != 0;
+}
+
+#if defined(_WIN32)
+// ---- Windows/UWP: real embedding, statically linked Mono ----
+// The Mono runtime is built by third_party/mono-uwp/build-mono-uwp.sh
+// (stock 6.8.0.105, SGen, interpreter-capable) and linked directly
+// into the exe — no dlopen/LoadLibrary: the AppContainer has no
+// libmono DLL to load, and direct linking is the UWP equivalent of
+// dlopen. Interpreter mode is FORCED: AppContainer processes cannot
+// allocate executable memory (dynamic code generation is blocked), so
+// JIT code cannot run; the interpreter is proven for Celeste on Linux.
+// Console-verification-pending: this wiring is buildable + linkable,
+// but whether Celeste runs under it on the Series S needs a console
+// test (no UWP runtime exists on Linux).
+#include <windows.h>  // GetModuleFileNameW, SetEnvironmentVariableW,
+// GetFileAttributesA, WideCharToMultiByte
+
+// The Mono headers provide exact declarations; the calls below are
+// direct (statically linked), so a signature drift fails at link time
+// instead of corrupting a call at runtime.
+#include <mono/jit/jit.h>
+#include <mono/metadata/appdomain.h>
+#include <mono/metadata/assembly.h>
+#include <mono/metadata/blob.h>
+#include <mono/metadata/image.h>
+#include <mono/metadata/loader.h>
+#include <mono/metadata/metadata.h>
+#include <mono/metadata/mono-config.h>
+#include <mono/metadata/object.h>
+
+// domain.h is not shipped in the Ubuntu libmono-2.0-dev header set, so
+// mono_domain_set_config is declared directly (same as the Linux path).
+extern "C" void mono_domain_set_config(MonoDomain* domain, const char* base_dir,
+                                       const char* config_file_name);
+
+namespace {
+
+// dllmaps for the assembly-load hook (same contract as Linux: set for
+// the duration of one run; Mono has no hook uninstall, and one run per
+// process is the contract).
+const trt_mono_dllmap* g_hook_dllmaps_uwp = nullptr;
+int g_hook_dllmap_count_uwp = 0;
+
+void assembly_load_hook_uwp(MonoAssembly* assembly, void* user_data) {
+  (void)user_data;
+  MonoImage* image = mono_assembly_get_image(assembly);
+  if (!image) return;
+  // FNA3D is exported from the exe itself (FNA3DAPI __declspec(dllexport)
+  // under _WIN32): map it to __Internal so Mono resolves the P/Invokes
+  // via GetProcAddress on the main module. Installed into EVERY image,
+  // before any P/Invoke in it can resolve. FAudio is mapped the same way
+  // (Path B step 6): the FAudio core + the Tiramisu UWP platform layer
+  // (XAudio2 output, third_party/faudio/uwp/) are compiled into the host
+  // by tools/build-host.sh, and FAUDIOAPI is __declspec(dllexport) under
+  // _WIN32, so stock FNA managed code finds FAudio with no managed-code
+  // changes. (The Linux path keeps resolving FAudio by soname from
+  // third_party/faudio/out via the config dllmaps.)
+  mono_dllmap_insert(image, "FNA3D", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "FAudio", nullptr, "__Internal", nullptr);
+  if (!g_hook_dllmaps_uwp || g_hook_dllmap_count_uwp <= 0) return;
+  for (int i = 0; i < g_hook_dllmap_count_uwp; ++i) {
+    mono_dllmap_insert(image, g_hook_dllmaps_uwp[i].module, nullptr,
+                       g_hook_dllmaps_uwp[i].target, nullptr);
+  }
+}
+
+// UTF-16 -> UTF-8 (for the path from GetModuleFileNameW). The buffer is
+// always NUL-terminated; returns false on overflow or conversion error.
+bool utf16_to_utf8(const wchar_t* wide, char* out, size_t out_cap) {
+  if (!wide || !out || out_cap == 0) return false;
+  const int n = WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, (int)out_cap,
+                                    nullptr, nullptr);
+  if (n <= 0) {
+    out[0] = 0;
+    return false;
+  }
+  return true;
+}
+
+// Install dir of the running exe (the UWP package's install location):
+// the directory containing tiramisu.exe. The Mono framework assemblies
+// live in <install>/mono/4.5/ and the machine config in
+// <install>/etc/mono/config (packaged by tools/build-host.sh).
+bool install_dir(char* out, size_t out_cap) {
+  wchar_t path_w[MAX_PATH];
+  const DWORD n = GetModuleFileNameW(nullptr, path_w, MAX_PATH);
+  if (n == 0 || n >= MAX_PATH) return false;
+  // Strip the file name (accept both separators; the path uses
+  // backslashes, but be liberal).
+  wchar_t* slash = nullptr;
+  for (wchar_t* p = path_w; *p; ++p) {
+    if (*p == L'\\' || *p == L'/') slash = p;
+  }
+  if (!slash) return false;
+  *slash = 0;
+  return utf16_to_utf8(path_w, out, out_cap);
+}
+
+}  // namespace
+
+extern "C" int trt_mono_run(const trt_mono_config* cfg,
+                            const char* const* args, int nargs,
+                            int* exit_code_out) {
+  g_last_error[0] = 0;
+  if (exit_code_out) *exit_code_out = 0;
+  if (!cfg || !cfg->exe_path || !cfg->exe_path[0])
+    return fail("trt_mono_run: no exe_path");
+  if (cfg->log) g_log = cfg->log;
+
+  // FNA platform selection via environment variables, as on Linux —
+  // but through SetEnvironmentVariableW (the UCRT setenv/unsetenv are
+  // not available under UWP; the Win32 API is the direct equivalent
+  // and works in the AppContainer). Passing NULL deletes the variable.
+  if (cfg->fna_platform && cfg->fna_platform[0]) {
+    if (std::strcmp(cfg->fna_platform, "tiramisu") == 0) {
+      SetEnvironmentVariableW(L"TIRAMISU_FNA_PLATFORM", L"1");
+      SetEnvironmentVariableW(L"FNA_PLATFORM_BACKEND", L"TIRAMISU");
+      mono_log("fna platform: tiramisu (host surface + host input)");
+    } else if (std::strcmp(cfg->fna_platform, "sdl2") == 0) {
+      SetEnvironmentVariableW(L"TIRAMISU_FNA_PLATFORM", nullptr);
+      SetEnvironmentVariableW(L"FNA_PLATFORM_BACKEND", L"SDL2");
+      mono_log("fna platform: sdl2");
+    } else {
+      char detail[512];
+      std::snprintf(detail, sizeof(detail),
+                    "unknown fna_platform \"%s\" (want \"tiramisu\" or "
+                    "\"sdl2\")",
+                    cfg->fna_platform);
+      return fail(detail);
+    }
+  }
+
+  // Framework + config dirs: derived from the install dir unless the
+  // caller overrode them. The layout (packaged by build-host.sh) is
+  // <install>/mono/4.5/*.dll + <install>/mono/gac/... and
+  // <install>/etc/mono/config, mirroring Linux's /usr/lib + /etc split.
+  char install[1024];
+  if (!install_dir(install, sizeof(install)))
+    return fail("trt_mono_run: cannot determine install dir");
+  char framework_dir[1024];
+  char config_dir[1120];
+  std::snprintf(framework_dir, sizeof(framework_dir), "%s",
+                cfg->framework_dir && cfg->framework_dir[0]
+                    ? cfg->framework_dir
+                    : install);
+  if (cfg->config_dir && cfg->config_dir[0]) {
+    std::snprintf(config_dir, sizeof(config_dir), "%s", cfg->config_dir);
+  } else {
+    std::snprintf(config_dir, sizeof(config_dir), "%s\\etc", install);
+  }
+
+  // Dirs FIRST, then the machine config: mono_config_parse(nullptr)
+  // reads <config_dir>/mono/config, and the compiled-in default config
+  // dir is meaningless for a UWP package. (Linux does config first
+  // because its compiled-in default, /etc, is already right.)
+  mono_set_dirs(framework_dir, config_dir);
+  mono_config_parse(nullptr);
+  if (cfg->assemblies_path && cfg->assemblies_path[0])
+    mono_set_assemblies_path(cfg->assemblies_path);
+  {
+    char line[2300];
+    std::snprintf(line, sizeof(line), "mono dirs: framework=%s config=%s",
+                  framework_dir, config_dir);
+    mono_log(line);
+  }
+
+  // Interpreter mode is FORCED on UWP: the AppContainer blocks dynamic
+  // code generation, so JIT code cannot execute; the interpreter is the
+  // only execution engine. (cfg->interpreter is ignored here — there is
+  // no JIT path on UWP to select.)
+  {
+    char* opt_argv[2] = {(char*)"tiramisu-mono", (char*)"--interpreter"};
+    mono_jit_parse_options(2, opt_argv);
+    mono_log("mode: interpreter (forced on UWP; no JIT in AppContainer)");
+  }
+
+  // Install the dllmap hook BEFORE opening any assembly so every image —
+  // the exe, its managed DLLs, lazily-loaded assemblies — gets the maps.
+  g_hook_dllmaps_uwp = cfg->dllmaps;
+  g_hook_dllmap_count_uwp = cfg->dllmap_count;
+  mono_install_assembly_load_hook(assembly_load_hook_uwp, nullptr);
+
+  {
+    char line[700];
+    std::snprintf(line, sizeof(line), "opening %s", cfg->exe_path);
+    mono_log(line);
+  }
+  MonoDomain* domain = mono_jit_init(
+      cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  if (!domain) return fail("mono_jit_init returned NULL");
+
+  // Register the Tiramisu backend's native internal calls now, before
+  // any managed code runs (same as Linux).
+  trt_fna_register_internal_calls(
+      (trt_fna_add_internal_call_fn)mono_add_internal_call);
+  mono_log("fna platform: native internal calls registered");
+
+  // Set the AppDomain base directory to the game's directory and apply
+  // the game's .config file if it has one (Celeste.exe.config pins the
+  // v4.0/.NET 4.5 runtime). Must happen before the main assembly is
+  // opened. Always pass the .config path, like the mono CLI: this Mono
+  // build's mono_domain_set_config strlen()s it unconditionally, so
+  // NULL segfaults. Mono ignores a missing file. Paths on Windows use
+  // backslashes; accept both separators.
+  {
+    const char* slash = nullptr;
+    for (const char* p = cfg->exe_path; *p; ++p) {
+      if (*p == '/' || *p == '\\') slash = p;
+    }
+    char game_dir[1024];
+    if (!slash) {
+      std::snprintf(game_dir, sizeof(game_dir), ".");
+    } else if (slash == cfg->exe_path) {
+      std::snprintf(game_dir, sizeof(game_dir), "\\");
+    } else {
+      const size_t len = (size_t)(slash - cfg->exe_path);
+      if (len >= sizeof(game_dir))
+        return fail("exe_path directory too long");
+      std::memcpy(game_dir, cfg->exe_path, len);
+      game_dir[len] = 0;
+    }
+    char config_path[1120];
+    std::snprintf(config_path, sizeof(config_path), "%s.config", cfg->exe_path);
+    const bool has_config =
+        (GetFileAttributesA(config_path) != INVALID_FILE_ATTRIBUTES);
+    mono_domain_set_config(domain, game_dir, config_path);
+    char line[1200];
+    std::snprintf(line, sizeof(line), "domain base dir: %s%s", game_dir,
+                  has_config ? " (exe .config applied)" : "");
+    mono_log(line);
+  }
+
+  MonoAssembly* assembly = mono_domain_assembly_open(domain, cfg->exe_path);
+  if (!assembly) {
+    char detail[512];
+    std::snprintf(detail, sizeof(detail),
+                  "mono_domain_assembly_open failed for %s", cfg->exe_path);
+    return fail(detail);
+  }
+
+  // Enter Main via mono_jit_exec — the same entry the mono CLI uses. It
+  // sets the entry assembly (so Assembly.GetEntryAssembly() works —
+  // Celeste's Engine static constructor dereferences it) and invokes
+  // Main with argv[1..] as its string[] args; argv[0] is the exe path.
+  // It returns the game's exit code, or -1 when Main is missing or an
+  // unhandled managed exception escapes. A game whose Main legitimately
+  // returns -1 would be misreported as a failure; Celeste's Main is
+  // void, so -1 is unambiguous here.
+  mono_log("invoking managed Main");
+  std::vector<char*> exec_argv;
+  exec_argv.reserve((size_t)(nargs > 0 ? nargs : 0) + 1);
+  exec_argv.push_back(const_cast<char*>(cfg->exe_path));
+  for (int i = 0; i < nargs; ++i)
+    exec_argv.push_back(const_cast<char*>(args[i] ? args[i] : ""));
+  const int exec_rc = mono_jit_exec(
+      domain, assembly, (int)exec_argv.size(), exec_argv.data());
+  if (exec_rc == -1)
+    return fail("mono_jit_exec failed: no Main or unhandled managed "
+                "exception (see stderr)");
+  if (exit_code_out) *exit_code_out = exec_rc;
+  {
+    char line[96];
+    std::snprintf(line, sizeof(line), "managed Main returned (exit code %d)",
+                  exec_rc);
+    mono_log(line);
+  }
+  mono_jit_cleanup(domain);
+  return TRT_OK;
+}
+
+#else
+// ---- Linux: real embedding via dlopen'd libmono-2.0 ----
+#include <cstdlib>  // setenv/unsetenv (FNA platform selection)
+#include <dlfcn.h>
+#include <unistd.h>
+
+// The Mono headers provide exact declarations; the function-pointer table
+// below is built from them with decltype, so a signature drift fails at
+// compile time instead of corrupting a call at runtime.
+#include <mono/jit/jit.h>
+#include <mono/metadata/appdomain.h>
+#include <mono/metadata/assembly.h>
+#include <mono/metadata/blob.h>
+#include <mono/metadata/image.h>
+#include <mono/metadata/loader.h>
+#include <mono/metadata/metadata.h>
+#include <mono/metadata/mono-config.h>
+#include <mono/metadata/object.h>
+
+// domain.h is not shipped in the Ubuntu libmono-2.0-dev header set, so
+// mono_domain_set_config is declared directly (signature per Mono's
+// embedding docs and upstream mono/metadata/domain.h; the symbol is
+// exported by libmonosgen-2.0 and resolved via dlsym like the rest).
+extern "C" void mono_domain_set_config(MonoDomain* domain, const char* base_dir,
+                                       const char* config_file_name);
+
+namespace {
+
+#define MONO_FN(name) decltype(&name) p_##name = nullptr
+struct MonoApi {
+  MONO_FN(mono_config_parse);
+  MONO_FN(mono_set_dirs);
+  MONO_FN(mono_set_assemblies_path);
+  MONO_FN(mono_jit_parse_options);
+  MONO_FN(mono_jit_init);
+  MONO_FN(mono_jit_cleanup);
+  MONO_FN(mono_domain_set_config);
+  MONO_FN(mono_install_assembly_load_hook);
+  MONO_FN(mono_domain_assembly_open);
+  MONO_FN(mono_assembly_get_image);
+  MONO_FN(mono_jit_exec);
+  MONO_FN(mono_dllmap_insert);
+  MONO_FN(mono_add_internal_call);
+};
+#undef MONO_FN
+
+MonoApi g_mono;
+void* g_libmono = nullptr;
+
+// dllmaps for the assembly-load hook (set for the duration of one run;
+// Mono has no hook uninstall, and one run per process is the contract).
+const trt_mono_dllmap* g_hook_dllmaps = nullptr;
+int g_hook_dllmap_count = 0;
+
+void assembly_load_hook(MonoAssembly* assembly, void* user_data) {
+  (void)user_data;
+  if (!g_hook_dllmaps || g_hook_dllmap_count <= 0) return;
+  MonoImage* image = g_mono.p_mono_assembly_get_image(assembly);
+  if (!image) return;
+  // Insert BEFORE any P/Invoke in this image can resolve: the hook fires
+  // at load time, and P/Invoke targets bind lazily on first call.
+  for (int i = 0; i < g_hook_dllmap_count; ++i) {
+    g_mono.p_mono_dllmap_insert(image, g_hook_dllmaps[i].module, nullptr,
+                                g_hook_dllmaps[i].target, nullptr);
+  }
+}
+
+bool load_libmono(const char* explicit_path, char* detail, size_t detail_cap) {
+  const char* candidates[4];
+  int n = 0;
+  if (explicit_path && explicit_path[0]) candidates[n++] = explicit_path;
+  candidates[n++] = "libmono-2.0.so.1";
+  candidates[n++] = "libmonosgen-2.0.so.1";
+  candidates[n++] = "libmonoboehm-2.0.so.1";
+  const char* last_err = "";
+  for (int i = 0; i < n; ++i) {
+    g_libmono = dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL);
+    if (g_libmono) {
+      char line[512];
+      std::snprintf(line, sizeof(line), "libmono loaded: %s", candidates[i]);
+      mono_log(line);
+      return true;
+    }
+    const char* e = dlerror();
+    if (e) last_err = e;
+  }
+  std::snprintf(detail, detail_cap, "dlopen libmono failed: %s", last_err);
+  return false;
+}
+
+#define RESOLVE(api, name)                                                    \
+  do {                                                                        \
+    api.p_##name = reinterpret_cast<decltype(&name)>(dlsym(g_libmono, #name)); \
+    if (!api.p_##name) {                                                      \
+      std::snprintf(detail, detail_cap, "libmono lacks symbol %s", #name);    \
+      return false;                                                           \
+    }                                                                         \
+  } while (0)
+
+bool resolve_api(char* detail, size_t detail_cap) {
+  MonoApi& api = g_mono;
+  RESOLVE(api, mono_config_parse);
+  RESOLVE(api, mono_set_dirs);
+  RESOLVE(api, mono_set_assemblies_path);
+  RESOLVE(api, mono_jit_parse_options);
+  RESOLVE(api, mono_jit_init);
+  RESOLVE(api, mono_jit_cleanup);
+  RESOLVE(api, mono_domain_set_config);
+  RESOLVE(api, mono_install_assembly_load_hook);
+  RESOLVE(api, mono_domain_assembly_open);
+  RESOLVE(api, mono_assembly_get_image);
+  RESOLVE(api, mono_jit_exec);
+  RESOLVE(api, mono_dllmap_insert);
+  RESOLVE(api, mono_add_internal_call);
+  return true;
+}
+#undef RESOLVE
+
+}  // namespace
+
+extern "C" int trt_mono_run(const trt_mono_config* cfg,
+                            const char* const* args, int nargs,
+                            int* exit_code_out) {
+  g_last_error[0] = 0;
+  if (exit_code_out) *exit_code_out = 0;
+  if (!cfg || !cfg->exe_path || !cfg->exe_path[0])
+    return fail("trt_mono_run: no exe_path");
+  if (cfg->log) g_log = cfg->log;
+
+  // FNA platform selection: applied as env vars before Main runs (the
+  // FNA dispatch reads them in its static constructor). An unknown
+  // value fails the run: silently running the wrong backend would
+  // present a headless game as working.
+  if (cfg->fna_platform && cfg->fna_platform[0]) {
+    if (std::strcmp(cfg->fna_platform, "tiramisu") == 0) {
+      ::setenv("TIRAMISU_FNA_PLATFORM", "1", 1);
+      ::setenv("FNA_PLATFORM_BACKEND", "TIRAMISU", 1);
+      mono_log("fna platform: tiramisu (host surface + host input)");
+    } else if (std::strcmp(cfg->fna_platform, "sdl2") == 0) {
+      ::unsetenv("TIRAMISU_FNA_PLATFORM");
+      ::setenv("FNA_PLATFORM_BACKEND", "SDL2", 1);
+      mono_log("fna platform: sdl2");
+    } else {
+      char detail[512];
+      std::snprintf(detail, sizeof(detail),
+                    "unknown fna_platform \"%s\" (want \"tiramisu\" or "
+                    "\"sdl2\")",
+                    cfg->fna_platform);
+      return fail(detail);
+    }
+  }
+
+  char detail[512];
+  if (!load_libmono(cfg->libmono_path, detail, sizeof(detail)))
+    return fail(detail);
+  if (!resolve_api(detail, sizeof(detail))) return fail(detail);
+  MonoApi& api = g_mono;
+
+  // Machine config first (system dllmaps for the framework assemblies),
+  // then dirs, then the assembly search path.
+  api.p_mono_config_parse(nullptr);
+  api.p_mono_set_dirs(cfg->framework_dir ? cfg->framework_dir : "/usr/lib",
+                      cfg->config_dir ? cfg->config_dir : "/etc");
+  if (cfg->assemblies_path && cfg->assemblies_path[0])
+    api.p_mono_set_assemblies_path(cfg->assemblies_path);
+
+  // Interpreter mode (no JIT) must be selected before mono_jit_init.
+  // JIT is the default: it is what the Path B spike proved.
+  if (cfg->interpreter) {
+    char* opt_argv[2] = {(char*)"tiramisu-mono", (char*)"--interpreter"};
+    api.p_mono_jit_parse_options(2, opt_argv);
+    mono_log("mode: interpreter (no JIT)");
+  } else {
+    mono_log("mode: JIT");
+  }
+
+  // Install the dllmap hook BEFORE opening any assembly so every image —
+  // the exe, its managed DLLs, lazily-loaded assemblies — gets the maps.
+  g_hook_dllmaps = cfg->dllmaps;
+  g_hook_dllmap_count = cfg->dllmap_count;
+  api.p_mono_install_assembly_load_hook(assembly_load_hook, nullptr);
+
+  {
+    char line[700];
+    std::snprintf(line, sizeof(line), "opening %s", cfg->exe_path);
+    mono_log(line);
+  }
+  MonoDomain* domain = api.p_mono_jit_init(
+      cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  if (!domain) return fail("mono_jit_init returned NULL");
+
+  // Register the Tiramisu backend's native internal calls now, before
+  // any managed code runs: the FNA static constructor (inside Main)
+  // may select the Tiramisu backend, and its ProgramInit pings the
+  // bridge. Registered unconditionally — the bindings are inert unless
+  // managed code calls them, so the SDL2 path is unaffected.
+  trt_fna_register_internal_calls(
+      (trt_fna_add_internal_call_fn)api.p_mono_add_internal_call);
+  mono_log("fna platform: native internal calls registered");
+
+  // Set the AppDomain base directory to the game's directory and apply
+  // the game's .config file if it has one (Celeste.exe.config pins the
+  // v4.0/.NET 4.5 runtime). Must happen before the main assembly is
+  // opened. Without this, BaseDirectory is the process cwd and content
+  // loads look in the wrong place (TitleContainer is BaseDirectory-
+  // relative); the mono CLI does exactly this in its startup path.
+  {
+    const char* slash = std::strrchr(cfg->exe_path, '/');
+    char game_dir[1024];
+    if (!slash) {
+      std::snprintf(game_dir, sizeof(game_dir), ".");
+    } else if (slash == cfg->exe_path) {
+      std::snprintf(game_dir, sizeof(game_dir), "/");
+    } else {
+      const size_t len = (size_t)(slash - cfg->exe_path);
+      if (len >= sizeof(game_dir))
+        return fail("exe_path directory too long");
+      std::memcpy(game_dir, cfg->exe_path, len);
+      game_dir[len] = 0;
+    }
+    char config_path[1120];
+    std::snprintf(config_path, sizeof(config_path), "%s.config", cfg->exe_path);
+    // Always pass the .config path, like the mono CLI: this Mono
+    // build's mono_domain_set_config strlen()s it unconditionally, so
+    // NULL segfaults (found by the FNA probe, which ships no .config;
+    // Celeste.exe.config exists, so the Celeste path never hit it).
+    // Mono ignores a missing file.
+    const bool has_config = (::access(config_path, F_OK) == 0);
+    api.p_mono_domain_set_config(domain, game_dir, config_path);
+    // Publish the game dir for the dllmap bridges: the Steam door reads
+    // steam_appid.txt from $TIRAMISU_GAME_DIR at Init (the way the real
+    // Steam client finds the AppID).
+    ::setenv("TIRAMISU_GAME_DIR", game_dir, 1);
+    char line[1200];
+    std::snprintf(line, sizeof(line), "domain base dir: %s%s", game_dir,
+                  has_config ? " (exe .config applied)" : "");
+    mono_log(line);
+  }
+
+  MonoAssembly* assembly =
+      api.p_mono_domain_assembly_open(domain, cfg->exe_path);
+  if (!assembly) {
+    std::snprintf(detail, sizeof(detail),
+                  "mono_domain_assembly_open failed for %s", cfg->exe_path);
+    return fail(detail);
+  }
+
+  // Enter Main via mono_jit_exec — the same entry the mono CLI uses. It
+  // sets the entry assembly (so Assembly.GetEntryAssembly() works —
+  // Celeste's Engine static constructor dereferences it) and invokes
+  // Main with argv[1..] as its string[] args; argv[0] is the exe path.
+  // It returns the game's exit code, or -1 when Main is missing or an
+  // unhandled managed exception escapes (the exception + managed stack
+  // trace are printed to stderr by the runtime itself). A game whose
+  // Main legitimately returns -1 would be misreported as a failure;
+  // Celeste's Main is void, so -1 is unambiguous here.
+  mono_log("invoking managed Main");
+  std::vector<char*> exec_argv;
+  exec_argv.reserve((size_t)(nargs > 0 ? nargs : 0) + 1);
+  exec_argv.push_back(const_cast<char*>(cfg->exe_path));
+  for (int i = 0; i < nargs; ++i)
+    exec_argv.push_back(const_cast<char*>(args[i] ? args[i] : ""));
+  const int exec_rc = api.p_mono_jit_exec(
+      domain, assembly, (int)exec_argv.size(), exec_argv.data());
+  if (exec_rc == -1)
+    return fail("mono_jit_exec failed: no Main or unhandled managed "
+                "exception (see stderr)");
+  if (exit_code_out) *exit_code_out = exec_rc;
+  {
+    char line[96];
+    std::snprintf(line, sizeof(line), "managed Main returned (exit code %d)",
+                  exec_rc);
+    mono_log(line);
+  }
+  api.p_mono_jit_cleanup(domain);
+  return TRT_OK;
+}
+
+#endif  // _WIN32

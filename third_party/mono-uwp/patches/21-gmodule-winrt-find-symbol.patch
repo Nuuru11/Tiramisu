@@ -1,0 +1,29 @@
+# 21: mono/eglib/gmodule-win32.c — UWP fallback for w32_find_symbol.
+#
+# The classic implementation enumerates loaded modules with
+# EnumProcessModules (desktop-only), so under UWP it was compiled out
+# — but g_module_symbol calls it unguarded (as the fallback when
+# GetProcAddress on the main module misses) and the UWP link failed
+# on it. The UWP version returns NULL (symbol not found in other
+# modules); the GetProcAddress path — which is how __Internal P/Invoke
+# resolves FNA3D — is unaffected. The desktop path is unchanged.
+# (g_module_error is likewise classic-gated but nothing calls it, so
+# it needs no patch.)
+--- a/mono/eglib/gmodule-win32.c
++++ b/mono/eglib/gmodule-win32.c
+@@ -119,6 +119,15 @@
+ 	g_free (modules);
+ 	return NULL;
+ }
++#else
++gpointer
++w32_find_symbol (const gchar *symbol_name)
++{
++	/* UWP: EnumProcessModules is desktop-only, so symbols in other
++	 * loaded modules cannot be found; g_module_symbol's GetProcAddress
++	 * on the main module is the only lookup. */
++	return NULL;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ gboolean

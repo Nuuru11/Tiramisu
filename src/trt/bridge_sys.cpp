@@ -52,6 +52,48 @@ void utf16_to_utf8(const u16* in, char* out, size_t cap) {
   out[o] = 0;
 }
 
+// CP1252 byte -> UTF-16. 0x80..0x9F is where CP1252 differs from Latin-1;
+// 0x81/0x8D/0x8F/0x90/0x9D are undefined in CP1252 and map to the C1 control
+// code point, like Windows' default (MB_ERR_INVALID_CHARS off).
+u16 cp1252_to_u16(u8 c) {
+  if (c < 0x80 || c >= 0xA0) return (u16)c;
+  static const u16 k_cp1252_80_9f[32] = {
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+  };
+  return k_cp1252_80_9f[c - 0x80];
+}
+
+// Decode one UTF-8 sequence; always consumes >= 1 byte. Invalid, overlong,
+// truncated, surrogate, or out-of-range input yields U+FFFD and consumes
+// 1 byte (Windows' default without MB_ERR_INVALID_CHARS).
+int utf8_decode(const char* s, int avail, u32* cp_out) {
+  const u8 c = (u8)s[0];
+  if (c < 0x80) { *cp_out = c; return 1; }
+  int need = 0;
+  u32 cp = 0;
+  if ((c & 0xE0) == 0xC0) { need = 2; cp = c & 0x1F; }
+  else if ((c & 0xF0) == 0xE0) { need = 3; cp = c & 0x0F; }
+  else if ((c & 0xF8) == 0xF0) { need = 4; cp = c & 0x07; }
+  else { *cp_out = 0xFFFD; return 1; }
+  if (avail < need) { *cp_out = 0xFFFD; return 1; }
+  for (int k = 1; k < need; ++k) {
+    const u8 cc = (u8)s[k];
+    if ((cc & 0xC0) != 0x80) { *cp_out = 0xFFFD; return 1; }
+    cp = (cp << 6) | (cc & 0x3F);
+  }
+  if ((need == 2 && cp < 0x80) || (need == 3 && cp < 0x800) ||
+      (need == 4 && cp < 0x10000) || cp > 0x10FFFF ||
+      (cp >= 0xD800 && cp <= 0xDFFF)) {
+    *cp_out = 0xFFFD;
+    return 1;
+  }
+  *cp_out = cp;
+  return need;
+}
+
 } // namespace
 
 extern "C" {
@@ -135,7 +177,7 @@ int TRT_STDCALL trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
 
 u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
                                                u32 size) {
-  if (!name) return 0;
+  if (!name) { trt_core_log("strtrace: GetEnvironmentVariableW -> name=NULL value=NULL"); return 0; }
   char n[256];
   utf16_to_utf8(name, n, sizeof(n));
   // the SetEnvironmentVariableW store first (cross-call consistency: a
@@ -147,8 +189,9 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
     v = trt_gap_env_get(n);
   }
   if (!v) v = getenv(n);
-  if (!v) return 0;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" value=NULL", n); trt_core_log(st_line); return 0; }
   const u32 need = (u32)strlen(v) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" buf=%p value=\"%.128s\"", n, (void*)buf, v); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)v[i];
     return need;
@@ -161,13 +204,36 @@ u32 TRT_STDCALL trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
   if (!in) return 0;
   char src[1024], dst[2048];
   utf16_to_utf8(in, src, sizeof(src));
-  const char* base = nullptr;
-  {
-    extern const char* trt_gap_env_get(const char*);
-    base = trt_gap_env_get(src);
+  // Expand each %VAR% token in place (Windows semantics): an unknown or
+  // unterminated token is copied through verbatim. The old code looked the
+  // WHOLE input up as one variable name, so "%SystemRoot%\\x" never expanded.
+  size_t o = 0;
+  for (size_t i = 0; src[i] && o + 1 < sizeof(dst);) {
+    if (src[i] != '%') { dst[o++] = src[i++]; continue; }
+    const char* close = strchr(src + i + 1, '%');
+    if (!close) { dst[o++] = src[i++]; continue; }  // unterminated: verbatim
+    const size_t nlen = (size_t)(close - (src + i + 1));
+    char name[128];
+    const char* base = nullptr;
+    if (nlen < sizeof(name)) {
+      memcpy(name, src + i + 1, nlen);
+      name[nlen] = 0;
+      {
+        extern const char* trt_gap_env_get(const char*);
+        base = trt_gap_env_get(name);
+      }
+      if (!base) base = getenv(name);
+    }
+    if (!base) {  // unknown var (or absurdly long name): copy "%NAME%" verbatim
+      for (const char* p = src + i; p <= close && o + 1 < sizeof(dst); ++p)
+        dst[o++] = *p;
+    } else {
+      for (const char* p = base; *p && o + 1 < sizeof(dst); ++p) dst[o++] = *p;
+    }
+    i = (size_t)(close - src) + 1;
   }
-  if (!base) base = getenv(src);
-  snprintf(dst, sizeof(dst), "%s", base ? base : src);
+  dst[o] = 0;
+  { char st_line[320]; snprintf(st_line, sizeof(st_line), "strtrace: ExpandEnvironmentStringsW -> in=\"%.64s\" value=\"%.128s\"", src, dst); trt_core_log(st_line); }
   const u32 need = (u32)strlen(dst) + 1;
   if (out && size >= need) {
     for (u32 i = 0; i < need; ++i) out[i] = (u16)(u8)dst[i];
@@ -186,6 +252,7 @@ int TRT_STDCALL trt_GetComputerNameW(u16* buf, u32* size) {
   const char* host = getenv("COMPUTERNAME");
   if (!host) host = "TIRAMISU";
   const u32 need = (u32)strlen(host) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetComputerNameW -> buf=%p value=\"%.128s\"", (void*)buf, host); trt_core_log(st_line); }
   if (buf && size && *size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)host[i];
     *size = need;
@@ -198,27 +265,58 @@ int TRT_STDCALL trt_GetComputerNameW(u16* buf, u32* size) {
 // ---- wide/ANSI conversion ----
 
 // MultiByteToWideChar(codepage, flags, src, srclen, dst, dstlen)
+// Real conversion: CP_UTF8 (65001) decodes UTF-8 (surrogate pairs above
+// U+FFFF); anything else is the ANSI code page, CP1252 here (GetACP
+// returns 1252). The old code emitted TWO UTF-16 units per byte >= 0x80
+// (a UTF-8 encoding of the byte value stored as UTF-16) — mojibake, and
+// a buffer overrun for callers that sized the buffer from the size query.
 int TRT_STDCALL trt_MultiByteToWideChar(u32 codepage, u32 flags,
                                           const char* src, int srclen,
                                           u16* dst, int dstlen) {
-  (void)codepage; (void)flags;
+  (void)flags;
   if (!src) return 0;
+  const bool utf8 = (codepage == 65001u);  // CP_UTF8
   const int len = srclen < 0 ? (int)strlen(src) : srclen;
-  if (!dst || dstlen <= 0) return (srclen < 0) ? (len + 1) : len;
-  int n = 0;
-  for (int i = 0; i < len; ++i) {
-    const u8 c = (u8)src[i];
-    u16 w = c;
-    if (c >= 0x80) {  // latin-1 -> utf-16 for the common range
-      w = (u16)(0x00C0 | (c >> 6));
-      if (n + 1 >= dstlen) break;
-      dst[n++] = w;
-      w = (u16)(0x0080 | (c & 0x3F));
+  // Pass 1: required UTF-16 units (the size query must decode, not count
+  // bytes — a UTF-8 multibyte sequence is fewer units than bytes).
+  int need = 0;
+  for (int i = 0; i < len;) {
+    u32 cp = 0;
+    int used = 0;
+    if (utf8) {
+      used = utf8_decode(src + i, len - i, &cp);
+    } else {
+      cp = cp1252_to_u16((u8)src[i]);
+      used = 1;
     }
-    if (n + 1 > dstlen) break;
-    dst[n++] = w;
+    need += (cp > 0xFFFF) ? 2 : 1;
+    i += used;
   }
-  if (n < dstlen) dst[n] = 0;
+  if (srclen < 0) need += 1;  // terminating NUL is part of the conversion
+  if (!dst || dstlen <= 0) return need;
+  // Pass 2: fill what fits (whole code points only).
+  int n = 0;
+  for (int i = 0; i < len;) {
+    u32 cp = 0;
+    int used = 0;
+    if (utf8) {
+      used = utf8_decode(src + i, len - i, &cp);
+    } else {
+      cp = cp1252_to_u16((u8)src[i]);
+      used = 1;
+    }
+    const int units = (cp > 0xFFFF) ? 2 : 1;
+    if (n + units > dstlen) break;
+    if (units == 2) {
+      const u32 v = cp - 0x10000;
+      dst[n++] = (u16)(0xD800 + (v >> 10));
+      dst[n++] = (u16)(0xDC00 + (v & 0x3FF));
+    } else {
+      dst[n++] = (u16)cp;
+    }
+    i += used;
+  }
+  if (srclen < 0 && n < dstlen) dst[n++] = 0;
   return n;
 }
 
@@ -261,6 +359,7 @@ u32 TRT_STDCALL trt_GetTempPathW(u32 size, u16* buf) {
   // environment block already advertises TEMP=C:\Temp — match it.
   const char* t = "C:\\Temp\\";
   const u32 need = (u32)strlen(t) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetTempPathW -> buf=%p size=%u value=\"%.128s\"", (void*)buf, size, t); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)t[i];
     return need;
@@ -285,6 +384,7 @@ u32 TRT_STDCALL trt_GetTempFileNameW(const u16* dir, const u16* prefix,
 u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {
   const char* w = "C:\\Windows";
   const u32 need = (u32)strlen(w) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetWindowsDirectoryW -> buf=%p size=%u value=\"%.128s\"", (void*)buf, size, w); trt_core_log(st_line); }
   if (buf && size >= need)
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)w[i];
   return need;

@@ -1,0 +1,27 @@
+# Top-level public types of the real Microsoft.Xna.Framework.Game.dll 4.0.0.0
+# (xnafx40_redist.msi GAC assembly), enumerated with `monodis --typedef` and
+# filtered to (flags & 7) == 1 (TypeAttributes.Public). 17 types in the real
+# assembly; 16 listed here.
+# EXCLUDED: Microsoft.Xna.Framework.GamerServices.GamerServicesComponent —
+# FNA has no GamerServices namespace, and Celeste has 0 references to it
+# (verified in the Path B spike, 2026-11-20). If a future game references it,
+# the forwarder build must gain a real GamerServices type (or a stub).
+# Nested public types (6: NativeMethods/* structs) are Win32 interop details
+# of the real Game.dll; FNA does not define them and nothing references them
+# through the forwarder.
+Microsoft.Xna.Framework.IGameComponent
+Microsoft.Xna.Framework.IUpdateable
+Microsoft.Xna.Framework.GameComponent
+Microsoft.Xna.Framework.IDrawable
+Microsoft.Xna.Framework.DrawableGameComponent
+Microsoft.Xna.Framework.PreparingDeviceSettingsEventArgs
+Microsoft.Xna.Framework.Game
+Microsoft.Xna.Framework.GameComponentCollectionEventArgs
+Microsoft.Xna.Framework.GameComponentCollection
+Microsoft.Xna.Framework.GameServiceContainer
+Microsoft.Xna.Framework.GameTime
+Microsoft.Xna.Framework.GameWindow
+Microsoft.Xna.Framework.GraphicsDeviceInformation
+Microsoft.Xna.Framework.IGraphicsDeviceManager
+Microsoft.Xna.Framework.GraphicsDeviceManager
+Microsoft.Xna.Framework.LaunchParameters

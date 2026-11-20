@@ -1,0 +1,24 @@
+# 07: mono/sgen/sgen-protocol.c — use CreateFileFromAppW under UWP.
+#
+# The SGen binary-protocol debug log (MONO_SGEN_BINARY_PROTOCOL)
+# opens its file with CreateFileA, which is not declared under the
+# UWP (APP) WINAPI family (fileapi.h gates it to DESKTOP | SYSTEM |
+# GAMES). Under UWP, convert the UTF-8 filename to UTF-16 and open
+# with CreateFileFromAppW (the UWP equivalent, declared under APP).
+# The conversion uses eglib's g_utf8_to_utf16 (glib.h via sgen-gc.h).
+--- a/mono/sgen/sgen-protocol.c
++++ b/mono/sgen/sgen-protocol.c
+@@ -99,3 +99,13 @@
+ #if defined(HOST_WIN32)
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	/* CreateFileA is not declared under the UWP (APP) WINAPI family;
++	 * use CreateFileFromAppW (its UWP equivalent) with a UTF-16 name. */
++	{
++		gunichar2 *filename_utf16 = g_utf8_to_utf16 (filename, -1, NULL, NULL, NULL);
++		binary_protocol_file = CreateFileFromAppW (filename_utf16, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++		g_free (filename_utf16);
++	}
++#else
+ 	binary_protocol_file = CreateFileA (filename, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
++#endif
+ #elif defined(HAVE_UNISTD_H)

@@ -16,6 +16,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 
@@ -119,6 +120,20 @@ static bool g_vk_hooks_set = false;
 
 static void vk_log(const char* msg) { trt_core_log(msg); }
 
+// Single-line formatted log (trt_core_log takes one line, no trailing \n).
+// Newlines in the formatted text are flattened so one call stays one line.
+static void vk_logf(const char* fmt, ...) {
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  for (char* p = buf; *p; ++p) {
+    if (*p == '\n' || *p == '\r') *p = ' ';
+  }
+  vk_log(buf);
+}
+
 static constexpr i32 VK_SUCCESS_V = 0;
 static constexpr i32 VK_NOT_READY_V = 1;
 static constexpr i32 VK_EVENT_SET_V = 3;
@@ -127,6 +142,8 @@ static constexpr i32 VK_INCOMPLETE_V = 5;
 static constexpr i32 VK_ERROR_OUT_OF_HOST_MEMORY_V = -1;
 static constexpr i32 VK_ERROR_OUT_OF_DEVICE_MEMORY_V = -2;
 static constexpr i32 VK_ERROR_INITIALIZATION_FAILED_V = -3;
+static constexpr i32 VK_ERROR_EXTENSION_NOT_PRESENT_V = -7;
+static constexpr i32 VK_ERROR_FEATURE_NOT_PRESENT_V = -8;
 
 static constexpr u32 VK_MAKE_VER(u32 maj, u32 min, u32 pat) {
   return (maj << 22) | (min << 12) | pat;
@@ -162,6 +179,29 @@ static_assert(sizeof(VkPhysicalDeviceLimits) == 504,
               "VkPhysicalDeviceLimits ABI drift");
 static_assert(offsetof(VkPhysicalDeviceProperties, limits) == 296,
               "VkPhysicalDeviceProperties.limits offset drift");
+// Feature-struct ABI pins (measured 1.3.275; sizes include trailing padding
+// to the 8-byte alignment — the bool counts in feature_struct_bool_count()
+// are the real field counts, not (sizeof-16)/4).
+static_assert(sizeof(VkPhysicalDeviceFeatures) == 220,
+              "VkPhysicalDeviceFeatures ABI drift");
+static_assert(sizeof(VkPhysicalDeviceVulkan11Features) == 64,
+              "VkPhysicalDeviceVulkan11Features ABI drift");
+static_assert(sizeof(VkPhysicalDeviceVulkan12Features) == 208,
+              "VkPhysicalDeviceVulkan12Features ABI drift");
+static_assert(sizeof(VkPhysicalDeviceVulkan13Features) == 80,
+              "VkPhysicalDeviceVulkan13Features ABI drift");
+static_assert(sizeof(VkPhysicalDeviceDescriptorIndexingFeatures) == 96,
+              "VkPhysicalDeviceDescriptorIndexingFeatures ABI drift");
+static_assert(sizeof(VkPhysicalDeviceBufferDeviceAddressFeatures) == 32,
+              "VkPhysicalDeviceBufferDeviceAddressFeatures ABI drift");
+static_assert(sizeof(VkPhysicalDeviceDynamicRenderingFeatures) == 24,
+              "VkPhysicalDeviceDynamicRenderingFeatures ABI drift");
+static_assert(sizeof(VkPhysicalDeviceSynchronization2Features) == 24,
+              "VkPhysicalDeviceSynchronization2Features ABI drift");
+static_assert(sizeof(VkPhysicalDeviceTimelineSemaphoreFeatures) == 24,
+              "VkPhysicalDeviceTimelineSemaphoreFeatures ABI drift");
+static_assert(offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge) == 16,
+              "feature-struct bool offset drift");
 #endif
 // Local aliases keep the existing call sites unchanged.
 using vk_phys_dev_props = VkPhysicalDeviceProperties;
@@ -483,7 +523,7 @@ struct vk_cmd_op {
     OP_DRAW_INDIRECT = 17, OP_DRAW_IDX_INDIRECT = 18, OP_DRAW_INDIRECT_COUNT = 19,
     OP_DRAW_IDX_INDIRECT_COUNT = 20, OP_DISPATCH_INDIRECT = 21,
     OP_UPDATE_BUF = 22, OP_FILL_BUF = 23, OP_SET_EVENT = 24, OP_RESET_EVENT = 25,
-    OP_EXEC_CMDS = 26,
+    OP_EXEC_CMDS = 26, OP_PUSH_DS = 27,
   } kind{};
   trt_vk_rp_begin rp{};
   u32 bind_point = 0;
@@ -495,6 +535,9 @@ struct vk_cmd_op {
   u8 idx_u32 = 0;
   u32 ds_first = 0, ds_count = 0;
   u64 dsets[8] = {};
+  // OP_PUSH_DS: snapshot of the pushed writes for set ds_first
+  // (binding -> value), resolved at draw time like a bound set.
+  std::map<u32, vk_desc_binding_val> push_entries;
   u32 push_off = 0, push_sz = 0;
   u8 push_bytes[256] = {};
   u32 a0 = 0, a1 = 0, a2 = 0, a3 = 0;
@@ -618,6 +661,11 @@ struct vk_exec_state {
   u64 bound_vbs[8] = {}, bound_vb_offs[8] = {};
   u32 bound_vb_cnt = 0;
   u64 gfx_dsets[8] = {}, cs_dsets[8] = {};
+  // VK_KHR_push_descriptor: per-set pushed contents. A pushed set replaces
+  // any bound set at the same index (and vice versa); push_valid tracks
+  // which source is live for each set index.
+  std::map<u32, vk_desc_binding_val> gfx_push[8], cs_push[8];
+  bool gfx_push_valid[8] = {}, cs_push_valid[8] = {};
   u8 push_buf[256] = {};
   u32 push_sz = 0;
   vk_viewport cur_vp{0, 0, 1280, 720, 0, 1};
@@ -630,28 +678,40 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
   if (!d || !cb || depth > 8) return;
 
   auto build_bindings = [&](const vk_pipe_obj& p, const u64* sets,
+                            const std::map<u32, vk_desc_binding_val>* push_sets,
+                            const bool* push_valid,
                             std::vector<trt_vk_desc_binding>& out) {
     out.clear();
     for (const auto& mb : p.bindings) {
-      if (mb.set >= 8 || !sets[mb.set]) continue;
-      auto dsit = d->dsets.find(sets[mb.set]);
-      if (dsit == d->dsets.end()) continue;
-      auto eit = dsit->second.entries.find(mb.binding);
-      if (eit == dsit->second.entries.end()) continue;
+      if (mb.set >= 8) continue;
+      // A pushed set replaces the bound set at the same index.
+      const vk_desc_binding_val* val = nullptr;
+      if (push_valid[mb.set]) {
+        auto eit = push_sets[mb.set].find(mb.binding);
+        if (eit == push_sets[mb.set].end()) continue;
+        val = &eit->second;
+      } else {
+        if (!sets[mb.set]) continue;
+        auto dsit = d->dsets.find(sets[mb.set]);
+        if (dsit == d->dsets.end()) continue;
+        auto eit = dsit->second.entries.find(mb.binding);
+        if (eit == dsit->second.entries.end()) continue;
+        val = &eit->second;
+      }
       trt_vk_desc_binding db{};
       db.kind = (u32)mb.kind;
       db.stage_mask = mb.stage_mask;
       db.hlsl_reg = mb.hlsl_reg;
       db.smp_reg = mb.smp_reg;
-      db.buf_id = eit->second.buf_id;
-      db.buf_off = eit->second.buf_off;
-      db.buf_range = eit->second.buf_range;
+      db.buf_id = val->buf_id;
+      db.buf_off = val->buf_off;
+      db.buf_range = val->buf_range;
       if (db.buf_id) sync_buf_mem(d, db.buf_id);
-      if (eit->second.img_view && d->views.count(eit->second.img_view)) {
-        db.img_id = d->views[eit->second.img_view].image_id;
+      if (val->img_view && d->views.count(val->img_view)) {
+        db.img_id = d->views[val->img_view].image_id;
       }
-      if (eit->second.sampler && d->samps.count(eit->second.sampler)) {
-        const auto& s = d->samps[eit->second.sampler];
+      if (val->sampler && d->samps.count(val->sampler)) {
+        const auto& s = d->samps[val->sampler];
         db.min_filter = s.min_filter; db.mag_filter = s.mag_filter;
         db.addr_u = s.addr_u; db.addr_v = s.addr_v;
       }
@@ -663,7 +723,7 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
   auto emit_draw = [&](bool indexed, u32 a0, u32 a1, u32 a2, i32 vtx_off, u32 a3) {
     auto pit = d->pipes.find(st.bound_gfx_pipe);
     if (pit == d->pipes.end()) return;
-    build_bindings(pit->second, st.gfx_dsets, tmp_binds);
+    build_bindings(pit->second, st.gfx_dsets, st.gfx_push, st.gfx_push_valid, tmp_binds);
     trt_vk_draw_cmd cmd{};
     cmd.pipeline_id = st.bound_gfx_pipe;
     cmd.indexed = indexed ? 1 : 0;
@@ -691,7 +751,7 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
   auto emit_dispatch = [&](u32 gx, u32 gy, u32 gz) {
     auto pit = d->pipes.find(st.bound_cs_pipe);
     if (pit == d->pipes.end()) return;
-    build_bindings(pit->second, st.cs_dsets, tmp_binds);
+    build_bindings(pit->second, st.cs_dsets, st.cs_push, st.cs_push_valid, tmp_binds);
     trt_vk_dispatch_cmd cmd{};
     cmd.pipeline_id = st.bound_cs_pipe;
     cmd.gx = gx; cmd.gy = gy; cmd.gz = gz;
@@ -743,9 +803,24 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
         break;
       case vk_cmd_op::OP_BIND_DS: {
         u64* dst = (op.bind_point == 1) ? st.cs_dsets : st.gfx_dsets;
+        bool* pv = (op.bind_point == 1) ? st.cs_push_valid : st.gfx_push_valid;
         for (u32 i = 0; i < op.ds_count && (op.ds_first + i) < 8u; ++i) {
           dst[op.ds_first + i] = op.dsets[i];
+          pv[op.ds_first + i] = false;  // binding a set replaces any push
         }
+      } break;
+      case vk_cmd_op::OP_PUSH_DS: {
+        if (op.ds_first >= 8u) break;
+        auto* push = (op.bind_point == 1) ? st.cs_push : st.gfx_push;
+        bool* pv = (op.bind_point == 1) ? st.cs_push_valid : st.gfx_push_valid;
+        u64* dst = (op.bind_point == 1) ? st.cs_dsets : st.gfx_dsets;
+        // Push updates the bindings it writes (like vkUpdateDescriptorSets
+        // on the push set); bindings from earlier pushes survive.
+        for (const auto& kv : op.push_entries) {
+          push[op.ds_first][kv.first] = kv.second;
+        }
+        pv[op.ds_first] = true;
+        dst[op.ds_first] = 0;  // pushing a set replaces any bound set
       } break;
       case vk_cmd_op::OP_PUSH_CONST:
         if (op.push_off + op.push_sz <= 256u) {
@@ -1072,46 +1147,231 @@ void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties(void*, VkPhysicalDeviceProp
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceProperties2(void* pd, VkPhysicalDeviceProperties2* p2) {
   if (p2) trt_vkGetPhysicalDeviceProperties(pd, &p2->properties);
 }
-void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, VkPhysicalDeviceFeatures* f) {
-  if (f) {
-    *f = {};
-    // Features actually honored by the SPIR-V->HLSL->D3D11 bridge; the rest
-    // stay false rather than promising what the bridge can't deliver.
-    // Godot's _check_device_features hard-gates on imageCubeArray +
-    // independentBlend (rendering_device_driver_vulkan.cpp:_check_device_features
-    // — measured live: alert "does not support the following features" ->
-    // Vulkan init aborted -> forced GL fallback). Both are real D3D11
-    // capabilities the bridge carries.
-    f->robustBufferAccess = VK_TRUE;
-    f->fullDrawIndexUint32 = VK_TRUE;
-    f->independentBlend = VK_TRUE;
-    f->imageCubeArray = VK_TRUE;
-    f->dualSrcBlend = VK_TRUE;
-    f->sampleRateShading = VK_TRUE;
-    f->fragmentStoresAndAtomics = VK_TRUE;
-    f->vertexPipelineStoresAndAtomics = VK_TRUE;
-    f->shaderClipDistance = VK_TRUE;
-    f->shaderCullDistance = VK_TRUE;
-    f->shaderImageGatherExtended = VK_TRUE;
-    f->shaderStorageImageExtendedFormats = VK_TRUE;
-    f->depthClamp = VK_TRUE;
-    f->depthBiasClamp = VK_TRUE;
-    f->fillModeNonSolid = VK_TRUE;
-    f->multiViewport = VK_TRUE;
-    f->samplerAnisotropy = VK_TRUE;
-    f->textureCompressionBC = VK_TRUE;
-    f->tessellationShader = VK_TRUE;
-    f->geometryShader = VK_TRUE;
-    f->shaderTessellationAndGeometryPointSize = VK_TRUE;
-    f->occlusionQueryPrecise = VK_TRUE;
-    f->pipelineStatisticsQuery = VK_TRUE;
-    f->shaderFloat64 = VK_FALSE;  // D3D11: 64-bit shader floats are optional
-    f->shaderInt64 = VK_FALSE;
-    f->sparseBinding = VK_FALSE;  // sparse not bridged
+// ---- Honest feature reporting (shared by queries + vkCreateDevice) --------
+// Every feature struct here is (sType, pNext, N x VkBool32) with the first
+// bool at offset 16. The fill functions zero the bool region and set only
+// the bits the ICD/backend genuinely implements; the validation helpers
+// compare a request against the same honest fill, so a game can never be
+// told a feature exists and then be rejected for requesting it (or the
+// reverse). One source of truth for both directions.
+//
+// Evidence for the FALSE bits (verified 2026-11-20 against this tree):
+//  - geometry/tessellation stages: the pipeline builder maps every stage to
+//    VS or PS (no GS/HS/DS path; trt_vk_pipeline_desc has vs/ps/cs only).
+//  - fragment/vertex stores+atomics, 64-bit atomics: the SPIR-V translator
+//    has no OpAtomic* handling at all.
+//  - shaderImageGatherExtended: no OpImageGather in the translator.
+//  - multiViewport: vkCmdSetViewport records vp[0] only; one vp per draw.
+//  - occlusionQueryPrecise/pipelineStatisticsQuery/hostQueryReset: query
+//    pools return zeros (vkGetQueryPoolResults memsets 0; Begin/EndQuery
+//    are no-ops).
+//  - descriptor indexing (all): not implemented (later batch).
+//  - bufferDeviceAddress: the translator has no PhysicalStorageBuffer
+//    support, so the addresses vkGetBufferDeviceAddress returns cannot be
+//    dereferenced by any shader.
+//  - samplerYcbcrConversion: creation returns an id but no conversion is
+//    applied anywhere in sampling.
+//  - shaderDrawParameters: no DrawId/BaseVertex/BaseInstance in the
+//    translator. 16-bit/8-bit storage, subgroups, inline uniform block,
+//    private data, demote/terminate, dot product, ASTC-HDR, scalar block
+//    layout, separate depth/stencil layouts, imageless framebuffer (no
+//    attachment-begin-info path), vulkanMemoryModel: none implemented.
+// TRUE bits and why:
+//  - dynamicRendering: vkCmdBeginRendering records a real OP_BEGIN_RENDERING
+//    with attachments + clears, executed by the backend.
+//  - synchronization2: vkQueueSubmit2 executes synchronously; barrier2 is
+//    a no-op, which is correct on this single-queue in-order device.
+//  - timelineSemaphore: real per-semaphore counters (create/signal/get);
+//    waits are trivially satisfied because submits execute synchronously.
+//  - drawIndirectCount: exec reads the count buffer, clamps, and draws.
+//  - samplerMirrorClampToEdge: vkCreateSampler stores the address modes and
+//    the D3D11 backend maps mode 4 to D3D11_TEXTURE_ADDRESS_MIRROR_ONCE.
+
+// VkStructureType values (Khronos; the KHR aliases share the same value).
+static constexpr u32 VK_STYPE_VULKAN_11_FEATURES_V = 49u;
+static constexpr u32 VK_STYPE_VULKAN_12_FEATURES_V = 51u;
+static constexpr u32 VK_STYPE_VULKAN_13_FEATURES_V = 53u;
+static constexpr u32 VK_STYPE_DESCRIPTOR_INDEXING_FEATURES_V = 1000161001u;
+static constexpr u32 VK_STYPE_TIMELINE_SEMAPHORE_FEATURES_V = 1000207000u;
+static constexpr u32 VK_STYPE_BUFFER_DEVICE_ADDRESS_FEATURES_V = 1000257000u;
+static constexpr u32 VK_STYPE_SYNCHRONIZATION_2_FEATURES_V = 1000314007u;
+static constexpr u32 VK_STYPE_DYNAMIC_RENDERING_FEATURES_V = 1000044003u;
+
+// Header shared by every pNext-chained struct: sType at 0, pNext at 8.
+struct vk_pnext_hdr { u32 sType; const void* pNext; };
+
+static void fill_vk_features(VkPhysicalDeviceFeatures* f) {
+  if (!f) return;
+  *f = {};
+  // Features actually honored by the SPIR-V->HLSL->D3D11 bridge; the rest
+  // stay false rather than promising what the bridge can't deliver.
+  // Godot's _check_device_features hard-gates on imageCubeArray +
+  // independentBlend (rendering_device_driver_vulkan.cpp:_check_device_features
+  // — measured live: alert "does not support the following features" ->
+  // Vulkan init aborted -> forced GL fallback). Both are real D3D11
+  // capabilities the bridge carries.
+  f->robustBufferAccess = VK_TRUE;
+  f->fullDrawIndexUint32 = VK_TRUE;
+  f->independentBlend = VK_TRUE;
+  f->imageCubeArray = VK_TRUE;
+  f->dualSrcBlend = VK_TRUE;
+  f->sampleRateShading = VK_TRUE;
+  f->shaderClipDistance = VK_TRUE;
+  f->shaderCullDistance = VK_TRUE;
+  f->shaderStorageImageExtendedFormats = VK_TRUE;
+  f->depthClamp = VK_TRUE;
+  f->depthBiasClamp = VK_TRUE;
+  f->fillModeNonSolid = VK_TRUE;
+  f->samplerAnisotropy = VK_TRUE;
+  f->textureCompressionBC = VK_TRUE;
+  // Deliberately FALSE (were TRUE; the stages/ops don't exist — see the
+  // evidence block above): geometryShader, tessellationShader,
+  // shaderTessellationAndGeometryPointSize, fragmentStoresAndAtomics,
+  // vertexPipelineStoresAndAtomics, shaderImageGatherExtended,
+  // multiViewport, occlusionQueryPrecise, pipelineStatisticsQuery.
+  f->shaderFloat64 = VK_FALSE;  // D3D11: 64-bit shader floats are optional
+  f->shaderInt64 = VK_FALSE;
+  f->sparseBinding = VK_FALSE;  // sparse not bridged
+}
+
+// Each fill zeroes the struct's bool region, then sets the honestly
+// supported bits by name. (memset spans sizeof()-16, which includes the
+// trailing alignment padding — harmless, it is inside the struct.)
+static void fill_vulkan11_features(VkPhysicalDeviceVulkan11Features* f) {
+  memset(&f->storageBuffer16BitAccess, 0,
+         sizeof(*f) - offsetof(VkPhysicalDeviceVulkan11Features, storageBuffer16BitAccess));
+  // All FALSE: no 16-bit storage, multiview, variable pointers, protected
+  // memory, YCbCr conversion, or DrawParameters.
+}
+static void fill_vulkan12_features(VkPhysicalDeviceVulkan12Features* f) {
+  memset(&f->samplerMirrorClampToEdge, 0,
+         sizeof(*f) - offsetof(VkPhysicalDeviceVulkan12Features, samplerMirrorClampToEdge));
+  f->samplerMirrorClampToEdge = VK_TRUE;
+  f->drawIndirectCount = VK_TRUE;
+  f->timelineSemaphore = VK_TRUE;
+  // Everything else FALSE: no descriptor indexing, buffer device address,
+  // 8/16-bit storage, subgroups, or Vulkan memory model.
+}
+static void fill_vulkan13_features(VkPhysicalDeviceVulkan13Features* f) {
+  memset(&f->robustImageAccess, 0,
+         sizeof(*f) - offsetof(VkPhysicalDeviceVulkan13Features, robustImageAccess));
+  f->synchronization2 = VK_TRUE;
+  f->dynamicRendering = VK_TRUE;
+  // Everything else FALSE: no inline uniform block, private data,
+  // demote/terminate, subgroups, ASTC-HDR, dot product, maintenance4.
+}
+static void fill_descriptor_indexing_features(VkPhysicalDeviceDescriptorIndexingFeatures* f) {
+  memset(&f->shaderInputAttachmentArrayDynamicIndexing, 0,
+         sizeof(*f) - offsetof(VkPhysicalDeviceDescriptorIndexingFeatures,
+                               shaderInputAttachmentArrayDynamicIndexing));
+  // All FALSE: descriptor indexing is a later batch.
+}
+static void fill_buffer_device_address_features(VkPhysicalDeviceBufferDeviceAddressFeatures* f) {
+  memset(&f->bufferDeviceAddress, 0,
+         sizeof(*f) - offsetof(VkPhysicalDeviceBufferDeviceAddressFeatures, bufferDeviceAddress));
+  // All FALSE: no PhysicalStorageBuffer support in the translator.
+}
+static void fill_dynamic_rendering_features(VkPhysicalDeviceDynamicRenderingFeatures* f) {
+  f->dynamicRendering = VK_TRUE;
+}
+static void fill_synchronization2_features(VkPhysicalDeviceSynchronization2Features* f) {
+  f->synchronization2 = VK_TRUE;
+}
+static void fill_timeline_semaphore_features(VkPhysicalDeviceTimelineSemaphoreFeatures* f) {
+  f->timelineSemaphore = VK_TRUE;
+}
+
+// Fills a known feature struct in place (sType/pNext untouched). Returns
+// false for unknown sTypes — the caller leaves those alone.
+static bool fill_feature_struct(u32 sType, void* s) {
+  switch (sType) {
+    case VK_STYPE_VULKAN_11_FEATURES_V:
+      fill_vulkan11_features((VkPhysicalDeviceVulkan11Features*)s); return true;
+    case VK_STYPE_VULKAN_12_FEATURES_V:
+      fill_vulkan12_features((VkPhysicalDeviceVulkan12Features*)s); return true;
+    case VK_STYPE_VULKAN_13_FEATURES_V:
+      fill_vulkan13_features((VkPhysicalDeviceVulkan13Features*)s); return true;
+    case VK_STYPE_DESCRIPTOR_INDEXING_FEATURES_V:
+      fill_descriptor_indexing_features((VkPhysicalDeviceDescriptorIndexingFeatures*)s);
+      return true;
+    case VK_STYPE_BUFFER_DEVICE_ADDRESS_FEATURES_V:
+      fill_buffer_device_address_features((VkPhysicalDeviceBufferDeviceAddressFeatures*)s);
+      return true;
+    case VK_STYPE_DYNAMIC_RENDERING_FEATURES_V:
+      fill_dynamic_rendering_features((VkPhysicalDeviceDynamicRenderingFeatures*)s);
+      return true;
+    case VK_STYPE_SYNCHRONIZATION_2_FEATURES_V:
+      fill_synchronization2_features((VkPhysicalDeviceSynchronization2Features*)s);
+      return true;
+    case VK_STYPE_TIMELINE_SEMAPHORE_FEATURES_V:
+      fill_timeline_semaphore_features((VkPhysicalDeviceTimelineSemaphoreFeatures*)s);
+      return true;
+    default: return false;
   }
 }
+
+// Exact VkBool32 field count for a known feature struct, 0 if unknown.
+// NOTE: not (sizeof-16)/4 — several structs carry trailing alignment
+// padding (e.g. Vulkan12 is 208 B but has 47 bools), and comparing the
+// padding slot would reject callers for garbage they never set.
+static u32 feature_struct_bool_count(u32 sType) {
+  switch (sType) {
+    case VK_STYPE_VULKAN_11_FEATURES_V: return 12;
+    case VK_STYPE_VULKAN_12_FEATURES_V: return 47;
+    case VK_STYPE_VULKAN_13_FEATURES_V: return 15;
+    case VK_STYPE_DESCRIPTOR_INDEXING_FEATURES_V: return 20;
+    case VK_STYPE_BUFFER_DEVICE_ADDRESS_FEATURES_V: return 3;
+    case VK_STYPE_DYNAMIC_RENDERING_FEATURES_V: return 1;
+    case VK_STYPE_SYNCHRONIZATION_2_FEATURES_V: return 1;
+    case VK_STYPE_TIMELINE_SEMAPHORE_FEATURES_V: return 1;
+    default: return 0;
+  }
+}
+
+// True when every feature the requester asks for (non-zero VkBool32) is one
+// the ICD honestly implements. Unknown structs are not rejected: a newer
+// extension's features are outside what this ICD can judge, and the
+// extension-name check in vkCreateDevice is the gate for those.
+static bool feature_struct_request_supported(u32 sType, const void* req) {
+  const u32 n = feature_struct_bool_count(sType);
+  if (n == 0) return true;
+  // Honest reference: fill a scratch copy, then compare bool-by-bool.
+  // The biggest known struct is Vulkan12 (208 B); 256 B covers all.
+  alignas(8) u8 honest[256];
+  memset(honest, 0, sizeof(honest));
+  if (!fill_feature_struct(sType, honest)) return true;
+  const u32* r = (const u32*)((const u8*)req + 16);
+  const u32* h = (const u32*)(honest + 16);
+  for (u32 i = 0; i < n; ++i) {
+    if (r[i] != 0 && h[i] == 0) return false;
+  }
+  return true;
+}
+
+static bool base_features_request_supported(const VkPhysicalDeviceFeatures* req) {
+  VkPhysicalDeviceFeatures honest{};
+  fill_vk_features(&honest);
+  const u32* r = (const u32*)req;
+  const u32* h = (const u32*)&honest;
+  constexpr u32 n = (u32)(sizeof(VkPhysicalDeviceFeatures) / sizeof(u32));  // 55
+  for (u32 i = 0; i < n; ++i) {
+    if (r[i] != 0 && h[i] == 0) return false;
+  }
+  return true;
+}
+
+void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures(void*, VkPhysicalDeviceFeatures* f) {
+  fill_vk_features(f);
+}
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFeatures2(void* pd, VkPhysicalDeviceFeatures2* f2) {
-  if (f2) trt_vkGetPhysicalDeviceFeatures(pd, &f2->features);
+  if (!f2) return;
+  trt_vkGetPhysicalDeviceFeatures(pd, &f2->features);
+  // Walk the pNext chain and fill every known feature struct honestly.
+  // Unknown structs are left untouched (forward-compat).
+  for (const vk_pnext_hdr* p = (const vk_pnext_hdr*)f2->pNext; p;
+       p = (const vk_pnext_hdr*)p->pNext) {
+    fill_feature_struct(p->sType, (void*)p);
+  }
 }
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceFormatProperties(void*, u32, vk_fmt_props* p) {
   if (p) {
@@ -1215,29 +1475,43 @@ void TRT_GUEST_ABI trt_vkGetPhysicalDeviceMemoryProperties(void*, vk_mem_props* 
 void TRT_GUEST_ABI trt_vkGetPhysicalDeviceMemoryProperties2(void* pd, vk_mem_props2* p2) {
   if (p2) trt_vkGetPhysicalDeviceMemoryProperties(pd, &p2->memoryProperties);
 }
+// Device extensions the ICD advertises. File scope so vkCreateDevice
+// validation checks requests against exactly this list (one source of truth).
+static const vk_ext_props k_vk_dev_exts[] = {
+    {"VK_KHR_swapchain", 70},
+    {"VK_KHR_dynamic_rendering", 1},
+    {"VK_KHR_synchronization2", 1},
+    {"VK_KHR_maintenance1", 2},
+    {"VK_KHR_maintenance2", 1},
+    {"VK_KHR_maintenance3", 1},
+    {"VK_KHR_create_renderpass2", 1},
+    {"VK_KHR_timeline_semaphore", 2},
+    {"VK_KHR_get_memory_requirements2", 1},
+    {"VK_KHR_bind_memory2", 1},
+    {"VK_KHR_sampler_ycbcr_conversion", 14},
+    {"VK_KHR_descriptor_update_template", 1},
+    {"VK_KHR_draw_indirect_count", 1},
+    {"VK_KHR_buffer_device_address", 1},
+    {"VK_KHR_push_descriptor", 2},
+};
+static constexpr u32 k_vk_dev_ext_count =
+    (u32)(sizeof(k_vk_dev_exts) / sizeof(k_vk_dev_exts[0]));
+
+static bool vk_dev_ext_supported(const char* name) {
+  if (!name) return false;
+  for (u32 i = 0; i < k_vk_dev_ext_count; ++i) {
+    if (strcmp(k_vk_dev_exts[i].extensionName, name) == 0) return true;
+  }
+  return false;
+}
+
 i32 TRT_GUEST_ABI trt_vkEnumerateDeviceExtensionProperties(void*, const char*, u32* pCount,
                                                            vk_ext_props* pProps) {
-  static const vk_ext_props k_dev_exts[] = {
-      {"VK_KHR_swapchain", 70},
-      {"VK_KHR_dynamic_rendering", 1},
-      {"VK_KHR_synchronization2", 1},
-      {"VK_KHR_maintenance1", 2},
-      {"VK_KHR_maintenance2", 1},
-      {"VK_KHR_maintenance3", 1},
-      {"VK_KHR_create_renderpass2", 1},
-      {"VK_KHR_timeline_semaphore", 2},
-      {"VK_KHR_get_memory_requirements2", 1},
-      {"VK_KHR_bind_memory2", 1},
-      {"VK_KHR_sampler_ycbcr_conversion", 14},
-      {"VK_KHR_descriptor_update_template", 1},
-      {"VK_KHR_draw_indirect_count", 1},
-      {"VK_KHR_buffer_device_address", 1},
-  };
-  const u32 n = (u32)(sizeof(k_dev_exts) / sizeof(k_dev_exts[0]));
+  const u32 n = k_vk_dev_ext_count;
   if (!pProps) { if (pCount) *pCount = n; return VK_SUCCESS_V; }
   u32 cap = pCount ? *pCount : 0;
   u32 cp = std::min(cap, n);
-  for (u32 i = 0; i < cp; ++i) pProps[i] = k_dev_exts[i];
+  for (u32 i = 0; i < cp; ++i) pProps[i] = k_vk_dev_exts[i];
   if (pCount) *pCount = cp;
   return (cp < n) ? VK_INCOMPLETE_V : VK_SUCCESS_V;
 }
@@ -1296,6 +1570,34 @@ i32 TRT_GUEST_ABI trt_vkGetPhysicalDeviceSurfacePresentModesKHR(void*, u64, u32*
 
 i32 TRT_GUEST_ABI trt_vkCreateDevice(void*, const vk_dev_ci* ci, const void*, void** pDev) {
   if (!ci || !pDev) return VK_ERROR_INITIALIZATION_FAILED_V;
+  // Validate before allocating anything: requested extensions must be ones
+  // the ICD advertises, and requested features must be ones it implements.
+  // The feature checks use the same honest fill as vkGetPhysicalDevice-
+  // Features(2), so a game that asks for exactly what it was told exists
+  // can never be rejected here.
+  for (u32 i = 0; i < ci->enabledExtensionCount; ++i) {
+    const char* name =
+        ci->ppEnabledExtensionNames ? ci->ppEnabledExtensionNames[i] : nullptr;
+    if (!vk_dev_ext_supported(name)) {
+      vk_logf("vulkan: vkCreateDevice rejected - extension not present: %s",
+              name ? name : "(null)");
+      return VK_ERROR_EXTENSION_NOT_PRESENT_V;
+    }
+  }
+  if (ci->pEnabledFeatures && !base_features_request_supported(ci->pEnabledFeatures)) {
+    vk_log("vulkan: vkCreateDevice rejected - requested VkPhysicalDeviceFeatures "
+           "not implemented by this ICD");
+    return VK_ERROR_FEATURE_NOT_PRESENT_V;
+  }
+  for (const vk_pnext_hdr* p = (const vk_pnext_hdr*)ci->pNext; p;
+       p = (const vk_pnext_hdr*)p->pNext) {
+    if (!feature_struct_request_supported(p->sType, p)) {
+      vk_logf("vulkan: vkCreateDevice rejected - requested feature struct "
+              "sType %u asks for features this ICD does not implement",
+              p->sType);
+      return VK_ERROR_FEATURE_NOT_PRESENT_V;
+    }
+  }
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = new vk_device_obj();
   d->main_queue.device = d;
@@ -1696,6 +1998,24 @@ i32 TRT_GUEST_ABI trt_vkFreeDescriptorSets(void* dev_v, u64, u32 cnt, const u64*
   if (d && pSets) for (u32 i = 0; i < cnt; ++i) d->dsets.erase(pSets[i]);
   return VK_SUCCESS_V;
 }
+// Applies one VkWriteDescriptorSet to a binding map (a real descriptor
+// set's entries, or a push-descriptor op's snapshot). Same limitation as
+// the rest of the ICD: only element [0] of an array write is kept —
+// descriptor arrays are a later batch.
+static void apply_desc_write(std::map<u32, vk_desc_binding_val>& entries,
+                             const vk_write_desc_set& w) {
+  auto& e = entries[w.dstBinding];
+  if (w.pBufferInfo && w.descriptorCount > 0) {
+    e.buf_id = w.pBufferInfo[0].buffer;
+    e.buf_off = w.pBufferInfo[0].offset;
+    e.buf_range = w.pBufferInfo[0].range;
+  }
+  if (w.pImageInfo && w.descriptorCount > 0) {
+    e.sampler = w.pImageInfo[0].sampler;
+    e.img_view = w.pImageInfo[0].imageView;
+  }
+}
+
 void TRT_GUEST_ABI trt_vkUpdateDescriptorSets(void* dev_v, u32 writeCnt,
                                               const vk_write_desc_set* writes, u32, const void*) {
   if (!writes) return;
@@ -1704,16 +2024,7 @@ void TRT_GUEST_ABI trt_vkUpdateDescriptorSets(void* dev_v, u32 writeCnt,
   for (u32 i = 0; i < writeCnt; ++i) {
     const auto& w = writes[i];
     if (!d->dsets.count(w.dstSet)) continue;
-    auto& e = d->dsets[w.dstSet].entries[w.dstBinding];
-    if (w.pBufferInfo && w.descriptorCount > 0) {
-      e.buf_id = w.pBufferInfo[0].buffer;
-      e.buf_off = w.pBufferInfo[0].offset;
-      e.buf_range = w.pBufferInfo[0].range;
-    }
-    if (w.pImageInfo && w.descriptorCount > 0) {
-      e.sampler = w.pImageInfo[0].sampler;
-      e.img_view = w.pImageInfo[0].imageView;
-    }
+    apply_desc_write(d->dsets[w.dstSet].entries, w);
   }
 }
 
@@ -1730,21 +2041,44 @@ static void collect_spec(const vk_spec_info* si, std::vector<spirv_spec_entry>& 
   }
 }
 
+// Human-readable shader stage bit for failure logs.
+static const char* vk_stage_name(u32 stage) {
+  switch (stage) {
+    case 0x1u: return "VERTEX";
+    case 0x2u: return "TESSELLATION_CONTROL";
+    case 0x4u: return "TESSELLATION_EVALUATION";
+    case 0x8u: return "GEOMETRY";
+    case 0x10u: return "FRAGMENT";
+    case 0x20u: return "COMPUTE";
+    default: return "UNKNOWN";
+  }
+}
+
 i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
                                                  const vk_gfx_pipe_ci* cis, const void*, u64* pPipes) {
   if (!cis || !pPipes) return VK_ERROR_INITIALIZATION_FAILED_V;
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
+  bool any_failed = false;
   for (u32 i = 0; i < count; ++i) {
     const auto& ci = cis[i];
     u64 pid = d->next_h++;
     vk_pipe_obj po{}; po.id = pid;
     std::string vs_h, ps_h;
     std::vector<spirv_spec_entry> specs;
+    bool stage_failed = false;
 
     for (u32 s = 0; s < ci.stageCount; ++s) {
       const auto& st = ci.pStages[s];
-      if (!d->shaders.count(st.module)) continue;
+      if (!d->shaders.count(st.module)) {
+        // Fail-visible: a stage whose module does not exist used to be
+        // silently skipped, producing a pipeline with a missing stage.
+        vk_logf("vulkan: vkCreateGraphicsPipelines FAILED - pipeline %u stage %u (%s): "
+                "shader module %llu does not exist",
+                i, s, vk_stage_name(st.stage), (unsigned long long)st.module);
+        stage_failed = true;
+        break;
+      }
       collect_spec(st.pSpecializationInfo, specs);
       const auto& spv = d->shaders[st.module].spv;
       spirv_stage sst = (st.stage == 0x10u) ? SPV_STAGE_FRAGMENT : SPV_STAGE_VERTEX;
@@ -1764,13 +2098,30 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
                             specs.empty() ? nullptr : specs.data(),
                             (u32)specs.size(), cr.hlsl);
       }
-      if (!cr.ok) continue;
+      if (!cr.ok) {
+        // Fail-visible: never create a pipeline with a silently missing
+        // stage — the game must see the failure, not render black.
+        vk_logf("vulkan: vkCreateGraphicsPipelines FAILED - pipeline %u stage %u (%s, entry '%s'): "
+                "SPIR-V->HLSL failed (%u words, fnv %016llx): %.200s",
+                i, s, vk_stage_name(st.stage), st.pName ? st.pName : "(null)",
+                (u32)spv.size(),
+                (unsigned long long)vkshader_cache::fnv1a(spv.data(), (u32)spv.size()),
+                cr.log.c_str());
+        stage_failed = true;
+        break;
+      }
       if (sst == SPV_STAGE_VERTEX) vs_h = cr.hlsl;
       else ps_h = cr.hlsl;
       if (cr.push_constant_bytes) po.push_reg = cr.push_constant_reg;
       for (const auto& b : cr.bindings) {
         po.bindings.push_back({b.set, b.binding, b.kind, st.stage, b.hlsl_reg, b.smp_reg});
       }
+    }
+
+    if (stage_failed) {
+      pPipes[i] = 0;  // VK_NULL_HANDLE: this pipeline was not created
+      any_failed = true;
+      continue;
     }
 
     std::vector<trt_vk_vert_bind> vbs;
@@ -1829,7 +2180,9 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
     }
     pPipes[i] = pid;
   }
-  return VK_SUCCESS_V;
+  // Vulkan semantics: pipelines that failed are VK_NULL_HANDLE in pPipes
+  // and the call reports an error; the ones that succeeded stay valid.
+  return any_failed ? VK_ERROR_INITIALIZATION_FAILED_V : VK_SUCCESS_V;
 }
 
 i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
@@ -1837,11 +2190,19 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
   if (!cis || !pPipes) return VK_ERROR_INITIALIZATION_FAILED_V;
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
+  bool any_failed = false;
   for (u32 i = 0; i < count; ++i) {
     u64 pid = d->next_h++;
     vk_pipe_obj po{}; po.id = pid; po.is_compute = true;
     std::string cs_h;
-    if (d->shaders.count(cis[i].stage.module)) {
+    bool stage_failed = false;
+    if (!d->shaders.count(cis[i].stage.module)) {
+      // Fail-visible: same missing-stage rule as graphics pipelines.
+      vk_logf("vulkan: vkCreateComputePipelines FAILED - pipeline %u (COMPUTE): "
+              "shader module %llu does not exist",
+              i, (unsigned long long)cis[i].stage.module);
+      stage_failed = true;
+    } else {
       std::vector<spirv_spec_entry> specs;
       collect_spec(cis[i].stage.pSpecializationInfo, specs);
       const auto& spv = d->shaders[cis[i].stage.module].spv;
@@ -1863,13 +2224,28 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
                             specs.empty() ? nullptr : specs.data(),
                             (u32)specs.size(), cr.hlsl);
       }
-      if (cr.ok) {
+      if (!cr.ok) {
+        // Fail-visible: never create a compute pipeline with a silently
+        // missing shader — the game must see the failure.
+        vk_logf("vulkan: vkCreateComputePipelines FAILED - pipeline %u (COMPUTE, entry '%s'): "
+                "SPIR-V->HLSL failed (%u words, fnv %016llx): %.200s",
+                i, cis[i].stage.pName ? cis[i].stage.pName : "(null)",
+                (u32)spv.size(),
+                (unsigned long long)vkshader_cache::fnv1a(spv.data(), (u32)spv.size()),
+                cr.log.c_str());
+        stage_failed = true;
+      } else {
         cs_h = cr.hlsl;
         if (cr.push_constant_bytes) po.push_reg = cr.push_constant_reg;
         for (const auto& b : cr.bindings) {
           po.bindings.push_back({b.set, b.binding, b.kind, 0x20u, b.hlsl_reg, b.smp_reg});
         }
       }
+    }
+    if (stage_failed) {
+      pPipes[i] = 0;  // VK_NULL_HANDLE: this pipeline was not created
+      any_failed = true;
+      continue;
     }
     d->pipes[pid] = std::move(po);
     trt_vk_pipeline_desc pd{};
@@ -1879,7 +2255,7 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
     if (g_vk_hooks_set && g_vk_hooks.create_pipeline) g_vk_hooks.create_pipeline(&pd, g_vk_hooks.user);
     pPipes[i] = pid;
   }
-  return VK_SUCCESS_V;
+  return any_failed ? VK_ERROR_INITIALIZATION_FAILED_V : VK_SUCCESS_V;
 }
 void TRT_GUEST_ABI trt_vkDestroyPipeline(void* dev_v, u64 p, const void*) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
@@ -2238,6 +2614,23 @@ void TRT_GUEST_ABI trt_vkCmdBindDescriptorSets(void* cb_v, u32 bp, u64, u32 firs
   op.ds_first = first; op.ds_count = std::min(cnt, 8u);
   for (u32 i = 0; i < op.ds_count; ++i) op.dsets[i] = sets[i];
   ((vk_cmdbuf_obj*)cb_v)->ops.push_back(op);
+}
+// VK_KHR_push_descriptor: the writes are snapshotted into the command
+// buffer op (same apply_desc_write machinery as vkUpdateDescriptorSets)
+// and resolved at draw/dispatch time in place of a bound set at the same
+// index. The layout handle is unused — the ICD does not record layouts,
+// and the writes carry their own binding info.
+void TRT_GUEST_ABI trt_vkCmdPushDescriptorSetKHR(void* cb_v, u32 bp, u64,
+                                                 u32 set, u32 writeCount,
+                                                 const vk_write_desc_set* writes) {
+  if (!cb_v || !writes || !writeCount || set >= 8u) return;
+  std::lock_guard<std::mutex> lk(g_vk_mu);
+  vk_cmd_op op{}; op.kind = vk_cmd_op::OP_PUSH_DS; op.bind_point = bp;
+  op.ds_first = set;
+  for (u32 i = 0; i < writeCount; ++i) {
+    apply_desc_write(op.push_entries, writes[i]);
+  }
+  ((vk_cmdbuf_obj*)cb_v)->ops.push_back(std::move(op));
 }
 void TRT_GUEST_ABI trt_vkCmdPushConstants(void* cb_v, u64, u32, u32 off, u32 sz, const void* pVals) {
   if (!cb_v || !pVals || off + sz > 256u) return;
@@ -2656,6 +3049,7 @@ const vk_proc_entry k_vk_procs[] = {
     {"vkCmdBindVertexBuffers", (void*)&trt_vkCmdBindVertexBuffers},
     {"vkCmdBindIndexBuffer", (void*)&trt_vkCmdBindIndexBuffer},
     {"vkCmdBindDescriptorSets", (void*)&trt_vkCmdBindDescriptorSets},
+    {"vkCmdPushDescriptorSetKHR", (void*)&trt_vkCmdPushDescriptorSetKHR},
     {"vkCmdPushConstants", (void*)&trt_vkCmdPushConstants},
     {"vkCmdDraw", (void*)&trt_vkCmdDraw},
     {"vkCmdDrawIndexed", (void*)&trt_vkCmdDrawIndexed},

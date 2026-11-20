@@ -20,7 +20,16 @@ struct webxfer_state {
   bool launch_requested = false;
   bool stop_requested = false;
   bool rescan_requested = false;
+  // Scoped rescan (item 4): the game dir that changed, or empty for a full
+  // rescan (manual /api/rescan, or a change that spans games). Set by the
+  // upload/config/delete handlers; consumed by webxfer_poll_rescan.
+  std::string rescan_game;
   std::string running_game;
+  // Launch honesty (item 9): the outcome of the last launch the host loop
+  // acted on ("started", "not found", ...), with the game it was for.
+  // /api/launch itself only queues (202) — this is where the result lands.
+  std::string last_launch_result;
+  std::string last_launch_name;
   // status for the TV overlay
   std::string last_upload;    // "name (123 MB, 42 files)"
   std::string last_error;
@@ -44,8 +53,15 @@ bool webxfer_poll_launch(std::string* out_name);
 // works, so the launcher falls back to this.
 bool webxfer_find_game(const char* name, char* out_exe, size_t cap);
 bool webxfer_poll_stop();
+// Consume a pending rescan request. The overload also returns the scoped
+// game dir (empty = full rescan). The no-arg form keeps the old contract
+// (used by tests and any caller that always rescans fully).
+bool webxfer_poll_rescan(std::string* out_game);
 bool webxfer_poll_rescan();
 void webxfer_set_running_game(const std::string& name);
+// Record the outcome of a launch the host loop acted on ("started",
+// "not found", ...). Surfaced in /api/status as last_launch_result.
+void webxfer_set_launch_result(const std::string& name, const std::string& result);
 
 // One-line status for the TV overlay ("transfer: http://...", last upload, err).
 std::string webxfer_status_line();

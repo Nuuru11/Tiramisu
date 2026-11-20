@@ -1,0 +1,29 @@
+# 13: mono/eglib/gunicode-win32.c — provide g_get_charset under UWP.
+#
+# The classic implementation calls GetACP (desktop-only), so under UWP
+# the file compiled to just an LNK4221-quiet dummy — but icall.c's
+# codepage detection calls g_get_charset unconditionally and the UWP
+# link failed on monoeg_g_get_charset. The AppContainer process code
+# page is UTF-8, so the UWP version reports "UTF-8" / TRUE. The
+# desktop path is unchanged.
+--- a/mono/eglib/gunicode-win32.c
++++ b/mono/eglib/gunicode-win32.c
+@@ -32,8 +32,14 @@
+ 
+ #else /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+-#ifdef _MSC_VER
+-// Quiet Visual Studio linker warning, LNK4221, in cases when this source file intentional ends up empty.
+-void __mono_win32_mono_gunicode_win32_quiet_lnk4221(void) {}
+-#endif
++/* UWP: GetACP is desktop-only, and the AppContainer process code page
++ * is UTF-8, so report UTF-8 unconditionally. (The caller lowercases
++ * the name to "utf_8", which Mono's encoding table understands.) */
++gboolean
++g_get_charset (G_CONST_RETURN char **charset)
++{
++	if (charset != NULL)
++		*charset = "UTF-8";
++	return TRUE;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
