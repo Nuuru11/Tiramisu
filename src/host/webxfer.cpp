@@ -9,6 +9,7 @@
 //   GET  /progress/<id>                         -> Fractional upload progress 0..1
 //   PUT  /upload/<name>.zip                     -> Streaming .zip upload -> extract to games\<stem>
 //   PUT  /api/upload-file?game=<n>&rel=<path>   -> Streaming unpacked folder file upload
+//   GET  /api/list-files?game=<n>              -> JSON array of {rel,size} for a game dir
 //   POST /launch/<name> | /api/launch/<name>    -> Launch game on TV
 //   POST /api/stop                              -> Request clean stop of active guest game
 //   POST /api/rescan                            -> Force immediate game library rescan
@@ -415,6 +416,29 @@ void scan_game_exes(const std::string& game_dir, const std::string& game_name,
   }
 }
 
+// ---------- recursive file listing (for /api/list-files) ----------
+struct file_item {
+  std::string rel;
+  uint64_t size = 0;
+};
+
+void collect_files_rec(const std::string& base_dir, const std::string& rel_dir,
+                       int depth, std::vector<file_item>* out) {
+  if (depth > 32) return;
+  const std::string sep(1, XFER_SEP);
+  const std::string dir = rel_dir.empty() ? base_dir : (base_dir + sep + rel_dir);
+  std::vector<dir_ent> ents;
+  list_dir_entries(dir, &ents);
+  for (const auto& e : ents) {
+    const std::string rel = rel_dir.empty() ? e.name : (rel_dir + sep + e.name);
+    if (e.is_dir) {
+      collect_files_rec(base_dir, rel, depth + 1, out);
+      continue;
+    }
+    out->push_back({rel, e.size});
+  }
+}
+
 // ---------- zip extraction (miniz) ----------
 bool extract_zip(const std::string& zip_path, const std::string& dest,
                  std::string* note) {
@@ -745,6 +769,16 @@ void respond(sock_t s, const char* code, const char* ctype,
   if (!body.empty()) send_all(s, body.data(), body.size());
 }
 
+// Send one HTTP/1.1 chunked-transfer chunk (hex length, data, CRLF).
+void send_chunk(sock_t s, const std::string& data) {
+  if (data.empty()) return;
+  char hdr[32];
+  int hl = snprintf(hdr, sizeof(hdr), "%zx\r\n", data.size());
+  if (hl > 0) send_all(s, hdr, (size_t)hl);
+  send_all(s, data.data(), data.size());
+  send_all(s, "\r\n", 2);
+}
+
 void handle_client(sock_t s) {
   sock_guard sg{s};
   char req[16384];
@@ -823,6 +857,56 @@ void handle_client(sock_t s) {
     const std::string logp =
         g_local_state_dir + std::string(1, XFER_SEP) + "tiramisu.log";
     respond(s, "200 OK", "text/plain; charset=utf-8", read_log_tail(logp));
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/list-files") {
+    std::string game;
+    if (!sanitize_game_name(query_param(query, "game"), &game)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game name");
+      return;
+    }
+    const std::string gdir = g_games_dir + std::string(1, XFER_SEP) + game;
+    if (!dir_exists(gdir)) {
+      respond(s, "404 Not Found", "text/plain", "game not found");
+      return;
+    }
+    std::vector<file_item> files;
+    collect_files_rec(gdir, "", 0, &files);
+    std::sort(files.begin(), files.end(),
+              [](const file_item& a, const file_item& b) { return a.rel < b.rel; });
+    // Stream the JSON array with chunked transfer encoding so a 33k-file
+    // tree never needs a multi-MB contiguous body buffer.
+    const char* hdr =
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    send_all(s, hdr, strlen(hdr));
+    std::string chunk;
+    chunk.reserve(65536);
+    auto flush_chunk = [&]() {
+      if (!chunk.empty()) {
+        send_chunk(s, chunk);
+        chunk.clear();
+      }
+    };
+    chunk += "[";
+    bool first = true;
+    char szbuf[32];
+    for (const auto& f : files) {
+      std::string rel = f.rel;
+      for (char& c : rel) if (c == '\\') c = '/';
+      if (!first) chunk += ",";
+      first = false;
+      snprintf(szbuf, sizeof(szbuf), "%llu", (unsigned long long)f.size);
+      chunk += "{\"rel\":\"";
+      chunk += json_escape(rel);
+      chunk += "\",\"size\":";
+      chunk += szbuf;
+      chunk += "}";
+      if (chunk.size() >= 32768) flush_chunk();
+    }
+    chunk += "]";
+    flush_chunk();
+    send_all(s, "0\r\n\r\n", 5);
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path.rfind("/progress/", 0) == 0) {
