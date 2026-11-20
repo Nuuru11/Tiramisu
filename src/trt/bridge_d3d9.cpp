@@ -7,6 +7,20 @@
 //   IDirect3DDevice9      = 119 slots (Present = 17, CreateTexture = 23,
 //                             SetRenderState = 57, DrawIndexedPrimitive = 82,
 //                             DrawPrimitiveUP = 83, SetStreamSource = 100)
+//   IDirect3D9Ex          = 22 slots (base 17 + GetAdapterModeCountEx = 17,
+//                             EnumAdapterModesEx = 18, GetAdapterDisplayModeEx
+//                             = 19, CreateDeviceEx = 20, GetAdapterLUID = 21)
+//   IDirect3DDevice9Ex    = 133 slots (base 119 + SetConvolutionMonoKernel =
+//                             119, ComposeRects = 120, PresentEx = 121,
+//                             Get/SetGPUThreadPriority = 122/123, WaitForVBlank
+//                             = 124, CheckResourceResidency = 125,
+//                             SetMaximumFrameLatency = 126, CheckDeviceState =
+//                             127, CreateRenderTargetEx = 128,
+//                             CreateOffscreenPlainSurfaceEx = 129,
+//                             CreateDepthStencilSurfaceEx = 130, ResetEx = 131,
+//                             GetDisplayModeEx = 132)
+// XNA 4.0 (Celeste) uses the Ex interfaces on Vista+ — without them it calls
+// CreateDeviceEx at slot 20 of a 17-slot vtable and reads past the end.
 //   IDirect3DTexture9     = 22 slots (LockRect = 19, UnlockRect = 20)
 //   IDirect3DVertexBuffer9 / IndexBuffer9 = 13 (Lock = 11, Unlock = 12)
 //   IDirect3DSurface9 (Resource9) = 11
@@ -167,8 +181,14 @@ void gpu_free_meta(u32 h) {
 // singleton interfaces the guest holds for the process lifetime
 d9_obj* g_d3d9_root = nullptr;   // IDirect3D9
 d9_obj* g_dev = nullptr;         // IDirect3DDevice9
+d9_obj* g_d3d9ex_root = nullptr;  // IDirect3D9Ex (22-slot vtable)
+d9_obj* g_devex = nullptr;        // IDirect3DDevice9Ex (133-slot vtable)
 d9_obj* g_backbuffer = nullptr;  // IDirect3DSurface9
 d9_obj* g_default_ds = nullptr;  // IDirect3DSurface9
+
+// SetMaximumFrameLatency value (accepted; the console backend presents
+// synchronously through the swapchain, so there is no queue to bound)
+u32 g_frame_latency = 0;
 
 // active draw state marshalled to the host at draw time
 u32 g_stream_vb[8] = {};
@@ -444,6 +464,8 @@ extern "C" int trt_d3d9_mojo_pack_cb(const void* parsed, const float* cf,
 extern "C" {
 extern const void* g_d3d9_vtbl[17];
 extern const void* g_dev9_vtbl[119];
+extern const void* g_d3d9ex_vtbl[22];
+extern const void* g_dev9ex_vtbl[133];
 extern const void* g_tex9_vtbl[22];
 extern const void* g_voltex9_vtbl[22];
 extern const void* g_cube9_vtbl[22];
@@ -456,6 +478,10 @@ extern const void* g_surf9_vtbl[17];
 extern const void* g_offscreen_surf9_vtbl[17];
 extern const void* g_vol9_vtbl[11];
 extern const void* g_sb9_vtbl[6];
+// Builds the Ex vtables once from the base vtables (defined below, next to
+// the vtable tables); called from Direct3DCreate9Ex / CreateDeviceEx and
+// from trt_bridge_register_d3d9.
+void ensure_ex_vtbls();
 }
 
 extern "C" {
@@ -473,7 +499,8 @@ u32 TRT_GUEST_ABI d9_Rel(void* self) {
   d9_obj* o = (d9_obj*)self;
   if (o->refcount) --o->refcount;
   if (o->refcount == 0 && o != (d9_obj*)g_d3d9_root &&
-      o != (d9_obj*)g_dev && o != (d9_obj*)g_backbuffer &&
+      o != (d9_obj*)g_dev && o != (d9_obj*)g_d3d9ex_root &&
+      o != (d9_obj*)g_devex && o != (d9_obj*)g_backbuffer &&
       o != (d9_obj*)g_default_ds) {
     if (o->parent_tex) {
       d9_Rel(o->parent_tex);
@@ -577,20 +604,32 @@ void* TRT_GUEST_ABI trt_Direct3DCreate9(u32 sdk_version) {
 }
 int TRT_GUEST_ABI trt_Direct3DCreate9Ex(u32 sdk_version, void** out) {
   if (!out) return D3DERR_INVALIDCALL_;
-  void* d = trt_Direct3DCreate9(sdk_version);
-  if (!d) return D3DERR_NOTIMPL_;
-  *out = d;
+  char line[128];
+  snprintf(line, sizeof(line), "d3d9: Direct3DCreate9Ex(sdk=%u) -> bridge Ex",
+           sdk_version);
+  trt_core_log(line);
+  // The Ex object gets the 22-slot vtable: returning the plain 17-slot
+  // object here (as before) let callers invoke CreateDeviceEx at slot 20
+  // past the end of the vtable.
+  ensure_ex_vtbls();
+  if (!g_d3d9ex_root) {
+    g_d3d9ex_root = obj_alloc(g_d3d9ex_vtbl, 0, 0);
+    if (!g_d3d9ex_root) return D3DERR_NOTIMPL_;
+  }
+  ++g_d3d9ex_root->refcount;
+  *out = g_d3d9ex_root;
   return D3D_OK_;
 }
 
-// CreateDevice(adapter, type, hwnd, flags, D3DPRESENT_PARAMETERS*, out_dev)
-int TRT_GUEST_ABI d9_CreateDevice(void*, u32 adapter, u32 dev_type, void* hwnd,
-                                  u32 flags, void* pp, void** out_dev) {
-  (void)adapter; (void)hwnd;
+// Shared device creation for CreateDevice / CreateDeviceEx. The two flavors
+// share all state, the backbuffer and the depth-stencil surface; they differ
+// only in the device object's vtable (119 vs 133 slots) and singleton.
+int d9_CreateDeviceImpl(u32 dev_type, u32 flags, void* pp, void** out_dev,
+                        bool ex) {
   char line[192];
   snprintf(line, sizeof(line),
-           "d3d9: CreateDevice(type=%u flags=0x%x) -> bridge device",
-           dev_type, flags);
+           "d3d9: CreateDevice%s(type=%u flags=0x%x) -> bridge device",
+           ex ? "Ex" : "", dev_type, flags);
   trt_core_log(line);
   if (!out_dev || !pp) return D3DERR_INVALIDCALL_;
   if (!g_hooks.present) return D3DERR_NOTIMPL_;  // no host backend bound
@@ -606,12 +645,82 @@ int TRT_GUEST_ABI d9_CreateDevice(void*, u32 adapter, u32 dev_type, void* hwnd,
   else { g_backbuffer->w = bw; g_backbuffer->h = bh; }
   if (!g_default_ds) g_default_ds = obj_alloc(g_surf9_vtbl, 0, 4, bw, bh, 75 /*D24S8*/);
   else { g_default_ds->w = bw; g_default_ds->h = bh; }
-  if (!g_dev) {
-    g_dev = obj_alloc(g_dev9_vtbl, 0, 0);
-    if (!g_dev) return D3DERR_NOTIMPL_;
+  if (ex) {
+    ensure_ex_vtbls();
+    if (!g_devex) {
+      g_devex = obj_alloc(g_dev9ex_vtbl, 0, 0);
+      if (!g_devex) return D3DERR_NOTIMPL_;
+    }
+    ++g_devex->refcount;
+    *out_dev = g_devex;
+  } else {
+    if (!g_dev) {
+      g_dev = obj_alloc(g_dev9_vtbl, 0, 0);
+      if (!g_dev) return D3DERR_NOTIMPL_;
+    }
+    ++g_dev->refcount;
+    *out_dev = g_dev;
   }
-  ++g_dev->refcount;
-  *out_dev = g_dev;
+  return D3D_OK_;
+}
+
+// CreateDevice(adapter, type, hwnd, flags, D3DPRESENT_PARAMETERS*, out_dev)
+int TRT_GUEST_ABI d9_CreateDevice(void*, u32 adapter, u32 dev_type, void* hwnd,
+                                  u32 flags, void* pp, void** out_dev) {
+  (void)adapter; (void)hwnd;
+  return d9_CreateDeviceImpl(dev_type, flags, pp, out_dev, false);
+}
+
+// ---- IDirect3D9Ex (root slots 17-21) ----
+// D3DDISPLAYMODEEX { UINT Width, Height, RefreshRate; D3DFORMAT Format;
+//                    D3DSCANLINEORDERING ScanLineOrdering; } = 20 bytes
+void fill_display_mode_ex(void* out, u32 fmt) {
+  u32* p = (u32*)out;
+  p[0] = g_hooks.width ? g_hooks.width : 1280u;
+  p[1] = g_hooks.height ? g_hooks.height : 720u;
+  p[2] = 60;
+  p[3] = fmt ? fmt : 21u /*D3DFMT_X8R8G8B8*/;
+  p[4] = 0;  // D3DSCANLINEORDERING_UNKNOWN
+}
+
+// GetAdapterModeCountEx(adapter, D3DDISPLAYMODEFILTER*) — one mode, like the
+// non-Ex enumeration (the console has a single display mode).
+u32 TRT_GUEST_ABI d9_GetAdapterModeCountEx(void*, u32, const void*) {
+  return 1;
+}
+// EnumAdapterModesEx(adapter, filter, mode, D3DDISPLAYMODEEX*)
+// D3DDISPLAYMODEFILTER { UINT Size; D3DFORMAT Format;
+//                        D3DSCANLINEORDERING ScanLineOrdering; }
+int TRT_GUEST_ABI d9_EnumAdapterModesEx(void*, u32, const void* filter, u32 mode,
+                                        void* out) {
+  if (!out) return D3DERR_INVALIDCALL_;
+  if (mode > 0) return D3DERR_INVALIDCALL_;  // exactly one mode
+  const u32 fmt = filter ? ((const u32*)filter)[1] : 0u;
+  fill_display_mode_ex(out, fmt);
+  return D3D_OK_;
+}
+// GetAdapterDisplayModeEx(adapter, D3DDISPLAYMODEEX*, D3DDISPLAYROTATION*)
+int TRT_GUEST_ABI d9_GetAdapterDisplayModeEx(void*, u32, void* mode_out,
+                                             void* rot_out) {
+  if (!mode_out) return D3DERR_INVALIDCALL_;
+  fill_display_mode_ex(mode_out, 21u /*D3DFMT_X8R8G8B8*/);
+  if (rot_out) *(u32*)rot_out = 0;  // D3DDISPLAYROTATION_IDENTITY
+  return D3D_OK_;
+}
+// CreateDeviceEx(adapter, type, hwnd, flags, D3DPRESENT_PARAMETERS*,
+//                D3DDISPLAYMODEEX* fullscreen_mode, out_dev)
+int TRT_GUEST_ABI d9_CreateDeviceEx(void*, u32 adapter, u32 dev_type, void* hwnd,
+                                    u32 flags, void* pp, void* fullscreen_mode,
+                                    void** out_dev) {
+  (void)adapter; (void)hwnd; (void)fullscreen_mode;  // always windowed here
+  return d9_CreateDeviceImpl(dev_type, flags, pp, out_dev, true);
+}
+// GetAdapterLUID(adapter, LUID*) — the console backend has no adapter LUID;
+// a zero LUID is the honest value (D3D9On12 does the same for its adapter).
+int TRT_GUEST_ABI d9_GetAdapterLUID(void*, u32, void* luid_out) {
+  if (!luid_out) return D3DERR_INVALIDCALL_;
+  ((u32*)luid_out)[0] = 0;
+  ((u32*)luid_out)[1] = 0;
   return D3D_OK_;
 }
 
@@ -1158,10 +1267,15 @@ int TRT_GUEST_ABI dev_GetBackBuffer(void*, u32, u32, u32, void** out) {
   return D3D_OK_;
 }
 int TRT_GUEST_ABI dev_TestCooperativeLevel(void*) { return D3D_OK_; }
-int TRT_GUEST_ABI dev_GetDirect3D(void*, void** out) {
-  if (!out || !g_d3d9_root) return D3DERR_INVALIDCALL_;
-  ++g_d3d9_root->refcount;
-  *out = g_d3d9_root;
+int TRT_GUEST_ABI dev_GetDirect3D(void* self, void** out) {
+  // An Ex device answers with the Ex root: its vtable is a strict superset
+  // of the plain one, so returning the plain root here would let the caller
+  // invoke CreateDeviceEx past the end of a 17-slot vtable.
+  d9_obj* root =
+      (self == (void*)g_devex && g_d3d9ex_root) ? g_d3d9ex_root : g_d3d9_root;
+  if (!out || !root) return D3DERR_INVALIDCALL_;
+  ++root->refcount;
+  *out = root;
   return D3D_OK_;
 }
 int TRT_GUEST_ABI dev_GetDeviceCaps(void* self, void* out) {
@@ -1178,6 +1292,80 @@ int TRT_GUEST_ABI dev_EvictManagedResources(void*) { return D3D_OK_; }
 int TRT_GUEST_ABI dev_GetDisplayMode(void*, u32 swapchain, void* out) {
   (void)swapchain;
   return d9_GetAdapterDisplayMode(nullptr, 0, out);
+}
+
+// ---- IDirect3DDevice9Ex (device slots 119-132) ----
+// XNA 4.0's device-lost path calls ResetEx + CheckDeviceState; the rest is
+// either a thin delegate onto the matching non-Ex method or an honest
+// NOTIMPL for something the console backend cannot observe (residency,
+// convolution kernels, rect composition).
+int TRT_GUEST_ABI devex_SetConvolutionMonoKernel(void*, u32, u32, const float*,
+                                                 const float*) {
+  return D3DERR_NOTIMPL_;
+}
+int TRT_GUEST_ABI devex_ComposeRects(void*, void*, void*, void*, u32, void*,
+                                     u32, i32, i32) {
+  return D3DERR_NOTIMPL_;
+}
+int TRT_GUEST_ABI devex_PresentEx(void*, const void*, const void*, const void*,
+                                  const void*, u32) {
+  if (g_hooks.present) g_hooks.present(g_hooks.user);
+  return D3D_OK_;
+}
+int TRT_GUEST_ABI devex_GetGPUThreadPriority(void*, i32* prio) {
+  if (!prio) return D3DERR_INVALIDCALL_;
+  *prio = 0;  // the console backend has no GPU thread priority to report
+  return D3D_OK_;
+}
+int TRT_GUEST_ABI devex_SetGPUThreadPriority(void*, i32) { return D3D_OK_; }
+int TRT_GUEST_ABI devex_WaitForVBlank(void*, u32) {
+  // No vsync-wait primitive on the console backend; Present already syncs
+  // through the swapchain, so there is nothing to wait for.
+  return D3D_OK_;
+}
+int TRT_GUEST_ABI devex_CheckResourceResidency(void*, void**, u32) {
+  return D3DERR_NOTIMPL_;  // residency is not observable through the hooks
+}
+int TRT_GUEST_ABI devex_SetMaximumFrameLatency(void*, u32 max_latency) {
+  g_frame_latency = max_latency;
+  return D3D_OK_;
+}
+int TRT_GUEST_ABI devex_CheckDeviceState(void*, void*) {
+  return D3D_OK_;  // the device is never lost in this model (cf. slot 3)
+}
+int TRT_GUEST_ABI devex_CreateRenderTargetEx(void* self, u32 w, u32 h, u32 fmt,
+                                             u32 multi, u32 msq, int lockable,
+                                             void** out, void** shared,
+                                             u32 usage) {
+  (void)lockable; (void)shared; (void)usage;  // no shared handles on console
+  return dev_CreateRenderTarget(self, w, h, fmt, multi, msq, 1 /*windowed*/,
+                                out, nullptr);
+}
+int TRT_GUEST_ABI devex_CreateOffscreenPlainSurfaceEx(void* self, u32 w, u32 h,
+                                                      u32 fmt, u32 pool,
+                                                      void** out, void** shared,
+                                                      u32 usage) {
+  (void)shared; (void)usage;
+  return dev_CreateOffscreenPlainSurface(self, w, h, fmt, pool, out, nullptr);
+}
+int TRT_GUEST_ABI devex_CreateDepthStencilSurfaceEx(void* self, u32 w, u32 h,
+                                                    u32 fmt, u32 multi, u32 msq,
+                                                    int discard, void** out,
+                                                    void** shared, u32 usage) {
+  (void)shared; (void)usage;
+  return dev_CreateDepthStencilSurface(self, w, h, fmt, multi, msq, discard,
+                                       1 /*zenable*/, out);
+}
+int TRT_GUEST_ABI devex_ResetEx(void* self, void* pp, void* fullscreen_mode) {
+  (void)fullscreen_mode;  // always windowed here
+  return dev_Reset(self, pp);
+}
+int TRT_GUEST_ABI devex_GetDisplayModeEx(void*, u32, void* mode_out,
+                                         void* rot_out) {
+  if (!mode_out) return D3DERR_INVALIDCALL_;
+  fill_display_mode_ex(mode_out, 21u /*D3DFMT_X8R8G8B8*/);
+  if (rot_out) *(u32*)rot_out = 0;  // D3DDISPLAYROTATION_IDENTITY
+  return D3D_OK_;
 }
 
 // ---- draws ----
@@ -1432,9 +1620,14 @@ int TRT_GUEST_ABI tex_UnlockRect(void* self, u32 level) {
 
 // ---- texture/resource shared slots ----
 int TRT_GUEST_ABI res_GetDevice(void*, void** out) {
-  if (!out || !g_dev) return D3DERR_INVALIDCALL_;
-  ++g_dev->refcount;
-  *out = g_dev;
+  // Prefer the Ex device when one exists: its vtable is a superset of the
+  // plain device's, so plain callers still work while Ex callers (XNA calls
+  // GetDevice on its textures, then ResetEx on the result) don't overrun a
+  // 119-slot vtable.
+  d9_obj* dev = g_devex ? g_devex : g_dev;
+  if (!out || !dev) return D3DERR_INVALIDCALL_;
+  ++dev->refcount;
+  *out = dev;
   return D3D_OK_;
 }
 int TRT_GUEST_ABI res_SetPrivateData(void*, const void*, const void*, u32, u32) {
@@ -1814,6 +2007,37 @@ int TRT_GUEST_ABI dev_GetPixelShaderConstantB(void*, u32 start, int* d,
 }
 u32 TRT_GUEST_ABI dev_GetNumberOfSwapChains(void*) { return 1u; }
 
+// ---- Ex vtables (built once from the base vtables) ----
+// IDirect3D9Ex = IDirect3D9 (17 slots) + 5 Ex slots; IDirect3DDevice9Ex =
+// IDirect3DDevice9 (119 slots) + 14 Ex slots. Copying the base entries (not
+// re-listing them) keeps the two vtables in lock-step by construction.
+bool g_ex_vtbls_ready = false;
+void ensure_ex_vtbls() {
+  if (g_ex_vtbls_ready) return;
+  memcpy((void*)g_d3d9ex_vtbl, g_d3d9_vtbl, sizeof(g_d3d9_vtbl));
+  g_d3d9ex_vtbl[17] = (const void*)&d9_GetAdapterModeCountEx;
+  g_d3d9ex_vtbl[18] = (const void*)&d9_EnumAdapterModesEx;
+  g_d3d9ex_vtbl[19] = (const void*)&d9_GetAdapterDisplayModeEx;
+  g_d3d9ex_vtbl[20] = (const void*)&d9_CreateDeviceEx;
+  g_d3d9ex_vtbl[21] = (const void*)&d9_GetAdapterLUID;
+  memcpy((void*)g_dev9ex_vtbl, g_dev9_vtbl, sizeof(g_dev9_vtbl));
+  g_dev9ex_vtbl[119] = (const void*)&devex_SetConvolutionMonoKernel;
+  g_dev9ex_vtbl[120] = (const void*)&devex_ComposeRects;
+  g_dev9ex_vtbl[121] = (const void*)&devex_PresentEx;
+  g_dev9ex_vtbl[122] = (const void*)&devex_GetGPUThreadPriority;
+  g_dev9ex_vtbl[123] = (const void*)&devex_SetGPUThreadPriority;
+  g_dev9ex_vtbl[124] = (const void*)&devex_WaitForVBlank;
+  g_dev9ex_vtbl[125] = (const void*)&devex_CheckResourceResidency;
+  g_dev9ex_vtbl[126] = (const void*)&devex_SetMaximumFrameLatency;
+  g_dev9ex_vtbl[127] = (const void*)&devex_CheckDeviceState;
+  g_dev9ex_vtbl[128] = (const void*)&devex_CreateRenderTargetEx;
+  g_dev9ex_vtbl[129] = (const void*)&devex_CreateOffscreenPlainSurfaceEx;
+  g_dev9ex_vtbl[130] = (const void*)&devex_CreateDepthStencilSurfaceEx;
+  g_dev9ex_vtbl[131] = (const void*)&devex_ResetEx;
+  g_dev9ex_vtbl[132] = (const void*)&devex_GetDisplayModeEx;
+  g_ex_vtbls_ready = true;
+}
+
 // ---- vtables (SDK order) ----
 const void* g_d3d9_vtbl[17] = {
     (const void*)&d9_QI,
@@ -1834,6 +2058,10 @@ const void* g_d3d9_vtbl[17] = {
     (const void*)&d9_GetAdapterMonitor,               // 15
     (const void*)&d9_CreateDevice,                    // 16
 };
+
+// Ex vtables: zero-initialised here, filled by ensure_ex_vtbls() before
+// any Ex object is handed out (see above).
+const void* g_d3d9ex_vtbl[22];
 
 const void* g_dev9_vtbl[119] = {
     (const void*)&d9_QI,                              // 0
@@ -1956,6 +2184,8 @@ const void* g_dev9_vtbl[119] = {
     (const void*)&dev_stub_117,                    // 117
     (const void*)&dev_stub_118,                    // 118
 };
+
+const void* g_dev9ex_vtbl[133];
 
 const void* g_tex9_vtbl[22] = {
     (const void*)&d9_QI, (const void*)&d9_AR, (const void*)&d9_Rel,
@@ -2189,6 +2419,7 @@ const void* g_sb9_vtbl[6] = {
 };
 
 int trt_bridge_register_d3d9(void) {
+  ensure_ex_vtbls();  // Ex objects are servable from the first call
   static const trt_named_fn k_fns[] = {
       {"Direct3DCreate9", (void*)&trt_Direct3DCreate9},
       {"Direct3DCreate9Ex", (void*)&trt_Direct3DCreate9Ex},

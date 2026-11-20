@@ -164,6 +164,51 @@ void hk_draw(u32 prim, d3d9_handle vb, d3d9_handle ib, u32 base_index,
   g_last_draw_count = prim_count;
 }
 
+// ---- Wave 2B extension hooks (shaders, decls, render targets, scissor) ----
+int g_shader_created = 0, g_shader_set = 0, g_shader_const_f = 0;
+int g_decl_created = 0, g_decl_set = 0;
+int g_rt_set = 0, g_scissor_set = 0;
+u32 g_last_rt_handle = 0;
+
+u32 hk_create_shader(u32 is_ps, u32 maj, u32 min, const char* hlsl,
+                     u32 hlsl_len, const void* parsed, void* user) {
+  (void)maj; (void)min; (void)user;
+  // the bridge only calls this when MojoShader parsed cleanly and produced
+  // HLSL; a null/empty output here would mean a broken shader reached us
+  if (!hlsl || !hlsl_len || !parsed) return 0;
+  ++g_shader_created;
+  return (u32)(0x3000 + g_shader_created + (is_ps ? 0x100 : 0));
+}
+void hk_set_shader(u32 is_ps, u32 handle, void* user) {
+  (void)is_ps; (void)handle; (void)user;
+  ++g_shader_set;
+}
+void hk_set_shader_const_f(u32 is_ps, u32 start_reg, const float* data,
+                           u32 vec4_count, void* user) {
+  (void)is_ps; (void)start_reg; (void)data; (void)vec4_count; (void)user;
+  ++g_shader_const_f;
+}
+u32 hk_create_decl(const void* elems, u32 count, void* user) {
+  (void)elems; (void)user;
+  if (!count) return 0;
+  ++g_decl_created;
+  return (u32)(0x4000 + g_decl_created);
+}
+void hk_set_decl(u32 handle, void* user) {
+  (void)handle; (void)user;
+  ++g_decl_set;
+}
+void hk_set_render_target(u32 slot, u32 handle, void* user) {
+  (void)user;
+  ++g_rt_set;
+  if (slot == 0) g_last_rt_handle = handle;
+}
+void hk_set_scissor(int enabled, int left, int top, int right, int bottom,
+                    void* user) {
+  (void)enabled; (void)left; (void)top; (void)right; (void)bottom; (void)user;
+  ++g_scissor_set;
+}
+
 int failures = 0;
 #define CHECK(cond, msg)                                             \
   do {                                                               \
@@ -208,6 +253,13 @@ int main(int argc, char** argv) {
   hk.set_rs = &hk_set_rs;
   hk.set_sampler = &hk_set_sampler;
   hk.draw = &hk_draw;
+  hk.create_shader = &hk_create_shader;
+  hk.set_shader = &hk_set_shader;
+  hk.set_shader_const_f = &hk_set_shader_const_f;
+  hk.create_decl = &hk_create_decl;
+  hk.set_decl = &hk_set_decl;
+  hk.set_render_target = &hk_set_render_target;
+  hk.set_scissor = &hk_set_scissor;
   trt_d3d9_set_hooks(&hk);
 
   printf("tiramisu D3D9 bridge test\n");
@@ -225,7 +277,7 @@ int main(int argc, char** argv) {
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x3ff)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0x3fff)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x001u, "Direct3DCreate9 -> device");
   CHECK(ret & 0x002u, "GetAdapterCount >= 1");
@@ -237,18 +289,30 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x080u, "BeginScene/EndScene/Clear OK");
   CHECK(ret & 0x100u, "index buffer + indexed draw OK");
   CHECK(ret & 0x200u, "GetDeviceCaps sane");
+  CHECK(ret & 0x400u, "D3D9Ex: CreateDeviceEx + ResetEx + PresentEx + "
+                      "CheckDeviceState + GetDisplayModeEx OK");
+  CHECK(ret & 0x800u, "render target: create + set/get + backbuffer restore");
+  CHECK(ret & 0x1000u, "shaders + vertex declaration (XNA SpriteBatch path)");
+  CHECK(ret & 0x2000u, "sampler state + scissor rect round-trip");
 
   // host-side observation: the hooks actually fired
-  CHECK(g_tex_created == 1, "hook: 1 texture created");
+  CHECK(g_tex_created == 2, "hook: 2 textures created (tex + render target)");
   CHECK(g_buf_created == 2, "hook: 2 buffers created (vb + ib)");
   CHECK(g_cleared >= 1, "hook: Clear reached the host");
-  CHECK(g_presented == 1, "hook: Present reached the host");
+  CHECK(g_presented == 2, "hook: Present + PresentEx reached the host");
   CHECK(g_rs_count >= 3, "hook: render states marshalled");
   CHECK(g_last_fvf == 0x42, "hook: FVF (XYZ|DIFFUSE) = 0x42");
   CHECK(g_draw_count >= 2, "hook: both draws reached the host");
   CHECK(g_last_draw_prim == 4 /*TRIANGLELIST*/, "hook: prim type TRIANGLELIST");
   CHECK(g_vp_w == 1280.0f && g_vp_h == 720.0f,
         "hook: viewport = present params 1280x720");
+  CHECK(g_shader_created == 2, "hook: 2 shaders created (vs + ps, parsed OK)");
+  CHECK(g_shader_set == 2, "hook: both shaders bound");
+  CHECK(g_shader_const_f == 2, "hook: vs + ps constants marshalled");
+  CHECK(g_decl_created == 1, "hook: 1 vertex declaration created");
+  CHECK(g_decl_set == 1, "hook: vertex declaration bound");
+  CHECK(g_rt_set == 2, "hook: render target set + restored");
+  CHECK(g_scissor_set >= 1, "hook: scissor rect reached the host");
 
   // Wave 2B MojoShader cbuffer reflection & packing check (vs_2_0 using c2)
   {
@@ -279,6 +343,28 @@ int main(int argc, char** argv) {
               packed[0] == 11.0f && packed[1] == 22.0f &&
               packed[2] == 33.0f && packed[3] == 44.0f,
           "Wave2B: mojo_pack_cb packs c2 into b0 buffer cleanly");
+    trt_d3d9_mojo_free(pd);
+  }
+
+  // Celeste: the guest's ps_2_0 texture shader parses cleanly (same bytes
+  // the guest feeds CreatePixelShader) — extract() returns 0 on any parse
+  // error, so this is the parse verdict, not just a non-null pointer.
+  {
+    static const u32 k_ps_tex[] = {
+        0xFFFF0200u, 0x0200001Fu, 0x90000000u, 0xA00F0800u,
+        0x0200001Fu, 0x80000000u, 0xB0030000u, 0x03000042u, 0x800F0000u,
+        0xB0E40000u, 0xA0E40800u, 0x02000001u, 0x800F0800u, 0x80E40000u,
+        0x0000FFFFu};
+    u32 b_len = 0;
+    const void* pd = trt_d3d9_mojo_parse(k_ps_tex, sizeof(k_ps_tex), &b_len);
+    CHECK(pd != nullptr && b_len == sizeof(k_ps_tex),
+          "Celeste: mojo_parse parses ps_2_0 texld shader");
+    d3d9_mojo_layout lay{};
+    u32 smask = 0;
+    const u32 cb_sz = trt_d3d9_mojo_cb_info(pd, &smask);
+    CHECK(trt_d3d9_mojo_extract(pd, &lay) == 1 && lay.f4_count == 0 &&
+              cb_sz == 0 && smask == 1u,
+          "Celeste: mojo_extract: ps uses sampler s0, no float constants");
     trt_d3d9_mojo_free(pd);
   }
 

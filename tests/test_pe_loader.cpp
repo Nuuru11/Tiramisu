@@ -7,14 +7,20 @@
 //   5. verify the guest's import call landed in the host and the checksum
 //      matches the same arithmetic computed in C
 //   6. negative: corrupt DOS header -> TRT_ERR_BAD_DOS, no crash
+//   7. negative: managed (.NET) PE64 (COM descriptor set) -> TRT_ERR_MANAGED
+//      with the CLR gap named in the log; the boot audit agrees
+//   8. negative: 32-bit managed PE (Celeste.exe's shape) -> TRT_ERR_NOT_PE64
+//      with the managed detail; plain PE32 gets the generic bitness line
 // Console runs the identical loader through the UWP backend.
 #include "../src/trt/trt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <vector>
 
 // ---------------- mmap backend ----------------
 namespace {
@@ -71,6 +77,16 @@ void linux_release(void* base, size_t bytes) {
 }
 
 void linux_log(const char* line) { printf("  [trt] %s\n", line); }
+
+// capturing log: the negative cases assert the diagnostic text, not just
+// the error code (a code without a message is how the mscoree failure hid)
+char g_cap_log[8192];
+void capture_log(const char* line) {
+  const size_t n = strlen(g_cap_log);
+  if (n < sizeof(g_cap_log) - 2)
+    snprintf(g_cap_log + n, sizeof(g_cap_log) - n, "%s\n", line);
+  printf("  [trt] %s\n", line);
+}
 
 // ---------------- import plumbing ----------------
 // SysV implementations the guest's imports forward into
@@ -214,6 +230,74 @@ int main(int argc, char** argv) {
     const int rc = trt_map_pe(&be, &rs, file2, size2, &img);
     CHECK(rc == TRT_ERR_BAD_DOS, "corrupt MZ -> TRT_ERR_BAD_DOS");
     CHECK(img == nullptr, "no image leaked on error");
+  }
+
+  // negative: managed (.NET) PE64 — the guest bytes with only the COM
+  // descriptor directory (14) patched in, exactly what a .NET assembly
+  // carries. Must fail fast with the dedicated code, not at import bind.
+  {
+    u8* managed = (u8*)malloc(size);
+    memcpy(managed, file, size);
+    u32 pe_off = 0;
+    memcpy(&pe_off, managed + 0x3c, 4);
+    const size_t com_dir = (size_t)pe_off + 24 + 112 + 14 * 8;
+    const u32 com_va = 0x1000u, com_sz = 72u;
+    memcpy(managed + com_dir, &com_va, 4);
+    memcpy(managed + com_dir + 4, &com_sz, 4);
+    g_cap_log[0] = 0;
+    trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &capture_log, nullptr};
+    trt_resolver rs = {nullptr, &test_resolve};
+    trt_image* img = nullptr;
+    const int rc = trt_map_pe(&be, &rs, managed, size, &img);
+    CHECK(rc == TRT_ERR_MANAGED, "managed PE64 (COM descriptor) -> TRT_ERR_MANAGED");
+    CHECK(img == nullptr, "no image leaked on managed error");
+    CHECK(strstr(g_cap_log, "managed .NET assembly") != nullptr,
+          "managed failure names the CLR gap in the log");
+    CHECK(strstr(trt_errstr(rc), "MANAGED") != nullptr,
+          "trt_errstr names TRT_ERR_MANAGED");
+    // the boot audit agrees without mapping anything
+    std::vector<std::string> missing;
+    CHECK(trt_audit_imports(managed, size, &missing) == TRT_ERR_MANAGED,
+          "audit_imports on managed PE64 -> TRT_ERR_MANAGED");
+    free(managed);
+  }
+
+  // negative: 32-bit managed PE — Celeste.exe's shape (PE32, COM
+  // descriptor, sole import mscoree.dll!_CorExeMain). Bitness is the
+  // verdict, but the log must name the managed part too.
+  {
+    u8 pe32[512];
+    memset(pe32, 0, sizeof(pe32));
+    pe32[0] = 'M'; pe32[1] = 'Z';
+    const u32 pe_off = 0x80u;
+    memcpy(pe32 + 0x3c, &pe_off, 4);
+    memcpy(pe32 + 0x80, "PE\0\0", 4);
+    pe32[0x84] = 0x4c; pe32[0x85] = 0x01;  // machine i386
+    pe32[0x86] = 1;                          // number of sections
+    pe32[0x94] = 224;                        // size of optional header
+    pe32[0x98] = 0x0b; pe32[0x99] = 0x01;   // magic PE32
+    const u32 n_rva = 16u;
+    memcpy(pe32 + 0x98 + 92, &n_rva, 4);
+    const u32 com_va = 0x2008u, com_sz = 72u;
+    memcpy(pe32 + 0x98 + 96 + 14 * 8, &com_va, 4);
+    memcpy(pe32 + 0x98 + 96 + 14 * 8 + 4, &com_sz, 4);
+    g_cap_log[0] = 0;
+    trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &capture_log, nullptr};
+    trt_resolver rs = {nullptr, &test_resolve};
+    trt_image* img = nullptr;
+    const int rc = trt_map_pe(&be, &rs, pe32, sizeof(pe32), &img);
+    CHECK(rc == TRT_ERR_NOT_PE64, "PE32 managed -> TRT_ERR_NOT_PE64");
+    CHECK(img == nullptr, "no image leaked on PE32 error");
+    CHECK(strstr(g_cap_log, "32-bit managed .NET assembly") != nullptr,
+          "PE32 managed failure names both blockers in the log");
+    // same fixture without the COM descriptor: the generic bitness line
+    const u32 zero = 0;
+    memcpy(pe32 + 0x98 + 96 + 14 * 8, &zero, 4);
+    g_cap_log[0] = 0;
+    const int rc2 = trt_map_pe(&be, &rs, pe32, sizeof(pe32), &img);
+    CHECK(rc2 == TRT_ERR_NOT_PE64, "plain PE32 -> TRT_ERR_NOT_PE64");
+    CHECK(strstr(g_cap_log, "32-bit PE (0x014c/0x010b)") != nullptr,
+          "plain PE32 failure keeps the bitness-only detail");
   }
 
   free(file2);

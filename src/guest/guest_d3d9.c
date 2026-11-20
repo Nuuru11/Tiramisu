@@ -14,6 +14,14 @@
 //   0x080 BeginScene/EndScene/Clear OK
 //   0x100 CreateIndexBuffer + SetIndices + DrawIndexedPrimitive OK
 //   0x200 GetDeviceCaps sane (MaxTextureWidth >= 2048)
+//   0x400 D3D9Ex path (Direct3DCreate9Ex -> CreateDeviceEx -> ResetEx ->
+//         PresentEx -> CheckDeviceState -> GetDisplayModeEx)
+//   0x800 Render target (CreateRenderTarget -> Set/GetRenderTarget ->
+//         GetBackBuffer -> restore)
+//   0x1000 Shaders + vertex declaration (CreateVertex/PixelShader,
+//          SetVertex/PixelShader, SetVertex/PixelShaderConstantF,
+//          CreateVertexDeclaration, SetVertexDeclaration)
+//   0x2000 Sampler state + scissor rect (SetSamplerState, Set/GetScissorRect)
 typedef unsigned int u32;
 typedef int i32;
 typedef unsigned char u8;
@@ -28,6 +36,7 @@ typedef unsigned long long u64;
 int _fltused = 1;  // any float in the TU makes MSVC linkers want this
 
 __attribute__((dllimport)) void* GSTD Direct3DCreate9(u32 sdk);
+__attribute__((dllimport)) int GSTD Direct3DCreate9Ex(u32 sdk, void** out);
 
 // read slot N of a COM object's vtable (the vtable pointer is the object's
 // first member — the guest never links against bridge symbols directly)
@@ -189,6 +198,148 @@ u32 GSTD guest_d3d9_main(u64 a, u64 b, u64 c) {
     const u32 hr = ((u32 GSTD (*)(void*, u32, u32, void*))
                     vmethod(d3d, 14))(d3d, 0, 1 /*HAL*/, caps);
     if (hr == 0 && caps[0x54 / 4] >= 2048) bits |= 0x200u;
+  }
+
+  // ---- 10. D3D9Ex: the path XNA 4.0 takes on Vista+ (Direct3DCreate9Ex ->
+  //         GetAdapterLUID root slot 21 -> CreateDeviceEx root slot 20 ->
+  //         CheckDeviceState dev slot 127 -> ResetEx dev slot 131 ->
+  //         PresentEx dev slot 121 -> GetDisplayModeEx dev slot 132) ----
+  {
+    void* d3dex = 0;
+    void* devex = 0;
+    u32 pp[16];
+    for (u32 i = 0; i < 16; ++i) pp[i] = 0;
+    pp[0] = 1280; pp[1] = 720; pp[2] = 21 /* D3DFMT_X8R8G8B8 */;
+    pp[10] = 1;   // Windowed = TRUE
+    if (Direct3DCreate9Ex(32 /* D3D_SDK_VERSION */, &d3dex) == 0 && d3dex) {
+      u64 luid = 0xFFFFFFFFFFFFFFFFull;
+      const u32 hr_luid =
+          ((u32 GSTD (*)(void*, u32, void*))vmethod(d3dex, 21))(d3dex, 0,
+                                                               &luid);
+      const u32 hr_dev =
+          ((u32 GSTD (*)(void*, u32, u32, void*, u32, void*, void*, void**))
+           vmethod(d3dex, 20))(d3dex, 0 /*adapter*/, 1 /*HAL*/, 0, 0, pp,
+                               0 /*fullscreen mode*/, &devex);
+      if (hr_luid == 0 && luid == 0 && hr_dev == 0 && devex) {
+        const u32 ok_state =
+            ((u32 GSTD (*)(void*, void*))vmethod(devex, 127))(devex, 0) == 0;
+        const u32 ok_reset =
+            ((u32 GSTD (*)(void*, void*, void*))vmethod(devex, 131))(devex, pp,
+                                                                    0) == 0;
+        const u32 ok_present =
+            ((u32 GSTD (*)(void*, const void*, const void*, const void*,
+                           const void*, u32))vmethod(devex, 121))(devex, 0, 0,
+                                                                 0, 0, 0) == 0;
+        u32 modeex[8];
+        for (u32 i = 0; i < 8; ++i) modeex[i] = 0;
+        u32 rot = 99;
+        const u32 ok_mode =
+            ((u32 GSTD (*)(void*, u32, void*, void*))vmethod(devex, 132))
+                    (devex, 0, modeex, &rot) == 0 &&
+            modeex[0] == 1920u && modeex[1] == 1080u && rot == 0;
+        if (ok_state && ok_reset && ok_present && ok_mode) bits |= 0x400u;
+      }
+    }
+  }
+
+  // ---- 11. render target: the path Celeste's Monocle engine renders its
+  //         320x180 virtual screen through (CreateRenderTarget dev slot 28,
+  //         SetRenderTarget 37, GetRenderTarget 38, GetBackBuffer 18) ----
+  if (dev) {
+    void* rt = 0;
+    const u32 hr =
+        ((u32 GSTD (*)(void*, u32, u32, u32, u32, u32, int, void**, void**))
+         vmethod(dev, 28))(dev, 320, 180, 21 /*X8R8G8B8*/, 0, 0, 1, &rt, 0);
+    if (hr == 0 && rt) {
+      const u32 ok_set =
+          ((u32 GSTD (*)(void*, u32, void*))vmethod(dev, 37))(dev, 0, rt) == 0;
+      void* got = 0;
+      const u32 ok_get =
+          ((u32 GSTD (*)(void*, u32, void**))vmethod(dev, 38))(dev, 0, &got) ==
+              0 &&
+          got == rt;
+      void* bb = 0;
+      const u32 ok_bb =
+          ((u32 GSTD (*)(void*, u32, u32, u32, void**))vmethod(dev, 18))
+                  (dev, 0, 0, 0, &bb) == 0 &&
+          bb != 0;
+      // restore the backbuffer as render target 0
+      const u32 ok_restore =
+          ((u32 GSTD (*)(void*, u32, void*))vmethod(dev, 37))(dev, 0, bb) == 0;
+      if (ok_set && ok_get && ok_bb && ok_restore) bits |= 0x800u;
+    }
+  }
+
+  // ---- 12. shaders + vertex declaration: XNA's SpriteBatch/BasicEffect
+  //         path (CreateVertexShader 91, CreatePixelShader 106,
+  //         SetVertexShader 92, SetPixelShader 107, SetVertexShaderConstantF
+  //         94, SetPixelShaderConstantF 109, CreateVertexDeclaration 86,
+  //         SetVertexDeclaration 87) ----
+  if (dev) {
+    // vs_2_0: dcl_position v0; add oPos, v0, c2; end
+    static const u32 vs_c2[] = {
+        0xFFFE0200u, 0x0200001Fu, 0x80000000u, 0x900F0000u,
+        0x03000002u, 0xC00F0000u, 0x90E40000u, 0xA0E40002u, 0x0000FFFFu};
+    // ps_2_0: dcl_2d s0; dcl t0.xy; texld r0, t0, s0; mov oC0, r0; end
+    // (encoding verified against MojoShader: parses with 0 errors)
+    static const u32 ps_tex[] = {
+        0xFFFF0200u, 0x0200001Fu, 0x90000000u, 0xA00F0800u,
+        0x0200001Fu, 0x80000000u, 0xB0030000u, 0x03000042u, 0x800F0000u,
+        0xB0E40000u, 0xA0E40800u, 0x02000001u, 0x800F0800u, 0x80E40000u,
+        0x0000FFFFu};
+    // VertexPositionColorTexture: FLOAT3 pos @0, UBYTE4 color @12,
+    // FLOAT2 texcoord @16 (D3DVERTEXELEMENT9 = 8 bytes each, 0xFF ends)
+    static const u32 decl[] = {
+        0x00000000u, 0x00000002u,  // {0, 0, FLOAT3, DEFAULT, POSITION, 0}
+        0x000C0000u, 0x000A0005u,  // {0, 12, UBYTE4, DEFAULT, COLOR, 0}
+        0x00100000u, 0x00050001u,  // {0, 16, FLOAT2, DEFAULT, TEXCOORD, 0}
+        0x000000FFu, 0x00000000u};  // D3DDECL_END
+    void* vs = 0;
+    void* ps = 0;
+    void* vd = 0;
+    const u32 hr_vs = ((u32 GSTD (*)(void*, const u32*, void**))vmethod(dev, 91))
+                          (dev, vs_c2, &vs);
+    const u32 hr_ps = ((u32 GSTD (*)(void*, const u32*, void**))vmethod(dev, 106))
+                          (dev, ps_tex, &ps);
+    const u32 hr_vd =
+        ((u32 GSTD (*)(void*, const void*, void**))vmethod(dev, 86))(dev, decl,
+                                                                    &vd);
+    float cf[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    const u32 ok_bind =
+        hr_vs == 0 && vs != 0 && hr_ps == 0 && ps != 0 && hr_vd == 0 &&
+        vd != 0 &&
+        ((u32 GSTD (*)(void*, void*))vmethod(dev, 92))(dev, vs) == 0 &&
+        ((u32 GSTD (*)(void*, void*))vmethod(dev, 107))(dev, ps) == 0 &&
+        ((u32 GSTD (*)(void*, void*))vmethod(dev, 87))(dev, vd) == 0 &&
+        ((u32 GSTD (*)(void*, u32, const float*, u32))vmethod(dev, 94))
+                (dev, 0, cf, 1) == 0 &&
+        ((u32 GSTD (*)(void*, u32, const float*, u32))vmethod(dev, 109))
+                (dev, 0, cf, 1) == 0;
+    if (ok_bind) bits |= 0x1000u;
+  }
+
+  // ---- 13. sampler state + scissor rect (SpriteBatch sets linear/clamp
+  //         samplers per draw; Monocle scissor-clips the virtual screen) ----
+  if (dev) {
+    const u32 ok_samp =
+        ((u32 GSTD (*)(void*, u32, u32, u32))vmethod(dev, 69))
+                (dev, 0, 5 /*MAGFILTER*/, 2 /*LINEAR*/) == 0 &&
+        ((u32 GSTD (*)(void*, u32, u32, u32))vmethod(dev, 69))
+                (dev, 0, 6 /*MINFILTER*/, 2) == 0 &&
+        ((u32 GSTD (*)(void*, u32, u32, u32))vmethod(dev, 69))
+                (dev, 0, 7 /*MIPFILTER*/, 0 /*NONE*/) == 0 &&
+        ((u32 GSTD (*)(void*, u32, u32, u32))vmethod(dev, 69))
+                (dev, 0, 1 /*ADDRESSU*/, 3 /*CLAMP*/) == 0 &&
+        ((u32 GSTD (*)(void*, u32, u32, u32))vmethod(dev, 69))
+                (dev, 0, 2 /*ADDRESSV*/, 3) == 0;
+    i32 rect[4] = {0, 0, 320, 180};
+    const u32 ok_scissor =
+        ((u32 GSTD (*)(void*, const void*))vmethod(dev, 75))(dev, rect) == 0;
+    i32 back[4] = {-1, -1, -1, -1};
+    const u32 ok_scissor_get =
+        ((u32 GSTD (*)(void*, void*))vmethod(dev, 76))(dev, back) == 0 &&
+        back[0] == 0 && back[1] == 0 && back[2] == 320 && back[3] == 180;
+    if (ok_samp && ok_scissor && ok_scissor_get) bits |= 0x2000u;
   }
 
   return bits;

@@ -291,6 +291,7 @@ extern "C" const char* trt_errstr(int code) {
     case TRT_ERR_TLS_BOUNDS: return "TLS_BOUNDS";
     case TRT_ERR_SEAL: return "SEAL (final protect failed)";
     case TRT_ERR_DELAY_IMPORT: return "DELAY_IMPORT (delay-load directory not processed in v0)";
+    case TRT_ERR_MANAGED: return "MANAGED (.NET assembly: CLR header present, no .NET Framework CLR on console)";
     default: return "UNKNOWN";
   }
 }
@@ -316,8 +317,27 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   if (rd32((const u8*)&nt->signature) != 0x00004550)
     return fail(&img, be, TRT_ERR_BAD_PE, "no PE\\0\\0");
   if (rd16((const u8*)&nt->file_header.machine) != TRT_PE_MACHINE_X64 ||
-      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT64_MAGIC)
+      rd16((const u8*)&nt->optional_header.magic) != TRT_PE_OPT64_MAGIC) {
+    // Name a 32-bit image precisely: a PE32 with a COM descriptor (data
+    // directory 14 in the PE32 optional header: NumberOfRvaAndSizes at
+    // opt+92, directories at opt+96) is a managed .NET assembly — it needs
+    // BOTH an x86 engine and a CLR, and neither exists on this path.
+    // (Celeste.exe is exactly this: PE32, COM descriptor, sole import
+    // mscoree.dll!_CorExeMain.) The e_lfanew bounds check above validated
+    // 264 bytes of NT headers, which covers the PE32 directory table.
+    if (rd16((const u8*)&nt->file_header.machine) == 0x014c &&
+        rd16((const u8*)&nt->optional_header.magic) == 0x010b) {
+      const u8* opt32 = (const u8*)&nt->optional_header;
+      if (rd32(opt32 + 92) > TRT_PE_DIR_COM_DESCRIPTOR &&
+          rd32(opt32 + 96 + TRT_PE_DIR_COM_DESCRIPTOR * 8) != 0)
+        return fail(&img, be, TRT_ERR_NOT_PE64,
+                    "32-bit managed .NET assembly (COM descriptor present); "
+                    "needs x86 engine + CLR, neither available");
+      return fail(&img, be, TRT_ERR_NOT_PE64,
+                  "32-bit PE (0x014c/0x010b); only PE64 on this path");
+    }
     return fail(&img, be, TRT_ERR_NOT_PE64, "only PE64 (0x8664/0x020b) on this path");
+  }
   u32 nsec = rd16((const u8*)&nt->file_header.number_of_sections);
   if (nsec == 0 || nsec > 96)
     return fail(&img, be, TRT_ERR_NO_SECTIONS, "section count 0 or >96");
@@ -331,6 +351,20 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   const u64 entry_rva = rd32((const u8*)&nt->optional_header.address_of_entry_point);
   const u64 size_headers = rd32((const u8*)&nt->optional_header.size_of_headers);
   const trt_data_directory* dirs = nt->optional_header.directories;
+
+  // ---- 2b. managed (.NET) assemblies ----
+  // A PE with a COM descriptor (data directory 14) is a .NET assembly: its
+  // entry point is a stub that jumps to mscoree.dll!_CorExeMain, and there
+  // is no .NET Framework CLR on the console (no mscoree/clr.dll, no GAC,
+  // no fusion, no XNA redist). Fail fast with a dedicated code instead of
+  // dying later at import bind with an unexplained mscoree.dll error.
+  // Deliberately NOT a STUB: binding _CorExeMain to a thunk that returns 0
+  // would make the game "exit 0" silently, which is worse than failing.
+  if (rd32((const u8*)&nt->optional_header.number_of_rva_and_sizes) >
+          TRT_PE_DIR_COM_DESCRIPTOR &&
+      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
+    return fail(&img, be, TRT_ERR_MANAGED,
+                "managed .NET assembly (COM descriptor present); no CLR on console");
 
   // section headers live right after optional header, in the file
   const u8* sec_base = (const u8*)&nt->optional_header +
@@ -849,6 +883,12 @@ extern "C" int trt_audit_imports(const u8* file, size_t file_size,
   const u64 preferred =
       rd64((const u8*)&nt->optional_header.image_base);
   const trt_data_directory* dirs = nt->optional_header.directories;
+  // Managed (.NET) assemblies never reach import bind: the CLR header is
+  // the verdict (same check as trt_map_pe step 2b).
+  if (rd32((const u8*)&nt->optional_header.number_of_rva_and_sizes) >
+          TRT_PE_DIR_COM_DESCRIPTOR &&
+      dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0)
+    return TRT_ERR_MANAGED;
   const u64 sec_off = (u64)((const u8*)&nt->optional_header +
       rd16((const u8*)&nt->file_header.size_of_optional_header) - file);
   file_view fv{file, file_size, sec_off, nsec};
