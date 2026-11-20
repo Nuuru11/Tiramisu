@@ -2703,7 +2703,23 @@ void fill_startup_info_w(void* si) {
   if (!si) return;
   memset(si, 0, 104);
   ((u32*)si)[0] = 104;  // cb
+  // Real Windows fills lpDesktop ("WinSta0\Default") and lpTitle (full exe path
+  // GoW faults passing a NULL string to a CRT string function right
+  // after Steam init; a NULL lpTitle/lpDesktop is the live candidate.
+  // Static storage: the struct holds pointers, so stack buffers would dangle.
+  // u16 arrays (not L"..." literals): wchar_t is 32-bit on the Linux gate.
+  static u16 desktop_buf[] = {'W', 'i', 'n', 'S', 't', 'a', '0', '\\',
+                              'D', 'e', 'f', 'a', 'u', 'l', 't', 0};
+  static u16 title_buf[260];
+  // Full path, not basename: GoW strrchrs lpTitle for a backslash;
+  // a bare basename returns NULL and its pointer math faults at -1.
+  size_t ti = 0;
+  for (; g_exepath[ti] && ti < 258; ++ti) title_buf[ti] = (u16)(u8)g_exepath[ti];
+  title_buf[ti] = 0;
+  ((u16**)si)[2] = desktop_buf;  // lpDesktop @16
+  ((u16**)si)[3] = title_buf;    // lpTitle @24
   boot_log("kernel32: GetStartupInfoW -> zeroed STARTUPINFOW (no console)");
+  boot_log("kernel32: GetStartupInfoW lpDesktop/lpTitle filled");
 }
 
 void fill_startup_info_a(void* si) {
