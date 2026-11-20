@@ -7,8 +7,8 @@
 // the Mono runtime (MIT) and invokes the managed Main directly. The game
 // runs as 64-bit managed code; its XNA references bind to the FNA
 // substitutes (third_party/fna) and its native P/Invokes bind through
-// dllmaps installed here (offline: the spike-parity stubs in
-// third_party/fna-stubs; next step: the real FMOD/Steam bridges).
+// dllmaps installed here (offline: the real FMOD/Steam bridges in
+// third_party/mono-bridges).
 //
 // PLATFORM: the embedding is real on Linux (offline harness), where
 // libmono-2.0 is dlopen'd from third_party/mono (see its README). On
@@ -43,7 +43,7 @@ extern "C" {
 // managed DLLs, and lazily-loaded assemblies alike.
 typedef struct trt_mono_dllmap {
   const char* module;  // e.g. "fmod"
-  const char* target;  // e.g. "/abs/path/libfmod-stub.so"
+  const char* target;  // e.g. "/abs/path/libfmod-real.so"
 } trt_mono_dllmap;
 
 typedef struct trt_mono_config {

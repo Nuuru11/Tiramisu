@@ -7,8 +7,8 @@
 // markers are seen — the test's job is the boot, not the play session.
 //
 // Usage:
-//   test_mono_celeste <celeste-exe> <fna-out-dir> <fmod-stub.so>
-//                     <steam-stub.so> <libmono.so> [timeout-secs]
+//   test_mono_celeste <celeste-exe> <fna-out-dir> <libfmod-real.so>
+//                     <libcsteamworks-real.so> <libmono.so> [timeout-secs]
 // Env:
 //   TIRAMISU_MONO_INTERPRETER=1  run Mono in interpreter mode (no JIT)
 // Requires a display (run under xvfb-run; see build-test.sh section 45).
@@ -17,6 +17,20 @@
 // The game runs with cwd + HOME redirected to a scratch dir so its own
 // writes (logs, saves) never touch the game folder. The game folder itself
 // is only ever read.
+//
+// REAL-BRIDGE ASSERTIONS (this test FAILS if the old spike-parity stubs
+// are loaded instead of the real bridges):
+//   * the .so files must export trt_mono_bridge_is_real()==1 and
+//     trt_mono_bridge_name()=="fmod-real"/"steam-real" (the stubs
+//     export neither);
+//   * a counting voice hook installed into libfmod-real.so before the
+//     game starts must receive real PCM during boot (the worldmap
+//     ambience event starts during loading);
+//   * trt_fmod_studio_global_event_count() must be > 0 after boot (real
+//     banks parsed — the stubs load nothing);
+//   * the Steam door chain SteamClient_ -> GetISteamUser ->
+//     ISteamUser_GetSteamID must return the bridged ID
+//     0x0110000100000001 through the real bridge.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -26,6 +40,7 @@
 #include <thread>
 #include <vector>
 
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -46,6 +61,28 @@ std::atomic<bool> g_saw_unhandled{false};
 std::atomic<bool> g_reader_done{false};
 std::atomic<int> g_mono_rc{-1};
 std::string g_mono_err;
+
+// Real-bridge evidence, collected while the game runs.
+std::atomic<int> g_pcm_submits{0};
+std::atomic<unsigned long long> g_pcm_bytes{0};
+std::atomic<int> g_pcm_rate{0};
+std::atomic<int> g_pcm_channels{0};
+
+int pcm_hook(unsigned long long voice, const void* pcm, unsigned bytes,
+             unsigned rate, unsigned channels, unsigned bps,
+             unsigned is_float, float volume, void* user) {
+  (void)voice;
+  (void)pcm;
+  (void)bps;
+  (void)is_float;
+  (void)volume;
+  (void)user;
+  g_pcm_submits.fetch_add(1);
+  g_pcm_bytes.fetch_add(bytes);
+  g_pcm_rate.store((int)rate);
+  g_pcm_channels.store((int)channels);
+  return 1;
+}
 
 void verdict(const char* line) {
   // Unbuffered, straight to the real stdout: _exit() follows, so nothing
@@ -106,15 +143,15 @@ void game_thread_fn(trt_mono_config cfg, const char* const* argv, int argc) {
 int main(int argc, char** argv) {
   if (argc < 6) {
     std::fprintf(stderr,
-                 "usage: %s <celeste-exe> <fna-out-dir> <fmod-stub.so> "
-                 "<steam-stub.so> <libmono.so> [timeout-secs]\n",
+                 "usage: %s <celeste-exe> <fna-out-dir> <libfmod-real.so> "
+                 "<libcsteamworks-real.so> <libmono.so> [timeout-secs]\n",
                  argv[0]);
     return 2;
   }
   const char* exe = argv[1];
   const char* fna_out = argv[2];
-  const char* fmod_stub = argv[3];
-  const char* steam_stub = argv[4];
+  const char* fmod_so = argv[3];
+  const char* steam_so = argv[4];
   const char* libmono = argv[5];
   const int timeout_secs = argc > 6 ? std::atoi(argv[6]) : 90;
 
@@ -128,11 +165,63 @@ int main(int argc, char** argv) {
   const std::string game_dll =
       std::string(fna_out) + "/Microsoft.Xna.Framework.Game.dll";
   for (const char* p : {core_dll.c_str(), gfx_dll.c_str(), game_dll.c_str(),
-                        fmod_stub, steam_stub, libmono}) {
+                        fmod_so, steam_so, libmono}) {
     if (!file_exists(p)) {
       std::printf("SKIP mono/celeste: missing input %s\n", p);
       return 0;
     }
+  }
+
+  // NO-STUB ASSERTION 1: the .so files must be the REAL bridges. dlopen
+  // them here (dlopen of the same path later returns the same object
+  // Mono uses) and check the marker exports the stubs do not have.
+  void* hf = ::dlopen(fmod_so, RTLD_NOW | RTLD_LOCAL);
+  if (!hf) {
+    std::printf("FAIL mono/celeste: dlopen %s: %s\n", fmod_so, ::dlerror());
+    return 1;
+  }
+  void* hs = ::dlopen(steam_so, RTLD_NOW | RTLD_LOCAL);
+  if (!hs) {
+    std::printf("FAIL mono/celeste: dlopen %s: %s\n", steam_so, ::dlerror());
+    return 1;
+  }
+  {
+    ::dlerror();
+    auto fmod_is_real = (int (*)())::dlsym(hf, "trt_mono_bridge_is_real");
+    auto fmod_name =
+        (const char* (*)())::dlsym(hf, "trt_mono_bridge_name");
+    auto steam_is_real = (int (*)())::dlsym(hs, "trt_mono_bridge_is_real");
+    auto steam_name =
+        (const char* (*)())::dlsym(hs, "trt_mono_bridge_name");
+    if (!fmod_is_real || !fmod_name || fmod_is_real() != 1 ||
+        std::strcmp(fmod_name(), "fmod-real") != 0) {
+      std::printf("FAIL mono/celeste: %s is NOT the real FMOD bridge "
+                  "(missing trt_mono_bridge_is_real/name markers — "
+                  "a stub .so was passed)\n",
+                  fmod_so);
+      return 1;
+    }
+    if (!steam_is_real || !steam_name || steam_is_real() != 1 ||
+        std::strcmp(steam_name(), "steam-real") != 0) {
+      std::printf("FAIL mono/celeste: %s is NOT the real Steam bridge "
+                  "(missing trt_mono_bridge_is_real/name markers — "
+                  "a stub .so was passed)\n",
+                  steam_so);
+      return 1;
+    }
+  }
+  // Install the counting voice hook into the FMOD .so BEFORE the game
+  // starts, so boot audio (the worldmap ambience) is observed.
+  {
+    ::dlerror();
+    auto set_hook =
+        (void (*)(void*, void*))::dlsym(hf, "trt_audio_set_voice_hook");
+    if (!set_hook) {
+      std::printf("FAIL mono/celeste: %s has no trt_audio_set_voice_hook\n",
+                  fmod_so);
+      return 1;
+    }
+    set_hook((void*)pcm_hook, nullptr);
   }
 
   // Managed-exe sanity: the game must have a CLR header (else the native
@@ -141,7 +230,7 @@ int main(int argc, char** argv) {
     FILE* f = std::fopen(exe, "rb");
     if (!f) {
       std::printf("SKIP mono/celeste: cannot open %s\n", exe);
-      return 0;
+      return 1;
     }
     std::vector<u8> head(4096);
     const size_t n = std::fread(head.data(), 1, head.size(), f);
@@ -197,10 +286,10 @@ int main(int argc, char** argv) {
   }
 
   trt_mono_dllmap maps[4] = {
-      {"fmod", fmod_stub},
-      {"fmodstudio", fmod_stub},
-      {"CSteamworks", steam_stub},
-      {"sdkencryptedappticket", steam_stub},
+      {"fmod", fmod_so},
+      {"fmodstudio", fmod_so},
+      {"CSteamworks", steam_so},
+      {"sdkencryptedappticket", steam_so},
   };
   trt_mono_config cfg = {};
   cfg.exe_path = exe;
@@ -223,8 +312,69 @@ int main(int argc, char** argv) {
       std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
   for (;;) {
     if (g_saw_displayed.load() && g_saw_loaded.load()) {
+      // NO-STUB ASSERTIONS 2-4 (after the gate markers): real PCM
+      // reached the voice hook, real banks were parsed, and the Steam
+      // door chain returns the bridged ID. Give the feeder thread up
+      // to 3 s after the markers to submit its first chunk.
+      const auto pcm_deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(3);
+      while (g_pcm_submits.load() == 0 &&
+             std::chrono::steady_clock::now() < pcm_deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (g_pcm_submits.load() == 0 || g_pcm_bytes.load() == 0) {
+        verdict("FAIL mono/celeste: title screen reached but NO PCM "
+                "reached the voice hook — the real FMOD bridge did not "
+                "play the boot ambience");
+        _exit(1);
+      }
+      {
+        ::dlerror();
+        auto global_events = (int (*)())::dlsym(
+            hf, "trt_fmod_studio_global_event_count");
+        if (!global_events || global_events() <= 0) {
+          verdict("FAIL mono/celeste: title screen reached but the "
+                  "Studio engine reports zero parsed events — no real "
+                  "banks were loaded");
+          _exit(1);
+        }
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "[harness] real-bridge evidence: PCM %d submits, "
+                      "%llu bytes, %d Hz %d ch; Studio events parsed: %d",
+                      g_pcm_submits.load(), g_pcm_bytes.load(),
+                      g_pcm_rate.load(), g_pcm_channels.load(),
+                      global_events());
+        verdict(line);
+      }
+      {
+        ::dlerror();
+        auto steam_client = (void* (*)())::dlsym(hs, "SteamClient_");
+        auto get_user = (void* (*)(int, int, const char*))::dlsym(
+            hs, "ISteamClient_GetISteamUser");
+        auto get_id =
+            (unsigned long long (*)())::dlsym(hs, "ISteamUser_GetSteamID");
+        if (!steam_client || !get_user || !get_id) {
+          verdict("FAIL mono/celeste: Steam door chain symbols missing "
+                  "from the .so");
+          _exit(1);
+        }
+        void* client = steam_client();
+        void* user = client ? get_user(1, 1, "SteamUser023") : nullptr;
+        (void)user;  // the door takes the user object from the bridge
+        unsigned long long id = get_id();
+        if (id != 0x0110000100000001ULL) {
+          char line[256];
+          std::snprintf(line, sizeof(line),
+                        "FAIL mono/celeste: Steam GetSteamID returned "
+                        "%llu, expected 76561197960265729",
+                        id);
+          verdict(line);
+          _exit(1);
+        }
+      }
       verdict("PASS mono/celeste: GAME DISPLAYED + DONE LOADING "
-              "(title screen reached under embedded Mono)");
+              "(title screen reached under embedded Mono) + real FMOD "
+              "PCM + real banks + bridged Steam ID");
       _exit(0);
     }
     const int rc = g_mono_rc.load();
@@ -240,7 +390,7 @@ int main(int argc, char** argv) {
     }
     if (g_saw_steam_abort.load()) {
       verdict("FAIL mono/celeste: game aborted 'Steam not found!' "
-              "(Steam stub Init/IsSteamRunning did not return true)");
+              "(Steam bridge Init/IsSteamRunning did not return true)");
       _exit(1);
     }
     if (std::chrono::steady_clock::now() >= deadline) {

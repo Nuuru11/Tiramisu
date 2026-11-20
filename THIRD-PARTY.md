@@ -13,6 +13,8 @@ Vendored, with licenses preserved in their directories:
 | FNA3D | `third_party/fna3d-src`, built in `third_party/fna3d/out` | zlib | FNA's 3D renderer (OpenGL offline; D3D11 adaptation is a later step) |
 | FAudio | `third_party/faudio-src`, built in `third_party/faudio/out` | zlib | FNA's XAudio2 reimplementation (offline audio-device dependency) |
 | Mono 6.8.0.105 | `third_party/mono` (Ubuntu noble `.deb`s, extracted, never installed) | MIT | Embedding headers + shared SGen runtime for `src/trt/mono_host.cpp` |
+| stb_vorbis | `src/trt/vendor_stb_vorbis.c` | public domain | Ogg Vorbis decoder (v1.24) for FSB5 sample playback in the FMOD Studio bridge |
+| TriMO-FSB5 Vorbis setup packets | `src/trt/fsb_vorbis_setups.h` | Apache-2.0 | FSB Vorbis setup-header packets for the 2 CRC32s Celeste banks need (fork of python-fsb5, MIT) |
 
 Everything else in this repository is original code, MIT licensed — see
 `LICENSE`. D3D9/D3D8/DDraw bridges follow the published semantics of

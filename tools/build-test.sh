@@ -793,6 +793,19 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_fmod"
 "$out/test_fmod"
 
+# --- 43b. FMOD Studio engine: real bank parsing (RIFF/FEV + FSB5 Vorbis),
+#          event graph, VCA/bus state, real PCM through the voice hook
+#          (Path B step 4). SKIP when the game banks are absent. ---
+MONO_CELESTE_BANKS="$HOME/celeste-xbox/Celeste/Content/FMOD/Desktop"
+if [[ -f "$MONO_CELESTE_BANKS/sfx.bank" ]]; then
+  clang++ -std=c++20 -O2 -Wall -no-pie \
+    tests/test_fmod_studio.cpp "$out/libtrt.a" -lpthread \
+    -o "$out/test_fmod_studio"
+  "$out/test_fmod_studio"
+else
+  echo "SKIP fmod/studio: no game banks at $MONO_CELESTE_BANKS"
+fi
+
 # --- 44. loader fuzzer: malformed PEs must fail NAMED, never crash the host
 #         (the launch path reads untrusted game files) ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
@@ -801,22 +814,34 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 "$out/test_fuzz_loader"
 
 # --- 45. Mono embedding: Celeste.exe boots to the title screen under the
-#         embedded Mono runtime + FNA (Path B step 1). SKIP when the game
-#         is absent (other machines have no Celeste) or no Xvfb exists. ---
+#         embedded Mono runtime + FNA (Path B step 1), with the REAL FMOD
+#         + Steamworks dllmaps (Path B step 4 — the old spike-parity stubs
+#         are gone). The door test runs first: it dlopens both .so files
+#         and proves the real bridges answer (markers, real bank event
+#         counts, bridged Steam ID). SKIP when the game is absent (other
+#         machines have no Celeste) or no Xvfb exists. ---
 MONO_CELESTE_EXE="$HOME/celeste-xbox/Celeste/Celeste.exe"
 if [[ -f "$MONO_CELESTE_EXE" ]]; then
   if command -v xvfb-run >/dev/null; then
     bash third_party/build-fna-stack.sh
+    # Door test: flat door calls through dlopen (no Mono needed).
+    clang++ -std=c++20 -O2 -Wall -no-pie \
+      tests/test_mono_doors.cpp -ldl -lpthread \
+      -o "$out/test_mono_doors"
+    "$out/test_mono_doors" \
+      "$here/third_party/mono-bridges/out/libfmod-real.so" \
+      "$here/third_party/mono-bridges/out/libcsteamworks-real.so" \
+      "$MONO_CELESTE_BANKS"
     clang++ -std=c++20 -O2 -Wall -no-pie \
       tests/test_mono_celeste.cpp "$out/libtrt.a" -ldl -lpthread \
       -o "$out/test_mono_celeste"
-    # FNA's dllmap resolves FNA3D/FAudio by soname; the stubs + libmono
-    # are passed by absolute path and need no LD_LIBRARY_PATH.
+    # FNA's dllmap resolves FNA3D/FAudio by soname; the real bridges +
+    # libmono are passed by absolute path and need no LD_LIBRARY_PATH.
     LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
     xvfb-run -a "$out/test_mono_celeste" "$MONO_CELESTE_EXE" \
       "$here/third_party/fna/out" \
-      "$here/third_party/fna-stubs/out/libfmod-stub.so" \
-      "$here/third_party/fna-stubs/out/libcsteamworks-stub.so" \
+      "$here/third_party/mono-bridges/out/libfmod-real.so" \
+      "$here/third_party/mono-bridges/out/libcsteamworks-real.so" \
       "$here/third_party/mono/usr/lib/libmono-2.0.so.1" 90
   else
     echo "SKIP mono/celeste: xvfb-run not found (no virtual display)"

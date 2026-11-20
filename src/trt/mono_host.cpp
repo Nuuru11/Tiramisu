@@ -334,6 +334,10 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     // Mono ignores a missing file.
     const bool has_config = (::access(config_path, F_OK) == 0);
     api.p_mono_domain_set_config(domain, game_dir, config_path);
+    // Publish the game dir for the dllmap bridges: the Steam door reads
+    // steam_appid.txt from $TIRAMISU_GAME_DIR at Init (the way the real
+    // Steam client finds the AppID).
+    ::setenv("TIRAMISU_GAME_DIR", game_dir, 1);
     char line[1200];
     std::snprintf(line, sizeof(line), "domain base dir: %s%s", game_dir,
                   has_config ? " (exe .config applied)" : "");
