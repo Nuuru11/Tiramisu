@@ -2010,18 +2010,16 @@ int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
 
 extern const u16* trt_gap_env_build_wblock(const char* const* defaults,
                                            size_t default_count);
+extern const char* const* trt_gap_env_defaults(size_t* count);
 extern int trt_gap_env_free_wblock(const u16* block);
 
 const u16* TRT_STDCALL trt_GetEnvironmentStringsW() {
-  const char* pairs[] = {
-    "PATH=C:\\Windows\\System32;Z:\\",
-    "TEMP=C:\\Temp", "TMP=C:\\Temp",
-    "USERPROFILE=C:\\Users\\Player",
-    "APPDATA=C:\\Users\\Player\\AppData\\Roaming",
-    "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
-    "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
-  };
-  const u16* st_blk = trt_gap_env_build_wblock(pairs, sizeof(pairs) / sizeof(pairs[0]));
+  // 0.2.2.95: the full standard Windows env set, shared with the store seed
+  // (bridge_kernel32_gap.cpp kTrtDefaultEnv) so the advertised block and
+  // GetEnvironmentVariableW/_wgetenv agree.
+  size_t default_count = 0;
+  const char* const* pairs = trt_gap_env_defaults(&default_count);
+  const u16* st_blk = trt_gap_env_build_wblock(pairs, default_count);
   { char st_tmp[136]; char st_line[256]; if (st_blk) { size_t st_o = 0; for (size_t st_i = 0; (st_blk[st_i] || st_blk[st_i + 1]) && st_o < 130; ++st_i) st_tmp[st_o++] = st_blk[st_i] ? (char)(st_blk[st_i] & 0x7f) : ';'; st_tmp[st_o] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> ptr=%p \"%.128s\"", (const void*)st_blk, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> NULL"); } trt_core_log(st_line); }
   return st_blk;
 }
