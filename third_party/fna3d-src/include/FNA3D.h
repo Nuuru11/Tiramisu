@@ -24,6 +24,15 @@
  *
  */
 
+/* TIRAMISU MODIFICATION (Path B step 3, FNA3D D3D11 host-device adoption):
+ * This file is altered from upstream FNA3D (d01538e). The additions are the
+ * FNA3D_CreateDeviceWithDevice / FNA3D_D3D11_SetHostDevice /
+ * FNA3D_D3D11_ClearHostDevice entry points below, marked TIRAMISU EXTENSION.
+ * Nothing else in this file is changed. Runtime D3D11 behavior on the
+ * console is console-verification-pending: the adaptation is compile-
+ * verified only (no D3D11 exists on the Linux build host).
+ */
+
 #ifndef FNA3D_H
 #define FNA3D_H
 
@@ -538,6 +547,60 @@ FNA3DAPI FNA3D_Device* FNA3D_CreateDevice(
 	FNA3D_PresentationParameters *presentationParameters,
 	uint8_t debugMode
 );
+
+/* TIRAMISU EXTENSION: creates a rendering context on a host-provided
+ * D3D11 device and swapchain instead of creating its own. Only the D3D11
+ * driver implements this; with any other selected driver (or if
+ * FNA3D_PrepareWindowAttributes has not run yet) it returns NULL.
+ *
+ * presentationParameters:\tThe initial device/backbuffer settings.
+ * debugMode:\t\t\tEnable debugging and backend validation features
+ *\t\t\t\tat the cost of reduced overall performance.
+ * device:\t\t\tID3D11Device* (required). The host keeps owning it;
+ *\t\t\t\tFNA3D takes its own reference and releases it in
+ *\t\t\t\tFNA3D_DestroyDevice.
+ * context:\t\t\tID3D11DeviceContext* (may be NULL: the device's
+ *\t\t\t\timmediate context is derived instead). Same ownership
+ *\t\t\t\tas device.
+ * swapchain:\t\t\tIDXGISwapChain* (required). The host keeps owning
+ *\t\t\t\tit; FNA3D renders into its back buffer (as the default
+ *\t\t\t\trender target, directly or via the faux-backbuffer
+ *\t\t\t\tblit) and presents on it. FNA3D never resizes,
+ *\t\t\t\trecreates, or destroys the host swapchain.
+ *
+ * Returns a device ready for use, or NULL. Be sure to only call device
+ * functions from the thread that it was created on!
+ */
+FNA3DAPI FNA3D_Device* FNA3D_CreateDeviceWithDevice(
+	FNA3D_PresentationParameters *presentationParameters,
+	uint8_t debugMode,
+	void *device,
+	void *context,
+	void *swapchain
+);
+
+/* TIRAMISU EXTENSION: pre-registers a host D3D11 device/swapchain so a
+ * later stock FNA3D_CreateDevice call adopts them instead of creating its
+ * own (the managed game needs no code change: its normal GraphicsDevice
+ * creation lands here). The registration is one-shot: the first
+ * FNA3D_CreateDevice consumes it. The pointers are borrowed until then --
+ * the host must keep the objects alive until the device is created or
+ * FNA3D_D3D11_ClearHostDevice is called. Returns 1 if the registration
+ * was accepted, 0 if the D3D11 driver is not compiled in or the required
+ * handles are NULL.
+ */
+FNA3DAPI uint8_t FNA3D_D3D11_SetHostDevice(
+	void *device,
+	void *context,
+	void *swapchain
+);
+
+/* TIRAMISU EXTENSION: clears a pending host-device registration (no-op
+ * if already consumed or never set). Never releases the host objects.
+ * Call at game exit, after FNA3D_DestroyDevice has released FNA3D's own
+ * references to them.
+ */
+FNA3DAPI void FNA3D_D3D11_ClearHostDevice(void);
 
 /* Destroys a rendering context previously returned by FNA3D_CreateDevice. */
 FNA3DAPI void FNA3D_DestroyDevice(FNA3D_Device *device);

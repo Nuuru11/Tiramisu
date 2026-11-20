@@ -24,6 +24,13 @@
  *
  */
 
+/* TIRAMISU MODIFICATION (Path B step 3): adds FNA3D_CreateDeviceWithDevice
+ * (vtable dispatch to the D3D11 driver's host-device init path) and the
+ * no-D3D11 fallback for FNA3D_D3D11_SetHostDevice /
+ * FNA3D_D3D11_ClearHostDevice (used on builds without the D3D11 driver,
+ * e.g. Linux). Nothing else in this file is changed.
+ */
+
 #include "FNA3D_Driver.h"
 #include "FNA3D_Tracing.h"
 
@@ -235,6 +242,65 @@ FNA3D_Device* FNA3D_CreateDevice(
 		debugMode
 	);
 }
+
+/* TIRAMISU EXTENSION: create on a host-provided D3D11 device/swapchain.
+ * Dispatches through the selected driver's CreateDeviceWithDevice slot;
+ * only the D3D11 driver implements it.
+ */
+FNA3D_Device* FNA3D_CreateDeviceWithDevice(
+	FNA3D_PresentationParameters *presentationParameters,
+	uint8_t debugMode,
+	void *device,
+	void *context,
+	void *swapchain
+) {
+	TRACE_CREATEDEVICE
+	if (selectedDriver < 0)
+	{
+		FNA3D_LogError("Call FNA3D_PrepareWindowAttributes first!");
+		return NULL;
+	}
+	if (drivers[selectedDriver]->CreateDeviceWithDevice == NULL)
+	{
+		FNA3D_LogError(
+			"Selected FNA3D driver (%s) does not support host-provided devices!",
+			drivers[selectedDriver]->Name
+		);
+		return NULL;
+	}
+
+	return drivers[selectedDriver]->CreateDeviceWithDevice(
+		presentationParameters,
+		debugMode,
+		device,
+		context,
+		swapchain
+	);
+}
+
+#if !FNA3D_DRIVER_D3D11
+/* TIRAMISU EXTENSION: no D3D11 driver in this build (e.g. Linux), so
+ * there is no host device to pre-register. Honest failure, not a stub:
+ * callers must check the return value. (When FNA3D_DRIVER_D3D11 is on,
+ * the real implementations live in FNA3D_Driver_D3D11.c.)
+ */
+uint8_t FNA3D_D3D11_SetHostDevice(
+	void *device,
+	void *context,
+	void *swapchain
+) {
+	(void) device;
+	(void) context;
+	(void) swapchain;
+	FNA3D_LogError("FNA3D_D3D11_SetHostDevice: no D3D11 driver in this build!");
+	return 0;
+}
+
+void FNA3D_D3D11_ClearHostDevice(void)
+{
+	/* Nothing was registered; nothing to clear. */
+}
+#endif /* !FNA3D_DRIVER_D3D11 */
 
 void FNA3D_DestroyDevice(FNA3D_Device *device)
 {

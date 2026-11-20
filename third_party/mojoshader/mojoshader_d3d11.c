@@ -116,10 +116,10 @@ static void set_error(const char *str)
     snprintf(error_buffer, sizeof (error_buffer), "%s", str);
 } // set_error
 
-static inline void out_of_memory(void)
+static inline void d3d11_out_of_memory(void)
 {
     set_error("out of memory");
-} // out_of_memory
+} // d3d11_out_of_memory
 
 /* Structs */
 
@@ -673,7 +673,7 @@ MOJOSHADER_d3d11Context* MOJOSHADER_d3d11CreateContext(
     ctx = (MOJOSHADER_d3d11Context *) m(sizeof(MOJOSHADER_d3d11Context), malloc_d);
     if (ctx == NULL)
     {
-        out_of_memory();
+        d3d11_out_of_memory();
         goto init_fail;
     } // if
 

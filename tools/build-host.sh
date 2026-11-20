@@ -20,8 +20,20 @@ command -v makemsix >/dev/null || { echo "ERROR: makemsix not in PATH" >&2; exit
 echo "offline loader test: PASS"
 
 # --- 2. compile + link the host (UWP profile) --------------------------------
+# FNA3D D3D11 (Path B step 3): the D3D11 driver + FNA3D core are compiled
+# into the host so a managed game renders on the host's CoreWindow
+# swapchain. MojoShader is NOT compiled separately here: it already
+# lives in the host via src/trt/mojo_hlsl.c (unity build, extended with
+# the effects + d3d11 backend for FNA3D) -- compiling it twice would
+# duplicate every MOJOSHADER_* symbol. The SDL shim
+# (third_party/fna3d-src/sdl-shim) stands in for SDL2, which does not
+# exist on the console; see its README. The Linux gate keeps using
+# FNA3D's OpenGL driver (llvmpipe) via third_party/fna3d/build-fna3d.sh.
 UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --out "$out/layout/tiramisu.exe" --jobs "$(nproc)" \
+  -I third_party/fna3d-src/include \
+  -I third_party/fna3d-src/MojoShader \
+  -I third_party/fna3d-src/sdl-shim \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
@@ -41,13 +53,34 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_membudget.cpp src/trt/mono_host.cpp \
+  src/trt/fna3d_host.cpp \
+  third_party/fna3d-src/src/FNA3D.c \
+  third_party/fna3d-src/src/FNA3D_Driver_D3D11.c \
+  third_party/fna3d-src/src/FNA3D_PipelineCache.c \
+  third_party/fna3d-src/sdl-shim/sdl_shim.c \
   src/host/vendor/miniz.c src/host/vendor/miniz_tdef.c \
   src/host/vendor/miniz_tinfl.c src/host/vendor/miniz_zip.c \
   src/host/vendor/qrcodegen.c src/trt/mojo_hlsl.c src/trt/vendor_stb_vorbis.c \
   --link-arg d3d11.lib --link-arg d3d12.lib --link-arg dxgi.lib --link-arg xinput.lib \
   --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib --link-arg ws2_32.lib \
   -- /MT /O2 /EHsc /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN \
-     /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED
+     /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED \
+     /DFNA3D_DRIVER_D3D11 /DWINAPI_FAMILY_WINRT=1 \
+     /DMOJOSHADER_NO_VERSION_INCLUDE /DMOJOSHADER_EFFECT_SUPPORT
+
+# --- 2b. explicit check: the FNA3D D3D11 driver object built under the
+#         UWP toolchain (compile-level gate for Path B step 3). The link
+#         above already proves the objects exist and resolve (fna3d_host
+#         references FNA3D_D3D11_SetHostDevice; the driver references the
+#         MojoShader d3d11 backend from mojo_hlsl.o); this names the
+#         objects so a missing driver file fails loudly instead of
+#         silently dropping the D3D11 path.
+for fna_obj in "$out/obj/"*FNA3D_Driver_D3D11*.obj \
+               "$out/obj/"*FNA3D*.obj \
+               "$out/obj/"*fna3d_host*.obj; do
+  [[ -f "$fna_obj" ]] || { echo "ERROR: FNA3D UWP object missing: $fna_obj" >&2; exit 4; }
+done
+echo "FNA3D D3D11 driver objects present in $out/obj"
 
 # --- 3. sanity: UWP image MUST be an AppContainer image ----------------------
 objdump -p "$out/layout/tiramisu.exe" | grep -E 'DllCharacteristics|Subsystem' || true

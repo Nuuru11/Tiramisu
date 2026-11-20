@@ -24,6 +24,11 @@
  *
  */
 
+/* TIRAMISU MODIFICATION (Path B step 3): adds the CreateDeviceWithDevice
+ * vtable slot to FNA3D_Driver (NULL for drivers that do not implement
+ * host-device adoption). Nothing else in this file is changed.
+ */
+
 #ifndef FNA3D_DRIVER_H
 #define FNA3D_DRIVER_H
 
@@ -826,6 +831,19 @@ typedef struct FNA3D_Driver
 	FNA3D_Device* (*CreateDevice)(
 		FNA3D_PresentationParameters *presentationParameters,
 		uint8_t debugMode
+	);
+	/* TIRAMISU EXTENSION: create on a host-provided device/swapchain.
+	 * NULL for drivers that do not implement host-device adoption.
+	 * device/context/swapchain are D3D11 COM pointers passed as void*
+	 * so this header stays free of d3d11.h (it is included on Linux
+	 * builds too, where no D3D11 headers exist).
+	 */
+	FNA3D_Device* (*CreateDeviceWithDevice)(
+		FNA3D_PresentationParameters *presentationParameters,
+		uint8_t debugMode,
+		void *device,
+		void *context,
+		void *swapchain
 	);
 } FNA3D_Driver;
 

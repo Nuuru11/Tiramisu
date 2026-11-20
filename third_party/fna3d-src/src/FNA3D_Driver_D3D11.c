@@ -24,6 +24,22 @@
  *
  */
 
+/* TIRAMISU MODIFICATION (Path B step 3, FNA3D D3D11 host-device adoption):
+ * This file is altered from upstream FNA3D (d01538e). The additions, all
+ * marked TIRAMISU EXTENSION, let the driver run on a host-provided
+ * ID3D11Device + ID3D11DeviceContext + IDXGISwapChain (Tiramisu's
+ * CoreWindow swapchain on Xbox) instead of creating its own:
+ * FNA3D_D3D11_SetHostDevice / FNA3D_D3D11_ClearHostDevice pre-registration,
+ * D3D11_CreateDeviceWithDevice, host-swapchain registration as
+ * swapchainDatas[0], host-format RTV creation, Present on the host
+ * swapchain, and destroy-time release of FNA3D's references only (the
+ * host device/swapchain are never destroyed by us). The stock path
+ * (create-own-device) is unchanged in behavior; its tail was moved
+ * verbatim into D3D11_INTERNAL_FinishCreateDevice, shared by both paths.
+ * Runtime D3D11 behavior on the console is console-verification-pending:
+ * this adaptation is compile-verified only (no D3D11 on Linux).
+ */
+
 #if FNA3D_DRIVER_D3D11
 
 #include "FNA3D_Driver.h"
@@ -229,6 +245,17 @@ typedef struct D3D11Renderer /* Cast FNA3D_Renderer* to this! */
 	int32_t swapchainDataCount;
 	int32_t swapchainDataCapacity;
 
+	/* TIRAMISU EXTENSION: host-provided device. When hostAdopted is set,
+	 * device/context/swapchainDatas[0]->swapchain are owned by the host,
+	 * not by us: we AddRef them at adopt and Release at destroy, and we
+	 * never create, resize, recreate or destroy them. hostSwapWidth/
+	 * hostSwapHeight cache the host back-buffer size for the SwapBuffers
+	 * RTV refresh.
+	 */
+	uint8_t hostAdopted;
+	int32_t hostSwapWidth;
+	int32_t hostSwapHeight;
+
 	/* The Faux-Backbuffer */
 	D3D11Backbuffer *backbuffer;
 	uint8_t backbufferSizeChanged;
@@ -301,6 +328,66 @@ typedef struct D3D11Renderer /* Cast FNA3D_Renderer* to this! */
 	uint32_t currentPass;
 	uint8_t effectApplied;
 } D3D11Renderer;
+
+/* TIRAMISU EXTENSION: host-device pre-registration.
+ *
+ * The host (Tiramisu) calls FNA3D_D3D11_SetHostDevice before the managed
+ * game starts. The pointers are borrowed until the first
+ * FNA3D_CreateDevice consumes them (one-shot); the host must keep the
+ * objects alive until then, or until FNA3D_D3D11_ClearHostDevice is
+ * called. At adopt, the renderer AddRefs each object; at destroy it
+ * Releases them -- the host's own references keep the objects alive, so
+ * FNA3D never destroys the host device/swapchain.
+ */
+static ID3D11Device *g_hostDevice = NULL;
+static ID3D11DeviceContext *g_hostContext = NULL;
+static IDXGISwapChain *g_hostSwapchain = NULL;
+
+uint8_t FNA3D_D3D11_SetHostDevice(
+	void *device,
+	void *context,
+	void *swapchain
+) {
+	if (device == NULL || swapchain == NULL)
+	{
+		FNA3D_LogError("FNA3D_D3D11_SetHostDevice: device and swapchain are required!");
+		return 0;
+	}
+	if (g_hostDevice != NULL)
+	{
+		FNA3D_LogWarn("FNA3D_D3D11_SetHostDevice: overwriting a pending host device!");
+	}
+	g_hostDevice = (ID3D11Device*) device;
+	g_hostContext = (ID3D11DeviceContext*) context;
+	g_hostSwapchain = (IDXGISwapChain*) swapchain;
+	return 1;
+}
+
+void FNA3D_D3D11_ClearHostDevice(void)
+{
+	g_hostDevice = NULL;
+	g_hostContext = NULL;
+	g_hostSwapchain = NULL;
+}
+
+/* One-shot take: copy the pending registration out and clear it.
+ * Returns 1 if one was pending, 0 otherwise.
+ */
+static uint8_t D3D11_INTERNAL_TakeHostDevice(
+	ID3D11Device **device,
+	ID3D11DeviceContext **context,
+	IDXGISwapChain **swapchain
+) {
+	if (g_hostDevice == NULL)
+	{
+		return 0;
+	}
+	*device = g_hostDevice;
+	*context = g_hostContext;
+	*swapchain = g_hostSwapchain;
+	FNA3D_D3D11_ClearHostDevice();
+	return 1;
+}
 
 /* XNA->D3D11 Translation Arrays */
 
@@ -1071,24 +1158,33 @@ static void D3D11_DestroyDevice(FNA3D_Device *device)
 	SDL_free(renderer->backbuffer);
 	renderer->backbuffer = NULL;
 
-	/* Release swapchain */
+	/* Release swapchain.
+	 * TIRAMISU EXTENSION: on the host-adopted path the swapchain Release
+	 * below only drops OUR reference (taken at adopt); the host's own
+	 * reference keeps the swapchain alive, so the host device is never
+	 * destroyed by us. The RTV is ours and is always released.
+	 */
 	for (i = 0; i < renderer->swapchainDataCount; i += 1)
 	{
 		swapchainData = renderer->swapchainDatas[i];
 		ID3D11RenderTargetView_Release(swapchainData->swapchainRTView);
 		IDXGISwapChain_Release(swapchainData->swapchain);
+		/* No SDL window on the host-adopted path (windowHandle NULL). */
+		if (swapchainData->windowHandle != NULL)
+		{
 #if SDL_MAJOR_VERSION >= 3
-		SDL_ClearProperty(
-			SDL_GetWindowProperties(swapchainData->windowHandle),
-			WINDOW_SWAPCHAIN_DATA
-		);
+			SDL_ClearProperty(
+				SDL_GetWindowProperties(swapchainData->windowHandle),
+				WINDOW_SWAPCHAIN_DATA
+			);
 #else
-		SDL_SetWindowData(
-			(SDL_Window*) swapchainData->windowHandle,
-			WINDOW_SWAPCHAIN_DATA,
-			NULL
-		);
+			SDL_SetWindowData(
+				(SDL_Window*) swapchainData->windowHandle,
+				WINDOW_SWAPCHAIN_DATA,
+				NULL
+			);
 #endif
+		}
 		SDL_free(renderer->swapchainDatas[i]);
 	}
 	SDL_free(renderer->swapchainDatas);
@@ -1148,19 +1244,38 @@ static void D3D11_DestroyDevice(FNA3D_Device *device)
 		SDL_iconv_close(renderer->iconv);
 	}
 
-	/* Release the factory */
-	IUnknown_Release((IUnknown*) renderer->factory);
+	/* Release the factory.
+	 * TIRAMISU EXTENSION: NULL on the host-adopted path (we never
+	 * create a factory there); guard the release.
+	 */
+	if (renderer->factory != NULL)
+	{
+		IUnknown_Release((IUnknown*) renderer->factory);
+	}
 
 	/* Release the MojoShader context */
 	MOJOSHADER_d3d11DestroyContext(renderer->shaderContext);
 
-	/* Release the device */
+	/* Release the device.
+	 * TIRAMISU EXTENSION: on the host-adopted path these Releases only
+	 * drop OUR references (taken at adopt); the host keeps owning the
+	 * device and context.
+	 */
 	ID3D11DeviceContext_Release(renderer->context);
 	ID3D11Device_Release(renderer->device);
 
-	/* Release the DLLs */
-	SDL_UnloadObject(renderer->d3d11_dll);
-	SDL_UnloadObject(renderer->dxgi_dll);
+	/* Release the DLLs.
+	 * TIRAMISU EXTENSION: NULL on the host-adopted path (we never load
+	 * them there); guard the unloads.
+	 */
+	if (renderer->d3d11_dll != NULL)
+	{
+		SDL_UnloadObject(renderer->d3d11_dll);
+	}
+	if (renderer->dxgi_dll != NULL)
+	{
+		SDL_UnloadObject(renderer->dxgi_dll);
+	}
 
 	SDL_DestroyMutex(renderer->ctxLock);
 	SDL_free(renderer);
@@ -1494,11 +1609,33 @@ static void D3D11_SwapBuffers(
 	if (renderer->backbuffer->type == BACKBUFFER_TYPE_D3D11)
 	{
 		/* Determine the regions to present */
-		SDL_GetWindowSizeInPixels(
-			(SDL_Window*) overrideWindowHandle,
-			&drawableWidth,
-			&drawableHeight
-		);
+		if (renderer->hostAdopted)
+		{
+			/* TIRAMISU EXTENSION: no SDL window on the console; the
+			 * drawable size is the host swapchain's back-buffer size.
+			 */
+			DXGI_SWAP_CHAIN_DESC hostDesc;
+			if (SUCCEEDED(IDXGISwapChain_GetDesc(
+				renderer->swapchainDatas[0]->swapchain,
+				&hostDesc
+			))) {
+				drawableWidth = (int32_t) hostDesc.BufferDesc.Width;
+				drawableHeight = (int32_t) hostDesc.BufferDesc.Height;
+			}
+			else
+			{
+				drawableWidth = renderer->hostSwapWidth;
+				drawableHeight = renderer->hostSwapHeight;
+			}
+		}
+		else
+		{
+			SDL_GetWindowSizeInPixels(
+				(SDL_Window*) overrideWindowHandle,
+				&drawableWidth,
+				&drawableHeight
+			);
+		}
 		if (sourceRectangle != NULL)
 		{
 			srcRect.x = sourceRectangle->x;
@@ -1549,18 +1686,49 @@ static void D3D11_SwapBuffers(
 		}
 	}
 
+	/* TIRAMISU EXTENSION: on the host-adopted path there is no SDL window
+	 * and no swapchain to create; present on the host swapchain. If the
+	 * host resized its swapchain since the RTV was created, refresh the
+	 * RTV from the current back buffer (the swapchain itself is never
+	 * resized by us).
+	 */
+	if (renderer->hostAdopted)
+	{
+		DXGI_SWAP_CHAIN_DESC hostDesc;
+		swapchainData = renderer->swapchainDatas[0];
+		if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchainData->swapchain, &hostDesc)) &&
+			(	(int32_t) hostDesc.BufferDesc.Width != renderer->hostSwapWidth ||
+				(int32_t) hostDesc.BufferDesc.Height != renderer->hostSwapHeight	))
+		{
+			renderer->hostSwapWidth = (int32_t) hostDesc.BufferDesc.Width;
+			renderer->hostSwapHeight = (int32_t) hostDesc.BufferDesc.Height;
+			if (swapchainData->swapchainRTView != NULL)
+			{
+				ID3D11RenderTargetView_Release(swapchainData->swapchainRTView);
+				swapchainData->swapchainRTView = NULL;
+			}
+			D3D11_INTERNAL_UpdateSwapchainRT(
+				renderer,
+				swapchainData,
+				hostDesc.BufferDesc.Format
+			);
+		}
+	}
+	else
+	{
 #if SDL_MAJOR_VERSION >= 3
-	swapchainData = (D3D11SwapchainData*) SDL_GetPointerProperty(
-		SDL_GetWindowProperties(overrideWindowHandle),
-		WINDOW_SWAPCHAIN_DATA,
-		NULL
-	);
+		swapchainData = (D3D11SwapchainData*) SDL_GetPointerProperty(
+			SDL_GetWindowProperties(overrideWindowHandle),
+			WINDOW_SWAPCHAIN_DATA,
+			NULL
+		);
 #else
-	swapchainData = (D3D11SwapchainData*) SDL_GetWindowData(
-		(SDL_Window*) overrideWindowHandle,
-		WINDOW_SWAPCHAIN_DATA
-	);
+		swapchainData = (D3D11SwapchainData*) SDL_GetWindowData(
+			(SDL_Window*) overrideWindowHandle,
+			WINDOW_SWAPCHAIN_DATA
+		);
 #endif
+	}
 	if (swapchainData == NULL)
 	{
 		D3D11_INTERNAL_CreateSwapChain(
@@ -2826,7 +2994,33 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 	}
 
 	/* Create or update the swapchain */
-	if (parameters->deviceWindowHandle != NULL)
+	if (renderer->hostAdopted)
+	{
+		/* TIRAMISU EXTENSION: the host swapchain was registered at
+		 * adopt time (swapchainDatas[0]). Never create, resize or
+		 * recreate it -- the host owns it. Release the old RTV so the
+		 * tail below recreates it from the current back buffer, and
+		 * decide the faux backbuffer from the host back-buffer size.
+		 */
+		DXGI_SWAP_CHAIN_DESC hostDesc;
+		swapchainData = renderer->swapchainDatas[0];
+		if (swapchainData->swapchainRTView != NULL)
+		{
+			ID3D11RenderTargetView_Release(swapchainData->swapchainRTView);
+			swapchainData->swapchainRTView = NULL;
+		}
+		if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchainData->swapchain, &hostDesc)))
+		{
+			renderer->hostSwapWidth = (int32_t) hostDesc.BufferDesc.Width;
+			renderer->hostSwapHeight = (int32_t) hostDesc.BufferDesc.Height;
+		}
+		useFauxBackbuffer = (
+			renderer->hostSwapWidth != parameters->backBufferWidth ||
+			renderer->hostSwapHeight != parameters->backBufferHeight ||
+			parameters->multiSampleCount > 0
+		);
+	}
+	else if (parameters->deviceWindowHandle != NULL)
 	{
 #if SDL_MAJOR_VERSION >= 3
 		swapchainData = (D3D11SwapchainData*) SDL_GetPointerProperty(
@@ -2918,8 +3112,12 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 		useFauxBackbuffer = 1;
 	}
 
-	/* Determine if we should use the faux backbuffer. */
-	if (!useFauxBackbuffer)
+	/* Determine if we should use the faux backbuffer.
+	 * TIRAMISU EXTENSION: skipped on the host-adopted path (decided
+	 * above from the host back-buffer size; there is no SDL window
+	 * to measure).
+	 */
+	if (!useFauxBackbuffer && !renderer->hostAdopted)
 	{
 		int32_t drawX, drawY;
 		SDL_GetWindowSizeInPixels(
@@ -3117,10 +3315,23 @@ static void D3D11_INTERNAL_CreateBackbuffer(
 
 	if (swapchainData != NULL)
 	{
+		/* TIRAMISU EXTENSION: the RTV format must match the host back
+		 * buffer (BGRA8 on the console), not the XNA backbuffer format
+		 * (RGBA8) -- a mismatched RTV fails to create.
+		 */
+		DXGI_FORMAT rtvFormat = dxgiFormat;
+		if (renderer->hostAdopted)
+		{
+			DXGI_SWAP_CHAIN_DESC hostDesc;
+			if (SUCCEEDED(IDXGISwapChain_GetDesc(swapchainData->swapchain, &hostDesc)))
+			{
+				rtvFormat = hostDesc.BufferDesc.Format;
+			}
+		}
 		D3D11_INTERNAL_UpdateSwapchainRT(
 			renderer,
 			swapchainData,
-			dxgiFormat
+			rtvFormat
 		);
 	}
 
@@ -5201,6 +5412,16 @@ static uint8_t D3D11_PrepareWindowAttributes(uint32_t *flags)
 	};
 	HRESULT res;
 
+	/* TIRAMISU EXTENSION: a pre-registered host device is already
+	 * known-good; skip the throwaway-device probe (creating a second
+	 * device on the console is wasteful and pointless). No window flags
+	 * are required on this path.
+	 */
+	if (g_hostDevice != NULL)
+	{
+		return 1;
+	}
+
 	const uint32_t driverType = SDL_GetHintBoolean("FNA3D_D3D11_USE_WARP", SDL_FALSE)
 		? D3D_DRIVER_TYPE_WARP
 		: D3D_DRIVER_TYPE_HARDWARE;
@@ -5461,11 +5682,237 @@ static void D3D11_INTERNAL_InitializeFauxBackbufferResources(
 	ERROR_CHECK_RETURN("Backbuffer blend state creation failed",)
 }
 
+/* TIRAMISU EXTENSION: register the host swapchain as swapchainDatas[0].
+ * The RTV is created later by D3D11_INTERNAL_CreateBackbuffer (which
+ * knows the host buffer format); windowHandle stays NULL because there
+ * is no SDL window on the console. Returns 1 on success, 0 on OOM.
+ */
+static uint8_t D3D11_INTERNAL_RegisterHostSwapchain(
+	D3D11Renderer *renderer,
+	IDXGISwapChain *hostSwapchain,
+	FNA3D_SurfaceFormat backBufferFormat
+) {
+	D3D11SwapchainData *swapchainData;
+	DXGI_SWAP_CHAIN_DESC hostDesc;
+
+	swapchainData = (D3D11SwapchainData*) SDL_malloc(sizeof(D3D11SwapchainData));
+	if (swapchainData == NULL)
+	{
+		return 0;
+	}
+	SDL_memset(swapchainData, 0, sizeof(D3D11SwapchainData));
+	swapchainData->swapchain = hostSwapchain;
+	swapchainData->windowHandle = NULL;
+	swapchainData->swapchainRTView = NULL;
+	swapchainData->format = backBufferFormat;
+	renderer->swapchainDatas[renderer->swapchainDataCount] = swapchainData;
+	renderer->swapchainDataCount += 1;
+
+	/* Cache the host back-buffer size for the SwapBuffers RTV refresh. */
+	if (SUCCEEDED(IDXGISwapChain_GetDesc(hostSwapchain, &hostDesc)))
+	{
+		renderer->hostSwapWidth = (int32_t) hostDesc.BufferDesc.Width;
+		renderer->hostSwapHeight = (int32_t) hostDesc.BufferDesc.Height;
+	}
+	return 1;
+}
+
+/* TIRAMISU EXTENSION: shared tail of D3D11_CreateDevice and
+ * D3D11_CreateDeviceWithDevice. The renderer already has a device,
+ * context and feature level (created or adopted); everything from the
+ * MojoShader context on is identical for both paths. Moved verbatim from
+ * D3D11_CreateDevice. adapterDesc is NULL on the host-adopted path (no
+ * adapter was picked); hostSwapchain is NULL on the self-created path.
+ */
+static FNA3D_Device* D3D11_INTERNAL_FinishCreateDevice(
+	D3D11Renderer *renderer,
+	FNA3D_PresentationParameters *presentationParameters,
+	uint32_t flags,
+	const DXGI_ADAPTER_DESC1 *adapterDesc,
+	IDXGISwapChain *hostSwapchain
+) {
+	FNA3D_Device *result;
+	int32_t i;
+	HRESULT res;
+
+	/* Print driver info */
+	FNA3D_LogInfo("FNA3D Driver: D3D11");
+	if (adapterDesc != NULL)
+	{
+		FNA3D_LogInfo("D3D11 Adapter: %S", adapterDesc->Description);
+	}
+	else
+	{
+		FNA3D_LogInfo("D3D11 Adapter: host-provided device (no adapter picked)");
+	}
+
+	/* Initialize MojoShader context */
+	renderer->shaderContext = MOJOSHADER_d3d11CreateContext(
+		renderer->device,
+		renderer->context,
+		NULL,
+		NULL,
+		renderer
+	);
+
+	/* Initialize texture and sampler collections */
+	for (i = 0; i < MAX_TOTAL_SAMPLERS; i += 1)
+	{
+		renderer->textures[i] = &NullTexture;
+		renderer->samplers[i] = NULL;
+	}
+
+	/* Initialize SetStringMarker support, if available */
+	if (renderer->featureLevel == D3D_FEATURE_LEVEL_11_1)
+	{
+		res = ID3D11DeviceContext_QueryInterface(
+			renderer->context,
+			&D3D_IID_ID3DUserDefinedAnnotation,
+			(void**) &renderer->annotation
+		);
+		ERROR_CHECK("Could not get UserDefinedAnnotation")
+	}
+	else
+	{
+		FNA3D_LogInfo("SetStringMarker not supported!");
+	}
+
+	/* Initialize renderer members not covered by SDL_memset('\0') */
+	renderer->debugMode = flags & D3D11_CREATE_DEVICE_DEBUG;
+	renderer->blendFactor.r = 0xFF;
+	renderer->blendFactor.g = 0xFF;
+	renderer->blendFactor.b = 0xFF;
+	renderer->blendFactor.a = 0xFF;
+	renderer->multiSampleMask = -1; /* AKA 0xFFFFFFFF, ugh -flibit */
+	renderer->topology = (FNA3D_PrimitiveType) -1; /* Force an update */
+
+	/* Initialize the faux backbuffer */
+	renderer->swapchainDataCapacity = 1;
+	renderer->swapchainDataCount = 0;
+	renderer->swapchainDatas = SDL_malloc(renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*));
+	if (hostSwapchain != NULL)
+	{
+		/* Register the host swapchain as swapchainDatas[0] BEFORE the
+		 * backbuffer is created, so the default render target binds
+		 * to the host back buffer.
+		 */
+		if (!D3D11_INTERNAL_RegisterHostSwapchain(
+			renderer,
+			hostSwapchain,
+			presentationParameters->backBufferFormat
+		)) {
+			FNA3D_LogError("Could not register host swapchain!");
+			return NULL;
+		}
+	}
+	D3D11_INTERNAL_CreateBackbuffer(renderer, presentationParameters);
+
+	/* Create any pipeline resources required for the faux backbuffer */
+	D3D11_INTERNAL_InitializeFauxBackbufferResources(
+		renderer,
+		SDL_GetHintBoolean("FNA3D_BACKBUFFER_SCALE_NEAREST", SDL_FALSE)
+	);
+
+	/* Set presentation interval */
+	D3D11_INTERNAL_SetPresentationInterval(
+		renderer,
+		presentationParameters->presentationInterval
+	);
+
+	/* A mutex, for ID3D11Context */
+	renderer->ctxLock = SDL_CreateMutex();
+
+	/* Create and return the FNA3D_Device */
+	result = (FNA3D_Device*) SDL_malloc(sizeof(FNA3D_Device));
+	result->driverData = (FNA3D_Renderer*) renderer;
+	ASSIGN_DRIVER(D3D11)
+	return result;
+}
+
+/* TIRAMISU EXTENSION: create on a host-provided D3D11 device/swapchain.
+ * Skips the DXGI factory, adapter selection and D3D11CreateDevice
+ * entirely: the host device/context/swapchain are adopted (AddRef'd;
+ * released, never destroyed, in D3D11_DestroyDevice). A NULL context
+ * derives the device's immediate context. The host swapchain's back
+ * buffer becomes the default render target (directly, or via the faux
+ * backbuffer blit when sizes differ or MSAA is on), and Present goes to
+ * the host swapchain. The host swapchain is never resized, recreated or
+ * destroyed by us.
+ */
+static FNA3D_Device* D3D11_CreateDeviceWithDevice(
+	FNA3D_PresentationParameters *presentationParameters,
+	uint8_t debugMode,
+	void *device,
+	void *context,
+	void *swapchain
+) {
+	D3D11Renderer *renderer;
+	ID3D11Device *hostDevice = (ID3D11Device*) device;
+	ID3D11DeviceContext *hostContext = (ID3D11DeviceContext*) context;
+	IDXGISwapChain *hostSwapchain = (IDXGISwapChain*) swapchain;
+	uint32_t flags;
+
+	if (hostDevice == NULL || hostSwapchain == NULL)
+	{
+		FNA3D_LogError("D3D11_CreateDeviceWithDevice: device and swapchain are required!");
+		return NULL;
+	}
+
+	/* Allocate and zero out the renderer */
+	renderer = (D3D11Renderer*) SDL_malloc(sizeof(D3D11Renderer));
+	SDL_memset(renderer, '\0', sizeof(D3D11Renderer));
+
+	/* Adopt the host objects. We take our own references; the host
+	 * keeps owning them. The factory/adapter/DLLs stay NULL: we never
+	 * load or create them on this path.
+	 */
+	ID3D11Device_AddRef(hostDevice);
+	renderer->device = hostDevice;
+	if (hostContext == NULL)
+	{
+		/* Derive the immediate context from the device. */
+		ID3D11Device_GetImmediateContext(hostDevice, &hostContext);
+		if (hostContext == NULL)
+		{
+			FNA3D_LogError("Could not get immediate context from host device!");
+			ID3D11Device_Release(hostDevice);
+			SDL_free(renderer);
+			return NULL;
+		}
+	}
+	else
+	{
+		ID3D11DeviceContext_AddRef(hostContext);
+	}
+	renderer->context = hostContext;
+	IDXGISwapChain_AddRef(hostSwapchain);
+	renderer->featureLevel = ID3D11Device_GetFeatureLevel(hostDevice);
+	renderer->hostAdopted = 1;
+
+	/* The host swapchain's flags are the host's business; never present
+	 * with tearing on a swapchain we did not create.
+	 */
+	renderer->supportsTearing = FALSE;
+
+	flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+	if (debugMode)
+	{
+		flags |= D3D11_CREATE_DEVICE_DEBUG;
+	}
+
+	return D3D11_INTERNAL_FinishCreateDevice(
+		renderer,
+		presentationParameters,
+		flags,
+		NULL, /* no adapter description on the host path */
+		hostSwapchain
+	);
+}
+
 static FNA3D_Device* D3D11_CreateDevice(
 	FNA3D_PresentationParameters *presentationParameters,
 	uint8_t debugMode
 ) {
-	FNA3D_Device *result;
 	D3D11Renderer *renderer;
 	DXGI_ADAPTER_DESC1 adapterDesc;
 	typedef HRESULT(WINAPI *PFN_CREATE_DXGI_FACTORY)(const GUID *riid, void **ppFactory);
@@ -5487,6 +5934,26 @@ static FNA3D_Device* D3D11_CreateDevice(
 	const uint32_t driverType = SDL_GetHintBoolean("FNA3D_D3D11_USE_WARP", SDL_FALSE)
 		? D3D_DRIVER_TYPE_WARP
 		: D3D_DRIVER_TYPE_UNKNOWN; /* Must be UNKNOWN if adapter is non-null according to spec */
+
+	/* TIRAMISU EXTENSION: a pre-registered host device takes over the
+	 * stock path, so the managed game needs no code change: its normal
+	 * GraphicsDevice creation adopts the host device/swapchain.
+	 */
+	{
+		ID3D11Device *hostDevice;
+		ID3D11DeviceContext *hostContext;
+		IDXGISwapChain *hostSwapchain;
+		if (D3D11_INTERNAL_TakeHostDevice(&hostDevice, &hostContext, &hostSwapchain))
+		{
+			return D3D11_CreateDeviceWithDevice(
+				presentationParameters,
+				debugMode,
+				hostDevice,
+				hostContext,
+				hostSwapchain
+			);
+		}
+	}
 
 	/* Allocate and zero out the renderer */
 	renderer = (D3D11Renderer*) SDL_malloc(sizeof(D3D11Renderer));
@@ -5659,82 +6126,21 @@ try_create_device:
 
 	ERROR_CHECK_RETURN("Could not create D3D11Device", NULL)
 
-	/* Print driver info */
-	FNA3D_LogInfo("FNA3D Driver: D3D11");
-	FNA3D_LogInfo("D3D11 Adapter: %S", adapterDesc.Description);
-
-	/* Initialize MojoShader context */
-	renderer->shaderContext = MOJOSHADER_d3d11CreateContext(
-		renderer->device,
-		renderer->context,
-		NULL,
-		NULL,
-		renderer
-	);
-
-	/* Initialize texture and sampler collections */
-	for (i = 0; i < MAX_TOTAL_SAMPLERS; i += 1)
-	{
-		renderer->textures[i] = &NullTexture;
-		renderer->samplers[i] = NULL;
-	}
-
-	/* Initialize SetStringMarker support, if available */
-	if (renderer->featureLevel == D3D_FEATURE_LEVEL_11_1)
-	{
-		res = ID3D11DeviceContext_QueryInterface(
-			renderer->context,
-			&D3D_IID_ID3DUserDefinedAnnotation,
-			(void**) &renderer->annotation
-		);
-		ERROR_CHECK("Could not get UserDefinedAnnotation")
-	}
-	else
-	{
-		FNA3D_LogInfo("SetStringMarker not supported!");
-	}
-
-	/* Initialize renderer members not covered by SDL_memset('\0') */
-	renderer->debugMode = flags & D3D11_CREATE_DEVICE_DEBUG;
-	renderer->blendFactor.r = 0xFF;
-	renderer->blendFactor.g = 0xFF;
-	renderer->blendFactor.b = 0xFF;
-	renderer->blendFactor.a = 0xFF;
-	renderer->multiSampleMask = -1; /* AKA 0xFFFFFFFF, ugh -flibit */
-	renderer->topology = (FNA3D_PrimitiveType) -1; /* Force an update */
-
-	/* Initialize the faux backbuffer */
-	renderer->swapchainDataCapacity = 1;
-	renderer->swapchainDataCount = 0;
-	renderer->swapchainDatas = SDL_malloc(renderer->swapchainDataCapacity * sizeof(D3D11SwapchainData*));
-	D3D11_INTERNAL_CreateBackbuffer(renderer, presentationParameters);
-
-	/* Create any pipeline resources required for the faux backbuffer */
-	D3D11_INTERNAL_InitializeFauxBackbufferResources(
+	/* Shared tail: MojoShader context, backbuffer, presentation. */
+	return D3D11_INTERNAL_FinishCreateDevice(
 		renderer,
-		SDL_GetHintBoolean("FNA3D_BACKBUFFER_SCALE_NEAREST", SDL_FALSE)
+		presentationParameters,
+		flags,
+		&adapterDesc,
+		NULL /* self-created device: no host swapchain */
 	);
-
-	/* Set presentation interval */
-	D3D11_INTERNAL_SetPresentationInterval(
-		renderer,
-		presentationParameters->presentationInterval
-	);
-
-	/* A mutex, for ID3D11Context */
-	renderer->ctxLock = SDL_CreateMutex();
-
-	/* Create and return the FNA3D_Device */
-	result = (FNA3D_Device*) SDL_malloc(sizeof(FNA3D_Device));
-	result->driverData = (FNA3D_Renderer*) renderer;
-	ASSIGN_DRIVER(D3D11)
-	return result;
 }
 
 FNA3D_Driver D3D11Driver = {
 	"D3D11",
 	D3D11_PrepareWindowAttributes,
-	D3D11_CreateDevice
+	D3D11_CreateDevice,
+	D3D11_CreateDeviceWithDevice
 };
 
 #else
