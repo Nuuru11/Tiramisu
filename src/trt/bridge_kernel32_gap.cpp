@@ -978,6 +978,7 @@ u32 TRT_STDCALL trt_GetModuleFileNameA(void* mod, char* buf, u32 len) {
   u32 i = 0;
   for (; i < n && i + 1 < len; ++i) buf[i] = (char)(w[i] & 0x7Fu);
   buf[i] = 0;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, buf); trt_core_log(st_line); }
   if (i < n) trt_SetLastError(122);
   return i;
 }
@@ -987,6 +988,7 @@ u32 TRT_STDCALL trt_GetSystemDirectoryA(char* buf, u32 len) {
   const int n = trt_GetSystemDirectoryW(w, 128);
   if (!buf || (int)len < n + 1) return (u32)n;
   for (int i = 0; i <= n; ++i) buf[i] = (char)(w[i] & 0x7Fu);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetSystemDirectoryA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, buf); trt_core_log(st_line); }
   return (u32)n;
 }
 
@@ -1061,11 +1063,12 @@ u16 TRT_STDCALL trt_RtlCaptureStackBackTrace(u32 skip, u32 capture, void** bt,
 
 u32 TRT_STDCALL trt_GetEnvironmentVariableA(const char* name, char* buf,
                                             u32 size) {
-  if (!name) { trt_SetLastError(87); return 0; }
+  if (!name) { trt_core_log("strtrace: GetEnvironmentVariableA -> name=NULL value=NULL"); trt_SetLastError(87); return 0; }
   const char* val = trt_gap_env_get(name);
   if (!val) val = getenv(name);
-  if (!val) { trt_SetLastError(203); return 0; }
+  if (!val) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableA -> name=\"%.64s\" value=NULL", name); trt_core_log(st_line); trt_SetLastError(203); return 0; }
   const size_t n = strlen(val);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableA -> name=\"%.64s\" buf=%p value=\"%.128s\"", name, (void*)buf, val); trt_core_log(st_line); }
   if (!buf || size <= n) return (u32)(n + 1);
   memcpy(buf, val, n + 1);
   return (u32)n;
@@ -1206,6 +1209,7 @@ u32 TRT_STDCALL trt_GetShortPathNameW(const u16* src, u16* dst, u32 cch) {
 u32 TRT_STDCALL trt_GetTempPathA(u32 len, char* buf) {
   const char* tmp = "C:\\Temp\\";
   const u32 n = 8;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetTempPathA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, tmp); trt_core_log(st_line); }
   if (!buf || len <= n) return n + 1;
   memcpy(buf, tmp, n + 1);
   return n;

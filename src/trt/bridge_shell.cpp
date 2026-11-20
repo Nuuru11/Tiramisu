@@ -220,6 +220,7 @@ int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
              "shell: SHGetKnownFolderPath %s -> E_FAIL (no mapping)",
              guid);
     log_line(line);
+    { char st_line[160]; snprintf(st_line, sizeof(st_line), "strtrace: SHGetKnownFolderPath -> guid=%s path=NULL (E_FAIL)", guid); log_line(st_line); }
     return E_FAIL_;
   }
   ensure_dir(p8);
@@ -231,6 +232,7 @@ int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
   char line[160];
   snprintf(line, sizeof(line), "shell: SHGetKnownFolderPath -> %s", p8);
   log_line(line);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: SHGetKnownFolderPath -> path_out=%p buf=%p value=\"%.128s\"", (void*)path_out, (void*)buf, p8); log_line(st_line); }
   return S_OK_;
 }
 

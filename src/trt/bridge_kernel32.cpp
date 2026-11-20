@@ -2002,6 +2002,7 @@ int TRT_STDCALL trt_SetCurrentDirectoryA(const char* name) {
 int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
   trt_vfs_get_cwd(g_cwd, sizeof(g_cwd));
   const u32 clen = (u32)strlen(g_cwd);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_cwd); trt_core_log(st_line); }
   if (!buf || len <= clen) return (int)(clen + 1);
   for (u32 i = 0; i <= clen; ++i) buf[i] = (u16)(u8)g_cwd[i];
   return (int)clen;
@@ -2020,7 +2021,9 @@ const u16* TRT_STDCALL trt_GetEnvironmentStringsW() {
     "LOCALAPPDATA=C:\\Users\\Player\\AppData\\Local",
     "COMPUTERNAME=TIRAMISU", "USERNAME=Player",
   };
-  return trt_gap_env_build_wblock(pairs, sizeof(pairs) / sizeof(pairs[0]));
+  const u16* st_blk = trt_gap_env_build_wblock(pairs, sizeof(pairs) / sizeof(pairs[0]));
+  { char st_tmp[136]; char st_line[256]; if (st_blk) { size_t st_o = 0; for (size_t st_i = 0; (st_blk[st_i] || st_blk[st_i + 1]) && st_o < 130; ++st_i) st_tmp[st_o++] = st_blk[st_i] ? (char)(st_blk[st_i] & 0x7f) : ';'; st_tmp[st_o] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> ptr=%p \"%.128s\"", (const void*)st_blk, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsW -> NULL"); } trt_core_log(st_line); }
+  return st_blk;
 }
 
 int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
@@ -2029,6 +2032,7 @@ int TRT_STDCALL trt_FreeEnvironmentStringsW(const u16* b) {
 
 u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
   (void)mod;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetModuleFileNameW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_exepath); trt_core_log(st_line); }
   if (!buf || !len) return 0;
   u32 i = 0;
   for (; g_exepath[i] && i < len - 1; ++i) buf[i] = (u16)(u8)g_exepath[i];
@@ -2039,6 +2043,7 @@ u32 TRT_STDCALL trt_GetModuleFileNameW(void* mod, u16* buf, u32 len) {
 int TRT_STDCALL trt_GetSystemDirectoryW(u16* buf, u32 len) {
   if (!buf || len < 18) return 18;
   const char* s = "C:\\Windows\\System32";
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetSystemDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, s); trt_core_log(st_line); }
   u32 i = 0;
   for (; s[i]; ++i) buf[i] = (u16)(u8)s[i];
   buf[i] = 0;
@@ -2211,6 +2216,13 @@ void* system_module_handle(const char* utf8_name) {
              "(system module, offline bridge surface)", base);
     trt_core_log(line);
   }
+  if (!h) {
+    char st_line[224];
+    snprintf(st_line, sizeof(st_line),
+             "modtrace: LoadLibrary/GetModuleHandle(%s) -> NULL (synthetic handle failed)",
+             base);
+    trt_core_log(st_line);
+  }
   return h;
 }
 } // namespace
@@ -2268,12 +2280,16 @@ static void* load_library_impl(const u16* path, u32 flags) {
 }
 
 void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
-  return load_library_impl(path, 0);
+  void* h = load_library_impl(path, 0);
+  { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
+  return h;
 }
 
 void* TRT_STDCALL trt_LoadLibraryExW(const u16* path, void* file, u32 flags) {
   (void)file;
-  return load_library_impl(path, flags);
+  void* h = load_library_impl(path, flags);
+  { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=%p", st_n, flags, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=NULL", st_n, flags); trt_core_log(st_line); }
+  return h;
 }
 
 int TRT_STDCALL trt_FreeLibrary(void* handle) {
@@ -2334,20 +2350,29 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
 }
 
 void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
+  void* h = nullptr;
+  const char* st_base = "(null)";
+  char st_u8[256];
   if (!name || !name[0]) {
     trt_image* first = trt_images_first();
-    return first ? trt_images_handle(first) : nullptr;
+    h = first ? trt_images_handle(first) : nullptr;
+  } else if (trt_utf16_to_utf8(name, st_u8, sizeof(st_u8)) != 0) {
+    h = nullptr;
+  } else {
+    st_base = path_basename(st_u8);
+    trt_image* img = trt_images_find(st_base);
+    if (img) {
+      h = trt_images_handle(img);
+    } else {
+      // STAGE 7 (OrTMM): the CRT boot asks for "kernel32.dll" (and apiset
+      // contract names) by handle before any file exists for them. A known
+      // SYSTEM/BUILTIN module name gets the synthetic handle — a NULL here
+      // failfasts the CRT before WinMain.
+      h = system_module_handle(st_base);
+    }
   }
-  char utf8[256];
-  if (trt_utf16_to_utf8(name, utf8, sizeof(utf8)) != 0) return nullptr;
-  const char* base = path_basename(utf8);
-  trt_image* img = trt_images_find(base);
-  if (img) return trt_images_handle(img);
-  // STAGE 7 (OrTMM): the CRT boot asks for "kernel32.dll" (and apiset
-  // contract names) by handle before any file exists for them. A known
-  // SYSTEM/BUILTIN module name gets the synthetic handle — a NULL here
-  // failfasts the CRT before WinMain.
-  return system_module_handle(base);
+  { char st_line[320]; if (h) snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=%p", st_base, h); else snprintf(st_line, sizeof(st_line), "modtrace: GetModuleHandleW -> \"%s\" handle=NULL", st_base); trt_core_log(st_line); }
+  return h;
 }
 
 // ==================== console + child-process honesty =======================
@@ -2718,6 +2743,7 @@ void fill_startup_info_w(void* si) {
   title_buf[ti] = 0;
   ((u16**)si)[2] = desktop_buf;  // lpDesktop @16
   ((u16**)si)[3] = title_buf;    // lpTitle @24
+  { char st_dt[64]; char st_tt[136]; char st_line[320]; size_t st_i = 0; for (; desktop_buf[st_i] && st_i < 60; ++st_i) st_dt[st_i] = (char)(desktop_buf[st_i] & 0x7f); st_dt[st_i] = 0; st_i = 0; for (; title_buf[st_i] && st_i < 132; ++st_i) st_tt[st_i] = (char)(title_buf[st_i] & 0x7f); st_tt[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetStartupInfoW -> lpDesktop=%p \"%s\" lpTitle=%p \"%.128s\"", (void*)desktop_buf, st_dt, (void*)title_buf, st_tt); trt_core_log(st_line); }
   boot_log("kernel32: GetStartupInfoW -> zeroed STARTUPINFOW (no console)");
   boot_log("kernel32: GetStartupInfoW lpDesktop/lpTitle filled");
 }
@@ -3289,6 +3315,7 @@ const char* TRT_STDCALL trt_GetCommandLineA(void) {
   } else {
     snprintf(cmd_a, sizeof(cmd_a), "\"%s\"", g_exepath);
   }
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCommandLineA -> ptr=%p \"%.128s\"", (const void*)cmd_a, cmd_a); trt_core_log(st_line); }
   return cmd_a;
 }
 
@@ -3305,6 +3332,7 @@ const u16* TRT_STDCALL trt_GetCommandLineW(void) {
     }
   }
   cmd[i] = 0;
+  { char st_tmp[136]; char st_line[256]; size_t st_i = 0; for (; cmd[st_i] && st_i < 132; ++st_i) st_tmp[st_i] = (char)(cmd[st_i] & 0x7f); st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetCommandLineW -> ptr=%p \"%.128s\"", (const void*)cmd, st_tmp); trt_core_log(st_line); }
   return cmd;
 }
 
@@ -6460,6 +6488,7 @@ u32 TRT_STDCALL trt_GetCurrentDirectoryA(u32 len, char* buf) {
   utf8[n] = 0;
   if (!buf || len < (u32)n + 1) return (u32)n + 1;
   memcpy(buf, utf8, (size_t)n + 1);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryA -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, utf8); trt_core_log(st_line); }
   return (u32)n;
 }
 
@@ -6482,6 +6511,7 @@ int TRT_STDCALL trt_GetComputerNameA(char* buf, u32* size) {
     return 0;
   }
   memcpy(buf, utf8, (size_t)n + 1);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetComputerNameA -> buf=%p value=\"%.128s\"", (void*)buf, utf8); trt_core_log(st_line); }
   *size = (u32)n;
   return 1;
 }
@@ -6515,6 +6545,7 @@ const char* TRT_STDCALL trt_GetEnvironmentStringsA(void) {
   for (int k = 0; k < 16; ++k) {
     if (!g_enva_blocks[k]) { g_enva_blocks[k] = out; break; }
   }
+  { char st_tmp[136]; char st_line[256]; if (out) { size_t st_o = 0; for (size_t st_i = 0; (out[st_i] || out[st_i + 1]) && st_o < 130; ++st_i) st_tmp[st_o++] = out[st_i] ? out[st_i] : ';'; st_tmp[st_o] = 0; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsA -> ptr=%p \"%.128s\"", (const void*)out, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentStringsA -> NULL"); } trt_core_log(st_line); }
   return out;
 }
 

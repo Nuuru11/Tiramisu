@@ -135,7 +135,7 @@ int TRT_STDCALL trt_GetSystemTimes(u64* idle, u64* kernel, u64* user) {
 
 u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
                                                u32 size) {
-  if (!name) return 0;
+  if (!name) { trt_core_log("strtrace: GetEnvironmentVariableW -> name=NULL value=NULL"); return 0; }
   char n[256];
   utf16_to_utf8(name, n, sizeof(n));
   // the SetEnvironmentVariableW store first (cross-call consistency: a
@@ -147,8 +147,9 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
     v = trt_gap_env_get(n);
   }
   if (!v) v = getenv(n);
-  if (!v) return 0;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" value=NULL", n); trt_core_log(st_line); return 0; }
   const u32 need = (u32)strlen(v) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" buf=%p value=\"%.128s\"", n, (void*)buf, v); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)v[i];
     return need;
@@ -168,6 +169,7 @@ u32 TRT_STDCALL trt_ExpandEnvironmentStringsW(const u16* in, u16* out,
   }
   if (!base) base = getenv(src);
   snprintf(dst, sizeof(dst), "%s", base ? base : src);
+  { char st_line[320]; snprintf(st_line, sizeof(st_line), "strtrace: ExpandEnvironmentStringsW -> in=\"%.64s\" value=\"%.128s\"", src, dst); trt_core_log(st_line); }
   const u32 need = (u32)strlen(dst) + 1;
   if (out && size >= need) {
     for (u32 i = 0; i < need; ++i) out[i] = (u16)(u8)dst[i];
@@ -186,6 +188,7 @@ int TRT_STDCALL trt_GetComputerNameW(u16* buf, u32* size) {
   const char* host = getenv("COMPUTERNAME");
   if (!host) host = "TIRAMISU";
   const u32 need = (u32)strlen(host) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetComputerNameW -> buf=%p value=\"%.128s\"", (void*)buf, host); trt_core_log(st_line); }
   if (buf && size && *size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)host[i];
     *size = need;
@@ -261,6 +264,7 @@ u32 TRT_STDCALL trt_GetTempPathW(u32 size, u16* buf) {
   // environment block already advertises TEMP=C:\Temp — match it.
   const char* t = "C:\\Temp\\";
   const u32 need = (u32)strlen(t) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetTempPathW -> buf=%p size=%u value=\"%.128s\"", (void*)buf, size, t); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)t[i];
     return need;
@@ -285,6 +289,7 @@ u32 TRT_STDCALL trt_GetTempFileNameW(const u16* dir, const u16* prefix,
 u32 TRT_STDCALL trt_GetWindowsDirectoryW(u16* buf, u32 size) {
   const char* w = "C:\\Windows";
   const u32 need = (u32)strlen(w) + 1;
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetWindowsDirectoryW -> buf=%p size=%u value=\"%.128s\"", (void*)buf, size, w); trt_core_log(st_line); }
   if (buf && size >= need)
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)w[i];
   return need;

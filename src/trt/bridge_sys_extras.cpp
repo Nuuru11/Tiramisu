@@ -831,6 +831,7 @@ u8 TRT_GUEST_ABI sec_GetUserNameExW(int, u16* buf, u32* len_io) {
     return 0;
   }
   write_u16_str(name, buf, *len_io);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameExW -> buf=%p value=\"%.128s\"", (void*)buf, name); trt_core_log(st_line); }
   *len_io = chars_no_null;
   return 1;
 }
@@ -849,6 +850,7 @@ u8 TRT_GUEST_ABI sec_GetUserNameExA(int, char* buf, u32* len_io) {
     return 0;
   }
   memcpy(buf, name, need);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameExA -> buf=%p value=\"%.128s\"", (void*)buf, name); trt_core_log(st_line); }
   *len_io = chars_no_null;
   return 1;
 }

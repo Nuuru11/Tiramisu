@@ -435,12 +435,13 @@ int TRT_GUEST_ABI trt_RegQueryValueExW(u64 hkey, const u16* name, u32* reserved,
   trt_core_log(line);
   if (!key) return REG_ERROR_INVALID_HANDLE;
   reg_value* v = find_value(key, vname);
-  if (!v) return REG_ERROR_FILE_NOT_FOUND;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" value=NULL (not found)", vname); trt_core_log(st_line); return REG_ERROR_FILE_NOT_FOUND; }
   if (type) *type = v->type;
   if (cbDataOut) *cbDataOut = v->size;
   if (!data) return REG_SUCCESS;
   if (cbData < v->size) return REG_ERROR_MORE_DATA;
   memcpy(data, v->data, v->size);
+  { char st_tmp[136]; char st_line[256]; if (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) { const u16* st_w = (const u16*)v->data; size_t st_n = v->size / 2; if (st_n > 132) st_n = 132; size_t st_i = 0; for (; st_i < st_n && st_w[st_i]; ++st_i) st_tmp[st_i] = (char)(st_w[st_i] & 0x7f); st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u value=\"%.128s\"", vname, v->type, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExW -> name=\"%.64s\" type=%u size=%u (non-string)", vname, v->type, v->size); } trt_core_log(st_line); }
   return REG_SUCCESS;
 }
 
@@ -995,7 +996,7 @@ int TRT_GUEST_ABI trt_RegQueryValueExA(u64 hkey, const char* name, u32* reserved
   if (!key) return REG_ERROR_INVALID_HANDLE;
   const char* vname = (name && name[0]) ? name : "(Default)";
   reg_value* v = find_value(key, vname);
-  if (!v) return REG_ERROR_FILE_NOT_FOUND;
+  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" value=NULL (not found)", vname); trt_core_log(st_line); return REG_ERROR_FILE_NOT_FOUND; }
   if (type) *type = v->type;
   const bool conv_sz = (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) &&
                        bytes_look_utf16_sz(v->data, v->size);
@@ -1009,6 +1010,7 @@ int TRT_GUEST_ABI trt_RegQueryValueExA(u64 hkey, const char* name, u32* reserved
   } else if (v->size) {
     memcpy(data, v->data, v->size);
   }
+  { char st_tmp[136]; char st_line[256]; if (v->type == TRT_REG_SZ || v->type == TRT_REG_EXPAND_SZ) { size_t st_n = need; if (st_n > 132) st_n = 132; size_t st_i = 0; for (; st_i < st_n && data[st_i]; ++st_i) st_tmp[st_i] = (char)data[st_i]; st_tmp[st_i] = 0; snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" type=%u value=\"%.128s\"", vname, v->type, st_tmp); } else { snprintf(st_line, sizeof(st_line), "strtrace: RegQueryValueExA -> name=\"%.64s\" type=%u size=%u (non-string)", vname, v->type, v->size); } trt_core_log(st_line); }
   return REG_SUCCESS;
 }
 
@@ -1091,6 +1093,7 @@ int TRT_GUEST_ABI trt_GetUserNameW(u16* buf, u32* cch) {
     return 0;
   }
   for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)k_user[i];
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameW -> buf=%p value=\"%.128s\"", (void*)buf, k_user); trt_core_log(st_line); }
   *cch = need;
   return 1;
 }
@@ -1105,6 +1108,7 @@ int TRT_GUEST_ABI trt_GetUserNameA(char* buf, u32* cch) {
     return 0;
   }
   memcpy(buf, k_user, need);
+  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetUserNameA -> buf=%p value=\"%.128s\"", (void*)buf, k_user); trt_core_log(st_line); }
   *cch = need;
   return 1;
 }
