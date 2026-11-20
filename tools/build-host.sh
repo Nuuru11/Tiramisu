@@ -19,6 +19,18 @@ command -v makemsix >/dev/null || { echo "ERROR: makemsix not in PATH" >&2; exit
   || { echo "ERROR: offline loader test FAILED — see $out/obj/test.log"; tail -5 "$out/obj/test.log"; exit 3; }
 echo "offline loader test: PASS"
 
+# --- 2a. build Mono for UWP (Path B step 5): stock 6.8.0.105, SGen,
+#         interpreter-capable, statically linked. Cached; a no-op when
+#         up to date (see third_party/mono-uwp/build-mono-uwp.sh). The
+#         script prints ONLY the library path on stdout (progress goes
+#         to stderr), so the path is captured here. The link below also
+#         adds bcrypt.lib: Mono's Windows crypto (mono-security-windows)
+#         uses BCryptGenRandom under UWP (BCrypt instead of CryptoAPI).
+MONO_LIB="$("$here/third_party/mono-uwp/build-mono-uwp.sh")" \
+  || { echo "ERROR: Mono for UWP build failed" >&2; exit 4; }
+[[ -f "$MONO_LIB" ]] || { echo "ERROR: Mono UWP lib missing: $MONO_LIB" >&2; exit 4; }
+echo "Mono for UWP: $MONO_LIB"
+
 # --- 2. compile + link the host (UWP profile) --------------------------------
 # FNA3D D3D11 (Path B step 3): the D3D11 driver + FNA3D core are compiled
 # into the host so a managed game renders on the host's CoreWindow
@@ -34,6 +46,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   -I third_party/fna3d-src/include \
   -I third_party/fna3d-src/MojoShader \
   -I third_party/fna3d-src/sdl-shim \
+  -I third_party/mono/usr/include/mono-2.0 \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
@@ -64,6 +77,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/host/vendor/qrcodegen.c src/trt/mojo_hlsl.c src/trt/vendor_stb_vorbis.c \
   --link-arg d3d11.lib --link-arg d3d12.lib --link-arg dxgi.lib --link-arg xinput.lib \
   --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib --link-arg ws2_32.lib \
+  --link-arg bcrypt.lib --link-arg "$MONO_LIB" \
   -- /MT /O2 /EHsc /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN \
      /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED \
      /DFNA3D_DRIVER_D3D11 /DWINAPI_FAMILY_WINRT=1 \
@@ -82,6 +96,61 @@ for fna_obj in "$out/obj/"*FNA3D_Driver_D3D11*.obj \
   [[ -f "$fna_obj" ]] || { echo "ERROR: FNA3D UWP object missing: $fna_obj" >&2; exit 4; }
 done
 echo "FNA3D D3D11 driver objects present in $out/obj"
+
+# --- 2c. explicit check: Mono is in the UWP link (Path B step 5). The
+#         link above already proves the symbols resolve (mono_host.o
+#         references mono_jit_init/mono_jit_exec; lld-link would fail
+#         on an unresolved symbol); this names them so a missing Mono
+#         lib fails loudly instead of silently dropping the embedding.
+#         The exe does not export the Mono symbols (statically linked,
+#         internal), so the check is on the linked objects + the lib.
+#         FNA3D IS exported from the exe (__declspec(dllexport)) — the
+#         __Internal dllmap target — so its exports are checked in the
+#         exe's export table.
+#         NB: each tool's output is captured to a file before grepping:
+#         piping to `grep -q` makes grep exit on the first match,
+#         SIGPIPE-ing the producer, which under `set -o pipefail` fails
+#         the check even when the symbol is present.
+llvm-nm --defined-only "$MONO_LIB" > "$out/obj/mono-symbols.txt" 2>/dev/null \
+  || { echo "ERROR: llvm-nm failed on $MONO_LIB" >&2; exit 5; }
+for sym in mono_jit_init mono_jit_exec mono_config_parse mono_set_dirs \
+           mono_domain_assembly_open mono_add_internal_call \
+           mono_install_assembly_load_hook mono_jit_cleanup; do
+  grep -q " T $sym$" "$out/obj/mono-symbols.txt" \
+    || { echo "ERROR: Mono symbol missing from $MONO_LIB: $sym" >&2; exit 5; }
+done
+mono_host_obj="$(ls "$out/obj/"*mono_host*.obj 2>/dev/null | head -1)"
+[[ -f "$mono_host_obj" ]] \
+  || { echo "ERROR: mono_host UWP object missing in $out/obj" >&2; exit 5; }
+llvm-nm --undefined-only "$mono_host_obj" > "$out/obj/mono_host-undef.txt" 2>/dev/null \
+  || { echo "ERROR: llvm-nm failed on $mono_host_obj" >&2; exit 5; }
+for sym in mono_jit_init mono_jit_exec; do
+  grep -q " U $sym$" "$out/obj/mono_host-undef.txt" \
+    || { echo "ERROR: mono_host.o does not reference $sym (UWP Mono embedding not wired?)" >&2; exit 5; }
+done
+echo "Mono symbols present in UWP link: mono_jit_init, mono_jit_exec, +6 more (lib: $MONO_LIB)"
+objdump -p "$out/layout/tiramisu.exe" > "$out/obj/exe-headers.txt" \
+  || { echo "ERROR: objdump failed on $out/layout/tiramisu.exe" >&2; exit 5; }
+grep -q "FNA3D_" "$out/obj/exe-headers.txt" \
+  || { echo "ERROR: no FNA3D_* exports in $out/layout/tiramisu.exe" >&2; exit 5; }
+echo "FNA3D exports present in tiramisu.exe"
+
+# --- 2d. package the Mono framework assemblies + machine config into
+#         the app layout (Path B step 5). The UWP branch of mono_host
+#         derives framework_dir/config_dir from the install dir:
+#         <install>/mono/4.5/*.dll + <install>/mono/gac/... and
+#         <install>/etc/mono/config, mirroring Linux's /usr/lib + /etc
+#         split. The assemblies are the same 6.8.0.105 IL the Linux
+#         path uses (platform-independent; not rebuilt). tools/pack.sh
+#         includes $out/layout in the MSIX.
+MONO_FW="${MONO_FRAMEWORK_DIR:-/usr/lib/mono}"
+[[ -d "$MONO_FW/4.5" && -f "$MONO_FW/4.5/mscorlib.dll" ]] \
+  || { echo "ERROR: Mono framework assemblies not found: $MONO_FW/4.5" >&2; exit 6; }
+mkdir -p "$out/layout/mono" "$out/layout/etc/mono"
+cp -r "$MONO_FW/4.5" "$out/layout/mono/4.5"
+[[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/gac"
+[[ -f /etc/mono/config ]] && cp /etc/mono/config "$out/layout/etc/mono/config"
+echo "Mono framework packaged: $(du -sh "$out/layout/mono" | cut -f1) assemblies + config"
 
 # --- 3. sanity: UWP image MUST be an AppContainer image ----------------------
 objdump -p "$out/layout/tiramisu.exe" | grep -E 'DllCharacteristics|Subsystem' || true

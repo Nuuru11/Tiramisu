@@ -1,0 +1,45 @@
+# 04: mono/metadata/w32file-win32.c + file-mmap-windows.c — use
+# CreateFileFromAppW under UWP.
+#
+# CreateFileW is not declared under the UWP (APP) WINAPI family: in
+# the SDK's fileapi.h it sits in a region gated to DESKTOP | SYSTEM |
+# GAMES. CreateFileFromAppW (fileapifromapp.h, included by winbase.h)
+# is the UWP equivalent with the identical 7-argument signature, and
+# is declared under the APP partition. This keeps managed file I/O
+# (System.IO.FileStream via mono_w32file_create, and memory-mapped
+# files via file-mmap-windows.c) working in the AppContainer, where
+# only app-accessible paths (package, LocalState) are reachable anyway.
+--- a/mono/metadata/w32file-win32.c
++++ b/mono/metadata/w32file-win32.c
+@@ -56,9 +56,15 @@
+ gpointer
+ mono_w32file_create(const gunichar2 *name, guint32 fileaccess, guint32 sharemode, guint32 createmode, guint32 attrs)
+ {
+ 	gpointer res;
+ 	MONO_ENTER_GC_SAFE;
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	/* CreateFileW is not declared under the UWP (APP) WINAPI family;
++	 * CreateFileFromAppW is its UWP equivalent, same signature. */
++	res = CreateFileFromAppW (name, fileaccess, sharemode, NULL, createmode, attrs, NULL);
++#else
+ 	res = CreateFileW (name, fileaccess, sharemode, NULL, createmode, attrs, NULL);
++#endif
+ 	MONO_EXIT_GC_SAFE;
+ 	return res;
+ }
+--- a/mono/metadata/file-mmap-windows.c
++++ b/mono/metadata/file-mmap-windows.c
+@@ -276,7 +276,13 @@
+ 			goto done;
+ 		}
+ 		MONO_ENTER_GC_SAFE;
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++		/* CreateFileW is not declared under the UWP (APP) WINAPI family;
++		 * CreateFileFromAppW is its UWP equivalent, same signature. */
++		hFile = CreateFileFromAppW (path, get_file_access (access), FILE_SHARE_READ, NULL, mode, FILE_ATTRIBUTE_NORMAL, NULL);
++#else
+ 		hFile = CreateFileW (path, get_file_access (access), FILE_SHARE_READ, NULL, mode, FILE_ATTRIBUTE_NORMAL, NULL);
++#endif
+ 		MONO_EXIT_GC_SAFE;
+ 		if (hFile == INVALID_HANDLE_VALUE) {
+ 			*ioerror = convert_win32_error (GetLastError (), COULD_NOT_OPEN);

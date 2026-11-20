@@ -11,11 +11,13 @@
 // third_party/mono-bridges).
 //
 // PLATFORM: the embedding is real on Linux (offline harness), where
-// libmono-2.0 is dlopen'd from third_party/mono (see its README). On
-// Windows/UWP there is no Mono runtime in the tree yet, so trt_mono_run
-// returns TRT_ERR_MONO with a clear message — it does NOT fake success.
-// Mono-on-UWP is a later step (Unity proves Mono runs on Xbox; the work is
-// a UWP Mono build + static linking, not a redesign of this file).
+// libmono-2.0 is dlopen'd from third_party/mono (see its README), and
+// on Windows/UWP, where the statically linked Mono built by
+// third_party/mono-uwp is embedded directly (same 6.8.0.105 runtime;
+// interpreter mode forced on UWP — the AppContainer blocks JIT code
+// generation). Runtime Mono-on-UWP execution is console-verification-
+// pending: it can only be proven by a console test (no UWP runtime
+// exists on Linux).
 //
 // FNA PLATFORM: managed XNA games pick their windowing/input backend
 // through trt_mono_config.fna_platform ("tiramisu" = the host surface +
@@ -38,9 +40,11 @@ extern "C" {
 
 // A P/Invoke module redirect: managed code P/Invoking `module` loads
 // `target` instead. `target` is an absolute path to a .so (or a bare
-// soname resolved by the system loader). Installed into EVERY image the
-// runtime loads (via the assembly-load hook), so it covers the exe, its
-// managed DLLs, and lazily-loaded assemblies alike.
+// soname resolved by the system loader) on Linux; on UWP it may also be
+// "__Internal" (resolve from the exe's own exports, e.g. FNA3D).
+// Installed into EVERY image the runtime loads (via the assembly-load
+// hook), so it covers the exe, its managed DLLs, and lazily-loaded
+// assemblies alike.
 typedef struct trt_mono_dllmap {
   const char* module;  // e.g. "fmod"
   const char* target;  // e.g. "/abs/path/libfmod-real.so"

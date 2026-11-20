@@ -1,0 +1,31 @@
+# 18: mono/metadata/marshal-windows.c — unguard the HGlobal
+# marshal functions.
+#
+# GlobalAlloc/GlobalReAlloc/GlobalFree are declared under the UWP
+# (APP) family (verified by compile test against the xwin SDK), but
+# the three functions were classic-gated while marshal.c calls them
+# unguarded (Marshal.AllocHGlobal/ReAllocHGlobal/FreeHGlobal) — the
+# UWP link failed on all three. The guard is removed; the bodies are
+# unchanged and identical on desktop and UWP.
+--- a/mono/metadata/marshal-windows.c
++++ b/mono/metadata/marshal-windows.c
+@@ -15,7 +15,10 @@
+ #include "mono/metadata/marshal-windows-internals.h"
+ #include "icall-decl.h"
+ 
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++/* GlobalAlloc/GlobalReAlloc/GlobalFree are available in both the
++ * classic and UWP (APP) WINAPI families, so these are unguarded.
++ * (They were classic-gated; marshal.c calls them unguarded for
++ * Marshal.AllocHGlobal and the UWP link failed on all three.) */
+ void*
+ mono_marshal_alloc_hglobal (size_t size, MonoError *error)
+ {
+@@ -36,7 +39,6 @@
+ {
+ 	GlobalFree (ptr);
+ }
+-#endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ void*
+ mono_marshal_alloc_co_task_mem (size_t size)

@@ -1,0 +1,144 @@
+# 15: mono/metadata/mono-security.c + mono-security-windows.c — UWP
+# stubs for the WindowsIdentity / WindowsImpersonationContext /
+# KeyPairPersistence security icalls and helpers.
+#
+# Windows token and ACL APIs (OpenThreadToken, GetTokenInformation,
+# DuplicateToken, ImpersonateLoggedOnUser, RevertToSelf,
+# Get/SetNamedSecurityInfo) are desktop-only, so their implementations
+# are classic-gated — but icall-def.h references the icalls
+# unconditionally, and the UNGUARDED KeyPairPersistence icalls call
+# the gated ACL helpers, so the UWP link failed on all of them. The
+# stubs report NotSupported, except mono_security_win_get_token_name,
+# which returns 0 (GetTokenName treats that as an empty name — the
+# graceful answer for WindowsIdentity.Name under UWP). The desktop
+# path is unchanged.
+--- a/mono/metadata/mono-security.c
++++ b/mono/metadata/mono-security.c
+@@ -406,6 +406,24 @@
+ 	return geteuid () == suid;
+ #endif
+ }
++#else
++MonoBoolean
++ves_icall_System_Security_Principal_WindowsImpersonationContext_SetCurrentToken (gpointer token, MonoError *error)
++{
++	g_unsupported_api ("ImpersonateLoggedOnUser");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "ImpersonateLoggedOnUser");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++MonoBoolean
++ves_icall_System_Security_Principal_WindowsImpersonationContext_RevertToSelf (MonoError *error)
++{
++	g_unsupported_api ("RevertToSelf");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "RevertToSelf");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ /* System.Security.Principal.WindowsPrincipal */
+--- a/mono/metadata/mono-security-windows.c
++++ b/mono/metadata/mono-security-windows.c
+@@ -110,6 +110,24 @@
+ 
+ 	return size;
+ }
++#else
++gpointer
++ves_icall_System_Security_Principal_WindowsIdentity_GetCurrentToken (MonoError *error)
++{
++	g_unsupported_api ("OpenThreadToken");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "OpenThreadToken");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL;
++}
++
++gint32
++mono_security_win_get_token_name (gpointer token, gunichar2 **uniname, MonoError *error)
++{
++	/* UWP: no token APIs. GetTokenName (unguarded, below) treats a 0
++	 * size with no error set as an empty name, which is the graceful
++	 * answer here — so return 0 without setting the error. */
++	return 0;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ MonoStringHandle
+@@ -203,6 +221,15 @@
+ 	}
+ 	return array;
+ }
++#else
++MonoArrayHandle
++ves_icall_System_Security_Principal_WindowsIdentity_GetRoles (gpointer token, MonoError *error)
++{
++	g_unsupported_api ("GetTokenInformation");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "GetTokenInformation");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL_HANDLE_ARRAY;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ MonoBoolean
+@@ -218,6 +245,15 @@
+ 	gpointer dupe = NULL;
+ 	return DuplicateToken (token, SecurityImpersonation, &dupe) ? dupe : NULL;
+ }
++#else
++gpointer
++ves_icall_System_Security_Principal_WindowsImpersonationContext_DuplicateToken (gpointer token, MonoError *error)
++{
++	g_unsupported_api ("DuplicateToken");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "DuplicateToken");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL;
++}
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ MonoBoolean
+@@ -440,6 +476,43 @@
+ 	return retval == ERROR_SUCCESS;
+ }
+ 
++#else
++gboolean
++mono_security_win_is_machine_protected (const gunichar2 *path, MonoError *error)
++{
++	g_unsupported_api ("GetNamedSecurityInfo");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "GetNamedSecurityInfo");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++gboolean
++mono_security_win_is_user_protected (const gunichar2 *path, MonoError *error)
++{
++	g_unsupported_api ("GetNamedSecurityInfo");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "GetNamedSecurityInfo");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++gboolean
++mono_security_win_protect_machine (const gunichar2 *path, MonoError *error)
++{
++	g_unsupported_api ("SetNamedSecurityInfo");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "SetNamedSecurityInfo");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
++gboolean
++mono_security_win_protect_user (const gunichar2 *path, MonoError *error)
++{
++	g_unsupported_api ("SetNamedSecurityInfo");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "SetNamedSecurityInfo");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return FALSE;
++}
++
+ #endif /* G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) */
+ 
+ MonoBoolean

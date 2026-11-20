@@ -1,0 +1,16 @@
+--- a/mono/eglib/gfile-posix.c
++++ b/mono/eglib/gfile-posix.c
+@@ -172,4 +172,12 @@ g_get_current_dir (void)
+ 	do {
+ 		buffer = g_realloc (buffer, s);
+-		r = getcwd (buffer, s);
++#ifdef G_OS_WIN32
++		/* _getcwd is the MSVC name; the POSIX alias getcwd is not
++		 * declared under WINAPI_FAMILY_APP (UWP), and the implicit
++		 * declaration it fell back to truncated the pointer on x64
++		 * (see the comment below about the 0xffffffff overflow). */
++		r = _getcwd (buffer, s);
++#else
++		r = getcwd (buffer, s);
++#endif
+ 		fail = (r == NULL && errno == ERANGE);

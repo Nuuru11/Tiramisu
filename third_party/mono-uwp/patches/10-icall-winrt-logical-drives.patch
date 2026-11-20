@@ -1,0 +1,34 @@
+# 10: mono/metadata/icall.c — return an empty array from
+# Environment.GetLogicalDrives under UWP.
+#
+# Upstream 6.8's non-classic (UWP) path for GetLogicalDrives was never
+# finished: icall-internals.h declares mono_icall_get_logical_drives
+# (void) for the non-classic family (claiming the implementation lives
+# in icall-windows.c), but no such implementation exists anywhere in
+# the tree — and the ves_icall still calls it with the classic
+# signature (error), so the UWP build fails with "too many arguments".
+# UWP has no drive enumeration API anyway (GetLogicalDriveStrings is
+# desktop-only) and the AppContainer exposes no drives, so under UWP
+# the icall returns an empty string array. The desktop path is
+# unchanged. (mono_icall_drive_info_get_drive_type is likewise
+# declared-but-never-defined for the non-classic family; nothing calls
+# it, so it needs no patch.)
+--- a/mono/metadata/icall.c
++++ b/mono/metadata/icall.c
+@@ -7775,7 +7775,16 @@
+ MonoArrayHandle
+ ves_icall_System_Environment_GetLogicalDrivesInternal (MonoError *error)
+ {
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
+ 	return mono_icall_get_logical_drives (error);
++#else
++	/* UWP has no drive enumeration API (GetLogicalDriveStrings is
++	   desktop-only) and the AppContainer exposes no drives; return
++	   an empty array. (Upstream 6.8 declares
++	   mono_icall_get_logical_drives for the non-classic family but
++	   never implements it.) */
++	return MONO_HANDLE_NEW (MonoArray, mono_array_new_checked (mono_domain_get (), mono_get_string_class (), 0, error));
++#endif
+ }
+ 
+ MonoStringHandle

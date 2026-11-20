@@ -1,0 +1,29 @@
+# 03: winconfig.h — only claim <winternl.h> under the classic WINAPI family.
+#
+# winconfig.h (the MSVC config.h template) defines HAVE_WINTERNL_H
+# unconditionally. Under the UWP (APP) WINAPI family the SDK's
+# winternl.h is empty — its entire content is gated to the desktop
+# partition — so claiming it makes mono-tls.h include a header that
+# declares nothing (see patch 02). Guard the define with
+# HAVE_CLASSIC_WINAPI_SUPPORT (from msvc/msvc-win32-support.h, included
+# at the top of winconfig.h): desktop builds keep HAVE_WINTERNL_H, UWP
+# builds don't, and toolchains without the family macros (undefined)
+# keep the old behaviour.
+#
+# NOTE: this patch touches the config.h template, so build-mono-uwp.sh
+# must apply patches BEFORE generating config.h from winconfig.h.
+--- a/winconfig.h
++++ b/winconfig.h
+@@ -127,6 +127,12 @@
+ #define HAVE_WCHAR_H 1
+ 
+ /* Define to 1 if you have the <winternl.h> header file. */
++/* <winternl.h>'s entire content is gated to the desktop WINAPI
++ * partition, so under UWP (APP) the header is empty. Only claim it
++ * under the classic (desktop) family; mono-tls.h falls back to a
++ * local TEB definition (as in the Unity mono fork) when unset. */
++#if !defined(HAVE_CLASSIC_WINAPI_SUPPORT) || HAVE_CLASSIC_WINAPI_SUPPORT
+ #define HAVE_WINTERNL_H 1
++#endif
+ 
+ #if defined(HAVE_SGEN_GC) && !defined(HAVE_WRITE_BARRIERS)

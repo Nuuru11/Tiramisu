@@ -1,0 +1,33 @@
+# 16: mono/metadata/w32subset.h — GetStdHandle and SignalObjectAndWait
+# ARE available under UWP; the availability table said otherwise.
+#
+# Both macros were classic-only, which compiled out
+# mono_w32file_get_console_{input,output,error} (called unguarded from
+# w32file.c's MonoIO icalls), the WaitHandle SignalAndWait icall
+# (threads.c) and its implementation (mono-os-wait-win32.c) — the UWP
+# link failed on all of them. Both APIs are declared under the UWP
+# (APP) family and present in the UWP import libraries (verified by
+# compile test + llvm-nm against the xwin SDK), so the macros now
+# match the ones that already include UWP (e.g. GET_COMPUTER_NAME).
+# (MoveFile is genuinely unavailable under UWP — see patch 17, which
+# uses MoveFileEx instead; the MOVE_FILE_EX macro already says UWP.)
+--- a/mono/metadata/w32subset.h
++++ b/mono/metadata/w32subset.h
+@@ -84,7 +84,7 @@
+ #endif
+ 
+ #ifndef HAVE_API_SUPPORT_WIN32_GET_STD_HANDLE
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) || G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
+ #define HAVE_API_SUPPORT_WIN32_GET_STD_HANDLE 1
+ #else
+ #define HAVE_API_SUPPORT_WIN32_GET_STD_HANDLE 0
+@@ -132,7 +132,7 @@
+ #endif
+ 
+ #ifndef HAVE_API_SUPPORT_WIN32_SIGNAL_OBJECT_AND_WAIT
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) || G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
+ #define HAVE_API_SUPPORT_WIN32_SIGNAL_OBJECT_AND_WAIT 1
+ #else
+ #define HAVE_API_SUPPORT_WIN32_SIGNAL_OBJECT_AND_WAIT 0

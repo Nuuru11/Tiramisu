@@ -1,0 +1,19 @@
+# 08: mono/utils/mono-dl-windows.c — pass 0, not NULL, as the
+# LoadPackagedLibrary flags argument.
+#
+# LoadPackagedLibrary(LPCWSTR, DWORD) takes a DWORD reserved-flags
+# argument that must be 0. Stock Mono passes NULL (a void*), which
+# MSVC accepts with a warning but clang rejects as a pointer-to-int
+# conversion error. Passing 0 is the documented value and is
+# behaviour-identical on MSVC.
+--- a/mono/utils/mono-dl-windows.c
++++ b/mono/utils/mono-dl-windows.c
+@@ -59,7 +59,7 @@
+ #if HAVE_API_SUPPORT_WIN32_LOAD_LIBRARY
+ 		hModule = LoadLibraryW (file_utf16);
+ #elif HAVE_API_SUPPORT_WIN32_LOAD_PACKAGED_LIBRARY
+-		hModule = LoadPackagedLibrary (file_utf16, NULL);
++		hModule = LoadPackagedLibrary (file_utf16, 0);
+ #else
+ 		g_assert_not_reached ();
+ #endif

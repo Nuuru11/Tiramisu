@@ -1,0 +1,34 @@
+# 14: mono/metadata/w32process.c — UWP stubs for the Process
+# GetModules/ProcessName icalls.
+#
+# Both are implemented via EnumProcessModules (desktop-only) inside a
+# classic-gated region, but icall-def.h references them unconditionally
+# and the UWP link failed on both. The stubs report NotSupported (the
+# same pattern as patch 11). The desktop path is unchanged.
+--- a/mono/metadata/w32process.c
++++ b/mono/metadata/w32process.c
+@@ -659,6 +659,24 @@
+ 	return res;
+ }
+ #endif /* ENABLE_NETCORE */
++#else
++MonoArrayHandle
++ves_icall_System_Diagnostics_Process_GetModules_internal (MonoObjectHandle this_obj, HANDLE process, MonoError *error)
++{
++	g_unsupported_api ("EnumProcessModules");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "EnumProcessModules");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL_HANDLE_ARRAY;
++}
++
++MonoStringHandle
++ves_icall_System_Diagnostics_Process_ProcessName_internal (HANDLE process, MonoError *error)
++{
++	g_unsupported_api ("EnumProcessModules");
++	mono_error_set_not_supported (error, G_UNSUPPORTED_API, "EnumProcessModules");
++	SetLastError (ERROR_NOT_SUPPORTED);
++	return NULL_HANDLE_STRING;
++}
+ 
+ #endif // G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) && defined(HOST_WIN32)
+ 

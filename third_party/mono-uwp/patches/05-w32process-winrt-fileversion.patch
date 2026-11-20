@@ -1,0 +1,32 @@
+# 05: mono/metadata/w32process.c — guard the FileVersionInfo call site
+# that the version-resource APIs don't cover under UWP.
+#
+# mono_w32process_get_fileversion (and its helpers) live inside a
+# `#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)` region, because
+# the version-resource APIs they use (GetFileVersionInfoW,
+# GetFileVersionInfoSizeW, VerQueryValueW) are desktop-only — the SDK's
+# winver.h declares nothing under the APP partition. But the icall
+# ves_icall_System_Diagnostics_FileVersionInfo_GetVersionInfo_internal
+# calls it guarded only by `#ifndef ENABLE_NETCORE`, so under UWP the
+# call is to an undeclared function. Guard the call with the same
+# classic-family test: under UWP, FileVersionInfo.GetVersionInfo still
+# sets the filename field but reports empty version fields (the same
+# result as a file with no version resource). The other call site
+# (process module enumeration, line ~491) is already inside a
+# classic-gated region and needs no change.
+--- a/mono/metadata/w32process.c
++++ b/mono/metadata/w32process.c
+@@ -432,7 +432,13 @@
+ 	stash_system_image (m_class_get_image (mono_handle_class (this_obj)));
+ 
++	/* mono_w32process_get_fileversion is only defined under the classic
++	 * (desktop) WINAPI family: the version-resource APIs it uses
++	 * (GetFileVersionInfo) are not available under UWP. Under UWP,
++	 * FileVersionInfo reports empty version fields. */
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
+ 	mono_w32process_get_fileversion (this_obj, str, filename, error);
+ 	return_if_nok (error);
++#endif
+ 
+ 	process_set_field_utf16 (this_obj, str, "filename", filename, filename_length, error);
+ }
