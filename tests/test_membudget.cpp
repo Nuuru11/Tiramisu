@@ -30,6 +30,11 @@ u64 trt_mem_budget_committed(void);
 u64 trt_mem_budget_mapped(void);
 u64 trt_mem_budget_peak(void);
 u64 trt_mem_budget_refusals(void);
+// VA ledger (item 3): reserved VA is tracked separately from commit
+u64 trt_mem_budget_va_bytes(void);
+u64 trt_mem_budget_reserved(void);
+u64 trt_mem_budget_va_peak(void);
+u64 trt_mem_budget_va_refusals(void);
 int trt_mem_budget_charge_commit(u64 bytes);
 void trt_mem_budget_discharge_commit(u64 bytes);
 int trt_mem_budget_charge_map(u64 bytes);
@@ -186,6 +191,53 @@ int run_small_budget_probe() {
   void* h3 = trt_HeapAlloc(heap, 0, 10ULL * MB);
   CHECK(h3 != nullptr, "after the free the same allocation succeeds again");
   trt_HeapFree(heap, 0, h3);
+
+  // --- heap pool (item 1): small allocs share one 1 MB slab reservation ---
+  {
+    const u64 pool_before = trt_mem_budget_committed();
+    void* s1 = trt_HeapAlloc(heap, 0, 64);
+    CHECK(s1 != nullptr, "pooled HeapAlloc(64) succeeds");
+    CHECK(trt_mem_budget_committed() == pool_before + 1ULL * MB,
+          "first small alloc charges exactly one 1 MB slab");
+    void* smalls[100];
+    int nsmall = 0;
+    for (int i = 0; i < 100; ++i) {
+      smalls[i] = trt_HeapAlloc(heap, 0, 64);
+      if (!smalls[i]) break;
+      ++nsmall;
+    }
+    CHECK(nsmall == 100, "100 more small allocs succeed from the pool");
+    CHECK(trt_mem_budget_committed() == pool_before + 1ULL * MB,
+          "pooled allocs add no further commit (one slab covers them)");
+    for (int i = 0; i < nsmall; ++i) trt_HeapFree(heap, 0, smalls[i]);
+    CHECK(trt_HeapFree(heap, 0, s1) == 1, "pooled HeapFree succeeds");
+    CHECK(trt_mem_budget_committed() == pool_before,
+          "freeing the whole slab discharges it");
+  }
+
+  // --- VA accounting (item 3): reservations charge VA, not commit ---
+  {
+    const u64 va_before = trt_mem_budget_reserved();
+    const u64 c_before = trt_mem_budget_committed();
+    void* r = trt_VirtualAlloc(nullptr, 8ULL * MB, 0x2000 /*MEM_RESERVE*/,
+                               0x04);
+    CHECK(r != nullptr, "reserve-only VirtualAlloc succeeds");
+    CHECK(trt_mem_budget_committed() == c_before,
+          "reserve-only charges no commit");
+    CHECK(trt_mem_budget_reserved() == va_before + 8ULL * MB,
+          "reserve-only charges VA");
+    void* c = trt_VirtualAlloc(r, 4ULL * MB, 0x1000 /*MEM_COMMIT*/, 0x04);
+    CHECK(c != nullptr, "commit inside the reservation succeeds");
+    CHECK(trt_mem_budget_committed() == c_before + 4ULL * MB,
+          "commit charges commit");
+    CHECK(trt_mem_budget_reserved() == va_before + 8ULL * MB,
+          "commit inside a reservation adds no VA");
+    CHECK(trt_VirtualFree(r, 0, 0x8000 /*MEM_RELEASE*/) == 1,
+          "release of the reserved region succeeds");
+    CHECK(trt_mem_budget_committed() == c_before &&
+              trt_mem_budget_reserved() == va_before,
+          "release discharges both commit and VA");
+  }
 
   // --- mapped views join the same ledger ---
   u64 mf = trt_CreateFileMappingW((u64)-1, nullptr, 0x04, 0,

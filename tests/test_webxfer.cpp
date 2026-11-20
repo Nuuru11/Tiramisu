@@ -242,11 +242,45 @@ int main() {
     CHECK(st.find("\"running_game\":\"HollowDemo\"") != std::string::npos,
           "GET /api/status reports active game");
 
+    // launch honesty (item 9): a launch while a game runs is a 409, not a
+    // silent overwrite of the running game
+    std::string rl_busy = http_req(port, "POST", "/launch/HollowDemo", "");
+    CHECK(rl_busy.find("409 Conflict") != std::string::npos,
+          "POST /launch while a game runs returns 409");
+
+    // with no game running, a launch queues (202) and the host poll sees it
+    longan::webxfer_set_running_game("");
     std::string rl = http_req(port, "POST", "/launch/HollowDemo", "");
     std::string ln;
-    CHECK(rl.find("200 OK") != std::string::npos &&
+    CHECK(rl.find("202 Accepted") != std::string::npos &&
+              rl.find("\"queued\":true") != std::string::npos &&
               longan::webxfer_poll_launch(&ln) && ln == "HollowDemo",
-          "POST /launch triggers host launch poll");
+          "POST /launch queues (202) and host launch poll fires");
+
+    // a launch queued while another is still queued is a 409
+    std::string rl2 = http_req(port, "POST", "/launch/HollowDemo", "");
+    std::string rl3 = http_req(port, "POST", "/launch/ZipQuest", "");
+    CHECK(rl2.find("202 Accepted") != std::string::npos &&
+              rl3.find("409 Conflict") != std::string::npos,
+          "POST /launch while a launch is queued returns 409");
+    std::string drained;
+    CHECK(longan::webxfer_poll_launch(&drained) && drained == "HollowDemo",
+          "queued launch drains via poll");
+
+    // the host loop's launch outcome lands in /api/status
+    longan::webxfer_set_launch_result("HollowDemo", "started");
+    std::string st2 = http_req(port, "GET", "/api/status", "");
+    CHECK(st2.find("\"last_launch_result\":\"started\"") != std::string::npos &&
+              st2.find("\"last_launch_name\":\"HollowDemo\"") != std::string::npos,
+          "GET /api/status reports last launch result");
+
+    // scoped rescan (item 4): an upload flags the changed game, not a blank rescan
+    std::string r_up = http_req(
+        port, "PUT", "/api/upload-file?game=HollowDemo&rel=extra.txt", "x");
+    std::string scoped;
+    CHECK(r_up.find("200 OK") != std::string::npos &&
+              longan::webxfer_poll_rescan(&scoped) && scoped == "HollowDemo",
+          "folder upload flags a scoped rescan for its game");
 
     std::string rs = http_req(port, "POST", "/api/stop", "");
     CHECK(rs.find("200 OK") != std::string::npos && longan::webxfer_poll_stop(),

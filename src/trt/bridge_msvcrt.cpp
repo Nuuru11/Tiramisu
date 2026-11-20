@@ -36,6 +36,14 @@
 // resolves to 0 -> crt_malloc keeps the 256 MB default.
 extern "C" int trt_settings_memory_budget_mb(void) __attribute__((weak));
 
+// 5 GB memory-budget governor (bridge_membudget.cpp): the CRT malloc family
+// used to be a raw pass-through to host malloc — real committed memory the
+// ledger never saw. Every guest CRT allocation charges commit + VA now.
+extern "C" int trt_mem_budget_charge_commit(u64 bytes);
+extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
+extern "C" int trt_mem_budget_charge_va(u64 bytes);
+extern "C" void trt_mem_budget_discharge_va(u64 bytes);
+
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -45,6 +53,8 @@ extern "C" int trt_settings_memory_budget_mb(void) __attribute__((weak));
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
 
@@ -490,6 +500,52 @@ void TRT_GUEST_ABI crt_longjmp(void* env, i32 val) {
 // "core/os/memory.cpp"/"alloc_static") is exactly a NULL from here. Log the
 // size when it exceeds any plausible game allocation so the guest-side
 // garbage-size source becomes measurable.
+//
+// Budget: CRT allocations are real committed host memory, so they charge
+// the ledger (commit + VA) like HeapAlloc does. Sizes are tracked in a
+// registry (free needs the size to discharge); a pointer the registry
+// never saw is freed uncharged, exactly like HeapFree treats foreign
+// pointers.
+namespace {
+std::mutex g_crt_alloc_mu;
+std::unordered_map<void*, size_t> g_crt_alloc;
+
+bool crt_charge(size_t n) {
+  if (!n) return true;
+  if (trt_mem_budget_charge_va((u64)n) != 0) return false;
+  if (trt_mem_budget_charge_commit((u64)n) != 0) {
+    trt_mem_budget_discharge_va((u64)n);
+    return false;
+  }
+  return true;
+}
+void crt_discharge(size_t n) {
+  if (!n) return;
+  trt_mem_budget_discharge_commit((u64)n);
+  trt_mem_budget_discharge_va((u64)n);
+}
+void crt_track(void* p, size_t n) {
+  if (!p) return;
+  std::lock_guard<std::mutex> lk(g_crt_alloc_mu);
+  g_crt_alloc[p] = n;
+}
+bool crt_untrack(void* p, size_t* n_out) {
+  if (!p) return false;
+  std::lock_guard<std::mutex> lk(g_crt_alloc_mu);
+  auto it = g_crt_alloc.find(p);
+  if (it == g_crt_alloc.end()) return false;
+  if (n_out) *n_out = it->second;
+  g_crt_alloc.erase(it);
+  return true;
+}
+size_t crt_tracked_size(void* p) {
+  if (!p) return 0;
+  std::lock_guard<std::mutex> lk(g_crt_alloc_mu);
+  auto it = g_crt_alloc.find(p);
+  return it == g_crt_alloc.end() ? 0 : it->second;
+}
+}  // namespace
+
 void* TRT_GUEST_ABI crt_malloc(u64 sz) {
   // Settings knob: memory_budget_mb caps the single-allocation refusal
   // threshold. Default 256 MB; a user can raise it for big allocators
@@ -512,25 +568,79 @@ void* TRT_GUEST_ABI crt_malloc(u64 sz) {
     }
     return nullptr;
   }
-  return malloc((size_t)sz);
+  const size_t n = (size_t)sz;
+  if (!crt_charge(n)) return nullptr;  // budget refusal (1455/8 set)
+  void* p = malloc(n ? n : 1);
+  if (!p) {
+    crt_discharge(n);
+    return nullptr;
+  }
+  crt_track(p, n);
+  return p;
 }
-void* TRT_GUEST_ABI crt_calloc(u64 n, u64 sz) { return calloc((size_t)n, (size_t)sz); }
-void* TRT_GUEST_ABI crt_realloc(void* p, u64 sz) { return realloc(p, (size_t)sz); }
-void  TRT_GUEST_ABI crt_free(void* p) { free(p); }
+void* TRT_GUEST_ABI crt_calloc(u64 n, u64 sz) {
+  const size_t total = (size_t)n * (size_t)sz;
+  if (n && sz && total / (size_t)n != (size_t)sz) return nullptr;  // overflow
+  if (!crt_charge(total)) return nullptr;
+  void* p = calloc((size_t)n, (size_t)sz);
+  if (!p) {
+    crt_discharge(total);
+    return nullptr;
+  }
+  crt_track(p, total);
+  return p;
+}
+// defined below; realloc(p, 0) frees
+void TRT_GUEST_ABI crt_free(void* p);
+void* TRT_GUEST_ABI crt_realloc(void* p, u64 sz) {
+  if (!p) return crt_malloc(sz);
+  if (!sz) { crt_free(p); return nullptr; }
+  const size_t old = crt_tracked_size(p);
+  const size_t want = (size_t)sz;
+  // charge only the delta (a realloc that grows by a few bytes near the
+  // ceiling must not refuse spuriously); discharge the shrink after success
+  const size_t delta = want > old ? want - old : 0;
+  if (delta && !crt_charge(delta)) return nullptr;
+  void* np = realloc(p, want);
+  if (!np) {
+    if (delta) crt_discharge(delta);
+    return nullptr;
+  }
+  crt_untrack(p, nullptr);
+  crt_track(np, want);
+  if (old > want) crt_discharge(old - want);
+  return np;
+}
+void  TRT_GUEST_ABI crt_free(void* p) {
+  if (!p) return;
+  size_t n = 0;
+  if (crt_untrack(p, &n)) crt_discharge(n);
+  free(p);
+}
 
 void* TRT_GUEST_ABI crt__aligned_malloc(u64 sz, u64 align) {
   if (align < sizeof(void*)) align = sizeof(void*);
   if ((align & (align - 1)) != 0) { set_errno_from_host(EINVAL); return nullptr; }
-#ifdef _WIN32
-  return _aligned_malloc((size_t)sz, (size_t)align);
-#else
+  const size_t n = (size_t)sz;
+  if (!crt_charge(n)) return nullptr;
   void* p = nullptr;
-  if (posix_memalign(&p, (size_t)align, sz ? (size_t)sz : 1) != 0) return nullptr;
-  return p;
+#ifdef _WIN32
+  p = _aligned_malloc(n ? n : 1, (size_t)align);
+#else
+  if (posix_memalign(&p, (size_t)align, n ? n : 1) != 0) p = nullptr;
 #endif
+  if (!p) {
+    crt_discharge(n);
+    return nullptr;
+  }
+  crt_track(p, n);
+  return p;
 }
 
 void TRT_GUEST_ABI crt__aligned_free(void* p) {
+  if (!p) return;
+  size_t n = 0;
+  if (crt_untrack(p, &n)) crt_discharge(n);
 #ifdef _WIN32
   _aligned_free(p);
 #else
@@ -608,7 +718,13 @@ char* TRT_GUEST_ABI crt_strrchr(const char* s, i32 c) { return (char*)strrchr(s,
 char* TRT_GUEST_ABI crt_strstr(const char* h, const char* n) { return (char*)strstr(h, n); }
 char* TRT_GUEST_ABI crt_strpbrk(const char* s, const char* a) { return (char*)strpbrk(s, a); }
 u64   TRT_GUEST_ABI crt_strcspn(const char* s, const char* r) { return (u64)strcspn(s, r); }
-char* TRT_GUEST_ABI crt__strdup(const char* s) { return s ? strdup(s) : nullptr; }
+char* TRT_GUEST_ABI crt__strdup(const char* s) {
+  if (!s) return nullptr;
+  const size_t n = strlen(s) + 1;
+  char* p = (char*)crt_malloc((u64)n);  // charged + tracked (freed via free)
+  if (p) memcpy(p, s, n);
+  return p;
+}
 char* TRT_GUEST_ABI crt_strerror(i32 e) { return strerror(e); }
 
 i64   TRT_GUEST_ABI crt_strtol(const char* s, char** end, i32 base) { return (i64)strtol(s, end, base); }
@@ -1317,7 +1433,7 @@ u16* TRT_GUEST_ABI crt__wgetcwd(u16* buf, i32 maxlen) {
   if (!n) return nullptr;
   if (!buf) {
     u64 need = (u64)n + 1;
-    u16* p = (u16*)malloc((size_t)need * 2);
+    u16* p = (u16*)crt_malloc(need * 2);  // charged + tracked
     if (p) memcpy(p, tmp, (size_t)need * 2);
     return p;
   }
@@ -1335,7 +1451,7 @@ char* TRT_GUEST_ABI crt__getcwd(char* buf, i32 maxlen) {
   u16_to_ascii(wtmp, tmp, sizeof(tmp));
   u32 len = (u32)strlen(tmp);
   if (!buf) {
-    char* p = (char*)malloc((size_t)len + 1);
+    char* p = (char*)crt_malloc((u64)len + 1);  // charged + tracked
     if (p) memcpy(p, tmp, (size_t)len + 1);
     return p;
   }
@@ -2277,7 +2393,7 @@ u16* TRT_GUEST_ABI crt__wcslwr(u16* s) {
 u16* TRT_GUEST_ABI crt__wcsdup(const u16* s) {
   if (!s) return nullptr;
   const size_t bytes = (size_t)(crt_wcslen(s) + 1) * 2u;
-  u16* p = (u16*)malloc(bytes);
+  u16* p = (u16*)crt_malloc((u64)bytes);  // charged + tracked
   if (p) memcpy(p, s, bytes);
   return p;
 }

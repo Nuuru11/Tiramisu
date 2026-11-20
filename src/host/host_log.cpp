@@ -24,6 +24,32 @@ std::mutex g_ring_mu;
 std::deque<std::string> g_ring;
 constexpr unsigned k_ring_max = 200;
 
+// On-disk log rotation: the log used to grow without bound (a wedged app
+// spamming the log fills LocalState) and log_line had no lock around the
+// FILE* writes (interleaved lines from the web + guest threads). 8 MB per
+// file, 2 backups = at most 24 MB of log on disk.
+std::mutex g_file_mu;
+long long g_bytes_written = 0;
+constexpr long long k_log_max_bytes = 8ll * 1024 * 1024;
+
+// Rotate the log file. Caller must hold g_file_mu. Closes the current
+// file, shifts .1 -> .2 and .log -> .1, opens a fresh .log.
+void rotate_locked() {
+  if (g_log) { fclose(g_log); g_log = nullptr; }
+  const std::string base = g_local_state + "\\tiramisu.log";
+  remove((base + ".2").c_str());
+  rename((base + ".1").c_str(), (base + ".2").c_str());
+  rename(base.c_str(), (base + ".1").c_str());
+  g_log = fopen(base.c_str(), "a");
+  g_bytes_written = 0;
+  if (g_log) {
+    const char* marker = "---- log rotated ----\n";
+    fputs(marker, g_log);
+    fflush(g_log);
+    g_bytes_written += (long long)strlen(marker);
+  }
+}
+
 void ring_push(const char* line) {
   std::lock_guard<std::mutex> lk(g_ring_mu);
   std::string s = line;
@@ -45,8 +71,21 @@ std::string log_open(const std::string& package_path) {
   // WinRT paths are plain NT paths (C:\Data\Users\...\LocalState)
   g_local_state.assign(ws.begin(), ws.end());
   const std::string path = g_local_state + "\\tiramisu.log";
-  if (g_log) fclose(g_log);
-  g_log = fopen(path.c_str(), "a");
+  {
+    std::lock_guard<std::mutex> lk(g_file_mu);
+    if (g_log) fclose(g_log);
+    g_log = fopen(path.c_str(), "a");
+    g_bytes_written = 0;
+    if (g_log) {
+      // seed the counter from the existing file size so a log that
+      // already grew past the cap rotates at open instead of growing
+      // without bound
+      _fseeki64(g_log, 0, SEEK_END);
+      long long sz = _ftelli64(g_log);
+      if (sz > 0) g_bytes_written = sz;
+      if (g_bytes_written >= k_log_max_bytes) rotate_locked();
+    }
+  }
   log_line("---- tiramisu session ----");
   return g_local_state;
 }
@@ -54,10 +93,13 @@ std::string log_open(const std::string& package_path) {
 void log_line(const char* line) {
   if (!line) return;
   ring_push(line);
+  std::lock_guard<std::mutex> lk(g_file_mu);
   if (!g_log) return;
   fputs(line, g_log);
   fputc('\n', g_log);
   fflush(g_log);
+  g_bytes_written += (long long)strlen(line) + 1;
+  if (g_bytes_written >= k_log_max_bytes) rotate_locked();
 }
 
 void log_get_recent(char* out, size_t cap) {
@@ -82,6 +124,9 @@ size_t log_read_disk_tail(char* out, size_t cap) {
   if (!out || !cap) return 0;
   out[0] = 0;
   if (g_local_state.empty()) return 0;
+  // serialize with log_line's writes and with rotation (which renames
+  // the file out from under a concurrent reader)
+  std::lock_guard<std::mutex> lk(g_file_mu);
   const std::string path = g_local_state + "\\\\tiramisu.log";
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return 0;
@@ -98,8 +143,10 @@ size_t log_read_disk_tail(char* out, size_t cap) {
 }
 
 void log_close() {
+  std::lock_guard<std::mutex> lk(g_file_mu);
   if (g_log) fclose(g_log);
   g_log = nullptr;
+  g_bytes_written = 0;
 }
 
 } // namespace longan

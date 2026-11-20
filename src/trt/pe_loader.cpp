@@ -18,6 +18,14 @@
 #include <vector>
 #include <string>
 
+// 5 GB memory-budget governor (bridge_membudget.cpp): a mapped PE image is
+// SizeOfImage bytes of real committed memory — charge it (commit + VA) at
+// map time, discharge at unmap / load failure.
+extern "C" int trt_mem_budget_charge_commit(u64 bytes);
+extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
+extern "C" int trt_mem_budget_charge_va(u64 bytes);
+extern "C" void trt_mem_budget_discharge_va(u64 bytes);
+
 #if defined(__has_feature)
 #  if __has_feature(address_sanitizer)
 extern "C" void __asan_unpoison_memory_region(const volatile void*, size_t)
@@ -254,6 +262,8 @@ int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
   logf_be(be, line);
   if (img && img->base && be) {
     be->release(img->base, (size_t)img->size_of_image);
+    trt_mem_budget_discharge_commit(img->size_of_image);
+    trt_mem_budget_discharge_va(img->size_of_image);
     img->base = nullptr;
   }
   return code;
@@ -349,6 +359,18 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
   if (!base)
     return fail(&img, be, can_relocate ? TRT_ERR_ALLOC : TRT_ERR_NO_BASE,
                 "VirtualAlloc/map failed");
+  // the image is real committed memory: charge SizeOfImage (commit + VA)
+  // to the guest budget; a refusal releases the reservation and fails the
+  // load with a named budget error instead of an uncharged image
+  if (trt_mem_budget_charge_va(size_of_image) != 0) {
+    be->release(base, (size_t)size_of_image);
+    return fail(&img, be, TRT_ERR_ALLOC, "VA budget refused image");
+  }
+  if (trt_mem_budget_charge_commit(size_of_image) != 0) {
+    trt_mem_budget_discharge_va(size_of_image);
+    be->release(base, (size_t)size_of_image);
+    return fail(&img, be, TRT_ERR_ALLOC, "memory budget refused image");
+  }
   memset(base, 0, (size_t)size_of_image);
 
   img.base = (u8*)base;
@@ -762,7 +784,11 @@ extern "C" int trt_seal_image(const trt_backend* be, trt_image* img) {
 
 extern "C" void trt_unmap(const trt_backend* be, trt_image* img) {
   if (!be || !img) return;
-  if (img->base) be->release(img->base, (size_t)img->size_of_image);
+  if (img->base) {
+    be->release(img->base, (size_t)img->size_of_image);
+    trt_mem_budget_discharge_commit(img->size_of_image);
+    trt_mem_budget_discharge_va(img->size_of_image);
+  }
   free(img);
 }
 
