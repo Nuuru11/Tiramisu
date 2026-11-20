@@ -259,12 +259,36 @@ u64 TRT_GUEST_ABI st_user_GetSteamID(void*, u64* hidden_sret) {
   if (hidden_sret) *hidden_sret = id;
   return id;
 }
+// ISteamUser slot 4: bool GetUserDataFolder(char* buf, int size).
+// Real Steam fills buf with the per-user data folder. The previous
+// steam_noop_zero returned false and left buf untouched, so games that
+// build save/config paths from it got an empty path.
+int TRT_GUEST_ABI st_user_GetUserDataFolder(void* self, char* buf, int size) {
+  const char* folder = "C:\\users\\player\\Saved Games";
+  int result = 0;
+  if (buf && size > 0) {
+    size_t n = strlen(folder);
+    if ((int)n >= size) n = (size_t)(size - 1);
+    memcpy(buf, folder, n);
+    buf[n] = '\0';
+    result = 1;
+  }
+  char line[192];
+  snprintf(line, sizeof(line), "trt: ISteamUser.GetUserDataFolder(self=%p buf=%p size=%d) -> %d",
+           self, (void*)buf, size, result);
+  trt_core_log(line);
+  return result;
+}
 const void* g_steam_user_vtbl[64] = {
     (const void*)&st_user_GetHSteamUser, // 0
     (const void*)&st_user_BLoggedOn,     // 1
     (const void*)&st_user_GetSteamID,    // 2
-    (const void*)&steam_noop_zero,       // 3
-    Z4, Z8, Z16, Z16, Z16,
+    (const void*)&steam_noop_zero,       // 3 TrackAppUsageEvent (void)
+    (const void*)&st_user_GetUserDataFolder, // 4 GetUserDataFolder
+    (const void*)&steam_noop_zero,       // 5 StartVoiceRecording (void)
+    (const void*)&steam_noop_zero,       // 6 StopVoiceRecording (void)
+    (const void*)&steam_noop_zero,       // 7 GetAvailableVoice
+    Z8, Z16, Z16, Z16,
 };
 fake_steam_iface g_steam_user_obj = {g_steam_user_vtbl};
 
@@ -298,12 +322,26 @@ const char* TRT_GUEST_ABI st_friends_GetPersonaName(void*) {
   return "TiramisuPlayer";
 }
 int TRT_GUEST_ABI st_friends_GetPersonaState(void*) { return 0; }
+// ISteamFriends slot 7: const char* GetFriendPersonaName(CSteamID).
+// Previously steam_noop_zero (NULL) - any caller passing the result to a
+// string function would fault on a null read.
+const char* TRT_GUEST_ABI st_friends_GetFriendPersonaName(void* self, u64 steam_id) {
+  char line[160];
+  snprintf(line, sizeof(line), "trt: ISteamFriends.GetFriendPersonaName(self=%p friend=%016llx) -> TiramisuPlayer",
+           self, (unsigned long long)steam_id);
+  trt_core_log(line);
+  return "TiramisuPlayer";
+}
 const void* g_steam_friends_vtbl[64] = {
     (const void*)&st_friends_GetPersonaName,  // 0 GetPersonaName
     (const void*)&steam_noop_zero,            // 1 SetPersonaName
     (const void*)&st_friends_GetPersonaState, // 2 GetPersonaState
     (const void*)&steam_noop_zero,            // 3 GetFriendCount
-    Z4, Z8, Z16, Z16, Z16,
+    (const void*)&steam_noop_zero,            // 4 GetFriendByIndex
+    (const void*)&steam_noop_zero,            // 5 GetFriendRelationship
+    (const void*)&steam_noop_zero,            // 6 GetFriendPersonaState
+    (const void*)&st_friends_GetFriendPersonaName, // 7 GetFriendPersonaName
+    Z8, Z16, Z16, Z16,
 };
 fake_steam_iface g_steam_friends_obj = {g_steam_friends_vtbl};
 
