@@ -55,11 +55,52 @@ spike tested). The clone is never modified by the build.
 
 - FNA's platform backend is chosen by env var: `FNA_PLATFORM_BACKEND=SDL2`
   (default is SDL3, which is not installed on mineplex). The harness test
-  sets it. The next step (Tiramisu_FNAPlatform backend) replaces SDL
-  entirely on the console.
+  sets it. The console backend is Tiramisu_FNAPlatform (below).
 - The `.dll.config` maps `FNA3D`/`FAudio`/`SDL2`/`SDL3` to their Linux
   `.so.0` names; the harness puts the FNA3D/FAudio out dirs on
   `LD_LIBRARY_PATH`.
+
+## Tiramisu_FNAPlatform backend (Path B step 2)
+
+`Tiramisu_FNAPlatform.cs` (this directory) replaces SDL windowing/input
+with the Tiramisu host surface: the CoreWindow for windowing, the trt
+input layer (CoreWindow keyboard/pointer + XInput pads) for input. It is
+compiled into the core by `build-fna.sh`, which also patches a *copy* of
+upstream `FNAPlatform.cs` (in `gen/`, via `FNAPlatform-tiramisu.patch`)
+to add the third dispatch branch; the `fna-src` clone is never modified.
+
+Selection (checked in this order by the patched dispatch):
+
+| Switch | Backend |
+|---|---|
+| `TIRAMISU_FNA_PLATFORM=1` or `FNA_PLATFORM_BACKEND=TIRAMISU` | Tiramisu (host surface) |
+| `FNA_PLATFORM_BACKEND=SDL2` | SDL2 (offline harness) |
+| otherwise | SDL3 (upstream default) |
+
+The managed run path selects it through `trt_mono_config.fna_platform`
+(`"tiramisu"` / `"sdl2"` / unset) in `src/trt/mono_host.{h,cpp}`; the
+host (`src/host/main.cpp`) sets `"tiramisu"` for console managed games.
+The backend reaches native code through Mono internal calls registered
+by `trt_mono_run` (`src/trt/fna_platform.{h,cpp}`) — no P/Invoke, no
+SDL. Outside the Tiramisu host the backend fails loudly in ProgramInit
+(internal calls unregistered) instead of limping.
+
+Headless mode (offline Linux harness): with no host window registered
+the backend still initializes and answers queries from host state
+(display size defaults to 1920x1080, no pads, no keys). A graphics
+device cannot be created headless (FNA3D needs a real surface); the
+full Celeste boot stays on the SDL2 backend offline
+(`tools/build-test.sh` section 45). The headless backend is covered by
+`tests/test_fna_platform.cpp` + `tests/probe_fna_platform.cs`
+(section 46): all 56 function-table entries populated and pointing at
+the Tiramisu backend, plus the event path (key/wheel/char/click fed
+through the native ring into Keyboard/Mouse/TextInput state).
+
+Console-verification-pending: real CoreWindow presentation and real
+XInput/GameInput state only exist on the console; nothing here claims
+them working until tested there. Named gaps (in the backend source):
+no on-screen keyboard, no trigger rumble (XInput has none), no
+microphone, no touch, no gyro/accel, no settable window title.
 
 ## Verification (spike values, 2026-11-20)
 

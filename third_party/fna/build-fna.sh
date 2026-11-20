@@ -15,6 +15,11 @@
 #     — FNA has no GamerServices namespace and Celeste has 0 references to
 #     it) are type-forwarder assemblies: [assembly: TypeForwardedTo] for
 #     every top-level public type of the real XNA assemblies.
+#   * Tiramisu backend (Path B step 2): FNAPlatform-tiramisu.patch adds a
+#     third dispatch branch (TIRAMISU_FNA_PLATFORM=1 or
+#     FNA_PLATFORM_BACKEND=TIRAMISU) to a COPY of FNAPlatform.cs in gen/,
+#     and Tiramisu_FNAPlatform.cs (host CoreWindow + host input, no SDL)
+#     is compiled into the core. SDL2/SDL3 backends are untouched.
 #
 # Outputs (kept in-tree): out/Microsoft.Xna.Framework{,.Graphics,.Game}.dll
 #   + out/Microsoft.Xna.Framework.dll.config (FNA's dllmap for FNA3D/FAudio/
@@ -49,7 +54,8 @@ if [[ "$needs_build" == 0 ]]; then
   done
   newer=$(find "$SRC/src" "$SRC/Makefile" "$here" \
     -not -path "$GEN/*" -not -path "$OUT/*" \
-    \( -name '*.cs' -o -name 'Makefile' -o -name '*.fxb' -o -name '*.txt' \) \
+    \( -name '*.cs' -o -name 'Makefile' -o -name '*.fxb' -o -name '*.txt' \
+       -o -name '*.patch' \) \
     -newer "$newest_out" -print -quit 2>/dev/null || true)
   [[ -n "$newer" ]] && needs_build=1
 fi
@@ -77,7 +83,21 @@ echo "fna: upstream mcs source files: $src_count"
 mcs_cmd=$(printf '%s' "$mcs_cmd" | sed "s|-out:bin/Release/FNA.dll|-out:$CORE|")
 mcs_cmd=$(printf '%s' "$mcs_cmd" | sed 's|src/Properties/AssemblyInfo.cs||')
 mcs_cmd="$mcs_cmd $here/AssemblyInfo.core.cs"
-echo "fna: building Microsoft.Xna.Framework.dll ..."
+# Tiramisu backend (Path B step 2): upstream FNAPlatform.cs only
+# dispatches SDL2/SDL3. Patch a COPY in gen/ (the clone is never
+# modified), swap it into the compile, and append the backend itself.
+# The dispatch selects Tiramisu when TIRAMISU_FNA_PLATFORM=1 or
+# FNA_PLATFORM_BACKEND=TIRAMISU; SDL2/SDL3 are untouched otherwise.
+command -v patch >/dev/null || { echo "ERROR: patch not found" >&2; exit 2; }
+PATCHED_PLATFORM="$GEN/FNAPlatform.cs"
+cp "$SRC/src/FNAPlatform/FNAPlatform.cs" "$PATCHED_PLATFORM"
+patch "$PATCHED_PLATFORM" < "$here/FNAPlatform-tiramisu.patch" \
+  || { echo "ERROR: FNAPlatform dispatch patch failed to apply" >&2; exit 2; }
+grep -q 'Tiramisu_FNAPlatform' "$PATCHED_PLATFORM" \
+  || { echo "ERROR: patched FNAPlatform.cs lacks the Tiramisu branch" >&2; exit 2; }
+mcs_cmd=$(printf '%s' "$mcs_cmd" | sed "s|src/FNAPlatform/FNAPlatform.cs|$PATCHED_PLATFORM|")
+mcs_cmd="$mcs_cmd $here/Tiramisu_FNAPlatform.cs"
+echo "fna: building Microsoft.Xna.Framework.dll (+ Tiramisu backend) ..."
 # shellcheck disable=SC2086
 eval "$mcs_cmd"
 ls -l "$CORE"

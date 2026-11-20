@@ -52,7 +52,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
-  src/trt/bridge_membudget.cpp src/trt/mono_host.cpp \
+  src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
   src/trt/fna3d_host.cpp \
   third_party/fna3d-src/src/FNA3D.c \
   third_party/fna3d-src/src/FNA3D_Driver_D3D11.c \

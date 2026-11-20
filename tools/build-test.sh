@@ -824,3 +824,31 @@ if [[ -f "$MONO_CELESTE_EXE" ]]; then
 else
   echo "SKIP mono/celeste: no game at $MONO_CELESTE_EXE"
 fi
+
+# --- 46. FNA platform backend: Tiramisu_FNAPlatform initializes headless
+#         under embedded Mono and reports a fully populated function
+#         table (Path B step 2). The probe needs no game files and no
+#         display (headless by design); it runs twice, once per backend
+#         selection path (trt_mono_config.fna_platform, then the raw
+#         TIRAMISU_FNA_PLATFORM env var). SKIP when mcs or libmono is
+#         missing. Section 45 above still proves the SDL2 path. ---
+MONO_LIB="$here/third_party/mono/usr/lib/libmono-2.0.so.1"
+if command -v mcs >/dev/null && [[ -f "$MONO_LIB" ]]; then
+  bash third_party/build-fna-stack.sh
+  mcs -out:"$out/probe_fna_platform.exe" \
+    -r:"$here/third_party/fna/out/Microsoft.Xna.Framework.dll" \
+    tests/probe_fna_platform.cs
+  clang++ -std=c++20 -O2 -Wall -no-pie \
+    tests/test_fna_platform.cpp "$out/libtrt.a" -ldl -lpthread \
+    -o "$out/test_fna_platform"
+  # FNA's dllmap resolves FNA3D/FAudio by soname for the log hook; the
+  # probe itself never creates a graphics device.
+  LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$out/test_fna_platform" "$out/probe_fna_platform.exe" \
+    "$here/third_party/fna/out" "$MONO_LIB" config
+  LD_LIBRARY_PATH="$here/third_party/fna3d/out:$here/third_party/faudio/out${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  "$out/test_fna_platform" "$out/probe_fna_platform.exe" \
+    "$here/third_party/fna/out" "$MONO_LIB" env
+else
+  echo "SKIP fna/platform: mcs or libmono missing"
+fi

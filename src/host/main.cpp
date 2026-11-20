@@ -13,6 +13,7 @@
 #include "settings.h"
 #include "../trt/trt.h"
 #include "../trt/mono_host.h"
+#include "../trt/fna_platform.h"
 #include "../trt/bridge_res.h"
 #include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
@@ -1184,6 +1185,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     trt_mono_config mcfg = {};
     mcfg.exe_path = exe_path.c_str();
     mcfg.log = [](const char* l) { longan::log_line(l); };
+    // Console managed games use the Tiramisu FNA backend (host
+    // CoreWindow + host input), never SDL.
+    mcfg.fna_platform = "tiramisu";
     r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
     if (r.map_rc != TRT_OK) {
       strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
@@ -1529,6 +1533,10 @@ struct tiramisu_host
 
   void SetWindow(CoreWindow const& window) {
     m_window = window;
+    // The FNA backend renders into this CoreWindow: hand its ABI
+    // pointer to the native FNA layer (FNA's CreateWindow returns it;
+    // the FNA3D D3D11 driver consumes it later).
+    trt_fna_set_window_handle((void*)winrt::get_abi(window));
     const auto sc = longan::swapchain_create(window);
     char line[256];
     snprintf(line, sizeof(line),
@@ -1621,6 +1629,8 @@ struct tiramisu_host
         ws2u8(winrt::Windows::Storage::ApplicationData::Current()
                   .LocalFolder()
                   .Path());
+    // Managed (FNA) games save under LocalState.
+    trt_fna_set_storage_root(g_local_state.c_str());
     g_games_dir = g_local_state + "\\games";
     longan::log_open(install);
     char line[256];

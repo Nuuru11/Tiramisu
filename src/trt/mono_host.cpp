@@ -9,7 +9,15 @@
 // Celeste's Engine static constructor dereferences it (NRE in
 // Monocle.Engine..cctor). The AppDomain base directory is set to the
 // game's directory so content and relative paths resolve like the CLI.
+//
+// FNA PLATFORM: before Main runs, trt_mono_run applies
+// cfg->fna_platform as environment variables (the FNA dispatch reads
+// them in its static constructor) and registers the Tiramisu backend's
+// native internal calls (fna_platform.cpp) with the runtime, so the
+// backend's ProgramInit finds its native bridge.
 #include "mono_host.h"
+
+#include "fna_platform.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -99,6 +107,7 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
 
 #else
 // ---- Linux: real embedding via dlopen'd libmono-2.0 ----
+#include <cstdlib>  // setenv/unsetenv (FNA platform selection)
 #include <dlfcn.h>
 #include <unistd.h>
 
@@ -138,6 +147,7 @@ struct MonoApi {
   MONO_FN(mono_assembly_get_image);
   MONO_FN(mono_jit_exec);
   MONO_FN(mono_dllmap_insert);
+  MONO_FN(mono_add_internal_call);
 };
 #undef MONO_FN
 
@@ -208,6 +218,7 @@ bool resolve_api(char* detail, size_t detail_cap) {
   RESOLVE(api, mono_assembly_get_image);
   RESOLVE(api, mono_jit_exec);
   RESOLVE(api, mono_dllmap_insert);
+  RESOLVE(api, mono_add_internal_call);
   return true;
 }
 #undef RESOLVE
@@ -222,6 +233,29 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   if (!cfg || !cfg->exe_path || !cfg->exe_path[0])
     return fail("trt_mono_run: no exe_path");
   if (cfg->log) g_log = cfg->log;
+
+  // FNA platform selection: applied as env vars before Main runs (the
+  // FNA dispatch reads them in its static constructor). An unknown
+  // value fails the run: silently running the wrong backend would
+  // present a headless game as working.
+  if (cfg->fna_platform && cfg->fna_platform[0]) {
+    if (std::strcmp(cfg->fna_platform, "tiramisu") == 0) {
+      ::setenv("TIRAMISU_FNA_PLATFORM", "1", 1);
+      ::setenv("FNA_PLATFORM_BACKEND", "TIRAMISU", 1);
+      mono_log("fna platform: tiramisu (host surface + host input)");
+    } else if (std::strcmp(cfg->fna_platform, "sdl2") == 0) {
+      ::unsetenv("TIRAMISU_FNA_PLATFORM");
+      ::setenv("FNA_PLATFORM_BACKEND", "SDL2", 1);
+      mono_log("fna platform: sdl2");
+    } else {
+      char detail[512];
+      std::snprintf(detail, sizeof(detail),
+                    "unknown fna_platform \"%s\" (want \"tiramisu\" or "
+                    "\"sdl2\")",
+                    cfg->fna_platform);
+      return fail(detail);
+    }
+  }
 
   char detail[512];
   if (!load_libmono(cfg->libmono_path, detail, sizeof(detail)))
@@ -262,6 +296,15 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
       cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
   if (!domain) return fail("mono_jit_init returned NULL");
 
+  // Register the Tiramisu backend's native internal calls now, before
+  // any managed code runs: the FNA static constructor (inside Main)
+  // may select the Tiramisu backend, and its ProgramInit pings the
+  // bridge. Registered unconditionally — the bindings are inert unless
+  // managed code calls them, so the SDL2 path is unaffected.
+  trt_fna_register_internal_calls(
+      (trt_fna_add_internal_call_fn)api.p_mono_add_internal_call);
+  mono_log("fna platform: native internal calls registered");
+
   // Set the AppDomain base directory to the game's directory and apply
   // the game's .config file if it has one (Celeste.exe.config pins the
   // v4.0/.NET 4.5 runtime). Must happen before the main assembly is
@@ -284,12 +327,16 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     }
     char config_path[1120];
     std::snprintf(config_path, sizeof(config_path), "%s.config", cfg->exe_path);
-    const char* config_file =
-        (::access(config_path, F_OK) == 0) ? config_path : nullptr;
-    api.p_mono_domain_set_config(domain, game_dir, config_file);
+    // Always pass the .config path, like the mono CLI: this Mono
+    // build's mono_domain_set_config strlen()s it unconditionally, so
+    // NULL segfaults (found by the FNA probe, which ships no .config;
+    // Celeste.exe.config exists, so the Celeste path never hit it).
+    // Mono ignores a missing file.
+    const bool has_config = (::access(config_path, F_OK) == 0);
+    api.p_mono_domain_set_config(domain, game_dir, config_path);
     char line[1200];
     std::snprintf(line, sizeof(line), "domain base dir: %s%s", game_dir,
-                  config_file ? " (exe .config applied)" : "");
+                  has_config ? " (exe .config applied)" : "");
     mono_log(line);
   }
 

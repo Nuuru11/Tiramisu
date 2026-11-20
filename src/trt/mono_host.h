@@ -17,6 +17,14 @@
 // Mono-on-UWP is a later step (Unity proves Mono runs on Xbox; the work is
 // a UWP Mono build + static linking, not a redesign of this file).
 //
+// FNA PLATFORM: managed XNA games pick their windowing/input backend
+// through trt_mono_config.fna_platform ("tiramisu" = the host surface +
+// host input, "sdl2" = SDL2 windowing for the offline harness). The
+// selection is applied as environment variables before Main runs, and
+// the Tiramisu backend's native internal calls (src/trt/fna_platform.cpp)
+// are registered with the runtime on every run, so a game that selects
+// the Tiramisu backend always finds its native bridge.
+//
 // One run per process: Mono does not support re-initialisation, and
 // trt_mono_run blocks until Main returns.
 #ifndef TIRAMISU_MONO_HOST_H
@@ -57,6 +65,16 @@ typedef struct trt_mono_config {
                                 // it sidesteps JIT/W^X concerns entirely
                                 // for a game this light.
   const char* domain_name;      // NULL = "tiramisu-mono"
+  const char* fna_platform;     // FNA windowing/input backend for XNA
+                                // games: "tiramisu" (host CoreWindow +
+                                // host input; the console backend),
+                                // "sdl2" (SDL2 windowing; the offline
+                                // harness default), NULL/"" = leave the
+                                // environment alone (whatever FNA picks
+                                // from FNA_PLATFORM_BACKEND, default
+                                // SDL3). Applied as env vars before Main
+                                // runs; an unknown value fails the run
+                                // with TRT_ERR_MONO (fail-visible).
   void (*log)(const char* line);  // NULL = stderr with a "mono: " prefix
 } trt_mono_config;
 

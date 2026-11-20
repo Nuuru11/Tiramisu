@@ -1,0 +1,106 @@
+--- a/src/FNAPlatform/FNAPlatform.cs
++++ b/src/FNAPlatform/FNAPlatform.cs
+@@ -38,7 +38,21 @@
+ 
+ 			bool useSDL2 = Environment.GetEnvironmentVariable("FNA_PLATFORM_BACKEND") == "SDL2";
+ 
+-			if (!useSDL2)
++			/* Tiramisu: the host-surface backend (third_party/fna/
++			 * Tiramisu_FNAPlatform.cs), selected by the Tiramisu config
++			 * switch or the FNA-style backend name. It wins over the
++			 * SDL2/SDL3 choice. Patched in by build-fna.sh; the
++			 * upstream clone is never modified.
++			 */
++			bool useTiramisu =
++				Environment.GetEnvironmentVariable("TIRAMISU_FNA_PLATFORM") == "1" ||
++				Environment.GetEnvironmentVariable("FNA_PLATFORM_BACKEND") == "TIRAMISU";
++
++			if (useTiramisu)
++			{
++				SetEnv = Tiramisu_FNAPlatform.SetEnv;
++			}
++			else if (!useSDL2)
+ 			{
+ 				SetEnv = SDL3_FNAPlatform.SetEnv;
+ 			}
+@@ -113,7 +127,65 @@
+ 				Environment.GetEnvironmentVariable("FNA_SDL2_FORCE_BASE_PATH")
+ 			);
+ 
+-			if (!useSDL2)
++			if (useTiramisu)
++			{
++				Malloc =			Tiramisu_FNAPlatform.Malloc;
++				Free =				Tiramisu_FNAPlatform.Free;
++				CreateWindow =			Tiramisu_FNAPlatform.CreateWindow;
++				DisposeWindow =			Tiramisu_FNAPlatform.DisposeWindow;
++				ApplyWindowChanges =		Tiramisu_FNAPlatform.ApplyWindowChanges;
++				ScaleForWindow =		Tiramisu_FNAPlatform.ScaleForWindow;
++				GetWindowBounds =		Tiramisu_FNAPlatform.GetWindowBounds;
++				GetWindowResizable =		Tiramisu_FNAPlatform.GetWindowResizable;
++				SetWindowResizable =		Tiramisu_FNAPlatform.SetWindowResizable;
++				GetWindowBorderless =		Tiramisu_FNAPlatform.GetWindowBorderless;
++				SetWindowBorderless =		Tiramisu_FNAPlatform.SetWindowBorderless;
++				SetWindowTitle =		Tiramisu_FNAPlatform.SetWindowTitle;
++				IsScreenKeyboardShown =		Tiramisu_FNAPlatform.IsScreenKeyboardShown;
++				RegisterGame =			Tiramisu_FNAPlatform.RegisterGame;
++				UnregisterGame =		Tiramisu_FNAPlatform.UnregisterGame;
++				PollEvents =			Tiramisu_FNAPlatform.PollEvents;
++				GetGraphicsAdapters =		Tiramisu_FNAPlatform.GetGraphicsAdapters;
++				GetCurrentDisplayMode =		Tiramisu_FNAPlatform.GetCurrentDisplayMode;
++				GetMonitorHandle =		Tiramisu_FNAPlatform.GetMonitorHandle;
++				GetKeyFromScancode =		Tiramisu_FNAPlatform.GetKeyFromScancode;
++				IsTextInputActive =		Tiramisu_FNAPlatform.IsTextInputActive;
++				StartTextInput =		Tiramisu_FNAPlatform.StartTextInput;
++				StopTextInput =			Tiramisu_FNAPlatform.StopTextInput;
++				SetTextInputRectangle =		Tiramisu_FNAPlatform.SetTextInputRectangle;
++				GetMouseState =			Tiramisu_FNAPlatform.GetMouseState;
++				SetMousePosition =		Tiramisu_FNAPlatform.SetMousePosition;
++				OnIsMouseVisibleChanged =	Tiramisu_FNAPlatform.OnIsMouseVisibleChanged;
++				GetRelativeMouseMode =		Tiramisu_FNAPlatform.GetRelativeMouseMode;
++				SetRelativeMouseMode =		Tiramisu_FNAPlatform.SetRelativeMouseMode;
++				GetGamePadCapabilities =	Tiramisu_FNAPlatform.GetGamePadCapabilities;
++				GetGamePadState =		Tiramisu_FNAPlatform.GetGamePadState;
++				SetGamePadVibration =		Tiramisu_FNAPlatform.SetGamePadVibration;
++				SetGamePadTriggerVibration =	Tiramisu_FNAPlatform.SetGamePadTriggerVibration;
++				GetGamePadGUID =		Tiramisu_FNAPlatform.GetGamePadGUID;
++				SetGamePadLightBar =		Tiramisu_FNAPlatform.SetGamePadLightBar;
++				GetGamePadGyro = 		Tiramisu_FNAPlatform.GetGamePadGyro;
++				GetGamePadAccelerometer =	Tiramisu_FNAPlatform.GetGamePadAccelerometer;
++				GetStorageRoot =		Tiramisu_FNAPlatform.GetStorageRoot;
++				GetDriveInfo =			Tiramisu_FNAPlatform.GetDriveInfo;
++				ReadFileToPointer =		Tiramisu_FNAPlatform.ReadFileToPointer;
++				FreeFilePointer =		Tiramisu_FNAPlatform.FreeFilePointer;
++				ShowRuntimeError =		Tiramisu_FNAPlatform.ShowRuntimeError;
++				GetMicrophones =		Tiramisu_FNAPlatform.GetMicrophones;
++				GetMicrophoneSamples =		Tiramisu_FNAPlatform.GetMicrophoneSamples;
++				GetMicrophoneQueuedBytes =	Tiramisu_FNAPlatform.GetMicrophoneQueuedBytes;
++				StartMicrophone =		Tiramisu_FNAPlatform.StartMicrophone;
++				StopMicrophone =		Tiramisu_FNAPlatform.StopMicrophone;
++				GetTouchCapabilities =		Tiramisu_FNAPlatform.GetTouchCapabilities;
++				UpdateTouchPanelState =		Tiramisu_FNAPlatform.UpdateTouchPanelState;
++				GetNumTouchFingers =		Tiramisu_FNAPlatform.GetNumTouchFingers;
++				SupportsOrientationChanges =	Tiramisu_FNAPlatform.SupportsOrientationChanges;
++				NeedsPlatformMainLoop = 	Tiramisu_FNAPlatform.NeedsPlatformMainLoop;
++				RunPlatformMainLoop =		Tiramisu_FNAPlatform.RunPlatformMainLoop;
++				WrapWindow =			Tiramisu_FNAPlatform.WrapWindow;
++				UnwrapWindow =			Tiramisu_FNAPlatform.UnwrapWindow;
++			}
++			else if (!useSDL2)
+ 			{
+ 				Malloc =			SDL3_FNAPlatform.Malloc;
+ 				Free =				SDL3.SDL.SDL_free;
+@@ -232,7 +304,12 @@
+ 
+ 			FNALoggerEXT.Initialize();
+ 
+-			if (!useSDL2)
++			if (useTiramisu)
++			{
++				AppDomain.CurrentDomain.ProcessExit += Tiramisu_FNAPlatform.ProgramExit;
++				TitleLocation = Tiramisu_FNAPlatform.ProgramInit(args);
++			}
++			else if (!useSDL2)
+ 			{
+ 				AppDomain.CurrentDomain.ProcessExit += SDL3_FNAPlatform.ProgramExit;
+ 				TitleLocation = SDL3_FNAPlatform.ProgramInit(args);
