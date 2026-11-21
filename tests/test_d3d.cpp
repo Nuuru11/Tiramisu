@@ -145,6 +145,29 @@ extern "C" void* g_fake_adapter;
 // generic stub: every SDK slot returns S_OK; the interesting ones are below
 extern "C" TRT_GUEST_ABI int fake_generic_hr(void*, void*, void*, void*) { return 0; }
 
+static u32 g_requested_swapchain_format;
+static u32 g_requested_swapchain_buffers;
+static unsigned g_prepare_presents;
+static int TRT_GUEST_ABI get_alternate_backbuffer(u32 index, const void*, void** out) {
+  if (!out || index != 0) return (int)0x887a0001u;
+  *out = g_fake_rtv;
+  return 0;
+}
+static void TRT_GUEST_ABI prepare_present() {
+  ++g_prepare_presents;
+}
+static int g_swapchain_format_result;
+static int TRT_GUEST_ABI set_swapchain_format(u32 format, u32 buffer_count) {
+  g_requested_swapchain_format = format;
+  g_requested_swapchain_buffers = buffer_count;
+  return g_swapchain_format_result;
+}
+
+static unsigned g_added_refs;
+extern "C" TRT_GUEST_ABI u32 fake_AddRef(void*) {
+  return ++g_added_refs;
+}
+
 // --- device ---
 extern "C" TRT_GUEST_ABI int fake_dev_CreateRenderTargetView(void* self, void* back,
                                                void* desc, void** out) {
@@ -162,7 +185,7 @@ extern "C" TRT_GUEST_ABI int fake_dev_GetImmediateContext(void* self, void** out
 // ID3D11Device: 3 (IUnknown) + 40 own methods = 43 slots
 const void* g_dev_vtbl[43] = {
     [0] = (const void*)&fake_generic_hr,   // QueryInterface
-    [1] = (const void*)&fake_generic_hr,   // AddRef
+    [1] = (const void*)&fake_AddRef,   // AddRef
     [2] = (const void*)&fake_generic_hr,   // Release
     [3] = (const void*)&fake_generic_hr,   // CreateBuffer
     [4] = (const void*)&fake_generic_hr,   // CreateTexture1D
@@ -219,7 +242,7 @@ extern "C" TRT_GUEST_ABI void fake_ctx_IASetPrimitiveTopology(void*, u32) {}
 // ID3D11DeviceContext: 3 + 112 = 115 slots
 const void* g_ctx_vtbl[115] = {
     [0] = (const void*)&fake_generic_hr,
-    [1] = (const void*)&fake_generic_hr,
+    [1] = (const void*)&fake_AddRef,
     [2] = (const void*)&fake_generic_hr,
     [9] = (const void*)&fake_ctx_PSSetShader,           // PSSetShader
     [11] = (const void*)&fake_ctx_VSSetShader,          // VSSetShader
@@ -245,7 +268,7 @@ extern "C" TRT_GUEST_ABI int fake_sc_Present(void* self, u32 sync, u32 flags) {
 // IDXGISwapChain: 3 + 15 = 18 slots
 const void* g_sc_vtbl[18] = {
     [0] = (const void*)&fake_generic_hr,
-    [1] = (const void*)&fake_generic_hr,
+    [1] = (const void*)&fake_AddRef,
     [2] = (const void*)&fake_generic_hr,
     [8] = (const void*)&fake_sc_Present,   // Present
     [9] = (const void*)&fake_sc_GetBuffer, // GetBuffer
@@ -388,10 +411,12 @@ int main(int argc, char** argv) {
 
   // {12_1, 11_1, 11_0} on an 11_0 host -> falls through to 11_0, S_OK
   const u32 req_modern[] = {0xc100, 0xb100, 0xb000};
+  g_added_refs = 0;
   int hr = trt_D3D11CreateDevice(nullptr, 1, nullptr, 0, req_modern, 3, 7,
                                  &dev, &got_level, &ctx);
   CHECK(hr == 0 && got_level == 0xb000,
         "request {12_1, 11_1, 11_0} on FL 11_0 host -> S_OK, FL 0xb000");
+  CHECK(g_added_refs == 2, "D3D11CreateDevice retains the returned device and context");
   CHECK(log_contains("d3d: guest requests FL 0xC100, host max 0xB000 - skipped") &&
             log_contains("d3d: guest requests FL 0xB100, host max 0xB000 - skipped"),
         "skipped levels each get the named skip log");
@@ -429,11 +454,14 @@ int main(int argc, char** argv) {
   // AndSwapChain: {11_1, 11_0} -> 11_0 + host swapchain
   void* sc = nullptr;
   const u32 req_asc[] = {0xb100, 0xb000};
+  g_added_refs = 0;
   got_level = 0;
   hr = trt_D3D11CreateDeviceAndSwapChain(nullptr, 1, nullptr, 0, req_asc, 2, 7,
                                          nullptr, &sc, &dev, &got_level, &ctx);
   CHECK(hr == 0 && got_level == 0xb000 && sc == g_fake_swapchain,
         "AndSwapChain {11_1, 11_0} -> S_OK, FL 0xb000, HOST swapchain");
+
+  CHECK(g_added_refs == 3, "AndSwapChain retains all returned COM objects");
 
   // AndSwapChain: {9_1} -> 9_1
   const u32 req_91[] = {0x9100};
@@ -472,6 +500,33 @@ int main(int argc, char** argv) {
             "IDXGISwapChain::ResizeBuffers handles fixed CoreWindow cleanly");
       CHECK(((pres_t)svt[8])(proxy_sc, 0, 0x200u) == 0 && g_presented == 2,
             "IDXGISwapChain::Present strips ALLOW_TEARING and forwards");
+      hooks.configure_d3d11_swapchain = &set_swapchain_format;
+      trt_gpu_set_hooks(&hooks);
+      const u32 rgba_srgb = 29;
+      CHECK(((rb_t)svt[13])(proxy_sc, 1, 1920, 1080, rgba_srgb, 0) == 0 &&
+                g_requested_swapchain_format == rgba_srgb &&
+                g_requested_swapchain_buffers == 1,
+            "D3D11 ResizeBuffers forwards the format and buffer count");
+      hooks.get_d3d11_backbuffer = &get_alternate_backbuffer;
+      hooks.prepare_d3d11_present = &prepare_present;
+      trt_gpu_set_hooks(&hooks);
+      using get_buffer_t = int (TRT_GUEST_ABI *)(void*, u32, const void*, void**);
+      void* guest_backbuffer = nullptr;
+      CHECK(((get_buffer_t)svt[9])(proxy_sc, 0, nullptr, &guest_backbuffer) == 0 &&
+                guest_backbuffer == g_fake_rtv,
+            "D3D11 GetBuffer uses the host-provided guest texture");
+      ((pres_t)svt[8])(proxy_sc, 0, 1u);
+      CHECK(g_prepare_presents == 0, "Present test skips the host copy");
+      ((pres_t)svt[8])(proxy_sc, 0, 0);
+      CHECK(g_prepare_presents == 1, "Present copies from the guest texture");
+      g_swapchain_format_result = (int)0x80070057u;
+      CHECK(((rb_t)svt[13])(proxy_sc, 2, 1920, 1080, rgba_srgb, 0) ==
+                g_swapchain_format_result,
+            "D3D11 ResizeBuffers preserves a host format error");
+      hooks.configure_d3d11_swapchain = nullptr;
+      hooks.get_d3d11_backbuffer = nullptr;
+      hooks.prepare_d3d11_present = nullptr;
+      trt_gpu_set_hooks(&hooks);
     }
   }
 

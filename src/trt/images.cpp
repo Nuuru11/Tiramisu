@@ -702,33 +702,30 @@ u64 trt_call_guest_img(void* fn, trt_image* img, u64 a, u64 b, u64 c, u64 d) {
 #if defined(_WIN32)
   // the host IS Win64: the guest ABI is the host ABI, except gs:[0x58]
   // (ThreadLocalStoragePointer) must point to THIS OS thread's guest .tls
-  // array with host's own _tls_index preserved inside the reserved host prefix.
+  // array with native static TLS pointers preserved in the reserved prefix.
   (void)img;
   void** guest_tls = trt_guest_tls_array();
-  struct Gs58Guard {
-    u64 saved;
-    bool active;
-    static inline volatile u64* teb_tls_slot() {
-      // NT_TIB64.Self at gs:[0x30] holds the flat linear address of the TEB;
-      // writing TEB+0x58 updates gs:[0x58] without relying on __writegsqword
-      // lowering under clang-cl MSVC ABI.
-      return (volatile u64*)((u8*)(uintptr_t)__readgsqword(0x30) + 0x58);
-    }
-    explicit Gs58Guard(void** gtls) : saved(0), active(false) {
-      if (!gtls) return;
-      saved = __readgsqword(0x58);
-      if (saved != (u64)(uintptr_t)gtls) {
-        trt_guest_tls_bind_host_slot((void**)(uintptr_t)saved, gtls);
-        *teb_tls_slot() = (u64)(uintptr_t)gtls;
-        active = true;
-      }
-    }
-    ~Gs58Guard() {
-      if (active) *teb_tls_slot() = saved;
-    }
-  } gs58_guard(guest_tls);
+  static thread_local void** native_tls = nullptr;
+  // NT_TIB.Self points at the actual TEB, even while its TLS vector is
+  // temporarily replaced. Use SEH cleanup since a guest can fault or exit
+  // through the host's nonlocal exit trap.
+  auto* const teb_tls_slot = reinterpret_cast<void** volatile*>(
+      __readgsqword(0x30) + 0x58);
+  void** const saved = *teb_tls_slot;
+  const bool outer = native_tls == nullptr;
+  if (outer) native_tls = saved;
+  const bool swapped = guest_tls && saved != guest_tls;
+  if (swapped) {
+    trt_guest_tls_bind_host_slots(native_tls, guest_tls);
+    *teb_tls_slot = guest_tls;
+  }
   using guest_fn = u64 (*)(u64, u64, u64, u64);
-  return ((guest_fn)fn)(a, b, c, d);
+  __try {
+    return reinterpret_cast<guest_fn>(fn)(a, b, c, d);
+  } __finally {
+    if (swapped) *teb_tls_slot = saved;
+    if (outer) native_tls = nullptr;
+  }
 #else
   // Linux test harness: the host is SysV, the guest is Win64. Marshal
   // rcx/rdx/r8/r9 and keep the stack correct for the Win64 callee:

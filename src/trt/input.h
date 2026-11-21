@@ -14,6 +14,8 @@ typedef struct trt_msg {
   u32 message;   // WM_*
   u64 wparam;
   i64 lparam;
+  u32 pointer_flags;
+  u32 pointer_change;
 } trt_msg;
 
 #define TRT_MSG_RING 512
@@ -43,6 +45,11 @@ void trt_input_pad_state_n(u32 index /*0..3*/, bool connected,
                            u16 buttons, u8 trigger_l, u8 trigger_r);
 void trt_input_display_size(int w, int h);             // GetSystemMetrics
 void trt_input_frame_begin();                          // clears per-frame bits
+void trt_input_release_all(void);
+bool trt_cursor_snapshot(int* x, int* y);
+int trt_input_show_cursor(bool show);
+void trt_input_set_cursor_shape(bool visible);
+void trt_input_reset_cursor_mode(bool force_visible);
 void trt_set_cursor_visible(bool v);                   // ShowCursor hook
 
 // ---- guest side (user32 bridge) ----
@@ -70,12 +77,27 @@ u16   trt_key_scan(u16 vk);                            // last scan code per VK
 // raw input (the layer most PC engines actually read)
 bool trt_raw_register(const void* devices, u32 count); // RAWINPUTDEVICE[]
 // hRawInput handles handed out through WM_INPUT lparams
-bool trt_raw_blob(u64 hraw, const u8** blob, u32* size);
+bool trt_raw_copy(u64 handle, u8 out[48], u32* size);
+u32 trt_raw_read_buffer(void* out, u32* size);
 
 // ---- message queue ----
+struct trt_mouse_pointer {
+  int x, y;
+  u32 frame, flags, time, change;
+  i32 wheel;
+  u32 key_states;
+  u64 window;
+};
+void trt_input_enable_mouse_pointer(bool enable);
+bool trt_input_mouse_pointer_enabled(void);
+void trt_input_accept_pointer(const trt_msg* message, u64 window, u32 time);
+bool trt_input_get_mouse_pointer(u32 id, trt_mouse_pointer* out);
+
 bool trt_msg_post(u32 message, u64 wparam, i64 lparam);
 bool trt_msg_peek(trt_msg* out, bool remove);
+bool trt_msg_peek_range(trt_msg* out, u32 minimum, u32 maximum, bool remove);
 bool trt_msg_pending();
+unsigned trt_msg_count(void);  // diagnostic: current ring depth
 
 #ifdef __cplusplus
 }

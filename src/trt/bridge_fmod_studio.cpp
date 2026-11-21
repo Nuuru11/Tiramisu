@@ -41,6 +41,15 @@
 //     submits (already-queued ~1s plays out) and 3D pan is attenuation
 //     only. Same limitation as the core FMOD bridge.
 #include "bridge_fmod_studio.h"
+#include "trt_trace.h"
+
+#if defined(_WIN32)
+// WinRT MemoryManager for the bank-load memory log (patch 07). UWP
+// only: the Linux harness has no WinRT (its branch logs PCM bytes
+// only, below).
+#include <winrt/base.h>  // winrt::hresult_error
+#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage
+#endif
 
 #include "bridge_audio.h"
 #include "bridge_fmod.h"
@@ -1052,6 +1061,7 @@ struct bank_walker {
 
 // Load + parse a bank file. On failure returns nullptr and logs the reason.
 bank_data* bank_load(const char* path) {
+  trt_trace("TRACE bank_load enter");
   FILE* f = fopen(path, "rb");
   if (!f) {
     logf("fmod-studio: LoadBankFile(%s) -> file not found", path);
@@ -1095,6 +1105,36 @@ bank_data* bank_load(const char* path) {
        path, (int)b->events.size(), (int)b->timelines.size(),
        (int)b->instruments.size(), (int)b->wavs.size(), (int)b->fsbs.size(),
        (int)b->string_guids.size());
+  // Memory instrumentation (oom-analysis.md section 6.2): log app memory
+  // + PCM cache bytes after each bank load. Requires patch 06 (the
+  // trt_fmod_studio_pcm_cache_bytes accessor). On Linux (no WinRT) only
+  // the PCM cache bytes are logged.
+#if defined(_WIN32)
+  {
+    char mem[256];
+    try {
+      using winrt::Windows::System::MemoryManager;
+      const u64 usage = MemoryManager::AppMemoryUsage();
+      const u64 limit = MemoryManager::AppMemoryUsageLimit();
+      const u64 pcm = trt_fmod_studio_pcm_cache_bytes();
+      std::snprintf(mem, sizeof(mem),
+                    "fmod-studio: mem after bank %s: app %llu/%llu MiB, "
+                    "pcm cache %llu MiB",
+                    path, (unsigned long long)(usage / (1024 * 1024)),
+                    (unsigned long long)(limit / (1024 * 1024)),
+                    (unsigned long long)(pcm / (1024 * 1024)));
+    } catch (const winrt::hresult_error&) {
+      std::snprintf(mem, sizeof(mem),
+                    "fmod-studio: mem after bank %s: app usage query failed",
+                    path);
+    }
+    logf("%s", mem);
+  }
+#else
+  logf("fmod-studio: mem after bank %s: pcm cache %llu MiB", path,
+       (unsigned long long)(trt_fmod_studio_pcm_cache_bytes() /
+                            (1024 * 1024)));
+#endif
   return b;
 }
 
@@ -1185,6 +1225,27 @@ bool fsb_vorbis_to_ogg(const fsb_sample& s, const u8* data, u32 data_len,
 bool decode_fsb_sample(bank_data* bank, const fsb_sample& s,
                        decoded_sample* out) {
   if (s.data_len == 0) return false;
+#ifdef _WIN32
+  // Console: Vorbis decode corrupts the heap here (AV in get_decoded).
+  // Skip it so the game can render; audio is named-silent on console.
+  // The Linux gate keeps real decode (test_fmod_studio asserts PCM).
+  { static std::atomic<int> once{0};
+    log_once(&once,
+      "fmod-studio: FSB sample decoding disabled on console (audio silent)"); }
+  (void)bank; (void)s; (void)out;
+  return false;
+#endif
+  // Guard against corrupt parsed offsets/sizes: a bogus data_len made
+  // stb_vorbis (and the vector heap) corrupt on console. Fail visible.
+  if (!bank || s.data_len > (1u << 28) ||
+      s.file_offset > bank->file_size ||
+      s.data_len > bank->file_size - s.file_offset) {
+    logf("fmod-studio: sample '%s' has invalid range (off=%llu len=%u "
+         "filesize=%llu)", s.name.c_str(),
+         (unsigned long long)s.file_offset, (unsigned)s.data_len,
+         (unsigned long long)bank->file_size);
+    return false;
+  }
   std::vector<u8> compressed(s.data_len);
   if (!file_read_at(bank->f, s.file_offset, compressed.data(), s.data_len))
     return false;
@@ -1454,6 +1515,15 @@ struct studio_system {
 };
 
 }  // namespace
+
+// Memory instrumentation for the Celeste OOM investigation
+// (oom-analysis.md): current PCM decode cache size in bytes. The Mono
+// watchdog (patch 06) and bank_load (patch 07) log this. g_cache_bytes
+// lives in the anonymous namespace above; this file-scope accessor is
+// how the rest of the host reads it.
+extern "C" u64 trt_fmod_studio_pcm_cache_bytes() {
+  return (u64)g_cache_bytes;
+}
 
 namespace {
 

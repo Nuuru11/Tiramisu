@@ -1,0 +1,131 @@
+--- a/mono/mini/interp/interp.c
++++ b/mono/mini/interp/interp.c
+@@ -1052,6 +1052,56 @@
+ static MonoFuncV mono_native_to_interp_trampoline = NULL;
+ #endif
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++/* Precompiled native->interp transition (third_party/mono-uwp/asm/win64.S):
++ * image-backed static code implementing the same CallContext transition
++ * that mono_arch_get_native_to_interp_trampoline would otherwise
++ * JIT-generate. The UWP AppContainer forbids executing dynamically
++ * generated code, so the JIT trampoline (and the JIT ftnptr arg
++ * trampoline below) would be killed on first execution (first delegate
++ * passed to native code). */
++extern void mono_native_to_interp_trampoline_static (void);
++/* Fixed pool of ftnptr entry thunks in win64.S (see there for the layout).
++ * Each thunk loads mono_ftnptr_table[i] into r10 (MONO_ARCH_RGCTX_REG)
++ * and jumps to mono_native_to_interp_trampoline_static. */
++extern guint8 mono_ftnptr_thunks [];
++extern gpointer mono_ftnptr_table [];
++
++/* Number of ftnptr thunks in asm/win64.S; must match the .rept count there.
++ * Each thunk is 12 bytes (7-byte RIP-relative load + 5-byte jmp); the size
++ * is verified by disassembly after the build (see mono-static-stubs.md). */
++#define MONO_UWP_FTNPTR_COUNT 256
++#define MONO_UWP_FTNPTR_THUNK_SIZE 12
++
++static gint32 mono_uwp_ftnptr_next = 0;
++
++/*
++ * mono_uwp_alloc_ftnptr_thunk:
++ *
++ *   Static replacement for mono_create_ftnptr_arg_trampoline (which
++ *   JIT-generates a mov-r10/jmp trampoline per descriptor). Hands out
++ *   the next thunk from the fixed pool in win64.S, stores FTNDESC in
++ *   its table slot, and returns the thunk address, which native code
++ *   calls as the delegate's function pointer. The descriptor is never
++ *   freed (same as the JIT path), so a slot stays valid for the
++ *   lifetime of the process. Aborts loudly if the pool runs out --
++ *   that means more distinct delegate methods were passed to native
++ *   code than the pool holds; bump MONO_UWP_FTNPTR_COUNT here and the
++ *   .rept count in win64.S together.
++ */
++static gpointer
++mono_uwp_alloc_ftnptr_thunk (MonoFtnDesc *ftndesc)
++{
++	gint32 slot = mono_atomic_inc_i32 (&mono_uwp_ftnptr_next) - 1;
++
++	if (slot < 0 || slot >= MONO_UWP_FTNPTR_COUNT)
++		g_error ("UWP ftnptr thunk pool exhausted (%d slots); increase MONO_UWP_FTNPTR_COUNT in interp.c and win64.S", MONO_UWP_FTNPTR_COUNT);
++	mono_ftnptr_table [slot] = ftndesc;
++	mono_memory_barrier ();
++	return (gpointer)(mono_ftnptr_thunks + slot * MONO_UWP_FTNPTR_THUNK_SIZE);
++}
++#endif
++
+ #ifndef MONO_ARCH_HAVE_INTERP_PINVOKE_TRAMP
+ static InterpMethodArguments* build_args_from_sig (MonoMethodSignature *sig, InterpFrame *frame)
+ {
+@@ -2741,7 +2791,14 @@
+ 	 */
+ 	MonoMethod *wrapper = mini_get_interp_in_wrapper (sig);
+ 
++#if !G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
+ 	entry_wrapper = mono_jit_compile_method_jit_only (wrapper, error);
++#else
++	/* Tiramisu UWP: do not JIT-compile the interp_in wrapper. Leave
++	 * entry_wrapper NULL so the code below takes the
++	 * MONO_ARCH_HAVE_INTERP_ENTRY_TRAMPOLINE branch, which on UWP
++	 * uses the precompiled native->interp stub (no JIT anywhere). */
++#endif
+ #endif
+ 	if (entry_wrapper) {
+ 		if (sig->param_count > MAX_INTERP_ENTRY_ARGS) {
+@@ -2766,6 +2823,12 @@
+ 		mono_error_cleanup (error);
+ 		error_init_reuse (error);
+ 		if (!mono_native_to_interp_trampoline) {
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++			/* Tiramisu UWP: use the precompiled, image-backed stub
++			 * instead of the JIT trampoline (see the extern decl
++			 * near the top of this file). */
++			mono_native_to_interp_trampoline = (MonoFuncV)mono_native_to_interp_trampoline_static;
++#else
+ 			if (mono_aot_only) {
+ 				mono_native_to_interp_trampoline = (MonoFuncV)mono_aot_get_trampoline ("native_to_interp_trampoline");
+ 			} else {
+@@ -2773,8 +2836,23 @@
+ 				mono_native_to_interp_trampoline = (MonoFuncV)mono_arch_get_native_to_interp_trampoline (&info);
+ 				mono_tramp_info_register (info, NULL);
+ 			}
++#endif
+ 		}
+ 		entry_wrapper = (gpointer)mono_native_to_interp_trampoline;
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++		/* Tiramisu UWP: use the direct entry for every signature. The
++		 * LMF wrapper exists for mixed JIT+interp mode (it lets EH
++		 * resume into JITted code across native frames); UWP runs the
++		 * interpreter only, there is no JITted code to resume into,
++		 * and the desktop primary path (interp_in wrapper) runs these
++		 * transitions without an LMF as well. Skipping the wrapper
++		 * also skips its JIT compile. One behavioral note: a managed
++		 * exception thrown from a native-invoked delegate callback
++		 * cannot propagate across the native frames to a managed
++		 * pinvoke caller (same as the desktop primary path); the
++		 * unhandled-exception hook still fires. */
++		entry_func = (gpointer)interp_entry_from_trampoline;
++#else
+ 		/* We need the lmf wrapper only when being called from mixed mode */
+ 		if (sig->pinvoke)
+ 			entry_func = (gpointer)interp_entry_from_trampoline;
+@@ -2787,6 +2865,7 @@
+ 			entry_func = cached_func;
+ 		}
+ #endif
++#endif
+ 	}
+ 
+ 	g_assert (entry_func);
+@@ -2801,7 +2880,11 @@
+ 	 * rgctx register using a trampoline.
+ 	 */
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++	addr = mono_uwp_alloc_ftnptr_thunk (ftndesc);
++#else
+ 	addr = mono_create_ftnptr_arg_trampoline (ftndesc, entry_wrapper);
++#endif
+ 
+ 	info = domain_jit_info (domain);
+ 	mono_domain_lock (domain);

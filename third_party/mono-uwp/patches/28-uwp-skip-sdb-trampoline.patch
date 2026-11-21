@@ -1,0 +1,19 @@
+--- a/mono/mini/mini-amd64.c
++++ b/mono/mini/mini-amd64.c
+@@ -1430,10 +1430,14 @@
+  */
+ void
+ mono_arch_init (void)
+ {
+-	if (!mono_aot_only)
+-		bp_trampoline = mini_get_breakpoint_trampoline ();
++	/* Tiramisu UWP: AppContainer denies RWX memory, so Mono's code
++	 * manager cannot allocate the debugger breakpoint trampoline;
++	 * mono_arch_create_sdb_trampoline would dereference a NULL reserve.
++	 * Celeste runs with no debugger; bp_trampoline is only consumed by
++	 * debug breakpoints, so skip it entirely on this platform. */
++	return;
+ }
+ 
+ /*
+  * Cleanup architecture specific code.

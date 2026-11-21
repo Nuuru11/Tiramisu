@@ -548,22 +548,74 @@ u32 TRT_STDCALL trt_GetRawInputDeviceList(void* list, u32* numDevices, u32 cbSiz
   return 2;
 }
 
-u32 TRT_STDCALL trt_GetRawInputDeviceInfoW(void* hDevice, u32 uiCommand,
-                                           void* pData, u32* pcbSize) {
-  (void)hDevice; (void)uiCommand; (void)pData;
-  if (pcbSize) *pcbSize = 0;
-  return 0;
+u32 trt_raw_device_info(void* device, u32 command, void* data,
+                        u32* size, bool wide) {
+  const auto handle = reinterpret_cast<uintptr_t>(device);
+  const bool keyboard = handle == 0x00060002u;
+  if (!size || (command != 0x20000007u && command != 0x2000000bu)) {
+    trt_SetLastError(87);
+    return (u32)-1;
+  }
+  if (!keyboard && handle != 0x00060001u) {
+    trt_SetLastError(6);
+    return (u32)-1;
+  }
+  if (command == 0x20000007u /*RIDI_DEVICENAME*/) {
+    const char* name = keyboard ? "Tiramisu Keyboard" : "Tiramisu Mouse";
+    const u32 chars = static_cast<u32>(strlen(name) + 1);
+    const u32 capacity = data ? *size : 0;
+    *size = chars;
+    if (!data) return 0;
+    if (capacity < chars) {
+      trt_SetLastError(122);
+      return (u32)-1;
+    }
+    if (wide) {
+      auto* out = static_cast<u16*>(data);
+      for (u32 i = 0; i < chars; ++i) out[i] = static_cast<u16>(name[i]);
+    } else {
+      memcpy(data, name, chars);
+    }
+    return chars;
+  }
+  // RID_DEVICE_INFO has a two-DWORD header and a six-DWORD union.
+  u32 info[8] = {sizeof(info), keyboard ? 1u : 0u};
+  if (keyboard) {
+    info[2] = 4;     // enhanced keyboard
+    info[5] = 12;    // function keys
+    info[6] = 3;     // indicators
+    info[7] = 101;   // keys
+  } else {
+    info[3] = 5;     // buttons
+  }
+  const u32 capacity = data ? *size : 0;
+  *size = sizeof(info);
+  if (!data) return 0;
+  if (capacity < sizeof(info)) {
+    trt_SetLastError(122);
+    return (u32)-1;
+  }
+  memcpy(data, info, sizeof(info));
+  return sizeof(info);
 }
-u32 TRT_STDCALL trt_GetRawInputDeviceInfoA(void* hDevice, u32 uiCommand,
-                                           void* pData, u32* pcbSize) {
-  (void)hDevice; (void)uiCommand; (void)pData;
-  if (pcbSize) *pcbSize = 0;
-  return 0;
+
+u32 TRT_STDCALL trt_GetRawInputDeviceInfoW(void* device, u32 command,
+                                           void* data, u32* size) {
+  return trt_raw_device_info(device, command, data, size, true);
+}
+
+u32 TRT_STDCALL trt_GetRawInputDeviceInfoA(void* device, u32 command,
+                                           void* data, u32* size) {
+  return trt_raw_device_info(device, command, data, size, false);
 }
 u32 TRT_STDCALL trt_GetRawInputBuffer(void* pData, u32* pcbSize, u32 cbSizeHeader) {
-  (void)pData; (void)cbSizeHeader;
-  if (pcbSize) *pcbSize = 0;
-  return 0;
+  if (!pcbSize || cbSizeHeader != 24) {
+    trt_SetLastError(87);
+    return (u32)-1;
+  }
+  const u32 count = trt_raw_read_buffer(pData, pcbSize);
+  if (count == (u32)-1) trt_SetLastError(122);
+  return count;
 }
 i64 TRT_STDCALL trt_DefRawInputProc(void** paRawInput, i32 nInput, u32 cbSizeHeader) {
   (void)paRawInput; (void)nInput; (void)cbSizeHeader;
@@ -860,6 +912,7 @@ static void* g_current_cursor = (void*)(uintptr_t)0x00020001ULL;
 void* TRT_STDCALL trt_SetCursor(void* hCursor) {
   void* prev = g_current_cursor;
   g_current_cursor = hCursor;
+  trt_input_set_cursor_shape(hCursor != nullptr);
   return prev;
 }
 void* TRT_STDCALL trt_GetCursor(void) { return g_current_cursor; }
@@ -869,10 +922,9 @@ int TRT_STDCALL trt_GetCursorInfo(void* pci) {
     u32 cbSize; u32 flags; void* hCursor; point_i32 ptScreenPos;
   };
   cursor_info* c = (cursor_info*)pci;
-  c->flags = 1;  // CURSOR_SHOWING
   c->hCursor = g_current_cursor;
   int x = 0, y = 0;
-  trt_mouse_pos(&x, &y);
+  c->flags = trt_cursor_snapshot(&x, &y) ? 1u : 0u;
   c->ptScreenPos = {x, y};
   return 1;
 }
@@ -1188,8 +1240,13 @@ void* TRT_STDCALL trt_GetMenu(void* hWnd) { (void)hWnd; return nullptr; }
 int TRT_STDCALL trt_DrawMenuBar(void* hWnd) { (void)hWnd; return 1; }
 
 // ---- Touch & Pointer stubs ----
-int TRT_STDCALL trt_EnableMouseInPointer(int fEnable) { (void)fEnable; return 1; }
-int TRT_STDCALL trt_IsMouseInPointerEnabled(void) { return 0; }
+int TRT_STDCALL trt_EnableMouseInPointer(int enable) {
+  trt_input_enable_mouse_pointer(enable != 0);
+  return 1;
+}
+int TRT_STDCALL trt_IsMouseInPointerEnabled(void) {
+  return trt_input_mouse_pointer_enabled();
+}
 int TRT_STDCALL trt_CloseTouchInputHandle(void* hTouchInput) { (void)hTouchInput; return 1; }
 int TRT_STDCALL trt_GetTouchInputInfo(void* hTouchInput, u32 cInputs, void* pInputs, int cbSize) {
   (void)hTouchInput; (void)cInputs; (void)pInputs; (void)cbSize;
@@ -1206,8 +1263,41 @@ int TRT_STDCALL trt_IsTouchWindow(void* hwnd, u32* pulFlags) {
   return 0;
 }
 int TRT_STDCALL trt_GetPointerInfo(u32 pointerId, void* pointerInfo) {
-  (void)pointerId; (void)pointerInfo;
-  return 0;
+  trt_mouse_pointer mouse{};
+  if (!pointerInfo || !trt_input_get_mouse_pointer(pointerId, &mouse)) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  // POINTER_INFO is a desktop API. Keep its x64 layout independent of
+  // whether the host SDK exposes the structure to AppContainer builds.
+  struct pointer_info {
+    u32 type, id, frame, flags;
+    u64 device, window;
+    i32 pixel[2], himetric[2], pixel_raw[2], himetric_raw[2];
+    u32 time, history;
+    i32 wheel;
+    u32 key_states;
+    u64 performance_count;
+    u32 button_change;
+  } info{};
+  static_assert(sizeof(pointer_info) == 96);
+  info.type = 4;  // PT_MOUSE
+  info.id = pointerId;
+  info.frame = mouse.frame;
+  info.flags = mouse.flags;
+  info.device = 0x00060001u;
+  info.window = mouse.window;
+  info.pixel[0] = info.pixel_raw[0] = mouse.x;
+  info.pixel[1] = info.pixel_raw[1] = mouse.y;
+  info.himetric[0] = info.himetric_raw[0] = mouse.x * 2540 / 96;
+  info.himetric[1] = info.himetric_raw[1] = mouse.y * 2540 / 96;
+  info.time = mouse.time;
+  info.history = 1;
+  info.wheel = mouse.wheel;
+  info.key_states = mouse.key_states;
+  info.button_change = mouse.change;
+  memcpy(pointerInfo, &info, sizeof(info));
+  return 1;
 }
 int TRT_STDCALL trt_GetPointerTouchInfo(u32 pointerId, void* touchInfo) {
   (void)pointerId; (void)touchInfo;
@@ -1218,8 +1308,12 @@ int TRT_STDCALL trt_GetPointerPenInfo(u32 pointerId, void* penInfo) {
   return 0;
 }
 int TRT_STDCALL trt_GetPointerType(u32 pointerId, u32* pointerType) {
-  (void)pointerId;
-  if (pointerType) *pointerType = 1;  // PT_POINTER
+  trt_mouse_pointer mouse{};
+  if (!pointerType || !trt_input_get_mouse_pointer(pointerId, &mouse)) {
+    trt_SetLastError(87);
+    return 0;
+  }
+  *pointerType = 4;  // PT_MOUSE
   return 1;
 }
 int TRT_STDCALL trt_GetPointerCursorId(u32 pointerId, u32* cursorId) {

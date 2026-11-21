@@ -35,6 +35,7 @@ if [[ "${1:-}" != "--force" ]] && [[ -f "$out/libfmod-real.so" ]] &&
    [[ -f "$out/libcsteamworks-real.so" ]]; then
   stale=0
   for src in src/trt/bridge_fmod.cpp src/trt/bridge_fmod_studio.cpp \
+             src/trt/trt_trace.cpp src/trt/trt_trace.h \
              src/trt/bridge_fmod_studio.h src/trt/bridge_steam.cpp \
              src/trt/bridge_steam.h src/trt/vendor_stb_vorbis.c \
              third_party/mono-bridges/mono_fmod_door.cpp \
@@ -68,6 +69,7 @@ objs="$out/objs"
 mkdir -p "$objs"
 $CXX $CXXFLAGS -c src/trt/bridge_fmod.cpp -o "$objs/bridge_fmod.o"
 $CXX $CXXFLAGS -c src/trt/bridge_fmod_studio.cpp -o "$objs/bridge_fmod_studio.o"
+$CXX $CXXFLAGS -c src/trt/trt_trace.cpp -o "$objs/trt_trace.o"
 $CXX $CXXFLAGS -c src/trt/bridge_steam.cpp -o "$objs/bridge_steam.o"
 $CC $CFLAGS -DSTB_VORBIS_NO_STDIO -c src/trt/vendor_stb_vorbis.c \
   -o "$objs/vendor_stb_vorbis.o"
@@ -81,6 +83,7 @@ $CXX $CXXFLAGS -c third_party/mono-bridges/mono_steam_door.cpp \
 # 3. Link.
 $CXX -shared -fPIC -Bsymbolic -Wl,--no-undefined \
   "$objs/bridge_fmod.o" "$objs/bridge_fmod_studio.o" \
+  "$objs/trt_trace.o" \
   "$objs/vendor_stb_vorbis.o" "$objs/mono_dllmap_shim.o" \
   "$objs/mono_fmod_door.o" -lpthread -lm \
   -o "$out/libfmod-real.so"

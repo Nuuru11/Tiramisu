@@ -31,6 +31,19 @@
 #include "FNA3D_Driver_D3D11.h"
 #include "FNA3D_Driver_D3D11_shaders.h"
 
+#if defined(_WIN32)
+/* Memory instrumentation (patch 08, oom-analysis.md section 6.3): the
+ * host provides the UWP app memory usage (this driver is C and cannot
+ * call WinRT), and the Mono SGen heap size comes from the runtime
+ * (mono/metadata/mono-gc.h:118-119; declared directly — the driver
+ * does not include Mono headers). Both are exported from the host
+ * binary / the statically linked Mono lib. */
+#include <stdint.h>
+extern uint64_t trt_fna3d_app_memory_usage(void);
+extern int64_t mono_gc_get_heap_size(void);
+extern int64_t mono_gc_get_used_size(void);
+#endif
+
 #ifdef USE_SDL3
 #include <SDL3/SDL.h>
 
@@ -3676,6 +3689,24 @@ static void D3D11_SetTextureData2D(
 		0
 	);
 	SDL_UnlockMutex(renderer->ctxLock);
+#if defined(_WIN32)
+	/* Memory instrumentation (oom-analysis.md section 6.3): log app
+	 * memory + SGen heap after each large texture upload. The atlas
+	 * phase is where the .141 process died, so this pins whether
+	 * memory climbs during it. Threshold: 1 MiB — atlas pages are
+	 * >= 1 MiB, loose PNGs are < 64 KiB, so small textures stay quiet.
+	 */
+	if (dataLength >= 1024 * 1024)
+	{
+		FNA3D_LogInfo(
+			"mem after SetData %dx%d (%d B): app %llu MiB, "
+			"sgen heap %lld used %lld MiB",
+			(int) w, (int) h, (int) dataLength,
+			(unsigned long long) (trt_fna3d_app_memory_usage() / (1024 * 1024)),
+			(long long) (mono_gc_get_heap_size() / (1024 * 1024)),
+			(long long) (mono_gc_get_used_size() / (1024 * 1024)));
+	}
+#endif
 }
 
 static void D3D11_SetTextureData3D(

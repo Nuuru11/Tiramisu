@@ -341,6 +341,11 @@ int trt_fmod_studio_bank_sample_count(void* bank);
 // harness test uses this — the game's system handle lives inside
 // managed code and the test cannot know it.
 int trt_fmod_studio_global_event_count();
+// Current PCM decode cache size in bytes (g_cache_bytes). Memory
+// instrumentation for the Celeste OOM investigation (oom-analysis.md):
+// the Mono watchdog (patch 06) logs this on every tick, and bank_load
+// (patch 07) logs it after each bank load.
+u64 trt_fmod_studio_pcm_cache_bytes();
 
 #ifdef __cplusplus
 }

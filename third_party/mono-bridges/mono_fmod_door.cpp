@@ -32,16 +32,10 @@
 #define DOOR_FMOD_OK 0
 #define DOOR_FMOD_ERR_INVALID_PARAM 28
 
-#if defined(_WIN32)
-#define MONO_DOOR_EXPORT __declspec(dllexport)
-#else
-#define MONO_DOOR_EXPORT
-#endif
-
 extern "C" {
 
 // ---- markers: prove the real bridge is loaded ----
-#if !defined(_WIN32)
+#ifndef TIRAMISU_UWP_HOST
 int trt_mono_bridge_is_real(void) { return 1; }
 const char* trt_mono_bridge_name(void) { return "fmod-real"; }
 #endif
@@ -108,47 +102,47 @@ group_state* group_state_for(void* h) {
 
 // ---- core FMOD doors (bridge_fmod.cpp) ----
 
-MONO_DOOR_EXPORT int FMOD_System_Create(void** out) {
+int FMOD_System_Create(void** out) {
   return fmod_System_Create(nullptr, out);
 }
-MONO_DOOR_EXPORT int FMOD_System_Release(void* sys) { return fmod_System_Release(sys); }
-MONO_DOOR_EXPORT int FMOD_System_Init(void* sys, int maxchannels, unsigned int flags,
+int FMOD_System_Release(void* sys) { return fmod_System_Release(sys); }
+int FMOD_System_Init(void* sys, int maxchannels, unsigned int flags,
                      void* extra) {
   return fmod_System_Init(sys, (u32)maxchannels, flags, extra);
 }
-MONO_DOOR_EXPORT int FMOD_System_Close(void* sys) { return fmod_System_Close(sys); }
-MONO_DOOR_EXPORT int FMOD_System_Update(void* sys) { return fmod_System_Update(sys); }
-MONO_DOOR_EXPORT int FMOD_System_CreateSound(void* sys, const unsigned char* name,
+int FMOD_System_Close(void* sys) { return fmod_System_Close(sys); }
+int FMOD_System_Update(void* sys) { return fmod_System_Update(sys); }
+int FMOD_System_CreateSound(void* sys, const unsigned char* name,
                             unsigned int mode, void* exinfo, void** out) {
   return fmod_System_CreateSound(sys, name, mode, exinfo, out);
 }
-MONO_DOOR_EXPORT int FMOD_System_CreateStream(void* sys, const unsigned char* name,
+int FMOD_System_CreateStream(void* sys, const unsigned char* name,
                              unsigned int mode, void* exinfo, void** out) {
   return fmod_System_CreateStream(sys, name, mode, exinfo, out);
 }
-MONO_DOOR_EXPORT int FMOD_System_PlaySound(void* sys, void* sound, void* group, int paused,
+int FMOD_System_PlaySound(void* sys, void* sound, void* group, int paused,
                           void** out) {
   return fmod_System_PlaySound(sys, sound, group, paused, out);
 }
-MONO_DOOR_EXPORT int FMOD_System_GetMasterChannelGroup(void* sys, void** out) {
+int FMOD_System_GetMasterChannelGroup(void* sys, void** out) {
   return fmod_System_GetMasterChannelGroup(sys, out);
 }
-MONO_DOOR_EXPORT int FMOD_System_SetOutput(void* sys, unsigned int output) {
+int FMOD_System_SetOutput(void* sys, unsigned int output) {
   return fmod_System_SetOutput(sys, output);
 }
-MONO_DOOR_EXPORT int FMOD_System_SetDSPBufferSize(void* sys, unsigned int len, int num) {
+int FMOD_System_SetDSPBufferSize(void* sys, unsigned int len, int num) {
   return fmod_System_SetDSPBufferSize(sys, len, (u32)num);
 }
 // One host output device exists (the mixer); the format is the mixer's
 // real format (48 kHz stereo), and the version is the bank format the
 // Studio engine implements (FMOD 2.02.09).
-MONO_DOOR_EXPORT int FMOD_System_GetNumDrivers(void* sys, int* numdrivers) {
+int FMOD_System_GetNumDrivers(void* sys, int* numdrivers) {
   (void)sys;
   if (!numdrivers) return DOOR_FMOD_ERR_INVALID_PARAM;
   *numdrivers = 1;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_System_GetSoftwareFormat(void* sys, int* samplerate, int* speakermode,
+int FMOD_System_GetSoftwareFormat(void* sys, int* samplerate, int* speakermode,
                                   int* numrawspeakers) {
   (void)sys;
   if (samplerate) *samplerate = 48000;
@@ -156,62 +150,62 @@ MONO_DOOR_EXPORT int FMOD_System_GetSoftwareFormat(void* sys, int* samplerate, i
   if (numrawspeakers) *numrawspeakers = 2;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_System_GetVersion(void* sys, unsigned int* version) {
+int FMOD_System_GetVersion(void* sys, unsigned int* version) {
   (void)sys;
   if (!version) return DOOR_FMOD_ERR_INVALID_PARAM;
   *version = 0x00020209u;  // FMOD 2.02.09
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_Sound_Release(void* snd) { return fmod_Sound_Release(snd); }
-MONO_DOOR_EXPORT int FMOD_Sound_SetMode(void* snd, unsigned int mode) {
+int FMOD_Sound_Release(void* snd) { return fmod_Sound_Release(snd); }
+int FMOD_Sound_SetMode(void* snd, unsigned int mode) {
   return fmod_Sound_SetMode(snd, mode);
 }
-MONO_DOOR_EXPORT int FMOD_Sound_GetMode(void* snd, unsigned int* mode) {
+int FMOD_Sound_GetMode(void* snd, unsigned int* mode) {
   return fmod_Sound_GetMode(snd, mode);
 }
-MONO_DOOR_EXPORT int FMOD_Sound_GetLength(void* snd, unsigned int* len, unsigned int unit) {
+int FMOD_Sound_GetLength(void* snd, unsigned int* len, unsigned int unit) {
   return fmod_Sound_GetLength(snd, len, unit);
 }
-MONO_DOOR_EXPORT int FMOD_Channel_SetFrequency(void* ch, float freq) {
+int FMOD_Channel_SetFrequency(void* ch, float freq) {
   return fmod_Channel_SetFrequency(ch, freq);
 }
-MONO_DOOR_EXPORT int FMOD_Channel_SetPosition(void* ch, unsigned int pos, unsigned int unit) {
+int FMOD_Channel_SetPosition(void* ch, unsigned int pos, unsigned int unit) {
   return fmod_Channel_SetPosition(ch, pos, unit);
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_Stop(void* h) {
+int FMOD_ChannelGroup_Stop(void* h) {
   int rc = fmod_Channel_Stop(h);
   if (rc == DOOR_FMOD_OK) return rc;
   // Not a channel: a group. The bridge tracks no group membership, so
   // there is nothing to stop; accept.
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_SetVolume(void* h, float vol) {
+int FMOD_ChannelGroup_SetVolume(void* h, float vol) {
   int rc = fmod_Channel_SetVolume(h, vol);
   if (rc == DOOR_FMOD_OK) return rc;
   group_state_for(h)->volume = vol;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_GetVolume(void* h, float* vol) {
+int FMOD_ChannelGroup_GetVolume(void* h, float* vol) {
   if (!vol) return DOOR_FMOD_ERR_INVALID_PARAM;
   int rc = fmod_Channel_GetVolume(h, vol);
   if (rc == DOOR_FMOD_OK) return rc;
   *vol = group_state_for(h)->volume;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_SetPaused(void* h, int paused) {
+int FMOD_ChannelGroup_SetPaused(void* h, int paused) {
   int rc = fmod_Channel_SetPaused(h, paused);
   if (rc == DOOR_FMOD_OK) return rc;
   group_state_for(h)->paused = paused ? 1 : 0;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_GetPaused(void* h, int* paused) {
+int FMOD_ChannelGroup_GetPaused(void* h, int* paused) {
   if (!paused) return DOOR_FMOD_ERR_INVALID_PARAM;
   int rc = fmod_Channel_GetPaused(h, paused);
   if (rc == DOOR_FMOD_OK) return rc;
   *paused = group_state_for(h)->paused;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_ChannelGroup_IsPlaying(void* h, int* playing) {
+int FMOD_ChannelGroup_IsPlaying(void* h, int* playing) {
   if (!playing) return DOOR_FMOD_ERR_INVALID_PARAM;
   int rc = fmod_Channel_IsPlaying(h, playing);
   if (rc == DOOR_FMOD_OK) return rc;
@@ -220,7 +214,7 @@ MONO_DOOR_EXPORT int FMOD_ChannelGroup_IsPlaying(void* h, int* playing) {
   *playing = 0;
   return DOOR_FMOD_OK;
 }
-MONO_DOOR_EXPORT int FMOD_Memory_Initialize(void* pool, int size, void* alloc, void* realloc,
+int FMOD_Memory_Initialize(void* pool, int size, void* alloc, void* realloc,
                            void* free_cb, unsigned int memtype) {
   // The bridge uses the host heap and ignores the callbacks, but pass
   // them through in the documented struct anyway.
@@ -235,7 +229,7 @@ MONO_DOOR_EXPORT int FMOD_Memory_Initialize(void* pool, int size, void* alloc, v
   funcs.free_cb = free_cb;
   return fmod_Memory_Initialize(pool, (u32)size, &funcs, memtype);
 }
-MONO_DOOR_EXPORT int FMOD_Debug_Initialize(unsigned int flags, int mode, void* callback,
+int FMOD_Debug_Initialize(unsigned int flags, int mode, void* callback,
                           const char* filename) {
   (void)callback;  // the bridge has no debug callback sink
   // NOTE: the bridge takes (flags, filename, mode) — reordered vs the
@@ -248,7 +242,7 @@ MONO_DOOR_EXPORT int FMOD_Debug_Initialize(unsigned int flags, int mode, void* c
 // FMOD_Studio_ParseID: "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" (braces
 // optional) into a 16-byte GUID. System.Guid layout: u32 LE, u16 LE,
 // u16 LE, 8 bytes as-is — the same as FMOD_GUID.
-MONO_DOOR_EXPORT int FMOD_Studio_ParseID(const unsigned char* str, unsigned char* guid_out) {
+int FMOD_Studio_ParseID(const unsigned char* str, unsigned char* guid_out) {
   if (!str || !guid_out) return DOOR_FMOD_ERR_INVALID_PARAM;
   const char* s = (const char*)str;
   if (*s == '{') ++s;
@@ -302,7 +296,7 @@ MONO_DOOR_EXPORT int FMOD_Studio_ParseID(const unsigned char* str, unsigned char
 }
 
 // Batch parameter set: loop over the by-index setter.
-MONO_DOOR_EXPORT int FMOD_Studio_EventInstance_SetParameterValuesByIndices(void* inst,
+int FMOD_Studio_EventInstance_SetParameterValuesByIndices(void* inst,
                                                           const int* indices,
                                                           const float* values,
                                                           int count) {

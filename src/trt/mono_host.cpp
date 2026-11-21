@@ -19,9 +19,13 @@
 #include "mono_host.h"
 
 #include "fna_platform.h"
+#include "trt_trace.h"
+#include "bridge_fmod_studio.h"  // trt_fmod_studio_pcm_cache_bytes (watchdog memory line)
 
 #include <cstdint>
+#include <cstdlib>  // malloc/free for the heap probe
 #include <cstdio>
+#include <csignal>  // SIGABRT handler (.126 diagnostic)
 #include <cstring>
 #include <vector>
 
@@ -104,6 +108,10 @@ extern "C" int trt_pe_is_managed(const u8* file, size_t file_size) {
 // Console-verification-pending: this wiring is buildable + linkable,
 // but whether Celeste runs under it on the Series S needs a console
 // test (no UWP runtime exists on Linux).
+#include <mono/utils/mono-logger.h>  // mono_trace_set_* — route Mono stderr/log into tiramisu.log
+#include <atomic>
+#include <chrono>
+#include <thread>
 #include <windows.h>  // GetModuleFileNameW, SetEnvironmentVariableW,
 // GetFileAttributesA, WideCharToMultiByte
 
@@ -119,11 +127,29 @@ extern "C" int trt_pe_is_managed(const u8* file, size_t file_size) {
 #include <mono/metadata/metadata.h>
 #include <mono/metadata/mono-config.h>
 #include <mono/metadata/object.h>
+#include <mono/metadata/exception.h>
+
+// WinRT MemoryManager for the watchdog memory line (patch 06): the UWP
+// app memory usage + limit. Inside the enclosing _WIN32 block.
+#include <winrt/base.h>  // winrt::hresult_error
+#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage
 
 // domain.h is not shipped in the Ubuntu libmono-2.0-dev header set, so
 // mono_domain_set_config is declared directly (same as the Linux path).
 extern "C" void mono_domain_set_config(MonoDomain* domain, const char* base_dir,
                                        const char* config_file_name);
+
+// mono_jit_set_aot_only is declared in mono/mini/jit.h (not in the shipped
+// header set), so it is declared directly here (same as mono_domain_set_config).
+extern "C" void mono_jit_set_aot_only(int aot_only);
+
+// mono_gc_get_heap_size / mono_gc_get_used_size are declared in
+// mono/metadata/mono-gc.h (mono-gc.h:118-119), which is not in the
+// shipped header set, so they are declared directly here (same as
+// mono_domain_set_config). Verified exported from libmonosgen-uwp.lib
+// (T symbols in mono-symbols.txt). Used by the watchdog memory line.
+extern "C" int64_t mono_gc_get_heap_size(void);
+extern "C" int64_t mono_gc_get_used_size(void);
 
 namespace {
 
@@ -133,20 +159,156 @@ namespace {
 const trt_mono_dllmap* g_hook_dllmaps_uwp = nullptr;
 int g_hook_dllmap_count_uwp = 0;
 
+// --- UWP Mono diagnostics: the console has no stderr, so a fault inside
+// mono_jit_init used to kill the app with no log line and no crash dump.
+// Route Mono's own print/log output into tiramisu.log, guard mono_jit_init
+// with SEH, and record the fault address + stack so the failing native
+// function can be identified from the console log alone.
+void mono_print_to_log(const char* str, mono_bool is_stdout) {
+  (void)is_stdout;
+  if (str && *str) mono_log(str);
+}
+void mono_log_to_log(const char* domain, const char* level,
+                     const char* message, mono_bool fatal, void* user_data) {
+  (void)user_data;
+  char line[1024];
+  std::snprintf(line, sizeof(line), "mono[%s/%s]%s %s",
+                domain ? domain : "?", level ? level : "?",
+                fatal ? " FATAL" : "", message ? message : "");
+  mono_log(line);
+}
+void mono_unhandled_hook(MonoObject* exc, void* user_data) {
+  (void)user_data;
+  const char* name = "?";
+  if (exc) {
+    MonoClass* k = mono_object_get_class(exc);
+    if (k) name = mono_class_get_name(k);
+  }
+  char line[768];
+  std::snprintf(line, sizeof(line), "MONO UNHANDLED EXCEPTION: %s", name);
+  mono_log(line);
+  if (exc) {
+    MonoObject* inner_exc = nullptr;
+    MonoString* str = mono_object_to_string(exc, &inner_exc);
+    if (str) {
+      char* msg = mono_string_to_utf8(str);
+      if (msg) {
+        std::snprintf(line, sizeof(line), "MONO EXCEPTION MSG: %.600s", msg);
+        mono_log(line);
+        mono_free(msg);
+      }
+    }
+  }
+}
+
+LONG WINAPI mono_veh(EXCEPTION_POINTERS* ep) {
+  if (!ep || !ep->ExceptionRecord) return EXCEPTION_CONTINUE_SEARCH;
+  const DWORD code = ep->ExceptionRecord->ExceptionCode;
+  if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
+      code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_BREAKPOINT) {
+    char line[320];
+    std::snprintf(line, sizeof(line), "VEH: exception 0x%08lX at %p",
+                  (unsigned long)code, ep->ExceptionRecord->ExceptionAddress);
+    mono_log(line);
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// .126 diagnostic: eglib g_assert aborts via abort() -> SIGABRT, with the
+// assert text on stderr only. Log the abort via the allocation-free trace
+// writer (survives stdio buffering loss) and exit with code 3 so the
+// termination mode is distinguishable from a kernel kill / clean exit.
+void sigabrt_handler(int sig) {
+  (void)sig;
+  trt_trace("TRACE SIGABRT (g_assert/abort) - process aborting");
+  std::fflush(nullptr);
+  _exit(3);
+}
+
+// Catch C++ std::terminate (uncaught C++ exception) and unhandled SEH
+// on ANY thread — both write via the allocation-free trace writer.
+void tiramisu_terminate_handler() {
+  trt_trace("TRACE std::terminate - process aborting");
+  std::fflush(nullptr);
+  _exit(4);
+}
+
+LONG WINAPI unhandled_filter(EXCEPTION_POINTERS* ep) {
+  if (ep && ep->ExceptionRecord) {
+    char line[160];
+    std::snprintf(line, sizeof(line),
+                  "TRACE UNHANDLED SEH 0x%08lX at %p",
+                  (unsigned long)ep->ExceptionRecord->ExceptionCode,
+                  ep->ExceptionRecord->ExceptionAddress);
+    trt_trace(line);
+    std::fflush(nullptr);
+  }
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
+struct JitInitFault {
+  DWORD code = 0;
+  void* address = nullptr;
+  void* module_base = nullptr;
+  DWORD flags = 0;
+  ULONG_PTR info0 = 0;
+  ULONG_PTR info1 = 0;
+  USHORT frames = 0;
+  void* stack[24] = {};
+};
+JitInitFault g_jit_fault;
+int jit_init_filter(EXCEPTION_POINTERS* ep) {
+  if (ep && ep->ExceptionRecord) {
+    const EXCEPTION_RECORD* r = ep->ExceptionRecord;
+    g_jit_fault.code = r->ExceptionCode;
+    g_jit_fault.address = r->ExceptionAddress;
+    g_jit_fault.flags = r->ExceptionFlags;
+    if (r->NumberParameters > 0) g_jit_fault.info0 = r->ExceptionInformation[0];
+    if (r->NumberParameters > 1) g_jit_fault.info1 = r->ExceptionInformation[1];
+  }
+  g_jit_fault.module_base = reinterpret_cast<void*>(GetModuleHandleW(nullptr));
+  g_jit_fault.frames =
+      CaptureStackBackTrace(0, 24, g_jit_fault.stack, nullptr);
+  return EXCEPTION_EXECUTE_HANDLER;
+}
+
 void assembly_load_hook_uwp(MonoAssembly* assembly, void* user_data) {
   (void)user_data;
   MonoImage* image = mono_assembly_get_image(assembly);
   if (!image) return;
+  {
+    const char* nm = mono_image_get_name(image);
+    char line[320];
+    std::snprintf(line, sizeof(line), "mono image: %s", nm ? nm : "?");
+    mono_log(line);
+  }
   // FNA3D is exported from the exe itself (FNA3DAPI __declspec(dllexport)
   // under _WIN32): map it to __Internal so Mono resolves the P/Invokes
   // via GetProcAddress on the main module. Installed into EVERY image,
-  // before any P/Invoke in it can resolve. (FAudio is NOT mapped: it is
-  // not compiled into the host yet — a later step.)
+  // before any P/Invoke in it can resolve. FAudio is mapped the same way:
+  // the core + Tiramisu UWP platform layer are compiled into the host.
   mono_dllmap_insert(image, "FNA3D", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "FAudio", nullptr, "__Internal", nullptr);
+#ifdef _WIN32
+  // Managed Celeste P/Invokes: the real bridges are compiled into this
+  // UWP host and exported (host-bridges.def), so map them to __Internal.
+  // The Linux harness uses cfg->dllmaps to the real .so files instead.
+  // Also install GLOBAL dllmaps (NULL image). The per-image maps above are
+  // only consulted for the image the hook saw; FNA's P/Invokes resolve from
+  // a forwarded assembly context where the per-image map is not applied.
+  mono_dllmap_insert(nullptr, "FNA3D", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "FAudio", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "fmod", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "fmodstudio", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "CSteamworks", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "sdkencryptedappticket", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(nullptr, "System.Native", nullptr, "__Internal", nullptr);
   mono_dllmap_insert(image, "fmod", nullptr, "__Internal", nullptr);
   mono_dllmap_insert(image, "fmodstudio", nullptr, "__Internal", nullptr);
   mono_dllmap_insert(image, "CSteamworks", nullptr, "__Internal", nullptr);
   mono_dllmap_insert(image, "sdkencryptedappticket", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "System.Native", nullptr, "__Internal", nullptr);
+#endif
   if (!g_hook_dllmaps_uwp || g_hook_dllmap_count_uwp <= 0) return;
   for (int i = 0; i < g_hook_dllmap_count_uwp; ++i) {
     mono_dllmap_insert(image, g_hook_dllmaps_uwp[i].module, nullptr,
@@ -196,6 +358,53 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   if (!cfg || !cfg->exe_path || !cfg->exe_path[0])
     return fail("trt_mono_run: no exe_path");
   if (cfg->log) g_log = cfg->log;
+
+  // UWP: Mono/game stderr goes nowhere. Redirect it to a file in the
+  // game dir so g_error()/Console.Error messages survive a silent exit.
+  static bool stderr_redirected = false;
+  if (!stderr_redirected && cfg->exe_path) {
+    stderr_redirected = true;
+    const char* slash = nullptr;
+    for (const char* q = cfg->exe_path; *q; ++q)
+      if (*q == '/' || *q == '\\') slash = q;
+    char logpath[1200];
+    if (slash) {
+      const size_t n = (size_t)(slash - cfg->exe_path);
+      std::memcpy(logpath, cfg->exe_path, n);
+      std::memcpy(logpath + n, "\\mono-stderr.log", 17);
+    } else {
+      std::snprintf(logpath, sizeof(logpath), "mono-stderr.log");
+    }
+    wchar_t wide[1300];
+    // .126: verify the redirect actually took (mono-stderr.log was 0 B
+    // in .122-.125 - either nothing was written or the redirect failed
+    // silently), capture stdout too (eglib may write there), and force
+    // both streams unbuffered - abort() does NOT flush stdio buffers,
+    // so a buffered assert message would be lost on the g_assert path.
+    bool err_ok = false;
+    bool out_ok = false;
+    if (MultiByteToWideChar(CP_UTF8, 0, logpath, -1, wide, 1300) > 0) {
+      FILE* f_err = _wfreopen(wide, L"w", stderr);
+      FILE* f_out = _wfreopen(wide, L"a", stdout);
+      if (f_err) std::setvbuf(stderr, nullptr, _IONBF, 0);
+      if (f_out) std::setvbuf(stdout, nullptr, _IONBF, 0);
+      err_ok = (f_err != nullptr);
+      out_ok = (f_out != nullptr);
+    }
+    {
+      char line[256];
+      std::snprintf(line, sizeof(line),
+                    "126 diag: stderr->mono-stderr.log %s, stdout %s",
+                    err_ok ? "ok" : "FAILED", out_ok ? "ok" : "FAILED");
+      mono_log(line);
+    }
+  }
+
+  // Install Mono diagnostic handlers FIRST: on the console there is no
+  // console, so Mono's stderr/log vanishes — route it into tiramisu.log.
+  mono_trace_set_print_handler(mono_print_to_log);
+  mono_trace_set_printerr_handler(mono_print_to_log);
+  mono_trace_set_log_handler(mono_log_to_log, nullptr);
 
   // FNA platform selection via environment variables, as on Linux —
   // but through SetEnvironmentVariableW (the UCRT setenv/unsetenv are
@@ -254,6 +463,16 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     mono_log(line);
   }
 
+  // Diagnostic: route Mono GC/thread events into tiramisu.log so a
+  // stop-the-world deadlock is visible. .126 adds dll,asm (surfaces
+  // DllImport resolution traces, suppressed by default) and a 64 MB
+  // nursery: if the death is the first-finalization JIT compile
+  // (gc.c:296-306), deferring the first GC past startup lets the game
+  // proceed past Steamworks.NET - the decisive discriminator.
+  SetEnvironmentVariableW(L"MONO_LOG_MASK", L"gc,thread,dll,asm");
+  SetEnvironmentVariableW(L"MONO_LOG_LEVEL", L"debug");
+  SetEnvironmentVariableW(L"MONO_GC_PARAMS", L"nursery-size=64m");
+
   // Interpreter mode is FORCED on UWP: the AppContainer blocks dynamic
   // code generation, so JIT code cannot execute; the interpreter is the
   // only execution engine. (cfg->interpreter is ignored here — there is
@@ -262,7 +481,29 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     char* opt_argv[2] = {(char*)"tiramisu-mono", (char*)"--interpreter"};
     mono_jit_parse_options(2, opt_argv);
     mono_log("mode: interpreter (forced on UWP; no JIT in AppContainer)");
+  // Diagnostic: can Mono's __Internal path see the exported bridge
+  // functions in this exe? These are the flat P/Invoke entry points.
+  {
+    HMODULE self = GetModuleHandleW(nullptr);
+    const char* probes[] = {"Init", "RestartAppIfNecessary", "FMOD_System_Create",
+                            "FNA3D_CreateDevice", "TiramisuFNA_Ping"};
+    char line[256];
+    std::snprintf(line, sizeof(line), "self module: %p", (void*)self);
+    mono_log(line);
+    for (const char* sym : probes) {
+      void* fn = (void*)GetProcAddress(self, sym);
+      std::snprintf(line, sizeof(line), "export %s: %s", sym,
+                    fn ? "FOUND" : "MISSING");
+      mono_log(line);
+    }
   }
+
+  }
+
+  // NOTE (.124): mono_aot_only is NOT set before mono_jit_init - .123
+  // proved it kills mini_init itself (died before mscorlib loaded).
+  // It is set AFTER init succeeds (below), so init runs normally
+  // (patches 28+29 handle it) and Main runs with no trampolines.
 
   // Install the dllmap hook BEFORE opening any assembly so every image —
   // the exe, its managed DLLs, lazily-loaded assemblies — gets the maps.
@@ -275,9 +516,76 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     std::snprintf(line, sizeof(line), "opening %s", cfg->exe_path);
     mono_log(line);
   }
-  MonoDomain* domain = mono_jit_init(
-      cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  // .126 diagnostic: install the VEH (defined since .105 but never
+  // installed - a non-main-thread AV was totally silent) and a SIGABRT
+  // handler (g_assert aborts via abort()). Both must be in place before
+  // mono_jit_init so the whole run is covered.
+  {
+    // AddVectoredExceptionHandler is not declared in the UWP-partitioned
+    // headers, so resolve it at runtime from kernel32.dll; if it is
+    // unavailable the VEH is skipped (logged) instead of failing the link.
+    using AddVehFn =
+        PVOID (WINAPI*)(ULONG, LONG (WINAPI*)(EXCEPTION_POINTERS*));
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    auto pAddVeh = k32 ? reinterpret_cast<AddVehFn>(
+                              GetProcAddress(k32, "AddVectoredExceptionHandler"))
+                       : nullptr;
+    PVOID veh = pAddVeh ? pAddVeh(1, mono_veh) : nullptr;
+    std::signal(SIGABRT, sigabrt_handler);
+    std::set_terminate(tiramisu_terminate_handler);
+    HMODULE k32b = GetModuleHandleW(L"kernel32.dll");
+    using SetUefFn = LONG (WINAPI*)(LONG (WINAPI*)(EXCEPTION_POINTERS*));
+    auto pSetUef = k32b ? reinterpret_cast<SetUefFn>(
+        GetProcAddress(k32b, "SetUnhandledExceptionFilter")) : nullptr;
+    if (pSetUef) pSetUef(unhandled_filter);
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "126 diag: VEH %s, SIGABRT handler installed, "
+                  "nursery=64m",
+                  veh ? "installed" : "FAILED");
+    mono_log(line);
+  }
+  mono_log("mono_jit_init: calling (SEH-guarded)");
+  MonoDomain* domain = nullptr;
+  __try {
+    domain = mono_jit_init(
+        cfg->domain_name ? cfg->domain_name : "tiramisu-mono");
+  } __except (jit_init_filter(GetExceptionInformation())) {
+    domain = nullptr;
+  }
+  if (g_jit_fault.code != 0) {
+    const auto base = reinterpret_cast<ULONG_PTR>(g_jit_fault.module_base);
+    const auto addr = reinterpret_cast<ULONG_PTR>(g_jit_fault.address);
+    char detail[512];
+    std::snprintf(detail, sizeof(detail),
+                  "mono_jit_init SEH 0x%08lX at %p (modbase=%p rva=0x%llX) "
+                  "flags=0x%lX info0=0x%llX info1=0x%llX frames=%u",
+                  (unsigned long)g_jit_fault.code, g_jit_fault.address,
+                  g_jit_fault.module_base,
+                  (unsigned long long)(addr >= base ? addr - base : 0),
+                  (unsigned long)g_jit_fault.flags,
+                  (unsigned long long)g_jit_fault.info0,
+                  (unsigned long long)g_jit_fault.info1,
+                  (unsigned)g_jit_fault.frames);
+    mono_log(detail);
+    for (USHORT i = 0; i < g_jit_fault.frames; ++i) {
+      const auto fa = reinterpret_cast<ULONG_PTR>(g_jit_fault.stack[i]);
+      char frame[160];
+      std::snprintf(frame, sizeof(frame), "  jit_frame[%u] %p rva=0x%llX",
+                    (unsigned)i, g_jit_fault.stack[i],
+                    (unsigned long long)(fa >= base ? fa - base : 0));
+      mono_log(frame);
+    }
+    return fail("mono_jit_init raised SEH");
+  }
   if (!domain) return fail("mono_jit_init returned NULL");
+  mono_log("mono_jit_init: domain ok");
+
+  // NOTE (.125): mono_aot_only is NOT set here. .123 (pre-init) died in
+  // mini_init; .124 (post-init) died in mono_assembly_open. aot_only
+  // without AOT images is not viable - Mono needs AOT images for every
+  // assembly it loads in aot-only mode. The .122 baseline (no aot_only)
+  // is restored; the analyst's fix lands on top of it.
 
   // Register the Tiramisu backend's native internal calls now, before
   // any managed code runs (same as Linux).
@@ -313,6 +621,12 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     std::snprintf(config_path, sizeof(config_path), "%s.config", cfg->exe_path);
     const bool has_config =
         (GetFileAttributesA(config_path) != INVALID_FILE_ATTRIBUTES);
+    // UWP: the process CWD is the read-only package install dir, so a
+    // game that writes a relative path (Celeste: error_log.txt) gets
+    // UnauthorizedAccessException. Point CWD at the writable game dir.
+    wchar_t game_dir_w[1200];
+    if (MultiByteToWideChar(CP_UTF8, 0, game_dir, -1, game_dir_w, 1200) > 0)
+      SetCurrentDirectoryW(game_dir_w);
     mono_domain_set_config(domain, game_dir, config_path);
     char line[1200];
     std::snprintf(line, sizeof(line), "domain base dir: %s%s", game_dir,
@@ -320,6 +634,7 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
     mono_log(line);
   }
 
+  trt_trace("TRACE assembly open enter");
   MonoAssembly* assembly = mono_domain_assembly_open(domain, cfg->exe_path);
   if (!assembly) {
     char detail[512];
@@ -327,6 +642,7 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
                   "mono_domain_assembly_open failed for %s", cfg->exe_path);
     return fail(detail);
   }
+  trt_trace("TRACE assembly open ok");
 
   // Enter Main via mono_jit_exec — the same entry the mono CLI uses. It
   // sets the entry assembly (so Assembly.GetEntryAssembly() works —
@@ -336,14 +652,84 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   // unhandled managed exception escapes. A game whose Main legitimately
   // returns -1 would be misreported as a failure; Celeste's Main is
   // void, so -1 is unambiguous here.
+  mono_install_unhandled_exception_hook(mono_unhandled_hook, nullptr);
+  mono_log("unhandled exception hook installed");
   mono_log("invoking managed Main");
+  std::atomic<bool> wd_stop{false};
+  std::thread wd([&wd_stop]() {
+    // Tracing watchdog: uses the allocation-free trace writer (NOT
+    // mono_log, which blocks on the heap lock / g_file_mu during the
+    // freeze) and probes heap health each cycle: a hung malloc = the
+    // CRT heap lock is held (H1). Per cycle: PROBE enter -> malloc ->
+    // PROBE ok. If "enter" appears with no "ok", the heap is locked.
+    for (int i = 0; i < 40 && !wd_stop.load(); ++i) {
+      std::this_thread::sleep_for(std::chrono::seconds(3));
+      if (!wd_stop.load()) {
+        char t[96];
+        std::snprintf(t, sizeof(t), "TRACE watchdog: Main still running (%ds)",
+                      (i + 1) * 3);
+        trt_trace(t);
+        trt_trace("TRACE PROBE malloc enter");
+        void* p = std::malloc(64);
+        if (p) {
+          trt_trace("TRACE PROBE malloc ok");
+          std::free(p);
+        } else {
+          trt_trace("TRACE PROBE malloc NULL (out of memory)");
+        }
+        // Memory instrumentation (oom-analysis.md section 6.1): the
+        // DECISIVE measurement for the .141 ceiling — if app usage
+        // climbs toward the 5 GB limit before the death, it is OOM; if
+        // it stays flat (~500 MB), it is a silent crash. Allocation-free
+        // (stack buffer + trt_trace), like the rest of this watchdog.
+        {
+          char m[192];
+          try {
+            using winrt::Windows::System::MemoryManager;
+            const uint64_t usage = MemoryManager::AppMemoryUsage();
+            const uint64_t limit = MemoryManager::AppMemoryUsageLimit();
+            const uint64_t pcm = trt_fmod_studio_pcm_cache_bytes();
+            const int64_t heap = mono_gc_get_heap_size();
+            const int64_t used = mono_gc_get_used_size();
+            std::snprintf(m, sizeof(m),
+                          "TRACE mem: app %llu/%llu MiB, pcm %llu MiB, "
+                          "sgen heap %lld used %lld MiB",
+                          (unsigned long long)(usage / (1024 * 1024)),
+                          (unsigned long long)(limit / (1024 * 1024)),
+                          (unsigned long long)(pcm / (1024 * 1024)),
+                          (long long)(heap / (1024 * 1024)),
+                          (long long)(used / (1024 * 1024)));
+          } catch (const winrt::hresult_error&) {
+            std::snprintf(m, sizeof(m),
+                          "TRACE mem: app usage query failed");
+          }
+          trt_trace(m);
+        }
+      }
+    }
+  });
   std::vector<char*> exec_argv;
   exec_argv.reserve((size_t)(nargs > 0 ? nargs : 0) + 1);
   exec_argv.push_back(const_cast<char*>(cfg->exe_path));
   for (int i = 0; i < nargs; ++i)
     exec_argv.push_back(const_cast<char*>(args[i] ? args[i] : ""));
-  const int exec_rc = mono_jit_exec(
-      domain, assembly, (int)exec_argv.size(), exec_argv.data());
+  int exec_rc = -999;
+  trt_trace("TRACE mono_jit_exec enter");
+  __try {
+    exec_rc = mono_jit_exec(
+        domain, assembly, (int)exec_argv.size(), exec_argv.data());
+  } __except (jit_init_filter(GetExceptionInformation())) {
+    char ex[256];
+    std::snprintf(ex, sizeof(ex),
+                  "managed Main raised SEH 0x%08lX at %p",
+                  (unsigned long)g_jit_fault.code, g_jit_fault.address);
+    mono_log(ex);
+    trt_trace(ex);
+    exec_rc = -999;
+  }
+  trt_trace("TRACE mono_jit_exec returned");
+  wd_stop.store(true);
+  if (wd.joinable()) wd.join();
   if (exec_rc == -1)
     return fail("mono_jit_exec failed: no Main or unhandled managed "
                 "exception (see stderr)");
@@ -604,6 +990,7 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
                   "mono_domain_assembly_open failed for %s", cfg->exe_path);
     return fail(detail);
   }
+  trt_trace("TRACE assembly open ok");
 
   // Enter Main via mono_jit_exec — the same entry the mono CLI uses. It
   // sets the entry assembly (so Assembly.GetEntryAssembly() works —

@@ -66,11 +66,6 @@ constexpr u8 k_subtype_ieee_float[16] = {0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
                                          0x10, 0x00, 0x80, 0x00, 0x00, 0xAA,
                                          0x00, 0x38, 0x9B, 0x71};
 
-// KSDATAFORMAT_SUBTYPE_PCM: {00000001-0000-0010-8000-00AA00389B71}
-constexpr u8 k_subtype_pcm[16] = {0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-                                  0x10, 0x00, 0x80, 0x00, 0x00, 0xAA,
-                                  0x00, 0x38, 0x9B, 0x71};
-
 #pragma pack(push, 1)
 struct wave_format_extensible {
   u16 wFormatTag;       // 0xFFFE = WAVE_FORMAT_EXTENSIBLE
@@ -449,40 +444,52 @@ i32 TRT_GUEST_ABI client_Initialize(void* self, u32 share_mode,
   (void)hns_periodicity;
   (void)session_guid;
   wasapi_client* c = (wasapi_client*)self;
+  u32 rate = c->rate;
+  u32 channels = c->channels;
+  u32 bits_per_sample = c->bits_per_sample;
+  bool is_float = c->is_float;
   if (format) {
-    const wave_format_extensible* wf = (const wave_format_extensible*)format;
+    const auto* wf = static_cast<const wave_format_extensible*>(format);
     if (wf->nSamplesPerSec >= 8000 && wf->nSamplesPerSec <= 192000)
-      c->rate = wf->nSamplesPerSec;
-    if (wf->nChannels >= 1 && wf->nChannels <= 8) c->channels = wf->nChannels;
+      rate = wf->nSamplesPerSec;
+    if (wf->nChannels >= 1 && wf->nChannels <= 8) channels = wf->nChannels;
     if (wf->wBitsPerSample == 16 || wf->wBitsPerSample == 32)
-      c->bits_per_sample = wf->wBitsPerSample;
+      bits_per_sample = wf->wBitsPerSample;
     if (wf->wFormatTag == 3 /*WAVE_FORMAT_IEEE_FLOAT*/) {
-      c->is_float = true;
+      is_float = true;
     } else if (wf->wFormatTag == 1 /*WAVE_FORMAT_PCM*/) {
-      c->is_float = false;
+      is_float = false;
     } else if (wf->wFormatTag == 0xFFFEu && wf->cbSize >= 22) {
-      c->is_float = (memcmp(wf->SubFormat, k_subtype_ieee_float, 16) == 0);
-      if (memcmp(wf->SubFormat, k_subtype_pcm, 16) == 0) c->is_float = false;
+      is_float = memcmp(wf->SubFormat, k_subtype_ieee_float, 16) == 0;
     }
-    c->block_align = c->channels * (c->bits_per_sample / 8);
-    if (c->block_align == 0) c->block_align = 8;
   }
-  if (hns_buffer_duration > 0) {
-    const u64 frames =
-        ((u64)hns_buffer_duration * (u64)c->rate) / 10000000ULL;
-    c->buffer_frames = frames >= 1024 ? (u32)frames : 4800u;
-  } else {
-    // Settings knob: audio_buffer_ms (default 100). Games that never pass
-    // hnsBufferDuration get the user's tuning instead of a hard-coded 100ms.
+  const u32 block_align = channels * (bits_per_sample / 8);
+  // Clamp in time units before multiplying by the sample rate. The mixer
+  // stages a short software buffer, so a nonsensical duration must never
+  // wrap the frame count or request gigabytes of PCM storage.
+  constexpr i64 k_hns_per_second = 10000000;
+  constexpr i64 k_max_buffer_duration = 2 * k_hns_per_second;
+  i64 duration = hns_buffer_duration;
+  if (duration <= 0) {
     const int ms = trt_settings_audio_buffer_ms ? trt_settings_audio_buffer_ms() : 0;
-    const u64 frames =
-        (u64)c->rate * (u64)(ms > 0 ? ms : 100) / 1000ull;
-    c->buffer_frames = frames >= 1024 ? (u32)frames : 4800u;
+    duration = static_cast<i64>(ms > 0 ? ms : 100) * 10000;
   }
-  const size_t bytes = (size_t)c->buffer_frames * (size_t)c->block_align;
+  if (duration > k_max_buffer_duration) duration = k_max_buffer_duration;
+  const u32 frames = static_cast<u32>(duration * rate / k_hns_per_second);
+  const u32 buffer_frames = frames >= 1024 ? frames : 4800;
+  const size_t bytes = static_cast<size_t>(buffer_frames) * block_align;
+  auto* mix = static_cast<u8*>(calloc(1, bytes));
+  if (!mix) return k_e_outofmemory;
+
   free(c->mix_buf);
-  c->mix_buf = (u8*)calloc(1, bytes ? bytes : 64);
-  c->mix_buf_cap = bytes ? bytes : 64;
+  c->mix_buf = mix;
+  c->mix_buf_cap = bytes;
+  c->rate = rate;
+  c->channels = channels;
+  c->bits_per_sample = bits_per_sample;
+  c->block_align = block_align;
+  c->is_float = is_float;
+  c->buffer_frames = buffer_frames;
   c->in_flight_frames = 0;
   c->just_submitted = false;
   if (c->event_handle) trt_SetEvent(c->event_handle);

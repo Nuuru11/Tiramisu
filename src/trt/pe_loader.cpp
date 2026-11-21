@@ -14,7 +14,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#if !defined(_WIN32)
+#if defined(_WIN32)
+#  include <windows.h>
+#else
 #  include <pthread.h>
 #endif
 #include <atomic>
@@ -62,8 +64,8 @@ void logf_be(const trt_backend* be, const char* msg) {
 #define TRT_TEB_TLS_ARRAY_OFF 0x600u
 
 #if defined(_WIN32)
-// Leave indices [0..15] clear for host static/WinRT implicit TLS slots (_tls_index).
-constexpr u32 k_guest_tls_first_index = 16;
+// Leave the native loader's static TLS indices below the guest's range.
+constexpr u32 k_guest_tls_first_index = 1024;
 extern "C" unsigned long _tls_index;
 #else
 constexpr u32 k_guest_tls_first_index = 0;
@@ -230,16 +232,55 @@ void** trt_guest_tls_array(void) {
   return t_tls_state.slots;
 }
 
-void trt_guest_tls_bind_host_slot(void** host_tls, void** guest_tls) {
 #if defined(_WIN32)
-  if (!host_tls || !guest_tls || host_tls == guest_tls) return;
-  const u32 idx = (u32)_tls_index;
-  if (idx < k_guest_tls_first_index) {
-    guest_tls[idx] = host_tls[idx];
+static void bind_native_module_tls(HMODULE module, void** native, void** guest) {
+  if (!module) return;
+  // The platform supplies mapped module handles. A module can still unload
+  // between enumeration and this read, so guard the borrowed pointers.
+  __try {
+    const auto* base = reinterpret_cast<const u8*>(module);
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS) return;
+    const auto& entry = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (!entry.VirtualAddress || entry.Size < sizeof(IMAGE_TLS_DIRECTORY64)) return;
+    const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(base + entry.VirtualAddress);
+    if (!tls->AddressOfIndex) return;
+    const DWORD index = *reinterpret_cast<const DWORD*>(tls->AddressOfIndex);
+    if (index < k_guest_tls_first_index) guest[index] = native[index];
+  } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+#endif
+
+void trt_guest_tls_bind_host_slots(void** native, void** guest) {
+#if defined(_WIN32)
+  if (!native || !guest || native == guest) return;
+  const u32 index = (u32)_tls_index;
+  if (index < k_guest_tls_first_index) guest[index] = native[index];
+
+  using enum_modules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+  static const auto modules = reinterpret_cast<enum_modules>(
+      GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32EnumProcessModules"));
+  HMODULE loaded[256];
+  DWORD bytes = 0;
+  if (modules && modules(GetCurrentProcess(), loaded, sizeof(loaded), &bytes)) {
+    const size_t count = bytes < sizeof(loaded) ? bytes / sizeof(HMODULE)
+                                               : sizeof(loaded) / sizeof(HMODULE);
+    for (size_t i = 0; i < count; ++i) bind_native_module_tls(loaded[i], native, guest);
+  } else {
+    // The Xbox AppContainer can restrict process enumeration. Preserve the
+    // loaded system components that the direct graphics path calls into.
+    const wchar_t* graphics_modules[] = {
+        L"d3d11.dll", L"d3d11on12.dll", L"d3d12.dll", L"D3D12Core.dll",
+        L"dxgi.dll", L"d3dcompiler_47.dll", L"winrtbase.dll", L"combase.dll"};
+    for (const auto* name : graphics_modules)
+      bind_native_module_tls(GetModuleHandleW(name), native, guest);
   }
 #else
-  (void)host_tls;
-  (void)guest_tls;
+  (void)native;
+  (void)guest;
 #endif
 }
 

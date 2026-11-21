@@ -5,6 +5,7 @@
 // CoreWindow swapchain is cleanly rebound to that ID3D12CommandQueue and
 // restored to D3D11 when the guest exits back to the launcher.
 #include "swapchain.h"
+#include "host_log.h"
 #include "d3d9_backend.hpp"
 #include "gl_backend.hpp"
 #include "vk_backend.hpp"
@@ -12,6 +13,8 @@
 #include "../trt/bridge_d3d.h"
 #include "../trt/bridge_d3d12.h"
 #include "../trt/bridge_d3dx.h"
+#include "../trt/input.h"
+#include <algorithm>
 
 #include <d3d11on12.h>
 #include <d3d12.h>
@@ -19,6 +22,7 @@
 #include <dxgi1_6.h>
 
 #include "settings.h"
+#include <atomic>
 #include <chrono>
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -34,11 +38,13 @@ winrt::com_ptr<ID3D11DeviceContext1> g_ctx;
 winrt::com_ptr<IDXGISwapChain1> g_swap;
 winrt::com_ptr<IDXGISwapChain3> g_swap3;
 winrt::com_ptr<ID3D11RenderTargetView> g_rtv;
+winrt::com_ptr<ID3D11Texture2D> g_guest_backbuffer;
 winrt::com_ptr<IDXGIFactory2> g_factory;
 winrt::com_ptr<IDXGIFactory6> g_factory6;
 winrt::com_ptr<ID3D12Device> g_d3d12_device;
 winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
 bool g_in_d3d12 = false;
+std::atomic<bool> g_pointer_kbm_active{false};
 unsigned g_w = 1280, g_h = 720;
 unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
 
@@ -132,6 +138,138 @@ DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
   }
 }
 
+// A flip-model swapchain takes an UNORM format. D3D11 still permits an
+// sRGB render-target view on that buffer when the guest requests sRGB.
+int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
+  if (!g_swap || !g_ctx || !g_device) return E_FAIL;
+  if (format == DXGI_FORMAT_UNKNOWN) return S_OK;
+  const auto wanted = sanitize_flip_fmt(format);
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  HRESULT hr = g_swap->GetDesc1(&desc);
+  if (FAILED(hr) || desc.Format == wanted) return hr;
+
+  g_ctx->ClearState();
+  g_rtv = nullptr;
+  g_ctx->Flush();
+  hr = g_swap->ResizeBuffers(0, desc.Width, desc.Height, wanted, desc.Flags);
+  winrt::com_ptr<ID3D11Texture2D> back;
+  if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
+    g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
+    d3d9_rt::g_rt.rtv = g_rtv.get();
+    gl_rt::g_glrt.main_rtv = g_rtv.get();
+    vk_rt::g_vkrt.main_rtv = g_rtv.get();
+  }
+  char message[120];
+  snprintf(message, sizeof(message), "d3d: CoreWindow backbuffer format %u -> %u, hr=0x%08lx",
+           static_cast<unsigned>(desc.Format), static_cast<unsigned>(wanted),
+           static_cast<unsigned long>(hr));
+  log_line(message);
+  return hr;
+}
+
+int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
+  if (!g_swap || !g_device) return E_FAIL;
+  const HRESULT hr = set_d3d11_swapchain_format(format);
+  if (FAILED(hr)) return hr;
+
+  const bool single_buffer = buffer_count == 1 ||
+                             (buffer_count == 0 && g_guest_backbuffer);
+  if (!single_buffer) {
+    g_guest_backbuffer = nullptr;
+    return S_OK;
+  }
+
+  // Desktop swap-effects can expose one stable buffer. UWP needs at
+  // least two flip buffers. Keep the desktop render target stable and
+  // copy its pixels into the CoreWindow buffer before each flip.
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  if (FAILED(g_swap->GetDesc1(&desc))) return E_FAIL;
+  const bool srgb = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                    format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+  DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : desc.Format;
+  if (g_guest_backbuffer) {
+    D3D11_TEXTURE2D_DESC current{};
+    g_guest_backbuffer->GetDesc(&current);
+    if (format == DXGI_FORMAT_UNKNOWN) guest_format = current.Format;
+    if (current.Width == desc.Width && current.Height == desc.Height &&
+        current.Format == guest_format)
+      return S_OK;
+  }
+  D3D11_TEXTURE2D_DESC texture{};
+  texture.Width = desc.Width;
+  texture.Height = desc.Height;
+  texture.MipLevels = 1;
+  texture.ArraySize = 1;
+  texture.Format = guest_format;
+  texture.SampleDesc.Count = 1;
+  texture.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  winrt::com_ptr<ID3D11Texture2D> target;
+  const HRESULT created = g_device->CreateTexture2D(&texture, nullptr, target.put());
+  if (FAILED(created)) return created;
+  g_guest_backbuffer = std::move(target);
+  log_line("d3d: using a single guest backbuffer over the CoreWindow flip chain");
+  return S_OK;
+}
+
+int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
+  if (!g_guest_backbuffer) return E_NOTIMPL;
+  if (out) *out = nullptr;
+  if (index != 0 || !out || !iid) return DXGI_ERROR_INVALID_CALL;
+  return g_guest_backbuffer->QueryInterface(*static_cast<const IID*>(iid), out);
+}
+
+// Paint a small arrow on the presentation surface. ClearView writes just
+// these rectangles and leaves the guest's shaders and bindings intact.
+void draw_pointer_impl(bool launcher) {
+  if (!g_ctx || !g_rtv || !g_w || !g_h) return;
+  int x, y;
+  if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
+  const int scale = g_h >= 900 ? 2 : 1;
+  static constexpr const char* rows[] = {
+      "#", "##", "#o#", "#oo#", "#ooo#", "#oooo#", "#ooooo#", "#oooooo#",
+      "#ooooooo#", "#oooooooo#", "#ooooooooo#", "#ooooo#####",
+      "#oo#oo#", "#o##oo#", "##..#oo#", "#...#oo#", ".....###",
+  };
+  D3D11_RECT dark[64], light[64];
+  unsigned n_dark = 0, n_light = 0;
+  for (unsigned row = 0; row < sizeof(rows) / sizeof(rows[0]); ++row) {
+    const int top = y + static_cast<int>(row) * scale;
+    if (top < 0 || top >= static_cast<int>(g_h)) continue;
+    const char* pixels = rows[row];
+    for (int col = 0; pixels[col];) {
+      const int first = col;
+      const char color = pixels[col++];
+      while (pixels[col] == color) ++col;
+      if (color == '.') continue;
+      const int left = std::max(0, x + first * scale);
+      const int right = std::min(static_cast<int>(g_w), x + col * scale);
+      if (left >= right) continue;
+      const D3D11_RECT rect{left, top, right, std::min(top + scale, (int)g_h)};
+      if (color == '#') dark[n_dark++] = rect;
+      else light[n_light++] = rect;
+    }
+  }
+  const float black[4] = {0.015f, 0.015f, 0.015f, 1.f};
+  const float fill[4] = {
+      g_pointer_kbm_active.load() ? 0.13f : 1.f,
+      g_pointer_kbm_active.load() ? 0.83f : 1.f,
+      g_pointer_kbm_active.load() ? 0.93f : 1.f,
+      1.f,
+  };
+  if (n_dark) g_ctx->ClearView(g_rtv.get(), black, dark, n_dark);
+  if (n_light) g_ctx->ClearView(g_rtv.get(), fill, light, n_light);
+}
+
+void TRT_GUEST_ABI prepare_d3d11_present() {
+  if (!g_swap || !g_ctx) return;
+  if (g_guest_backbuffer) {
+    winrt::com_ptr<ID3D11Texture2D> back;
+    if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void())))
+      g_ctx->CopyResource(back.get(), g_guest_backbuffer.get());
+  }
+  draw_pointer_impl(false);
+}
+
 void publish_gpu_hooks() {
   trt_gpu_hooks hooks{};
   hooks.device = g_device.get();
@@ -172,6 +310,9 @@ void publish_gpu_hooks() {
     return S_OK;
   };
   hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
+  hooks.configure_d3d11_swapchain = &configure_d3d11_swapchain;
+  hooks.get_d3d11_backbuffer = &get_d3d11_backbuffer;
+  hooks.prepare_d3d11_present = &prepare_d3d11_present;
   hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,
                               u32 count, void* const* queues, u32 num_queues,
                               u32 node_mask, void** out_dev, void** out_ctx,
@@ -210,6 +351,11 @@ HRESULT create_d3d11_corewindow_swapchain() {
 }
 } // namespace
 
+void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
+void set_pointer_cursor_mode(bool kbm_active) {
+  g_pointer_kbm_active.store(kbm_active);
+}
+
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
   swapchain_result r{};
   auto bounds = w.Bounds();
@@ -226,6 +372,7 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   }
   r.width = g_w;
   r.height = g_h;
+  trt_input_display_size(static_cast<int>(g_w), static_cast<int>(g_h));
   winrt::copy_from_abi(g_window, winrt::get_abi(w));
 
   UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
@@ -277,6 +424,11 @@ void swapchain_restore_d3d11() {
   g_in_d3d12 = false;
   create_d3d11_corewindow_swapchain();
   publish_gpu_hooks();
+}
+
+void swapchain_restore_launcher_format() {
+  g_guest_backbuffer = nullptr;
+  set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM);
 }
 
 void swapchain_render_frame(float t) {
@@ -344,6 +496,7 @@ void swapchain_present() {
     }
   }
   last_present = now;
+  draw_pointer_impl(true);
   g_swap->Present(vsync ? 1 : 0, 0);
 }
 
@@ -356,6 +509,7 @@ void swapchain_shutdown() {
   vk_rt::shutdown();
   g_d3d12_swap = nullptr;
   g_d3d12_device = nullptr;
+  g_guest_backbuffer = nullptr;
   g_rtv = nullptr;
   g_swap3 = nullptr;
   g_swap = nullptr;

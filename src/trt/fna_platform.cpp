@@ -4,11 +4,14 @@
 // layer (input.h) — the same state native guests read — so the FNA
 // backend and the native guest path can never disagree about input.
 #include "fna_platform.h"
+#include "trt_trace.h"
 
 #include <atomic>
 #include <cstring>
+#include <cstdio>
 
 #include "input.h"
+#include "thunk.h"
 
 namespace {
 
@@ -19,6 +22,22 @@ std::atomic<void*> g_window_handle{nullptr};
 // The host storage root (UWP LocalState), UTF-8. Written once at boot;
 // read by the managed backend through a static pointer.
 char g_storage_root[1024] = "";
+
+// one-time trace of the first managed call to each native entry
+void fna_trace(const char* name) {
+  static std::atomic<int> ping{0}, win{0}, size{0}, poll{0}, mouse{0}, pad{0};
+  std::atomic<int>* c = &ping;
+  if (!std::strcmp(name, "GetWindowHandle")) c = &win;
+  else if (!std::strcmp(name, "GetDisplaySize")) c = &size;
+  else if (!std::strcmp(name, "PollEvent")) c = &poll;
+  else if (!std::strcmp(name, "GetMouseState") || !std::strcmp(name, "GetMouseDelta")) c = &mouse;
+  else if (!std::strcmp(name, "GetPadState")) c = &pad;
+  if (c->fetch_add(1) == 0) {
+    char line[128];
+    std::snprintf(line, sizeof(line), "TRACE fna-native: first %s call", name);
+    trt_trace(line);
+  }
+}
 
 }  // namespace
 
@@ -51,11 +70,18 @@ int trt_fna_is_headless(void) {
 
 // ---- Mono internal-call implementations ----
 
-int32_t TiramisuFNA_Ping(void) { return TRT_FNA_ABI_VERSION; }
+int32_t TiramisuFNA_Ping(void) {
+  fna_trace("Ping");
+  return TRT_FNA_ABI_VERSION;
+}
 
-void* TiramisuFNA_GetWindowHandle(void) { return trt_fna_window_handle(); }
+void* TiramisuFNA_GetWindowHandle(void) {
+  fna_trace("GetWindowHandle");
+  return trt_fna_window_handle();
+}
 
 void TiramisuFNA_GetDisplaySize(int32_t* w, int32_t* h) {
+  fna_trace("GetDisplaySize");
   int dw = 0, dh = 0;
   // trt_display_size falls back to 1920x1080 when the host has not fed
   // a size (headless), so this never returns 0x0.
@@ -66,9 +92,21 @@ void TiramisuFNA_GetDisplaySize(int32_t* w, int32_t* h) {
 
 int32_t TiramisuFNA_PollEvent(int32_t* message, int64_t* wparam,
                               int64_t* lparam) {
+  fna_trace("PollEvent");
   if (!message || !wparam || !lparam) return 0;
   trt_msg m;
   if (!trt_msg_peek(&m, true)) return 0;
+  {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 20) {
+      char line[160];
+      std::snprintf(line, sizeof(line),
+                    "TRACE input: poll msg=0x%x wp=%lld lp=0x%llx",
+                    m.message, (long long)m.wparam,
+                    (unsigned long long)m.lparam);
+      trt_trace(line);
+    }
+  }
   *message = (int32_t)m.message;
   *wparam = (int64_t)m.wparam;
   *lparam = (int64_t)m.lparam;

@@ -16,6 +16,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
 
@@ -24,7 +25,9 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <bcrypt.h>    // brown-line paired-LAN control pairing RNG
   #include <sys/stat.h>  // _stat64 for upload verification
+  #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
   using sock_t = SOCKET;
   static const sock_t kBadSock = INVALID_SOCKET;
@@ -100,6 +103,44 @@ struct inflight_guard {
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_workers{0};
 sock_t g_listener = kBadSock;
+
+using control_clock = std::chrono::steady_clock;
+std::mutex g_control_mu;
+std::string g_control_code;
+std::string g_control_token;
+std::vector<web_control_event> g_control_events;
+control_clock::time_point g_control_last{};
+control_clock::time_point g_control_retry{};
+unsigned g_control_bad_codes = 0;
+
+bool control_random(void* data, size_t size) {
+#ifdef _WIN32
+  return BCryptGenRandom(nullptr, static_cast<PUCHAR>(data),
+                         static_cast<ULONG>(size), BCRYPT_USE_SYSTEM_PREFERRED_RNG) >= 0;
+#else
+  FILE* source = fopen("/dev/urandom", "rb");
+  if (!source) return false;
+  const bool ok = fread(data, 1, size, source) == size;
+  fclose(source);
+  return ok;
+#endif
+}
+
+void reset_web_controls() {
+  unsigned bytes = 0;
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  g_control_code.clear();
+  if (control_random(&bytes, sizeof(bytes))) {
+    char code[9];
+    snprintf(code, sizeof(code), "%08u", bytes % 100000000u);
+    g_control_code = code;
+  }
+  g_control_token.clear();
+  g_control_events.clear();
+  g_control_last = {};
+  g_control_retry = {};
+  g_control_bad_codes = 0;
+}
 
 std::string g_local_state_dir;
 std::string g_games_dir;
@@ -579,48 +620,53 @@ std::string games_json() {
 const char* k_upload_page =
   "<!doctype html><html><head><meta charset=utf-8>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>Tiramisu Console Dashboard</title><style>"
-  "*{box-sizing:border-box}"
-  "body{background:#0b0f14;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
+  "<meta name=theme-color content='#1b120e'><title>Tiramisu Companion</title><style>"
+  "*{box-sizing:border-box}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #f1b477;outline-offset:2px}"
+  "body{background:#1b120e;color:#fff0dc;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
   "max-width:780px;margin:0 auto;padding:20px}"
   "header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}"
-  "h1{color:#29a8b8;font-size:24px;margin:0}h2{font-size:15px;color:#8fa6b2;margin:0 0 10px}"
-  ".card{background:#121821;border:1px solid #1e2a38;border-radius:12px;padding:16px;margin-bottom:16px}"
+  "h1{color:#e5a568;font-size:24px;margin:0}h2{font-size:15px;color:#d7b89f;margin:0 0 10px}"
+  ".card{background:#2b1e17;border:1px solid #513829;border-radius:12px;padding:16px;margin-bottom:16px}"
   ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
-  ".btn{padding:10px 14px;border:0;border-radius:8px;background:#20808d;color:#fff;font-weight:700;cursor:pointer;font-size:14px}"
-  ".btn:hover{background:#2898a7}.btn:disabled{background:#2a3a3e;color:#789}"
-  ".btn-sec{background:#1c2735;color:#cfe2ec}.btn-danger{background:#8b2635;color:#ffd6dc}"
-  "input,select{background:#0b1017;color:#e6edf3;border:1px solid #263649;border-radius:8px;padding:8px 10px;font-size:14px}"
-  ".drop{border:2px dashed #20808d;border-radius:10px;padding:20px;text-align:center;color:#9bb5bf;background:#0e141c;margin-bottom:10px}"
-  ".drop.over{border-color:#44d9ec;background:#11232c}"
-  "#bar{height:8px;background:#1b2532;border-radius:4px;overflow:hidden;margin:10px 0}"
-  "#fill{height:100%;width:0;background:#29a8b8;transition:width .2s}"
-  ".game{background:#0f151e;border:1px solid #1f2c3c;border-radius:10px;padding:12px;margin-bottom:10px}"
+  ".btn{padding:10px 14px;min-height:44px;border:0;border-radius:8px;background:#e5a568;color:#241812;font-weight:700;cursor:pointer;font-size:14px}"
+  ".btn:hover{background:#f1b477}.btn:disabled{background:#2a3a3e;color:#789}"
+  ".btn-sec{background:#423024;color:#f8e7d3}.btn-danger{background:#8b2635;color:#ffd6dc}"
+  "input,select{background:#211612;color:#fff0dc;border:1px solid #614534;border-radius:8px;padding:8px 10px;font-size:14px}"
+  ".drop{border:2px dashed #b47340;border-radius:10px;padding:20px;text-align:center;color:#d7b89f;background:#211612;margin-bottom:10px}"
+  ".drop.over{border-color:#f1b477;background:#3c281c}"
+  "#bar{height:8px;background:#483222;border-radius:4px;overflow:hidden;margin:10px 0}"
+  "#fill{height:100%;width:0;background:#e5a568;transition:width .2s}"
+  ".game{background:#241812;border:1px solid #553a2b;border-radius:10px;padding:12px;margin-bottom:10px}"
   ".game-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}"
   ".game-cfg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}"
   "@media(max-width:560px){.game-cfg{grid-template-columns:1fr}}"
-  "pre{background:#080b0f;border:1px solid #1c2530;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#a8c0cc;white-space:pre-wrap}"
-  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#172430;color:#7ccbd6}"
+  "pre{background:#1f1510;border:1px solid #503728;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#e4c5ac;white-space:pre-wrap}"
+  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#3f2a1d;color:#f1b477}"
   ".connect{display:flex;gap:16px;align-items:center;flex-wrap:wrap}"
   "#qrx canvas{border:8px solid #fff;border-radius:8px;background:#fff}"
   ".conn-info{flex:1;min-width:220px}"
-  ".conn-url{font-size:18px;font-weight:600;color:#44d9ec;word-break:break-all}"
-  ".conn-sub{font-size:13px;color:#8ea8b5;margin-top:6px}"
-  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #17212e}"
-  ".setrow label{font-size:14px;color:#cfe2ec}"
+  ".conn-url{font-size:18px;font-weight:600;color:#f1b477;word-break:break-all}"
+  ".conn-sub{font-size:13px;color:#c9a88f;margin-top:6px}"
+  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #4b3426}"
+  ".setrow label{font-size:14px;color:#f8e7d3}"
   ".setrow input,.setrow select{width:100%}"
   "@media(max-width:560px){.setrow{grid-template-columns:1fr}}"
+  "nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}"
+  "nav a{color:#f1b477;background:#3f2a1d;padding:10px 14px;border-radius:8px;text-decoration:none}"
+  "@media(max-width:560px){body{padding:12px}.card{padding:12px}input,select{font-size:16px}}"
   "</style></head><body>"
-  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill>Shelf Ready</span></div>"
+  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill role=status>Connecting…</span></div>"
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
-  "<div class=card><h2>Connect (Scan or Type)</h2>"
+  "<nav aria-label=Companion><a href='#transfer'>Transfer</a><a href='#games'>Games</a>"
+  "<a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
+  "<div class=card><h2>Console connection</h2>"
   "<div class=connect><div id=qrx></div><div class=conn-info>"
   "<div class=conn-url id=connurl>—</div>"
-  "<div class=conn-sub>This page IS the console dashboard — you are already connected.</div>"
-  "<div class=conn-sub style='color:#5a7684'>The TV shows the same QR under Settings → “Show QR / LAN link on TV”.</div>"
+  "<div class=conn-sub>Keep this device and Xbox on the same network.</div>"
+  "<div class=conn-sub style='color:#c9a88f'>Open Setup on the Xbox to find its QR code.</div>"
   "</div></div></div>"
-  "<div class=card><h2>Add Any PC / Steam Game (Unpacked Folder or .zip)</h2>"
+  "<div class=card id=transfer><h2>Transfer a game</h2>"
   "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b> or <b>.zip</b> here, or use the buttons below</div>"
   "<div class=row style='margin-bottom:10px'>"
   "<input id=gname placeholder='Game Name (auto from folder/zip)' style='flex:1;min-width:180px'>"
@@ -629,13 +675,13 @@ const char* k_upload_page =
   "<input type=file id=fdir webkitdirectory directory multiple style='display:none'>"
   "<input type=file id=fzip accept='.zip' style='display:none'></div>"
   "<div id=bar><div id=fill></div></div>"
-  "<div id=log style='font-size:13px;color:#8ea8b5;min-height:18px'>Ready over LAN</div></div>"
-  "<div class=card><h2>Games on Xbox Console</h2><div id=list><span style='color:#678'>loading...</span></div></div>"
-  "<div class=card><h2>Console Settings</h2>"
-  "<div id=setwrap><span style='color:#678'>loading settings...</span></div>"
+  "<div id=log role=status style='font-size:13px;color:#c9a88f;min-height:18px'>Ready over LAN</div></div>"
+  "<div class=card id=games><h2>Installed games</h2><div id=list><span style='color:#c9a88f'>loading...</span></div></div>"
+  "<div class=card id=settings><h2>Console settings</h2>"
+  "<div id=setwrap><span style='color:#c9a88f'>loading settings...</span></div>"
   "<div class=row style='margin-top:10px'><button class=btn onclick=saveSettings()>Save Settings</button>"
-  "<span id=setstat style='color:#8ea8b5;font-size:13px'></span></div></div>"
-  "<div class=card><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
+  "<span id=setstat style='color:#c9a88f;font-size:13px'></span></div></div>"
+  "<div class=card id=console-logs><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
   "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div>"
   "<pre id=logs style='margin-top:10px'>Click Refresh Logs or wait for auto-refresh...</pre></div>"
   "<script>"
@@ -704,8 +750,8 @@ const char* k_upload_page =
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
-  "async function refreshStatus(){try{const s=await(await fetch('/api/status')).json();"
-  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Shelf Ready';}catch{}}"
+  "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
+  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox connected';}catch{E('runpill').textContent='Xbox unavailable';}}"
   "async function loadLogs(){E('logs').textContent=await(await fetch('/api/logs')).text();}"
   // ---- settings editor ----
   "const SET_DEFS=["
@@ -849,6 +895,104 @@ void send_chunk(sock_t s, const std::string& data) {
   send_all(s, "\r\n", 2);
 }
 
+bool parse_control_events(const std::string& body, std::vector<web_control_event>* events) {
+  std::istringstream input(body);
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream row(line);
+    web_control_event e{};
+    std::string extra;
+    if (!(row >> e.kind >> e.first >> e.second) || (row >> extra) ||
+        events->size() == 128) return false;
+    const bool down = e.second == 0 || e.second == 1;
+    switch (e.kind) {
+      case 'a':
+        if (e.first < 0 || e.first > 1000 || e.second < 0 || e.second > 1000) return false;
+        break;
+      case 'm':
+        if (e.first < -2048 || e.first > 2048 || e.second < -2048 || e.second > 2048) return false;
+        break;
+      case 'b': if (e.first < 0 || e.first > 4 || !down) return false; break;
+      case 'k': if (e.first < 8 || e.first > 254 || !down) return false; break;
+      case 'w': if (e.first != 120 && e.first != -120) return false; break;
+      case 't': if (e.first < 32 || e.first > 65535) return false; break;
+      case 'r': break;
+      default: return false;
+    }
+    events->push_back(e);
+  }
+  return true;
+}
+
+void handle_controls(sock_t s, const std::string& path, const std::string& auth,
+                     const std::string& body) {
+  std::string output;
+  const char* status = "200 OK";
+  {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    const auto now = control_clock::now();
+    if (path == "/api/controls/pair") {
+      if (now < g_control_retry) {
+        status = "429 Too Many Requests";
+      } else if (g_control_code.empty() || body != g_control_code) {
+        status = "401 Unauthorized";
+        if (++g_control_bad_codes >= 5) {
+          g_control_bad_codes = 0;
+          g_control_retry = now + std::chrono::minutes(1);
+        }
+      } else {
+        unsigned char random[16]{};
+        if (!control_random(random, sizeof(random))) {
+          status = "503 Service Unavailable";
+        } else {
+          constexpr char hex[] = "0123456789abcdef";
+          for (unsigned char byte : random) {
+            output += hex[byte >> 4];
+            output += hex[byte & 15];
+          }
+          g_control_token = "Bearer " + output;
+          g_control_events = {{'r', 0, 0}};
+          g_control_last = now;
+          g_control_bad_codes = 0;
+        }
+      }
+    } else if (g_control_token.empty() || auth != g_control_token) {
+      status = "401 Unauthorized";
+    } else if (path == "/api/controls/leave") {
+      g_control_token.clear();
+      g_control_events = {{'r', 0, 0}};
+      g_control_last = {};
+    } else if (path == "/api/controls/input") {
+      std::vector<web_control_event> events;
+      if (!parse_control_events(body, &events)) {
+        status = "400 Bad Request";
+      } else if (g_control_events.size() + events.size() > 512) {
+        g_control_events = {{'r', 0, 0}};
+        status = "429 Too Many Requests";
+      } else {
+        g_control_events.insert(g_control_events.end(), events.begin(), events.end());
+        g_control_last = now;
+      }
+    } else {
+      status = "404 Not Found";
+    }
+  }
+  respond(s, status, "text/plain; charset=utf-8", output);
+}
+
+std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
+                              size_t size) {
+  std::string body(pre, std::min(size, pre_len));
+  while (body.size() < size) {
+    char buf[512];
+    const int count = recv(s, buf, static_cast<int>(
+        std::min(sizeof(buf), size - body.size())), 0);
+    if (count <= 0) break;
+    body.append(buf, count);
+  }
+  return body;
+}
+
 void handle_client(sock_t s) {
   sock_guard sg{s};
   char req[16384];
@@ -897,6 +1041,43 @@ void handle_client(sock_t s) {
     query = target.substr(qm + 1);
   }
 
+  if (strcmp(method, "GET") == 0 && url_path == "/controls") {
+    respond(s, "200 OK", "text/html; charset=utf-8", k_controls_page);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path.rfind("/api/controls/", 0) == 0) {
+    // Do not allow cross-origin browser requests to operate the app.
+    const auto origin = hdrs_low.find("\r\norigin:");
+    const auto host = hdrs_low.find("\r\nhost:");
+    if (origin != std::string::npos && host != std::string::npos) {
+      const auto value = [&](size_t at, size_t field) {
+        const size_t start = at + field;
+        return trim_ws(hdrs_low.substr(start, hdrs_low.find("\r\n", start) - start));
+      };
+      if (value(origin, 9) != "http://" + value(host, 7)) {
+        respond(s, "403 Forbidden", "text/plain", "");
+        return;
+      }
+    }
+    if (content_len > 2048) {
+      respond(s, "413 Payload Too Large", "text/plain", "");
+      return;
+    }
+    const auto at = hdrs_low.find("\r\nauthorization:");
+    std::string auth;
+    if (at != std::string::npos) {
+      const size_t start = at + 16;
+      auth = trim_ws(hdrs.substr(start, hdrs.find("\r\n", start) - start));
+    }
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const auto body = read_control_body(s, pre, pre_len, static_cast<size_t>(content_len));
+    if (body.size() != content_len) {
+      respond(s, "400 Bad Request", "text/plain", "");
+      return;
+    }
+    handle_controls(s, url_path, auth, body);
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/") {
     respond(s, "200 OK", "text/html; charset=utf-8", k_upload_page);
     return;
@@ -1484,6 +1665,7 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
   {
     std::lock_guard<std::mutex> lk(g_mu);
     g = webxfer_state{};
+    reset_web_controls();
     g_local_state_dir = local_state;
     const std::string sep(1, XFER_SEP);
     g_games_dir = local_state + sep + "games";
@@ -1638,6 +1820,22 @@ std::string webxfer_url() {
 unsigned short webxfer_port() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g.port;
+}
+
+std::vector<web_control_event> webxfer_control_events() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  if (g_control_last != control_clock::time_point{} &&
+      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
+    g_control_last = {};
+    g_control_events = {{'r', 0, 0}};
+  }
+  std::vector<web_control_event> events;
+  events.swap(g_control_events);
+  return events;
+}
+std::string webxfer_control_code() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  return g_control_code;
 }
 
 } // namespace longan

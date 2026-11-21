@@ -42,6 +42,8 @@ extern "C" int trt_fna3d_is_attached(void) { return g_attached; }
 #if defined(_WIN32)
 // ---- Windows/UWP: real handoff into the FNA3D D3D11 driver ----
 #include "FNA3D.h"
+#include <winrt/base.h>  // winrt::hresult_error
+#include <winrt/Windows.System.h>  // MemoryManager::AppMemoryUsage (patch 08)
 
 namespace {
 
@@ -114,6 +116,18 @@ extern "C" int trt_fna3d_attach_from_hooks(void (*log)(const char* line)) {
   return trt_fna3d_attach(&cfg);
 }
 
+extern "C" u64 trt_fna3d_app_memory_usage(void) {
+  // Memory instrumentation for the Celeste OOM investigation
+  // (oom-analysis.md): the FNA3D D3D11 driver logs this after each
+  // large texture upload (patch 08). Returns 0 if the query fails.
+  try {
+    using winrt::Windows::System::MemoryManager;
+    return (u64)MemoryManager::AppMemoryUsage();
+  } catch (const winrt::hresult_error&) {
+    return 0;
+  }
+}
+
 #else
 // ---- Linux: no D3D11. Honest failure, not a fake. ----
 extern "C" int trt_fna3d_attach(const trt_fna3d_attach_config* cfg) {
@@ -130,6 +144,11 @@ extern "C" int trt_fna3d_attach_from_hooks(void (*log)(const char* line)) {
   (void)log;
   return fail("FNA3D D3D11 handoff is not available on Linux (no D3D11; "
               "the offline harness renders via FNA3D/OpenGL)");
+}
+
+extern "C" u64 trt_fna3d_app_memory_usage(void) {
+  // No WinRT on Linux; the D3D11 driver is not built for Linux either.
+  return 0;
 }
 
 #endif  // _WIN32

@@ -13,6 +13,9 @@
 #include <deque>
 #include <mutex>
 #include <string>
+#include <chrono>
+
+#include "../trt/trt_trace.h"
 
 namespace longan {
 
@@ -28,7 +31,7 @@ constexpr unsigned k_ring_max = 200;
 // spamming the log fills LocalState) and log_line had no lock around the
 // FILE* writes (interleaved lines from the web + guest threads). 8 MB per
 // file, 2 backups = at most 24 MB of log on disk.
-std::mutex g_file_mu;
+std::timed_mutex g_file_mu;  // timed: log_line try_lock diagnoses H2
 long long g_bytes_written = 0;
 constexpr long long k_log_max_bytes = 8ll * 1024 * 1024;
 
@@ -72,7 +75,7 @@ std::string log_open(const std::string& package_path) {
   g_local_state.assign(ws.begin(), ws.end());
   const std::string path = g_local_state + "\\tiramisu.log";
   {
-    std::lock_guard<std::mutex> lk(g_file_mu);
+    std::lock_guard<std::timed_mutex> lk(g_file_mu);
     if (g_log) fclose(g_log);
     g_log = fopen(path.c_str(), "a");
     g_bytes_written = 0;
@@ -86,6 +89,7 @@ std::string log_open(const std::string& package_path) {
       if (g_bytes_written >= k_log_max_bytes) rotate_locked();
     }
   }
+  trt_trace_init(path.c_str());
   log_line("---- tiramisu session ----");
   return g_local_state;
 }
@@ -93,7 +97,14 @@ std::string log_open(const std::string& package_path) {
 void log_line(const char* line) {
   if (!line) return;
   ring_push(line);
-  std::lock_guard<std::mutex> lk(g_file_mu);
+  // H2 diagnostic: if g_file_mu is held >5s (log deadlock), do NOT
+  // block forever -- leave a marker via the allocation-free trace
+  // writer instead.
+  std::unique_lock<std::timed_mutex> lk(g_file_mu, std::defer_lock);
+  if (!lk.try_lock_for(std::chrono::seconds(5))) {
+    trt_trace("TRACE LOG-DEADLOCK: g_file_mu held >5s (H2)");
+    return;
+  }
   if (!g_log) return;
   fputs(line, g_log);
   fputc('\n', g_log);
@@ -125,8 +136,10 @@ size_t log_read_disk_tail(char* out, size_t cap) {
   out[0] = 0;
   if (g_local_state.empty()) return 0;
   // serialize with log_line's writes and with rotation (which renames
-  // the file out from under a concurrent reader)
-  std::lock_guard<std::mutex> lk(g_file_mu);
+  // the file out from under a concurrent reader). Try-lock: if the file
+  // mutex is stuck (freeze), return empty instead of hanging /api/logs.
+  std::unique_lock<std::timed_mutex> lk(g_file_mu, std::defer_lock);
+  if (!lk.try_lock_for(std::chrono::seconds(5))) return 0;
   const std::string path = g_local_state + "\\\\tiramisu.log";
   FILE* f = fopen(path.c_str(), "rb");
   if (!f) return 0;
@@ -143,10 +156,11 @@ size_t log_read_disk_tail(char* out, size_t cap) {
 }
 
 void log_close() {
-  std::lock_guard<std::mutex> lk(g_file_mu);
+  std::lock_guard<std::timed_mutex> lk(g_file_mu);
   if (g_log) fclose(g_log);
   g_log = nullptr;
   g_bytes_written = 0;
+  trt_trace_close();
 }
 
 } // namespace longan
