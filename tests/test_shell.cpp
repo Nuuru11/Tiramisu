@@ -191,6 +191,30 @@ int main(int argc, char** argv) {
   CHECK(stat(save, &st) == 0 && st.st_size == 4,
         "host: save.cfg exists with 4 bytes");
 
+  // icon extraction: SDL2 imports ExtractIconExW at LOAD time, so the
+  // export must exist AND answer honestly (zero icons, out-params cleared).
+  {
+    typedef u32 (TRT_GUEST_ABI * fn_extractex)(const u16*, int, void**, void**, u32);
+    typedef void* (TRT_GUEST_ABI * fn_extractone)(void*, const u16*, u32);
+    const fn_extractex ex = (fn_extractex)trt_resolve_module(
+        nullptr, "shell32.dll", "ExtractIconExW", 0);
+    const fn_extractone one = (fn_extractone)trt_resolve_module(
+        nullptr, "shell32.dll", "ExtractIconW", 0);
+    CHECK(ex != nullptr && one != nullptr,
+          "shell32!ExtractIconExW/ExtractIconW resolve (SDL2 load path)");
+    if (ex && one) {
+      void* large = (void*)(uintptr_t)1;
+      void* small = (void*)(uintptr_t)1;
+      const u16 fake[] = {'C', ':', '\\', 'x', '.', 'e', 'x', 'e', 0};
+      CHECK(ex(fake, 0, &large, &small, 1) == 0 && !large && !small,
+            "ExtractIconExW -> 0 icons, both out-params cleared");
+      CHECK(one(nullptr, fake, 0) == nullptr,
+            "ExtractIconW -> NULL (no icon extraction on console)");
+      CHECK(ex(nullptr, 0, nullptr, nullptr, 0) == 0,
+            "ExtractIconExW(NULL file, no out-params) -> 0, no crash");
+    }
+  }
+
   free(file);
   if (failures) {
     printf("RESULT: %d FAIL\n", failures);

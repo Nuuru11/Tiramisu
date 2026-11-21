@@ -32,6 +32,12 @@
 #define DOOR_FMOD_OK 0
 #define DOOR_FMOD_ERR_INVALID_PARAM 28
 
+#if defined(_WIN32)
+#define MONO_DOOR_EXPORT __declspec(dllexport)
+#else
+#define MONO_DOOR_EXPORT
+#endif
+
 extern "C" {
 
 // ---- markers: prove the real bridge is loaded ----

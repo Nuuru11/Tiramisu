@@ -58,6 +58,13 @@ u32 TRT_GUEST_ABI acm_StreamClose(void* h, u32) {
   (void)h;
   return MMSYSERR_NOERROR_;
 }
+u32 TRT_GUEST_ABI acm_StreamSize(void*, u32 in_bytes, u32* out_bytes, u32) {
+  if (out_bytes) *out_bytes = in_bytes;
+  return MMSYSERR_NOERROR_;
+}
+u32 TRT_GUEST_ABI acm_FormatSuggest(void*, void*, void*, u32, u32) {
+  return (u32)ACMERR_NOTPOSSIBLE_;
+}
 u32 TRT_GUEST_ABI acm_FormatTagEnum(void*, void* out, u32* size, u32) {
   // ACMFORMATTAGDETAILS: cbStruct(+0), dwFormatTagIndex(+4),
   // dwFormatTag(+8), cbFormatSize(+12), szFormatTag(+16...)
@@ -156,6 +163,8 @@ int trt_bridge_register_mmedia(void) {
       {"acmStreamConvert", (void*)&acm_StreamConvert},
       {"acmStreamReset", (void*)&acm_StreamReset},
       {"acmStreamClose", (void*)&acm_StreamClose},
+      {"acmStreamSize", (void*)&acm_StreamSize},
+      {"acmFormatSuggest", (void*)&acm_FormatSuggest},
       {"acmFormatTagEnumW", (void*)&acm_FormatTagEnum},
       {"acmFormatTagEnumA", (void*)&acm_FormatTagEnum},
       {"acmFormatEnumW", (void*)&acm_FormatEnum},

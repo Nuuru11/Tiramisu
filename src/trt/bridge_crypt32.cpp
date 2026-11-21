@@ -606,6 +606,12 @@ void* TRT_GUEST_ABI crypt_CertFindCertificateInStore(void* hCertStore,
   return nullptr;
 }
 
+// CertDuplicateCertificateContext: no refcounted store exists on console; treat
+// the input context as already owned and return it (identity duplicate).
+void* TRT_GUEST_ABI crypt_CertDuplicateCertificateContext(void* pCertContext) {
+  return pCertContext;
+}
+
 int trt_bridge_register_crypt32(void) {
   static const trt_named_fn k_fns[] = {
       {"CertOpenSystemStoreW", (void*)&crypt_CertOpenSystemStoreW},
@@ -618,6 +624,7 @@ int trt_bridge_register_crypt32(void) {
       {"CertVerifyCertificateChainPolicy",
        (void*)&crypt_CertVerifyCertificateChainPolicy},
       {"CertFreeCertificateContext", (void*)&crypt_CertFreeCertificateContext},
+      {"CertDuplicateCertificateContext", (void*)&crypt_CertDuplicateCertificateContext},
       {"CertFindCertificateInStore",
        (void*)&crypt_CertFindCertificateInStore},
       {"CertFreeCertificateChain", (void*)&crypt_CertFreeCertificateChain},

@@ -88,6 +88,9 @@
 | baselib.dll | DllMain(PROCESS_ATTACH) → 0x1 |
 | libgodotsteam.windows.template_release.x86_64.dll | DllMain → 0x1 |
 | steam_api64.dll | Maps + seals (was FAIL IMPORT; closed) |
+| binkw32.dll | Maps + seals (gdi32!SetStretchBltMode closed) |
+| discord_game_sdk.dll | Maps + seals (ktmw32!CreateTransaction/CommitTransaction closed) |
+| SDL2.dll | Maps + seals (shell32!ExtractIconExW closed) |
 | UnityPlayer.dll | DllMain → 0x1 |
 | GameAssembly.dll (96MB IL2CPP) | DllMain → 0x1 |
 | dxvk-2.5.3 d3d9.dll (native override) | Maps + seals + DllMain; boots as EXE entry |

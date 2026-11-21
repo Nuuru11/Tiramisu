@@ -512,18 +512,21 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
       } else {
         s->pcm = nullptr;
         s->silent = 1;
-        char line[224];
+        // Name the container class and the missing decoder. The channel is
+        // still real (play/stop/volume work); only the PCM is absent.
+        const char* fmt = "unknown container";
+        if (size >= 4 && !memcmp(data, "OggS", 4)) fmt = "ogg (decode failed)";
+        else if (size >= 3 && !memcmp(data, "FSB", 3)) fmt = "fsb bank (no decoder)";
+        else if (size >= 3 && !memcmp(data, "ID3", 3)) fmt = "mp3 (no decoder)";
+        else if (size >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0)
+          fmt = "mp3 (no decoder)";
+        else if (size >= 3 && !memcmp(data, "RIFF", 4)) fmt = "wav (decode failed)";
+        char line[256];
         snprintf(line, sizeof(line),
-                 "fmod: CreateSound(%s) -> compressed container, no decoder "
-                 "hit: channel control real, audio SILENT (named)", label);
+                 "fmod: CreateSound(%s) -> %s: channel control real, audio "
+                 "SILENT (named)", label, fmt);
         log_line(line);
       }
-      char line[256];
-      snprintf(line, sizeof(line),
-               "fmod: CreateSound(%s) -> compressed container (ogg/mp3/fsb): "
-               "decoder pending — channel control real, audio SILENT (named)",
-               label);
-      log_line(line);
     } else {
       free(s->alloc_base);
       s->alloc_base = nullptr;

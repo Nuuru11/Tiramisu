@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <mutex>
+
 namespace gdilog {
 static void line(const char* s) { trt_core_log(s); }
 }
@@ -427,6 +429,67 @@ int TRT_GUEST_ABI trt_StretchBlt(void* hdcDest, int xDest, int yDest, int wDest,
   log_line(line);
   return 1;
 }
+// ---- stretch-blit mode (per-DC GDI state) ----
+// Real GDI keeps a stretch mode per DC, defaulting to COLORONCOLOR (3).
+// Games set HALFTONE before scaling a loading screen and read it back; an
+// unresolved SetStretchBltMode is a LOAD-time import failure (measured on
+// binkw32.dll), not a cosmetic gap. The mode is recorded — the blit itself
+// already names itself as not drawn.
+struct stretch_mode_rec {
+  void* hdc;
+  i32 mode;
+};
+constexpr int GDI_MAX_STRETCH_DCS = 32;
+constexpr i32 GDI_STRETCH_DEFAULT = 3;  // COLORONCOLOR
+stretch_mode_rec g_stretch[GDI_MAX_STRETCH_DCS];
+std::mutex g_stretch_mu;
+
+int TRT_GUEST_ABI trt_SetStretchBltMode(void* hdc, i32 mode) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: SetStretchBltMode -> 0 (not a user32 DC)");
+    return 0;
+  }
+  if (mode < 1 || mode > 4) {  // BLACKONWHITE..HALFTONE
+    char line[112];
+    snprintf(line, sizeof(line),
+             "gdi32: SetStretchBltMode mode=%d -> 0 (invalid mode, want 1..4)",
+             mode);
+    log_line(line);
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(g_stretch_mu);
+  for (int i = 0; i < GDI_MAX_STRETCH_DCS; ++i) {
+    if (g_stretch[i].hdc == hdc) {
+      const i32 prev = g_stretch[i].mode;
+      g_stretch[i].mode = mode;
+      return (int)prev;
+    }
+  }
+  for (int i = 0; i < GDI_MAX_STRETCH_DCS; ++i) {
+    if (!g_stretch[i].hdc) {
+      g_stretch[i].hdc = hdc;
+      g_stretch[i].mode = mode;
+      return (int)GDI_STRETCH_DEFAULT;
+    }
+  }
+  // table full: recycle slot 0 with a named line (never a silent wrong mode)
+  g_stretch[0].hdc = hdc;
+  g_stretch[0].mode = mode;
+  log_line("gdi32: SetStretchBltMode DC table full -> recycled slot 0");
+  return (int)GDI_STRETCH_DEFAULT;
+}
+
+i32 TRT_GUEST_ABI trt_GetStretchBltMode(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) {
+    log_line("gdi32: GetStretchBltMode -> 0 (not a user32 DC)");
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(g_stretch_mu);
+  for (int i = 0; i < GDI_MAX_STRETCH_DCS; ++i)
+    if (g_stretch[i].hdc == hdc) return g_stretch[i].mode;
+  return GDI_STRETCH_DEFAULT;
+}
+
 int TRT_GUEST_ABI trt_PatBlt(void* hdc, int x, int y, int w, int h, u32 rop) {
   (void)hdc;
   char line[128];
@@ -891,6 +954,30 @@ int TRT_GUEST_ABI gdi_GetICMProfileW(void* hdc, u32* name_len, u16* name) {
   return 0;
 }
 
+// ExtEscape: printer/driver escapes are not available on the console.
+// Sekiro's amd_ags path probes it; return 0 (escape not supported).
+int TRT_GUEST_ABI trt_ExtEscape(void* hdc, int nEscape, int cbInput,
+                                const void* lpInData, int cbOutput, void* lpOutData) {
+  (void)hdc; (void)nEscape; (void)cbInput; (void)lpInData;
+  (void)cbOutput; (void)lpOutData;
+  return 0;
+}
+
+// GetGlyphOutlineW: font outline extraction not supported on console.
+u32 TRT_GUEST_ABI trt_GetGlyphOutlineW(void* hdc, u32 uChar, u32 fuFormat,
+                                       void* lpgm, u32 cbBuffer, void* lpvBuffer,
+                                       const void* lpmat2) {
+  (void)hdc; (void)uChar; (void)fuFormat; (void)lpgm;
+  (void)cbBuffer; (void)lpvBuffer; (void)lpmat2;
+  return (u32)-1;  // GDI_ERROR
+}
+
+// GetKerningPairsW: kerning pairs not available.
+u32 TRT_GUEST_ABI trt_GetKerningPairsW(void* hdc, u32 nPairs, void* lpkrnpair) {
+  (void)hdc; (void)nPairs; (void)lpkrnpair;
+  return 0;
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"GetICMProfileW", (void*)&gdi_GetICMProfileW},
@@ -936,6 +1023,8 @@ int trt_bridge_register_gdi(void) {
       {"StretchDIBits", (void*)&trt_StretchDIBits},
       {"BitBlt", (void*)&trt_BitBlt},
       {"StretchBlt", (void*)&trt_StretchBlt},
+      {"SetStretchBltMode", (void*)&trt_SetStretchBltMode},
+      {"GetStretchBltMode", (void*)&trt_GetStretchBltMode},
       {"PatBlt", (void*)&trt_PatBlt},
       {"GetPixel", (void*)&trt_GetPixel},
       {"SetPixel", (void*)&trt_SetPixel},
@@ -955,6 +1044,9 @@ int trt_bridge_register_gdi(void) {
       {"TextOutW", (void*)&trt_TextOutW},
       {"TextOutA", (void*)&trt_TextOutA},
       {"ExtTextOutW", (void*)&trt_ExtTextOutW},
+      {"ExtEscape", (void*)&trt_ExtEscape},
+      {"GetGlyphOutlineW", (void*)&trt_GetGlyphOutlineW},
+      {"GetKerningPairsW", (void*)&trt_GetKerningPairsW},
       {"AddFontResourceExW", (void*)&trt_AddFontResourceExW},
       {"RemoveFontResourceExW", (void*)&trt_RemoveFontResourceExW},
       {"EnumFontFamiliesExW", (void*)&trt_EnumFontFamiliesExW},

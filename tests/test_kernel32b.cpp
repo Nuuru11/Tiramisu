@@ -18,6 +18,19 @@
 extern "C" {
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_nvapi(void);
+int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out, int cch);
+int TRT_STDCALL trt_ResolveLocaleName(const u16* name, u16* out, int cch);
+int TRT_STDCALL trt_EnumSystemLocalesEx(void* cb, u32 flags, i64 lparam, void* reserved);
+int TRT_STDCALL trt_IsValidLocaleName(const u16* name);
+// ktmw32 bridge (discord_game_sdk.dll imports CreateTransaction/Commit)
+void* TRT_STDCALL trt_CreateTransaction(void* attrs, const void* uow,
+                                        u32 create_options, u32 isolation_level,
+                                        u32 isolation_flags, u32 timeout,
+                                        const u16* description);
+int TRT_STDCALL trt_CommitTransaction(void* handle);
+int TRT_STDCALL trt_RollbackTransaction(void* handle);
+int TRT_STDCALL trt_GetTransactionId(void* handle, void* guid_out);
+u32 TRT_STDCALL trt_GetLastError(void);
 }
 
 namespace {
@@ -195,6 +208,76 @@ int main(int argc, char** argv) {
 
   trt_unmap(&be, img);
   free(file);
+
+  // verify locale resolution surface (Sekiro UCRT setlocale unblocker)
+  {
+    u16 out_buf[128] = {};
+    const u16 q_jp[] = {'J','a','p','a','n','e','s','e',0};
+    int r = trt_ResolveLocaleName(q_jp, out_buf, 128);
+    CHECK(r == 6 && out_buf[0] == 'j' && out_buf[1] == 'a' && out_buf[2] == '-' &&
+          out_buf[3] == 'J' && out_buf[4] == 'P' && out_buf[5] == 0,
+          "locale: ResolveLocaleName(Japanese) -> ja-JP");
+
+    const u16 ja_jp[] = {'j','a','-','J','P',0};
+    r = trt_GetLocaleInfoEx(ja_jp, 0x1001 /*LOCALE_SENGLISHLANGUAGENAME*/, out_buf, 128);
+    CHECK(r == 9 && out_buf[0] == 'J' && out_buf[1] == 'a' && out_buf[2] == 'p' &&
+          out_buf[3] == 'a' && out_buf[4] == 'n' && out_buf[5] == 'e' &&
+          out_buf[6] == 's' && out_buf[7] == 'e' && out_buf[8] == 0,
+          "locale: GetLocaleInfoEx(ja-JP, LOCALE_SENGLISHLANGUAGENAME) -> Japanese");
+
+    u32 cp = 0;
+    r = trt_GetLocaleInfoEx(ja_jp, 0x1004 | 0x20000000u /*LOCALE_IDEFAULTANSICODEPAGE numeric*/, (u16*)&cp, 2);
+    CHECK(r == 2 && cp == 932, "locale: GetLocaleInfoEx(ja-JP, ANSI_CP) -> 932");
+
+    static bool s_saw_jp = false;
+    s_saw_jp = false;
+    auto enum_cb = [](const u16* loc, u32 flags, i64 lp) TRT_STDCALL -> int {
+      (void)flags;
+      (void)lp;
+      if (loc && loc[0] == 'j' && loc[1] == 'a' && loc[2] == '-' && loc[3] == 'J' && loc[4] == 'P') {
+        s_saw_jp = true;
+      }
+      return 1;
+    };
+    trt_EnumSystemLocalesEx((void*)(intptr_t)+enum_cb, 0, 0, nullptr);
+    CHECK(s_saw_jp, "locale: EnumSystemLocalesEx yields ja-JP");
+  }
+
+  // verify wldap32 fallback resolving (Sekiro LDAP unblocker)
+  {
+    void* fn_ord27 = trt_resolve_module(nullptr, "wldap32.dll", nullptr, 27);
+    CHECK(fn_ord27 != nullptr, "wldap32: resolve by ordinal #27 (ldap_next_entry)");
+    void* fn_name = trt_resolve_module(nullptr, "wldap32.dll", "ldap_init", 0);
+    CHECK(fn_name != nullptr, "wldap32: resolve by name ldap_init");
+    void* fn_vol = trt_resolve_module(nullptr, "winmm.dll", "waveOutSetVolume", 0);
+    CHECK(fn_vol != nullptr, "winmm: resolve waveOutSetVolume");
+  }
+
+  // ktmw32: discord_game_sdk.dll imports 2 transaction exports at LOAD time
+  {
+    CHECK(trt_resolve_module(nullptr, "ktmw32.dll", "CreateTransaction", 0) !=
+                  nullptr &&
+              trt_resolve_module(nullptr, "ktmw32.dll", "CommitTransaction", 0) !=
+                  nullptr,
+          "ktmw32: CreateTransaction/CommitTransaction resolve");
+    void* tx = trt_CreateTransaction(nullptr, nullptr, 0, 0, 0, 0, nullptr);
+    CHECK(tx != nullptr && tx != (void*)(uintptr_t)~0ull,
+          "ktmw32: CreateTransaction -> real handle");
+    u8 guid[16] = {};
+    CHECK(trt_GetTransactionId(tx, guid) == 1,
+          "ktmw32: GetTransactionId fills a UOW");
+    bool guid_nonzero = false;
+    for (int i = 0; i < 16; ++i)
+      if (guid[i]) guid_nonzero = true;
+    CHECK(guid_nonzero, "ktmw32: transaction id is non-zero/stable");
+    CHECK(trt_CommitTransaction(tx) == 1,
+          "ktmw32: CommitTransaction -> TRUE (writes already durable)");
+    CHECK(trt_CommitTransaction((void*)(uintptr_t)0xdeadbeef) == 0 &&
+              trt_GetLastError() == 6,
+          "ktmw32: commit on a garbage handle -> FALSE + ERROR_INVALID_HANDLE");
+    CHECK(trt_RollbackTransaction(tx) == 0 && trt_GetLastError() == 120,
+          "ktmw32: rollback -> FALSE + ERROR_CALL_NOT_IMPLEMENTED (named)");
+  }
 
   if (failures) {
     printf("\nRESULT: %d FAIL\n", failures);

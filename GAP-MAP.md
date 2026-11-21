@@ -24,6 +24,34 @@
 
 ## 1. Ground truth (measured 2026-11-14)
 
+### 2026-11-21 — corpus LOAD gaps closed (gdi32 stretch mode, shell32 icons, ktmw32)
+
+Corpus-smoke was failing three PEs with a named `FAIL IMPORT` gap. Each was a
+LOAD-time export, not a runtime option:
+
+- **gdi32!SetStretchBltMode / GetStretchBltMode** — binkw32.dll (RAD Game
+  Tools, shipped by many AAA titles) imports SetStretchBltMode. Implemented as
+  real per-DC state: default COLORONCOLOR (3), modes 1..4 validated; an invalid
+  mode or a non-user32 DC fails visibly (0) instead of pretending. Evidence:
+  `tests/test_gdi.cpp` default/round-trip/invalid-mode/garbage-DC checks.
+- **shell32!ExtractIconExW/A, ExtractIconW/A** — SDL2 imports ExtractIconExW at
+  load time for its window-icon path. Honest answer: 0 icons / NULL with the
+  requested file named in the log and both out-params cleared. Evidence:
+  `tests/test_shell.cpp` resolve + call checks.
+- **ktmw32.dll (new bridge)** — discord_game_sdk.dll imports CreateTransaction
+  and CommitTransaction at load time. Transaction handles are REAL kernel32
+  event handles (CloseHandle/GetTransactionId behave), CommitTransaction
+  answers TRUE with a named log (VFS writes are already applied, so it is
+  truthful about durability and explicit about the missing isolation), and
+  RollbackTransaction FAILS NAMED (ERROR_CALL_NOT_IMPLEMENTED) because nothing
+  can be undone. Evidence: `tests/test_kernel32b.cpp` create/id/commit/
+  garbage-handle/rollback checks.
+
+Files: `src/trt/bridge_gdi.cpp`, `src/trt/bridge_shell.cpp`,
+`src/trt/bridge_ktmw32.{h,cpp}`, `src/trt/bridge_kernel32.cpp` (registration),
+and the manual build lists in `tools/build-host.sh`, `tools/corpus-smoke.sh`,
+`tools/corpus-run.sh`.
+
 **Gates on the current tree (2026-11-15, ui+settings wave):**
 `build-test.sh` → gate_rc=0, 38× `RESULT: ALL PASS` (incl. the new
 funclet-rethrow + boundary-escape fixtures + test_settings) · corpus-run EXE

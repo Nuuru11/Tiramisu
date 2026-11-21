@@ -489,7 +489,18 @@ int TRT_GUEST_ABI dx11_CompileFromFileW(const u16* path, const void* defines,
   return hr;
 }
 
+int TRT_GUEST_ABI dx11_SaveTextureToFileW(void* ctx, void* res, u32 fmt, const u16* file) {
+  (void)ctx; (void)res; (void)fmt; (void)file;
+  return 0;
+}
+int TRT_GUEST_ABI dx11_SaveTextureToFileA(void* ctx, void* res, u32 fmt, const char* file) {
+  (void)ctx; (void)res; (void)fmt; (void)file;
+  return 0;
+}
+
 const trt_named_fn k_d3dx_fns[] = {
+    {"D3DX11SaveTextureToFileW", (void*)&dx11_SaveTextureToFileW},
+    {"D3DX11SaveTextureToFileA", (void*)&dx11_SaveTextureToFileA},
     {"D3DX11GetImageInfoFromMemory", (void*)&dx11_GetImageInfoFromMemory},
     {"D3DX11GetImageInfoFromFileW", (void*)&dx11_GetImageInfoFromFileW},
     {"D3DX11GetImageInfoFromFileA", (void*)&dx11_GetImageInfoFromFileA},

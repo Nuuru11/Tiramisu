@@ -2418,11 +2418,20 @@ const void* g_sb9_vtbl[6] = {
     (const void*)&sb_Apply,               // 5
 };
 
+u32 TRT_GUEST_ABI trt_D3DPERF_GetStatus(void* dev) { (void)dev; return 0; }
+int TRT_GUEST_ABI trt_D3DPERF_BeginEvent(u32 col, const u16* name) { (void)col; (void)name; return 0; }
+int TRT_GUEST_ABI trt_D3DPERF_EndEvent(void) { return 0; }
+void TRT_GUEST_ABI trt_D3DPERF_SetMarker(u32 col, const u16* name) { (void)col; (void)name; }
+
 int trt_bridge_register_d3d9(void) {
   ensure_ex_vtbls();  // Ex objects are servable from the first call
   static const trt_named_fn k_fns[] = {
       {"Direct3DCreate9", (void*)&trt_Direct3DCreate9},
       {"Direct3DCreate9Ex", (void*)&trt_Direct3DCreate9Ex},
+      {"D3DPERF_GetStatus", (void*)&trt_D3DPERF_GetStatus},
+      {"D3DPERF_BeginEvent", (void*)&trt_D3DPERF_BeginEvent},
+      {"D3DPERF_EndEvent", (void*)&trt_D3DPERF_EndEvent},
+      {"D3DPERF_SetMarker", (void*)&trt_D3DPERF_SetMarker},
   };
   trt_module_register("d3d9.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

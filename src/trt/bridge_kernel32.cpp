@@ -57,6 +57,8 @@
 #include "bridge_vulkan.h"
 #include "bridge_mf.h"
 #include "bridge_gameinput.h"
+#include "bridge_wldap32.h"
+#include "bridge_ktmw32.h"
 
 // ---- 5 GB memory-budget governor (bridge_membudget.cpp): every host-side
 // byte that stands in for guest commit charges one ledger. Over-budget
@@ -1623,6 +1625,9 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_vulkan();
   trt_bridge_register_mf();
   trt_bridge_register_gameinput();
+  trt_bridge_register_wldap32();
+  // ktmw32: transaction handles (discord_game_sdk imports 2 at LOAD time)
+  trt_bridge_register_ktmw32();
   trt_bridge_set_cmd_args("");
   g_err_epoch.fetch_add(1, std::memory_order_release);
   t_last_error = 0;
@@ -6243,7 +6248,9 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   // waiter's user-lock release and its wait registration (lost wakeup).
   std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
+  ::EnterCriticalSection(&s->cs);
   ::WakeAllConditionVariable(&s->cv);
+  ::LeaveCriticalSection(&s->cs);
 #else
   pthread_mutex_lock(&s->mu);
   pthread_cond_broadcast(&s->cv);
@@ -6269,7 +6276,9 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
   std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
+  ::EnterCriticalSection(&s->cs);
   ::WakeConditionVariable(&s->cv);
+  ::LeaveCriticalSection(&s->cs);
 #else
   pthread_mutex_lock(&s->mu);
   pthread_cond_signal(&s->cv);
@@ -7194,7 +7203,13 @@ int TRT_STDCALL trt_EnumSystemLocalesA(void* cb, u32 flags) {
   }
   typedef int (TRT_STDCALL *locale_enum_a_fn)(const char*);
   locale_enum_a_fn fn = (locale_enum_a_fn)cb;
-  fn("00000409");
+  static const char* const k_lcids[] = {
+      "00000409", "00000411", "00000407", "0000040C", "00000C0A", "00000410",
+      "00000412", "00000804", "00000404", "00000419", "00000416", "00000415",
+  };
+  for (const char* lcid : k_lcids) {
+    if (!fn(lcid)) return 1;
+  }
   return 1;
 }
 
@@ -7206,8 +7221,15 @@ int TRT_STDCALL trt_EnumSystemLocalesW(void* cb, u32 flags) {
   }
   typedef int (TRT_STDCALL *locale_enum_w_fn)(const u16*);
   locale_enum_w_fn fn = (locale_enum_w_fn)cb;
-  const u16 en_us[] = {'0','0','0','0','0','4','0','9',0};
-  fn(en_us);
+  static const char* const k_lcids[] = {
+      "00000409", "00000411", "00000407", "0000040C", "00000C0A", "00000410",
+      "00000412", "00000804", "00000404", "00000419", "00000416", "00000415",
+  };
+  for (const char* lcid : k_lcids) {
+    u16 lcid16[16] = {};
+    for (int i = 0; lcid[i] && i < 15; ++i) lcid16[i] = (u16)(unsigned char)lcid[i];
+    if (!fn(lcid16)) return 1;
+  }
   return 1;
 }
 
@@ -7220,11 +7242,19 @@ int TRT_STDCALL trt_EnumSystemLocalesEx(void* cb, u32 flags, i64 lparam,
   }
   typedef int (TRT_STDCALL *locale_enum_ex_fn)(const u16*, u32, i64);
   locale_enum_ex_fn fn = (locale_enum_ex_fn)cb;
-  const u16 en_us[] = {'e','n','-','U','S',0};
-  const u16 inv[] = {0};
-  // LOCALE_ALL (0) or LOCALE_WINDOWS (1) or LOCALE_NEUTRALDATA (0x10)
-  if (fn(en_us, flags ? flags : 1u, lparam)) {
-    if (flags == 0 || (flags & 0x10u)) fn(inv, 0x10u, lparam);
+  static const char* const k_locale_names[] = {
+      "en-US", "ja-JP", "de-DE", "fr-FR", "es-ES", "it-IT",
+      "ko-KR", "zh-CN", "zh-TW", "ru-RU", "pt-BR", "pl-PL",
+  };
+  const u32 f = flags ? flags : 1u;
+  for (const char* loc : k_locale_names) {
+    u16 loc16[32] = {};
+    for (int i = 0; loc[i] && i < 31; ++i) loc16[i] = (u16)(unsigned char)loc[i];
+    if (!fn(loc16, f, lparam)) return 1;
+  }
+  if (flags == 0 || (flags & 0x10u)) {
+    const u16 inv[] = {0};
+    fn(inv, 0x10u, lparam);
   }
   return 1;
 }
@@ -7458,6 +7488,8 @@ void TRT_STDCALL trt_RtlFillMemory(void* dst, u64 n, u8 fill) {
   memset(dst, (int)fill, (size_t)n);
 }
 
+extern "C" int TRT_STDCALL trt_ResolveLocaleName(const u16* name, u16* out, int cch);
+
 static const trt_named_fn k_kernel32_fns[] = {
   {"GetProcessHeap", (void*)&trt_GetProcessHeap},
   {"HeapCreate", (void*)&trt_HeapCreate},
@@ -7636,6 +7668,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"EnumSystemLocalesA", (void*)&trt_EnumSystemLocalesA},
   {"EnumSystemLocalesW", (void*)&trt_EnumSystemLocalesW},
   {"EnumSystemLocalesEx", (void*)&trt_EnumSystemLocalesEx},
+  {"ResolveLocaleName", (void*)&trt_ResolveLocaleName},
   {"CreatePipe", (void*)&trt_CreatePipe},
   {"CreateNamedPipeW", (void*)&trt_CreateNamedPipeW},
   {"ConnectNamedPipe", (void*)&trt_ConnectNamedPipe},

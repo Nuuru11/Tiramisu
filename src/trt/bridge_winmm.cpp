@@ -108,6 +108,16 @@ u32 TRT_GUEST_ABI trt_mciSendStringW(const u16* cmd, u16* ret, u32 ret_len, void
   return 263;
 }
 
+u32 TRT_GUEST_ABI trt_mciSendCommandA(u32 dev, u32 msg, u64 p1, u64 p2) {
+  (void)dev; (void)msg; (void)p1; (void)p2;
+  return 263;  // MCIERR_INVALID_DEVICE_NAME
+}
+
+u32 TRT_GUEST_ABI trt_mciSendCommandW(u32 dev, u32 msg, u64 p1, u64 p2) {
+  (void)dev; (void)msg; (void)p1; (void)p2;
+  return 263;  // MCIERR_INVALID_DEVICE_NAME
+}
+
 // ---- media key helpers some engines import ----
 
 u32 TRT_GUEST_ABI trt_GetProfileStringW(const u16* app, const u16* key,
@@ -167,6 +177,15 @@ u32 TRT_GUEST_ABI trt_waveOutMessage(u64, u32, u64, u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutBreakLoop(u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutRestart(u64) { return 4; }
 u32 TRT_GUEST_ABI trt_waveOutPause(u64) { return 4; }
+u32 TRT_GUEST_ABI trt_waveOutSetVolume(u64 dev, u32 vol) {
+  (void)dev; (void)vol;
+  return 0; // MMSYSERR_NOERROR
+}
+u32 TRT_GUEST_ABI trt_waveOutGetVolume(u64 dev, u32* vol) {
+  (void)dev;
+  if (vol) *vol = 0xFFFFFFFF;
+  return 0; // MMSYSERR_NOERROR
+}
 // waveInMessage / waveOutMessage twins; GetErrorText* answer "no such
 // error for an invalid device" with the API's own bad-device code.
 u32 TRT_GUEST_ABI trt_waveInMessage(u64, u32, u64, u64) { return 4; }
@@ -222,6 +241,8 @@ int trt_bridge_register_winmm(void) {
       {"waveOutBreakLoop", (void*)&trt_waveOutBreakLoop},
       {"waveOutRestart", (void*)&trt_waveOutRestart},
       {"waveOutPause", (void*)&trt_waveOutPause},
+      {"waveOutSetVolume", (void*)&trt_waveOutSetVolume},
+      {"waveOutGetVolume", (void*)&trt_waveOutGetVolume},
       {"waveInMessage", (void*)&trt_waveInMessage},
       {"waveOutGetErrorTextW", (void*)&trt_waveOutGetErrorTextW},
       {"waveOutGetErrorTextA", (void*)&trt_waveOutGetErrorTextW},
@@ -240,6 +261,8 @@ int trt_bridge_register_winmm(void) {
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},
       {"mciSendStringW", (void*)&trt_mciSendStringW},
+      {"mciSendCommandA", (void*)&trt_mciSendCommandA},
+      {"mciSendCommandW", (void*)&trt_mciSendCommandW},
       {"GetProfileStringW", (void*)&trt_GetProfileStringW},
       {"PlaySoundW", (void*)&trt_PlaySoundW},
   };

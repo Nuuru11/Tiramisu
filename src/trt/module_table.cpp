@@ -123,7 +123,7 @@ bool is_overridable_module(const char* name) {
       "ucrtbase.dll", "vcruntime140.dll", "vcruntime140_1.dll",
       "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",
       "combase.dll", "dwrite.dll", "d2d1.dll", "d3d10.dll", "d3d12.dll",
-      "dxgi.dll", "version.dll",
+      "dxgi.dll", "version.dll", "steam_api.dll", "steam_api64.dll",
   };
   for (const char* no : kNoOverride)
     if (name_eq(name, no)) return false;
@@ -255,6 +255,10 @@ void* resolve_through_table(void* user, const char* module,
         if (const char* alias = dll_alias_lookup(target))
           if (void* fn3 = g_system_load(alias, symbol)) return fn3;
       }
+      if (symbol) {
+        for (int i = 0; i < m.fn_count; ++i)
+          if (strcmp(m.fns[i].name, symbol) == 0) return (void*)m.fns[i].fn;
+      }
       return nullptr;
     default:
       return nullptr;
@@ -282,7 +286,8 @@ void trt_module_register(const char* name, trt_route route,
     // until the auth bridge replaced it); a STUB registration never
     // downgrades an existing BUILTIN
     if (route == TRT_ROUTE_STUB && m->route == TRT_ROUTE_BUILTIN) return;
-    if (m->route == TRT_ROUTE_BUILTIN && route == TRT_ROUTE_BUILTIN && fns) {
+    if ((m->route == TRT_ROUTE_BUILTIN || m->route == TRT_ROUTE_SYSTEM) &&
+        m->route == route && fns) {
       for (int i = 0; i < fn_count; ++i) {
         bool replaced = false;
         for (int j = 0; j < m->fn_count; ++j) {
@@ -439,6 +444,8 @@ const mod_default k_defaults[] = {
     {"dstoragecore.dll", TRT_ROUTE_SYSTEM},
     {"dxgi.dll", TRT_ROUTE_SYSTEM},
     {"d3dcompiler_47.dll", TRT_ROUTE_SYSTEM},
+    {"d3dcompiler_46.dll", TRT_ROUTE_SYSTEM},
+    {"d3dcompiler_43.dll", TRT_ROUTE_SYSTEM},
     {"dcomp.dll", TRT_ROUTE_SYSTEM},
     {"d2d1.dll", TRT_ROUTE_SYSTEM},
     {"dwrite.dll", TRT_ROUTE_SYSTEM},
@@ -470,6 +477,7 @@ const mod_default k_defaults[] = {
 
     // ---- networking ----
     {"ws2_32.dll", TRT_ROUTE_SYSTEM},
+    {"wldap32.dll", TRT_ROUTE_SYSTEM},
     {"mswsock.dll", TRT_ROUTE_BUILTIN},
     {"winhttp.dll", TRT_ROUTE_SYSTEM},
     {"wininet.dll", TRT_ROUTE_BUILTIN},   // STAGE 5: WinINet not available to
@@ -530,6 +538,7 @@ const mod_default k_defaults[] = {
     {"ddraw.dll", TRT_ROUTE_BUILTIN},    // M6: DirectDraw -> backend present
     {"opengl32.dll", TRT_ROUTE_BUILTIN}, // OpenGL 1.x-4.x -> GLSL->HLSL -> D3D11
     {"glu32.dll", TRT_ROUTE_STUB},
+    {"ktmw32.dll", TRT_ROUTE_STUB},
     {"dinput8.dll", TRT_ROUTE_STUB},     // console input = XInput
     {"dinput.dll", TRT_ROUTE_STUB},
     {"gameinput.dll", TRT_ROUTE_STUB},   // GDK input

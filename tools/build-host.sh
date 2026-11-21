@@ -68,7 +68,7 @@ echo "Mono for UWP: $MONO_LIB"
 # they are inert for TUs that do not use them. MF libs: the song path
 # (MFStartup/SourceReader) is APP-partition; mfuuid carries the MF GUIDs.
 UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
-  --out "$out/layout/tiramisu.exe" --jobs "$(nproc)" \
+  --out "$out/layout/tiramisu.exe" --jobs "${TRT_JOBS:-2}" \
   -I third_party/fna3d-src/include \
   -I third_party/fna3d-src/MojoShader \
   -I third_party/fna3d-src/sdl-shim \
@@ -93,6 +93,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
+  src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
   src/trt/bridge_fmod_studio.cpp \
   src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
   src/trt/trt_trace.cpp \

@@ -36,6 +36,12 @@
 #include "../../src/trt/bridge_steam.h"
 #include "../../src/trt/trt.h"
 
+#if defined(_WIN32)
+#define MONO_DOOR_EXPORT __declspec(dllexport)
+#else
+#define MONO_DOOR_EXPORT
+#endif
+
 extern "C" {
 
 // ---- markers: prove the real bridge is loaded ----

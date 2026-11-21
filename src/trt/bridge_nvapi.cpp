@@ -143,6 +143,42 @@ i32 TRT_STDCALL trt_ADL2_Adapter_AdapterInfo_Get(void* info, u32 size) {
   return -9;
 }
 
+// ---- amd_ags_x64.dll (AMD GPU Services) -----------------------------------
+// Sekiro (and other AMD-tuned titles) probe AGS for display-mode / crossfire /
+// driver-extension entry points. The console has no AMD driver surface of this
+// kind (AGS is a Windows driver-extension SDK), so every entry point returns
+// the AGS not-available code and clears output pointers. Honest stub: engines
+// bail to their non-AGS path instead of guessing.
+i32 TRT_STDCALL trt_agsInit(void* ctx, void* gpuInfo, void* config) {
+  if (ctx) *(void**)ctx = nullptr;
+  if (gpuInfo) *(void**)gpuInfo = nullptr;
+  static std::atomic<char> once{0};
+  if (!once.exchange(1)) {
+    nvlog("amd_ags: agsInit -> AGS_FAILURE (honest stub: no AGS surface)");
+  }
+  return -1;  // AGS_FAILURE
+}
+
+i32 TRT_STDCALL trt_agsDeInit(void* ctx) {
+  (void)ctx;
+  static std::atomic<char> once{0};
+  if (!once.exchange(1)) {
+    nvlog("amd_ags: agsDeInit -> AGS_FAILURE (honest stub)");
+  }
+  return -1;
+}
+
+i32 TRT_STDCALL trt_agsSetDisplayMode(void* ctx, i32 displayIndex, i32 width,
+                                      i32 height, i32 refreshRate, i32 flags) {
+  (void)ctx; (void)displayIndex; (void)width; (void)height;
+  (void)refreshRate; (void)flags;
+  static std::atomic<char> once{0};
+  if (!once.exchange(1)) {
+    nvlog("amd_ags: agsSetDisplayMode -> AGS_FAILURE (honest stub)");
+  }
+  return -1;
+}
+
 // ---- registration ----------------------------------------------------------
 static const trt_named_fn k_nvapi_fns[] = {
     {"NvAPI_Initialize", (void*)&trt_NvAPI_Initialize},
@@ -182,6 +218,14 @@ int trt_bridge_register_nvapi(void) {
                       (int)(sizeof(k_atiadl_fns) / sizeof(k_atiadl_fns[0])));
   trt_module_register("atiadlxy.dll", TRT_ROUTE_BUILTIN, k_atiadl_fns,
                       (int)(sizeof(k_atiadl_fns) / sizeof(k_atiadl_fns[0])));
+  // AMD GPU Services (amd_ags_x64.dll) — Sekiro and other AMD-tuned titles.
+  static const trt_named_fn k_amdags_fns[] = {
+      {"agsInit", (void*)&trt_agsInit},
+      {"agsDeInit", (void*)&trt_agsDeInit},
+      {"agsSetDisplayMode", (void*)&trt_agsSetDisplayMode},
+  };
+  trt_module_register("amd_ags_x64.dll", TRT_ROUTE_BUILTIN, k_amdags_fns,
+                      (int)(sizeof(k_amdags_fns) / sizeof(k_amdags_fns[0])));
   return 0;
 }
 

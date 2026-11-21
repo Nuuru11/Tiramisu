@@ -145,6 +145,8 @@ typedef int (TRT_STDCALL* fn_blt9)(void*, int, int, int, int, void*, int, int,
 typedef int (TRT_STDCALL* fn_sblt)(void*, int, int, int, int, void*, int, int,
                                    int, int, u32);
 typedef int (TRT_STDCALL* fn_caps)(void*, int);
+typedef int (TRT_STDCALL* fn_setstretch)(void*, int);
+typedef int (TRT_STDCALL* fn_getstretch)(void*);
 
 void* resolve_gdi(const char* name) {
   return trt_resolve_module(nullptr, "gdi32.dll", name, 0);
@@ -257,6 +259,10 @@ int main(int argc, char** argv) {
         "gdi32!ReleaseDC resolves (shared user32 handler)");
   CHECK(resolve_gdi("BitBlt") != nullptr, "gdi32!BitBlt resolves");
   CHECK(resolve_gdi("StretchBlt") != nullptr, "gdi32!StretchBlt resolves");
+  CHECK(resolve_gdi("SetStretchBltMode") != nullptr,
+        "gdi32!SetStretchBltMode resolves (binkw32 load path)");
+  CHECK(resolve_gdi("GetStretchBltMode") != nullptr,
+        "gdi32!GetStretchBltMode resolves");
   CHECK(resolve_gdi("CreateCompatibleDC") != nullptr,
         "gdi32!CreateCompatibleDC resolves");
   CHECK(resolve_gdi("CreateCompatibleBitmap") != nullptr,
@@ -293,6 +299,24 @@ int main(int argc, char** argv) {
   if (getdc && releasedc && ccdc && ccbmp && bitblt && sblt && selobj && deldc) {
     void* hdc = getdc(nullptr);
     CHECK(hdc != nullptr, "gdi32!GetDC(NULL) handed out a DC record");
+    const fn_setstretch setstretch =
+        (fn_setstretch)resolve_gdi("SetStretchBltMode");
+    const fn_getstretch getstretch =
+        (fn_getstretch)resolve_gdi("GetStretchBltMode");
+    if (setstretch && getstretch) {
+      CHECK(getstretch(hdc) == 3,
+            "stretch mode defaults to COLORONCOLOR (3)");
+      CHECK(setstretch(hdc, 4) == 3,
+            "SetStretchBltMode(HALFTONE) -> previous mode 3");
+      CHECK(getstretch(hdc) == 4, "stretch mode round-trips (HALFTONE)");
+      CHECK(setstretch(hdc, 9) == 0,
+            "invalid stretch mode -> 0 (fail-visible)");
+      CHECK(getstretch(hdc) == 4, "invalid set left the mode unchanged");
+      CHECK(setstretch(nullptr, 3) == 0,
+            "SetStretchBltMode on a garbage DC -> 0 (fail-visible)");
+    } else {
+      CHECK(false, "stretch-mode surface callable");
+    }
     void* memdc = ccdc(hdc);
     CHECK(memdc != nullptr, "CreateCompatibleDC off the window DC");
     void* hbmp = ccbmp(memdc, 64, 64);

@@ -681,6 +681,18 @@ static bool gap_u16_ieq(const u16* a, const char* b) {
   return *a == 0 && *b == 0;
 }
 
+static bool gap_u16_istartswith(const u16* a, const char* b) {
+  if (!a || !b) return false;
+  while (*b) {
+    u16 ca = *a++;
+    unsigned char cb = (unsigned char)*b++;
+    if (ca >= 'A' && ca <= 'Z') ca += 32;
+    if (cb >= 'A' && cb <= 'Z') cb = (unsigned char)(cb + 32);
+    if (ca != cb) return false;
+  }
+  return true;
+}
+
 static int gap_write_u16_answer(const char* s, u16* out, int cap) {
   const int need = (int)strlen(s) + 1;
   if (!out || cap == 0) return need;
@@ -693,6 +705,68 @@ static int gap_write_u16_answer(const char* s, u16* out, int cap) {
 // Locale / Date / Time surface (CRT + UnityPlayer + System.Globalization)
 // ============================================================================
 
+struct trt_locale_entry {
+  const char* name;          // "en-US", "ja-JP", ...
+  const char* lang_iso;      // "en", "ja", ...
+  const char* ctry_iso;      // "US", "JP", ...
+  const char* abbrev_lang;   // "ENU", "JPN", ...
+  const char* abbrev_ctry;   // "USA", "JPN", ...
+  const char* lang_name;     // "English", "Japanese", ... (LOCALE_SENGLISHLANGUAGENAME)
+  const char* ctry_name;     // "United States", "Japan", ... (LOCALE_SENGLISHCOUNTRYNAME)
+  const char* display_name;  // "English (United States)", "Japanese (Japan)", ...
+  const char* native_lang;   // "English", "日本語", ...
+  u32 lcid;                  // 0x0409, 0x0411, ...
+  u32 ansi_cp;               // 1252, 932, ...
+  u32 oem_cp;                // 437, 932, ...
+  u32 country_code;          // 1, 81, ...
+  const char* curr_symbol;   // "$", "¥", "€", etc.
+  const char* intl_curr;     // "USD", "JPY", "EUR", etc.
+  u32 curr_digits;           // 2 for USD, 0 for JPY
+};
+
+static const trt_locale_entry k_locales[] = {
+    {"en-US", "en", "US", "ENU", "USA", "English", "United States",
+     "English (United States)", "English", 0x0409, 1252, 437, 1, "$", "USD", 2},
+    {"ja-JP", "ja", "JP", "JPN", "JPN", "Japanese", "Japan",
+     "Japanese (Japan)", "\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e", 0x0411, 932, 932, 81, "\xc2\xa5", "JPY", 0},
+    {"de-DE", "de", "DE", "DEU", "DEU", "German", "Germany",
+     "German (Germany)", "Deutsch", 0x0407, 1252, 850, 49, "\xe2\x82\xac", "EUR", 2},
+    {"fr-FR", "fr", "FR", "FRA", "FRA", "French", "France",
+     "French (France)", "Fran\xc3\xa7\x61is", 0x040c, 1252, 850, 33, "\xe2\x82\xac", "EUR", 2},
+    {"es-ES", "es", "ES", "ESN", "ESP", "Spanish", "Spain",
+     "Spanish (Spain)", "Espa\xc3\xb1ol", 0x0c0a, 1252, 850, 34, "\xe2\x82\xac", "EUR", 2},
+    {"it-IT", "it", "IT", "ITA", "ITA", "Italian", "Italy",
+     "Italian (Italy)", "Italiano", 0x0410, 1252, 850, 39, "\xe2\x82\xac", "EUR", 2},
+    {"ko-KR", "ko", "KR", "KOR", "KOR", "Korean", "Korea",
+     "Korean (Korea)", "\xed\x95\x9c\xea\xb5\xad\xec\x96\xb4", 0x0412, 949, 949, 82, "\xe2\x82\xa9", "KRW", 0},
+    {"zh-CN", "zh", "CN", "CHS", "CHN", "Chinese", "China",
+     "Chinese (Simplified, China)", "\xe7\xae\x80\xe4\xbd\x93\xe4\xb8\xad\xe6\x96\x87", 0x0804, 936, 936, 86, "\xc2\xa5", "CNY", 2},
+    {"zh-TW", "zh", "TW", "CHT", "TWN", "Chinese", "Taiwan",
+     "Chinese (Traditional, Taiwan)", "\xe7\xb9\x81\xe9\xab\x94\xe4\xb8\xad\xe6\x96\x87", 0x0404, 950, 950, 886, "NT$", "TWD", 2},
+    {"ru-RU", "ru", "RU", "RUS", "RUS", "Russian", "Russia",
+     "Russian (Russia)", "\xd0\xa0\xd1\x83\xd1\x81\xd1\x81\xd0\xba\xd0\xb8\xd0\xb9", 0x0419, 1251, 866, 7, "\xe2\x82\xbd", "RUB", 2},
+    {"pt-BR", "pt", "BR", "PTB", "BRA", "Portuguese", "Brazil",
+     "Portuguese (Brazil)", "Portugu\xc3\xaas", 0x0416, 1252, 850, 55, "R$", "BRL", 2},
+    {"pl-PL", "pl", "PL", "PLK", "POL", "Polish", "Poland",
+     "Polish (Poland)", "Polski", 0x0415, 1250, 852, 48, "z\xc5\x82", "PLN", 2},
+};
+
+static const trt_locale_entry* find_locale_entry(const u16* name) {
+  if (!name || name[0] == 0) return &k_locales[0];
+  for (const auto& e : k_locales) {
+    if (gap_u16_ieq(name, e.name) || gap_u16_ieq(name, e.lang_iso) ||
+        gap_u16_ieq(name, e.lang_name) || gap_u16_ieq(name, e.abbrev_lang)) {
+      return &e;
+    }
+  }
+  for (const auto& e : k_locales) {
+    if (gap_u16_istartswith(name, e.name) || gap_u16_istartswith(name, e.lang_name)) {
+      return &e;
+    }
+  }
+  return nullptr;
+}
+
 int TRT_STDCALL trt_GetUserDefaultLocaleName(u16* name, int cch) {
   return gap_write_u16_answer("en-US", name, cch);
 }
@@ -704,19 +778,34 @@ int TRT_STDCALL trt_GetSystemDefaultLocaleName(u16* name, int cch) {
 int TRT_STDCALL trt_IsValidLocaleName(const u16* name) {
   if (!name) return 0;
   if (name[0] == 0) return 1;  // LOCALE_NAME_INVARIANT
-  if (gap_u16_ieq(name, "en-US") || gap_u16_ieq(name, "en") ||
-      gap_u16_ieq(name, "C"))
+  if (gap_u16_ieq(name, "!x-sys-default-locale") || gap_u16_ieq(name, "C"))
     return 1;
+  if (find_locale_entry(name) != nullptr) return 1;
+  int len = 0;
+  while (name[len]) len++;
+  if (len >= 2 && len <= 32) {
+    bool ok = true;
+    for (int i = 0; i < len; ++i) {
+      u16 c = name[i];
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_')) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return 1;
+  }
   return 0;
 }
 
 int TRT_STDCALL trt_IsValidLocale(u32 lcid, u32 flags) {
   (void)flags;
   const u32 lo = lcid & 0xFFFFu;
-  return (lo == 0x0409u || lo == 0x0009u || lo == 0x007Fu ||
-          lo == 0x0400u || lo == 0x0800u || lo == 0x0C00u || lo == 0)
-             ? 1
-             : 0;
+  if (lo == 0x007Fu || lo == 0x0009u || lo == 0x0400u || lo == 0x0800u || lo == 0x0C00u || lo == 0)
+    return 1;
+  for (const auto& e : k_locales) {
+    if ((e.lcid & 0xFFFFu) == lo) return 1;
+  }
+  return 0;
 }
 
 u16 TRT_STDCALL trt_GetUserDefaultUILanguage(void) { return 0x0409u; }
@@ -734,6 +823,9 @@ int TRT_STDCALL trt_LCIDToLocaleName(u32 lcid, u16* name, int cch, u32 flags) {
   (void)flags;
   const u32 lo = lcid & 0xFFFFu;
   if (lo == 0x007Fu) return gap_write_u16_answer("", name, cch);
+  for (const auto& e : k_locales) {
+    if ((e.lcid & 0xFFFFu) == lo) return gap_write_u16_answer(e.name, name, cch);
+  }
   if (trt_IsValidLocale(lcid, 0)) return gap_write_u16_answer("en-US", name, cch);
   trt_SetLastError(87);
   return 0;
@@ -742,7 +834,28 @@ int TRT_STDCALL trt_LCIDToLocaleName(u32 lcid, u16* name, int cch, u32 flags) {
 u32 TRT_STDCALL trt_LocaleNameToLCID(const u16* name, u32 flags) {
   (void)flags;
   if (!name || name[0] == 0) return 0x007Fu;
-  if (gap_u16_ieq(name, "en-US") || gap_u16_ieq(name, "en")) return 0x0409u;
+  const trt_locale_entry* e = find_locale_entry(name);
+  if (e) return e->lcid;
+  if (trt_IsValidLocaleName(name)) return 0x0409u;
+  trt_SetLastError(87);
+  return 0;
+}
+
+int TRT_STDCALL trt_ResolveLocaleName(const u16* name, u16* out, int cch) {
+  if (!name || name[0] == 0) {
+    return gap_write_u16_answer("", out, cch);
+  }
+  const trt_locale_entry* e = find_locale_entry(name);
+  if (e) {
+    return gap_write_u16_answer(e->name, out, cch);
+  }
+  if (trt_IsValidLocaleName(name)) {
+    char buf[64] = {};
+    int i = 0;
+    while (name[i] && i < 63) { buf[i] = (char)name[i]; i++; }
+    buf[i] = 0;
+    return gap_write_u16_answer(buf, out, cch);
+  }
   trt_SetLastError(87);
   return 0;
 }
@@ -754,24 +867,27 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     trt_SetLastError(87);
     return 0;
   }
+  const trt_locale_entry* e = find_locale_entry(locale);
+  if (!e) e = &k_locales[0];
+
   const bool want_num = (lctype & 0x20000000u /*LOCALE_RETURN_NUMBER*/) != 0;
   const u32 base_type = lctype & 0x0FFFFFFFu;
   if (want_num) {
     u32 num = 0;
     bool ok = true;
     switch (base_type) {
-      case 0x1004: num = 1252; break;  // LOCALE_IDEFAULTANSICODEPAGE
-      case 0x000B: num = 437; break;   // LOCALE_IDEFAULTCODEPAGE
-      case 0x0001: num = 0x0409; break;
-      case 0x000D: num = 1; break;     // LOCALE_IMEASURE
-      case 0x0011: num = 2; break;     // LOCALE_IDIGITS
-      case 0x0018: num = 2; break;     // LOCALE_ICURRDIGITS
-      case 0x001B: num = 0; break;     // LOCALE_ICURRENCY
-      case 0x001C: num = 0; break;     // LOCALE_INEGCURR
-      case 0x100B: num = 1; break;     // LOCALE_ICOUNTRY
-      case 0x100C: num = 6; break;     // LOCALE_IFIRSTDAYOFWEEK (Sunday)
-      case 0x100D: num = 0; break;     // LOCALE_IFIRSTWEEKOFYEAR
-      case 0x1010: num = 1; break;     // LOCALE_INEGNUMBER
+      case 0x1004: num = e->ansi_cp; break;  // LOCALE_IDEFAULTANSICODEPAGE
+      case 0x000B: num = e->oem_cp; break;   // LOCALE_IDEFAULTCODEPAGE
+      case 0x0001: num = e->lcid; break;     // LOCALE_ILANGUAGE
+      case 0x000D: num = (e->lcid == 0x0409) ? 1 : 0; break;     // LOCALE_IMEASURE
+      case 0x0011: num = 2; break;           // LOCALE_IDIGITS
+      case 0x0018: num = e->curr_digits; break; // LOCALE_ICURRDIGITS (0 for JPY, 2 for USD/EUR)
+      case 0x001B: num = 0; break;           // LOCALE_ICURRENCY
+      case 0x001C: num = 0; break;           // LOCALE_INEGCURR
+      case 0x100B: num = e->country_code; break; // LOCALE_ICOUNTRY
+      case 0x100C: num = (e->lcid == 0x0409) ? 6 : 0; break;     // LOCALE_IFIRSTDAYOFWEEK (Sunday for US, Monday for EU/JP)
+      case 0x100D: num = 0; break;           // LOCALE_IFIRSTWEEKOFYEAR
+      case 0x1010: num = 1; break;           // LOCALE_INEGNUMBER
       default: ok = false; break;
     }
     if (!ok) { trt_SetLastError(1004); return 0; }
@@ -781,38 +897,58 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
     return 2;
   }
 
+  char num_str[32] = {};
   const char* ans = nullptr;
   switch (base_type) {
-    case 0x0001: ans = "0409"; break;
-    case 0x0002: ans = "English (United States)"; break;
-    case 0x005C: ans = "en-US"; break;
-    case 0x0059: ans = "en"; break;
-    case 0x005A: ans = "US"; break;
-    case 0x006E: ans = "en"; break;
-    case 0x0079: ans = ""; break;
-    case 0x000B: ans = "437"; break;
-    case 0x1004: ans = "1252"; break;
+    case 0x0001:
+      snprintf(num_str, sizeof(num_str), "%04X", e->lcid);
+      ans = num_str;
+      break;
+    case 0x0002: ans = e->display_name; break;
+    case 0x0003: ans = e->abbrev_lang; break;   // LOCALE_SABBREVLANGNAME
+    case 0x0004: ans = e->native_lang; break;   // LOCALE_SNATIVELANGNAME
+    case 0x0007: ans = e->abbrev_ctry; break;   // LOCALE_SABBREVCTRYNAME
+    case 0x0008: ans = e->ctry_name; break;     // LOCALE_SNATIVECTRYNAME
+    case 0x000B:
+      snprintf(num_str, sizeof(num_str), "%u", e->oem_cp);
+      ans = num_str;
+      break;
+    case 0x1004:
+      snprintf(num_str, sizeof(num_str), "%u", e->ansi_cp);
+      ans = num_str;
+      break;
+    case 0x1001: ans = e->lang_name; break;     // LOCALE_SENGLISHLANGUAGENAME
+    case 0x1002: ans = e->ctry_name; break;     // LOCALE_SENGLISHCOUNTRYNAME
+    case 0x0072: ans = e->display_name; break;  // LOCALE_SENGLISHDISPLAYNAME
+    case 0x005C: ans = e->name; break;          // LOCALE_SNAME ("ja-JP", "en-US")
+    case 0x0059: ans = e->lang_iso; break;      // LOCALE_SISO639LANGNAME
+    case 0x005A: ans = e->ctry_iso; break;      // LOCALE_SISO3166CTRYNAME
+    case 0x006E: ans = e->lang_iso; break;      // LOCALE_SISO639LANGNAME2
+    case 0x0079: ans = ""; break;               // LOCALE_SPARENT
     case 0x000C: ans = ","; break;
     case 0x000D: ans = "1"; break;
     case 0x000E: ans = "."; break;
     case 0x000F: ans = ","; break;
     case 0x0010: ans = "3;0"; break;
     case 0x0011: ans = "2"; break;
-    case 0x0014: ans = "$"; break;
-    case 0x0015: ans = "USD"; break;
-    case 0x0018: ans = "2"; break;
+    case 0x0014: ans = e->curr_symbol; break;   // LOCALE_SCURRENCY
+    case 0x0015: ans = e->intl_curr; break;     // LOCALE_SINTLSYMBOL
+    case 0x0018: ans = (e->curr_digits == 0) ? "0" : "2"; break;
     case 0x001B: ans = "0"; break;
     case 0x001D: ans = "/"; break;
     case 0x001E: ans = ":"; break;
-    case 0x001F: ans = "M/d/yyyy"; break;
-    case 0x0020: ans = "dddd, MMMM d, yyyy"; break;
-    case 0x0028: ans = "AM"; break;
-    case 0x0029: ans = "PM"; break;
+    case 0x001F: ans = (e->lcid == 0x0411) ? "yyyy/MM/dd" : "M/d/yyyy"; break;
+    case 0x0020: ans = (e->lcid == 0x0411) ? "yyyy'年'M'月'd'日'" : "dddd, MMMM d, yyyy"; break;
+    case 0x0028: ans = (e->lcid == 0x0411) ? "\xe5\x8d\x88\xe5\x89\x8d" : "AM"; break;
+    case 0x0029: ans = (e->lcid == 0x0411) ? "\xe5\x8d\x88\xe5\xbe\x8c" : "PM"; break;
     case 0x0050: ans = ""; break;
     case 0x0051: ans = "-"; break;
     case 0x1003: ans = "h:mm:ss tt"; break;
-    case 0x100B: ans = "1"; break;
-    case 0x100C: ans = "6"; break;
+    case 0x100B:
+      snprintf(num_str, sizeof(num_str), "%u", e->country_code);
+      ans = num_str;
+      break;
+    case 0x100C: ans = (e->lcid == 0x0409) ? "6" : "0"; break;
     case 0x1010: ans = "1"; break;
     case 0x002A: ans = "Monday"; break;    case 0x002B: ans = "Tuesday"; break;
     case 0x002C: ans = "Wednesday"; break; case 0x002D: ans = "Thursday"; break;
@@ -840,7 +976,10 @@ int TRT_STDCALL trt_GetLocaleInfoEx(const u16* locale, u32 lctype, u16* out,
 }
 
 int TRT_STDCALL trt_GetLocaleInfoW(u32 lcid, u32 lctype, u16* out, int cch) {
-  (void)lcid;
+  u16 loc_name[32] = {};
+  if (trt_LCIDToLocaleName(lcid, loc_name, 32, 0) > 0) {
+    return trt_GetLocaleInfoEx(loc_name, lctype, out, cch);
+  }
   const u16 en[] = {'e','n','-','U','S',0};
   return trt_GetLocaleInfoEx(en, lctype, out, cch);
 }
@@ -3286,6 +3425,7 @@ static const trt_named_fn k_gap_fns[] = {
   {"GetSystemDefaultLocaleName", (void*)&trt_GetSystemDefaultLocaleName},
   {"IsValidLocaleName", (void*)&trt_IsValidLocaleName},
   {"IsValidLocale", (void*)&trt_IsValidLocale},
+  {"ResolveLocaleName", (void*)&trt_ResolveLocaleName},
   {"GetLocaleInfoEx", (void*)&trt_GetLocaleInfoEx},
   {"GetLocaleInfoW", (void*)&trt_GetLocaleInfoW},
   {"GetDateFormatEx", (void*)&trt_GetDateFormatEx},

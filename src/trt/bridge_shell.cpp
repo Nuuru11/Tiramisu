@@ -446,6 +446,64 @@ int TRT_GUEST_ABI shell_Shell_NotifyIconW(u32 msg, void* nid) {
   return 0;  // FALSE: no system tray on console UWP
 }
 
+// ---- icon extraction ----
+// SDL2 imports ExtractIconExW at load time for its window-icon path, so an
+// absent export is a LOAD failure for every SDL2 game (measured: corpus
+// SDL2.dll). There is no shell image list and no PE icon extraction on the
+// console, so the honest answer is zero icons with the request named — the
+// caller falls back to its own icon or none.
+u32 TRT_GUEST_ABI shell_ExtractIconExW(const u16* file, int index, void** large,
+                                       void** small, u32 count) {
+  if (large) *large = nullptr;
+  if (small) *small = nullptr;
+  char nm[96] = "";
+  if (file && trt_utf16_to_utf8(file, nm, sizeof(nm)) != 0) nm[0] = 0;
+  char line[224];
+  snprintf(line, sizeof(line),
+           "shell32: ExtractIconExW(\"%s\", index=%d, n=%u) -> 0 icons "
+           "(no icon extraction on console: fail-visible)",
+           nm, index, count);
+  log_line(line);
+  return 0;
+}
+
+u32 TRT_GUEST_ABI shell_ExtractIconExA(const char* file, int index, void** large,
+                                       void** small, u32 count) {
+  if (large) *large = nullptr;
+  if (small) *small = nullptr;
+  char line[224];
+  snprintf(line, sizeof(line),
+           "shell32: ExtractIconExA(\"%s\", index=%d, n=%u) -> 0 icons "
+           "(no icon extraction on console: fail-visible)",
+           file ? file : "", index, count);
+  log_line(line);
+  return 0;
+}
+
+void* TRT_GUEST_ABI shell_ExtractIconW(void* inst, const u16* file, u32 index) {
+  (void)inst;
+  char nm[96] = "";
+  if (file && trt_utf16_to_utf8(file, nm, sizeof(nm)) != 0) nm[0] = 0;
+  char line[192];
+  snprintf(line, sizeof(line),
+           "shell32: ExtractIconW(\"%s\", index=%u) -> NULL "
+           "(no icon extraction on console: fail-visible)",
+           nm, index);
+  log_line(line);
+  return nullptr;
+}
+
+void* TRT_GUEST_ABI shell_ExtractIconA(void* inst, const char* file, u32 index) {
+  (void)inst;
+  char line[192];
+  snprintf(line, sizeof(line),
+           "shell32: ExtractIconA(\"%s\", index=%u) -> NULL "
+           "(no icon extraction on console: fail-visible)",
+           file ? file : "", index);
+  log_line(line);
+  return nullptr;
+}
+
 }  // namespace
 
 extern "C" {
@@ -472,6 +530,10 @@ int trt_bridge_register_shell(void) {
        (void*)&shell_SetCurrentProcessExplicitAppUserModelID},
       {"Shell_NotifyIconGetRect", (void*)&shell_Shell_NotifyIconGetRect},
       {"Shell_NotifyIconW", (void*)&shell_Shell_NotifyIconW},
+      {"ExtractIconExW", (void*)&shell_ExtractIconExW},
+      {"ExtractIconExA", (void*)&shell_ExtractIconExA},
+      {"ExtractIconW", (void*)&shell_ExtractIconW},
+      {"ExtractIconA", (void*)&shell_ExtractIconA},
   };
   trt_module_register("shell32.dll", TRT_ROUTE_BUILTIN, k_fns,
                       (int)(sizeof(k_fns) / sizeof(k_fns[0])));

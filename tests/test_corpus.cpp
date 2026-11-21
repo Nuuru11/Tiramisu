@@ -227,7 +227,8 @@ const console_dll k_console_dlls[] = {
     {"d3d11.dll", 'U'}, {"dxgi.dll", 'U'}, {"d2d1.dll", 'U'},
     {"dwrite.dll", 'U'}, {"dcomp.dll", 'U'}, {"xinput1_4.dll", 'U'},
     {"ws2_32.dll", 'U'}, {"d3d12.dll", 'U'}, {"d3d12core.dll", 'U'},
-    {"bcrypt.dll", 'U'}, {"winhttp.dll", 'U'},
+    {"bcrypt.dll", 'U'}, {"winhttp.dll", 'U'}, {"wldap32.dll", 'U'},
+    {"d3dcompiler_47.dll", 'U'}, {"d3dcompiler_46.dll", 'U'}, {"d3dcompiler_43.dll", 'U'},
     {"kernel32.dll", 'U'}, {"kernelbase.dll", 'U'}, {"ntdll.dll", 'U'},
     {"ucrtbase.dll", 'U'}, {"combase.dll", 'U'}, {"user32.dll", 'U'},
     {"advapi32.dll", 'U'},  // token half UWP-documented; registry half is BUILTIN
