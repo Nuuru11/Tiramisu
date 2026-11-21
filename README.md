@@ -7,7 +7,7 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders-brightgreen)
+![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders%20%7C%20Celeste%20renders-brightgreen)
 ![Gates](https://img.shields.io/badge/offline%20gates-49%2F49%20pass-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -98,6 +98,25 @@ separate boots, ordered by how much of the scene each one rendered.
 
 The captures are 256×144 preview stills. They show the scene and the render
 path, not final resolution or frame pacing.
+
+### Celeste (2026-11-21) — boots and renders on console
+
+**Celeste v1.4.0.0** (XNA/Mono, FNA stack) now boots to its fully rendered,
+animated title screen on the Series S. This is the first **managed .NET game**
+to run — Tiramisu embeds a UWP build of Mono 6.8.0.105 and drives FNA3D
+against the host's real D3D11 device + CoreWindow swapchain.
+
+Evidence: title screen with mountain, icy logo, snow particles, `v1.4.0.0`
+(`docs/proof/celeste-title.png`); log shows `FNA3D_CreateDevice` succeeding,
+all seven FMOD banks parsed, PNG textures decoding, and 240 s+ of stable
+heartbeats with live keyboard input.
+
+What it took: UWP Mono patches (RWX fallback, static interp trampolines,
+P/Invoke host-export resolution), `System.Native` shims, 1470 flat export
+entry points, FNA3D image decode, and a writable CWD. **Audio is silent on
+console** — FMOD FSB/Vorbis sample decode is disabled there because it
+heap-corrupted on the Series S; Linux keeps real decode. Gameplay/menu
+navigation is not yet verified end-to-end.
 
 ### What the evidence does and doesn't cover
 
@@ -203,14 +222,15 @@ RACCOIN.exe (real Unity IL2CPP Steam game) — offline boot ladder:
 |---|---|---|
 | **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **Playable on console.** Menu, live run, coin physics, HUD progression; 7.2 s capture. |
 | **God of War** (PC) | AAA in-house engine, x64, D3D11 | **Boots and renders on console.** The opening forest, across four boots; menu and gameplay next. |
+| **Celeste** (v1.4.0.0) | XNA / Mono + FNA (managed .NET) | **Boots and renders on console.** Animated title screen; first managed game to run. Audio silent; gameplay next. |
 | **Ultra Pool** | Godot 4.3 + GodotSteam (Vulkan) | **Full lifecycle** — scene load → pump → Godot's own quit chain, exit(0) |
 | **Go Next (demo)** | Unity IL2CPP | boots, reaches `UNITYMAIN2` |
 | OrTMM | PyInstaller / commercial | full CRT→WinMain→window→pump lifecycle |
 | BotW-Native (launcher + recomp exe) | BOTW Wii U static recomp | whole MinGW/SDL3/OpenSSL/glslang binary set loads + `DllMain` clean |
 | GoWLauncher | Win32 launcher | loads 1/0 — launcher only, not the game above |
 
-**Engine classes covered:** Unity IL2CPP + **mono** (the W^X two-phase JIT
-fallback enables runtime JIT), AAA in-house D3D11, Godot 4.x (Vulkan),
+**Engine classes covered:** Unity IL2CPP + **mono**, **XNA/Mono via FNA (managed .NET)**,
+AAA in-house D3D11, Godot 4.x (Vulkan),
 PyInstaller/Python, static-recomp ports, Win32 launchers, GDI+ UI apps,
 FMOD-audio games.
 
@@ -293,7 +313,7 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Steam | **BUILT (auth only)** — QR login; `BIsSubscribedApp` answers 0 (no DRM bypass) |
 | ISO / disc images | **BUILT** — `.iso` → read-only `D:` drive, lazy per-file extraction |
 | Input (keyboard/mouse/gamepad, DInput8, XInput, Raw Input) | **PASS (RACCOIN)** — CoreWindow events → guest getters + pump; pad-as-mouse |
-| Console run | **PASS (2026-11-19)** — RACCOIN playable; God of War boots and renders the forest |
+| Console run | **PASS (2026-11-21)** — RACCOIN playable; God of War renders the forest; **Celeste boots to a rendered title screen** |
 | 32-bit x86 (PE32) | **not supported** — needs an x86 engine; see GAP-MAP W5 |
 
 <details>
@@ -327,7 +347,11 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 
 - **M0 console PoC — done (2026-11-19).** Signed MSIX deploys; RACCOIN
   reaches its menu, starts a run and plays; God of War boots and renders the
-  forest. Evidence: [Console proof](#console-proof-2026-11-19).
+  forest; Celeste boots and renders its title screen. Evidence:
+  [Console proof](#console-proof-2026-11-19).
+- **M1b — Celeste gameplay — in progress.** Verify menu navigation / level
+  entry on console and restore console audio (FSB/Vorbis decode currently
+  disabled due to a heap-corruption fault in the Series S AppContainer).
 - **M1 front end + sustained play — in progress.** God of War's normal
   front-end/menu path; RACCOIN soak test and frame-time capture; audio and
   save validation.
