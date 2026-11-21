@@ -527,6 +527,19 @@ struct dry_result {
 // these lines into the measured compatibility report.
 bool g_coverage_mode = false;
 int g_cov_real = 0, g_cov_recorded = 0, g_cov_silent = 0;
+int g_cov_delay = 0;
+
+// Classify one bound symbol and add it to this PE's coverage totals.
+// Game-dir exports, SYSTEM routes and ordinal-only binds are REAL by
+// construction (native code / a real host DLL).
+void add_coverage(const char* dll, const char* sym) {
+  int cls = TRT_IMPL_REAL;
+  int have_cls = 0;
+  if (sym && trt_symbol_class(dll, sym, &have_cls)) cls = have_cls;
+  if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
+  else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
+  else ++g_cov_real;
+}
 
 void append_csv(char* dst, size_t cap, const char* item) {
   if (!dst || !item || cap == 0) return;
@@ -615,16 +628,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
 
     if (binds) {
       ++out->bound;
-      // Classify the binding. A symbol our module table resolves gets its
-      // declared class; game-dir exports, SYSTEM routes and ordinal-only
-      // binds are REAL by construction (native code / real host DLL).
-      int cls = TRT_IMPL_REAL;
-      int have_cls = 0;
-      if (sym_name && trt_symbol_class(dll_name, sym_name, &have_cls))
-        cls = have_cls;
-      if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
-      else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
-      else ++g_cov_real;
+      add_coverage(dll_name, sym_name);
     } else {
       char one[160];
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
@@ -635,10 +639,61 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
   }
 }
 
+// Delay-import coverage. The loader binds delay descriptors eagerly, so a
+// coverage report that only walks the static import directory undercounts
+// exactly the games that delay-load d3d12 or Miles (UnityPlayer, binkw32).
+// Descriptor layout: Attributes@0, DllNameRVA@4, IAT@12, INT@16. Old linkers
+// store VAs (Attributes bit 0 == 0), in which case image_base is subtracted.
+void delay_coverage(const file_pe& pe, const u8* file, size_t size) {
+  const trt_data_directory& dd = pe.dirs[TRT_PE_DIR_DELAY_IMPORT];
+  if (!dd.virtual_address) return;
+  const u64 off = rva_to_file(file, size, pe.secs, pe.nsec,
+                              dd.virtual_address);
+  if (!off) return;
+  const u8* opt = (const u8*)&pe.nt->optional_header;
+  const u64 image_base = pe.is_pe32 ? (u64)rd32b(opt + 28) : rd64b(opt + 24);
+  const u64 stride = pe.is_pe32 ? 4 : 8;
+  const u64 flag = pe.is_pe32 ? 0x80000000ull : 0x8000000000000000ull;
+
+  for (u32 d = 0; d < 4096; ++d) {
+    const u64 at = off + (u64)d * 32;
+    if (at + 32 > size) break;
+    const u32 attrs = rd32b(file + at);
+    if (!attrs && !rd32b(file + at + 4)) break;  // terminator
+    const bool va_style = !(attrs & 1);
+    u64 name_rva = rd32b(file + at + 4);
+    u64 int_rva  = rd32b(file + at + 16);
+    if (va_style) {
+      if (name_rva >= image_base) name_rva -= image_base;
+      if (int_rva >= image_base) int_rva -= image_base;
+    }
+    const u64 nm_off = rva_to_file(file, size, pe.secs, pe.nsec, name_rva);
+    if (!nm_off || nm_off >= size) continue;
+    char dll[96];
+    snprintf(dll, sizeof(dll), "%s", (const char*)(file + nm_off));
+    const u64 thunks = rva_to_file(file, size, pe.secs, pe.nsec, int_rva);
+    if (!thunks) continue;
+    for (u64 t = 0; t < 200000; ++t) {
+      const u64 to = thunks + t * stride;
+      if (to + stride > size) break;
+      const u64 thunk = pe.is_pe32 ? rd32b(file + to) : rd64b(file + to);
+      if (!thunk) break;
+      if (thunk & flag) continue;  // ordinal: real by construction
+      const u64 hn = rva_to_file(file, size, pe.secs, pe.nsec,
+                                 thunk & 0x7FFFFFFFu);
+      if (!hn || hn + 2 >= size) continue;
+      const char* sym = (const char*)(file + hn + 2);
+      if (strnlen(sym, 256) == 256) continue;
+      ++g_cov_delay;
+      add_coverage(dll, sym);
+    }
+  }
+}
+
 void dry_run_pe(const char* path, const char* name, const u8* file,
                 size_t size) {
   (void)path;
-  g_cov_real = g_cov_recorded = g_cov_silent = 0;
+  g_cov_real = g_cov_recorded = g_cov_silent = g_cov_delay = 0;
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) {
     printf("  dry-run: PE HEADERS UNREADABLE\n");
@@ -699,9 +754,11 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
   }
 
   if (g_coverage_mode) {
+    delay_coverage(pe, file, size);
     const int total = g_cov_real + g_cov_recorded + g_cov_silent;
-    printf("COVERAGE %s: imports=%d real=%d recorded=%d named-silent=%d\n",
-           name, total, g_cov_real, g_cov_recorded, g_cov_silent);
+    printf("COVERAGE %s: imports=%d real=%d recorded=%d named-silent=%d "
+           "delay=%d\n",
+           name, total, g_cov_real, g_cov_recorded, g_cov_silent, g_cov_delay);
   }
 }
 
