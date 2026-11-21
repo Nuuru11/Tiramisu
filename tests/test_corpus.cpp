@@ -798,6 +798,12 @@ int run_corpus(int argc, char** argv) {
       printf("COVERAGE SELFTEST FAIL: kernel32!VirtualAlloc must be REAL\n");
       return 1;
     }
+    if (!trt_symbol_class("msacm32.dll", "acmStreamOpen", &cls) ||
+        cls != TRT_IMPL_NAMED_SILENT) {
+      printf("COVERAGE SELFTEST FAIL: msacm32 must be NAMED_SILENT "
+             "(no codecs installed)\n");
+      return 1;
+    }
     printf("COVERAGE SELFTEST: OK (real / recorded / named-silent)\n");
   }
 

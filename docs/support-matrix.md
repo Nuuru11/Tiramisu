@@ -26,22 +26,22 @@
 | GameAssembly.dll | 248 | 248 | 0 | 0 | 0 | 100.0% |
 | Go | 72 | 72 | 0 | 0 | 0 | 100.0% |
 | UnityCrashHandler64.exe | 211 | 211 | 0 | 0 | 0 | 100.0% |
-| UnityPlayer.dll | 558 | 556 | 1 | 1 | 1 | 99.6% |
+| UnityPlayer.dll | 558 | 553 | 1 | 4 | 1 | 99.1% |
 | GoWLauncher.exe | 77 | 77 | 0 | 0 | 0 | 100.0% |
 | binkw32.dll | 122 | 122 | 0 | 0 | 19 | 100.0% |
 | discord_game_sdk.dll | 120 | 120 | 0 | 0 | 0 | 100.0% |
 | OrTMM.exe | 145 | 145 | 0 | 0 | 0 | 100.0% |
-| SDL2.dll | 360 | 358 | 0 | 2 | 0 | 99.4% |
+| SDL2.dll | 360 | 356 | 0 | 4 | 0 | 98.9% |
 | baselib.dll | 129 | 129 | 0 | 0 | 0 | 100.0% |
 | GameAssembly.dll | 252 | 252 | 0 | 0 | 0 | 100.0% |
 | RACCOIN.exe | 72 | 72 | 0 | 0 | 0 | 100.0% |
 | UnityCrashHandler64.exe | 211 | 211 | 0 | 0 | 0 | 100.0% |
-| UnityPlayer.dll | 547 | 545 | 1 | 1 | 1 | 99.6% |
+| UnityPlayer.dll | 547 | 542 | 1 | 4 | 1 | 99.1% |
 | amd_ags_x64.dll | 74 | 74 | 0 | 0 | 0 | 100.0% |
 | bink2w64.dll | 126 | 126 | 0 | 0 | 19 | 100.0% |
 | fmod_event64.dll | 221 | 221 | 0 | 0 | 0 | 100.0% |
-| fmod_event_net64.dll | 272 | 271 | 0 | 1 | 0 | 99.6% |
-| fmodex64.dll | 165 | 164 | 0 | 1 | 0 | 99.4% |
+| fmod_event_net64.dll | 272 | 270 | 0 | 2 | 0 | 99.3% |
+| fmodex64.dll | 165 | 155 | 0 | 10 | 0 | 93.9% |
 | oo2core_6_win64.dll | 66 | 66 | 0 | 0 | 0 | 100.0% |
 | sekiro.exe | 534 | 518 | 0 | 16 | 0 | 97.0% |
 | steam_api64.dll | 9 | 9 | 0 | 0 | 0 | 100.0% |
@@ -70,22 +70,22 @@ COVERAGE dstorage.dll: imports=85 real=85 recorded=0 named-silent=0 delay=0
 COVERAGE GameAssembly.dll: imports=248 real=248 recorded=0 named-silent=0 delay=0
 COVERAGE Go Next demo.exe: imports=72 real=72 recorded=0 named-silent=0 delay=0
 COVERAGE UnityCrashHandler64.exe: imports=211 real=211 recorded=0 named-silent=0 delay=0
-COVERAGE UnityPlayer.dll: imports=558 real=556 recorded=1 named-silent=1 delay=1
+COVERAGE UnityPlayer.dll: imports=558 real=553 recorded=1 named-silent=4 delay=1
 COVERAGE GoWLauncher.exe: imports=77 real=77 recorded=0 named-silent=0 delay=0
 COVERAGE binkw32.dll: imports=122 real=122 recorded=0 named-silent=0 delay=19
 COVERAGE discord_game_sdk.dll: imports=120 real=120 recorded=0 named-silent=0 delay=0
 COVERAGE OrTMM.exe: imports=145 real=145 recorded=0 named-silent=0 delay=0
-COVERAGE SDL2.dll: imports=360 real=358 recorded=0 named-silent=2 delay=0
+COVERAGE SDL2.dll: imports=360 real=356 recorded=0 named-silent=4 delay=0
 COVERAGE baselib.dll: imports=129 real=129 recorded=0 named-silent=0 delay=0
 COVERAGE GameAssembly.dll: imports=252 real=252 recorded=0 named-silent=0 delay=0
 COVERAGE RACCOIN.exe: imports=72 real=72 recorded=0 named-silent=0 delay=0
 COVERAGE UnityCrashHandler64.exe: imports=211 real=211 recorded=0 named-silent=0 delay=0
-COVERAGE UnityPlayer.dll: imports=547 real=545 recorded=1 named-silent=1 delay=1
+COVERAGE UnityPlayer.dll: imports=547 real=542 recorded=1 named-silent=4 delay=1
 COVERAGE amd_ags_x64.dll: imports=74 real=74 recorded=0 named-silent=0 delay=0
 COVERAGE bink2w64.dll: imports=126 real=126 recorded=0 named-silent=0 delay=19
 COVERAGE fmod_event64.dll: imports=221 real=221 recorded=0 named-silent=0 delay=0
-COVERAGE fmod_event_net64.dll: imports=272 real=271 recorded=0 named-silent=1 delay=0
-COVERAGE fmodex64.dll: imports=165 real=164 recorded=0 named-silent=1 delay=0
+COVERAGE fmod_event_net64.dll: imports=272 real=270 recorded=0 named-silent=2 delay=0
+COVERAGE fmodex64.dll: imports=165 real=155 recorded=0 named-silent=10 delay=0
 COVERAGE oo2core_6_win64.dll: imports=66 real=66 recorded=0 named-silent=0 delay=0
 COVERAGE sekiro.exe: imports=534 real=518 recorded=0 named-silent=16 delay=0
 COVERAGE steam_api64.dll: imports=9 real=9 recorded=0 named-silent=0 delay=0

@@ -297,6 +297,14 @@ const impl_override k_impl_classes[] = {
     {"shell32.dll", "ExtractIconA", TRT_IMPL_NAMED_SILENT},
     {"winmm.dll", "waveOutGetNumDevs", TRT_IMPL_NAMED_SILENT},
     {"winmm.dll", "midiInGetNumDevs", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "waveInGetNumDevs", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "midiOutGetNumDevs", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "waveOutGetDevCapsW", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "waveOutGetDevCapsA", TRT_IMPL_NAMED_SILENT},
+    // Whole honest-empty surfaces (source-confirmed: no codecs, no printers).
+    {"msacm32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"msvfw32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"winspool.drv", nullptr, TRT_IMPL_NAMED_SILENT},
 };
 
 bool g_impl_applied = false;
