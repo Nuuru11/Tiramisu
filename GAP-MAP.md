@@ -831,12 +831,20 @@ No console claim without a TV screenshot + the log pull.
 
 ---
 
-## The distance, honestly
+## The distance, honestly (updated 2026-11-21)
 
-- **Offline (Linux gate):** a real Unity IL2CPP Steam game boots through engine
-  + IL2CPP init, window up, D3D11 device acquired — **one wall away from
-  UnityMain2 + the pump: our own SEH unwinder.**
-- **Console (the actual goal):** G1 has never run; G3's W^X answer is
-  unmeasured; audio/input/save unproven on hardware. **3–4 unmeasured walls.**
+- **Offline (Linux gate):** the SEH wall is broken through (W1), all corpus PEs
+  load/bind with zero unresolved imports, and D3D12 recording has a triangle
+  gate. Per-title capability is measured by `tools/support-matrix.sh`
+  (symbol classes: real / recorded / named-silent, delay imports included).
+  The earlier "one wall away, our own SEH unwinder" claim is stale — that
+  wall is down.
+- **Console (the actual goal):** G1 has run — signed MSIX deploys and
+  **RACCOIN is playable, Celeste is playable (Chapter 1), God of War renders
+  the forest** (see README "Console proof"). Still unproven on hardware:
+  sustained soak + frame times, save/profile round-trip, GoW front-end/menu,
+  720p+ output, and **audio** (Celeste's FSB/Vorbis decode is disabled on the
+  Series S after a heap-corruption fault). Those are the remaining walls,
+  not "G1 never ran".
   The probe sequence in W3 converts all of them from speculation to measurement
   in one deploy session.

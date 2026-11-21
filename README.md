@@ -390,6 +390,8 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Doc | Contents |
 |---|---|
 | [docs/03-evidence.md](docs/03-evidence.md) | what is proven vs assumed — every fix traces to a measurement |
+| [docs/04-support-roadmap.md](docs/04-support-roadmap.md) | the walls between "a few titles boot" and "any PC game runs", ranked by library share |
+| [docs/support-matrix.md](docs/support-matrix.md) | auto-generated, measured per-title `real / recorded / named-silent` import coverage |
 | [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |
 | [GAP-MAP.md](GAP-MAP.md) | live gap table, W-lanes, dependency order, triggers |
 | [docs/](docs/) | architecture notes, stage logs, console playbook |

@@ -150,16 +150,20 @@ three of which exist:
 4. **Per-title compatibility rows** (`COMPATIBILITY.md`): tier, engine,
    ladder reached, and the exact named gap for anything below Tier S.
 
-**Missing, and worth building next** (this is the differentiator):
+**DONE 2026-11-21 — symbol-level coverage classification + generated matrix:**
 
-- **Symbol-level coverage classification**: today a bridge function is either
-  registered or absent. Add an implementation class per registration
-  (`real` / `recorded` / `named-silent`) so the runtime can print, for any
-  title, "N imports: X real, Y recorded, Z named-silent" — the single number
-  that predicts whether a game will work, per title, automatically.
-- **Auto-generated compatibility matrix**: emit the above from a corpus run
-  into `docs/support-matrix.md`, so the compatibility page is measured, never
-  hand-written.
+- `trt_named_fn` carries an `impl_class` (`TRT_IMPL_REAL` / `RECORDED` /
+  `NAMED_SILENT`); `trt_module_mark_impl()` lets bridges override it and
+  `trt_symbol_class()` resolves it through the same path as the loader.
+  D3D12 is seeded as RECORDED; mfplat/mfreadwrite/mscoree/Steam as
+  NAMED_SILENT; the honest-empty shell32/winmm answers are per-symbol.
+- `test_corpus --coverage` prints one `COVERAGE <pe>: imports=N real=X
+  recorded=Y named-silent=Z delay=N` line per PE, with a self-test that fails
+  the gate if the seed table drifts. Delay-load descriptors are walked too
+  (VA-style and RVA-style), so UnityPlayer's d3d12 and binkw32's Miles are
+  counted just like static imports.
+- `tools/support-matrix.sh` runs the corpus and writes
+  `docs/support-matrix.md` from those lines — measured, never hand-written.
 
 ---
 
@@ -167,7 +171,7 @@ three of which exist:
 
 | # | Item | Why first | Gate |
 |---|---|---|---|
-| 1 | Symbol-level implementation classes + per-title coverage report | makes every later gap measurable and visible | new suite: counts match a fixture; report generation |
+| ~~1~~ | ~~Symbol-level implementation classes + per-title coverage report~~ | **DONE 2026-11-21** — see `docs/support-matrix.md` | `COVERAGE SELFTEST: OK` + generated matrix |
 | 2 | FADPCM + legacy-Ex FSB5 decode (W2) | audible games for the largest middleware class | `test_fmod` asserts real PCM for FSB5-FADPCM |
 | 3 | Wwise init/render/bank path (W3) | AAA audio class, GoW's named gap | fixture DLL call sequence reaches "samples submitted" |
 | 4 | D3D12 recording → submission (W5) | UE5-class titles | triangle fixture executes, not just records |
