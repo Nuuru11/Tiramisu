@@ -260,7 +260,7 @@ def main():
         if not params:
             params = 'void'
         lines.append(f'/* {fmod_name} <- trt_fmod_studio_{suffix} */')
-        lines.append(f'{c_ret} {fmod_name}({params}) {{')
+        lines.append(f'MONO_DOOR_EXPORT {c_ret} {fmod_name}({params}) {{')
         # Param-desc out-params need a temp + fill.
         call_args = []
         pre = []

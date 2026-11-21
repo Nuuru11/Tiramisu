@@ -143,6 +143,10 @@ void assembly_load_hook_uwp(MonoAssembly* assembly, void* user_data) {
   // before any P/Invoke in it can resolve. (FAudio is NOT mapped: it is
   // not compiled into the host yet — a later step.)
   mono_dllmap_insert(image, "FNA3D", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "fmod", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "fmodstudio", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "CSteamworks", nullptr, "__Internal", nullptr);
+  mono_dllmap_insert(image, "sdkencryptedappticket", nullptr, "__Internal", nullptr);
   if (!g_hook_dllmaps_uwp || g_hook_dllmap_count_uwp <= 0) return;
   for (int i = 0; i < g_hook_dllmap_count_uwp; ++i) {
     mono_dllmap_insert(image, g_hook_dllmaps_uwp[i].module, nullptr,

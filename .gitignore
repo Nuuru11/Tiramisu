@@ -21,3 +21,4 @@ third_party/mojoshader/.git/
 
 # local xwin SDK cache (build artifact)
 .xwin-cache/
+third_party/mono-bridges/gen/

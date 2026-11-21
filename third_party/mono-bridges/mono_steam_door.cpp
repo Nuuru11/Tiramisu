@@ -35,11 +35,19 @@
 #include "../../src/trt/bridge_steam.h"
 #include "../../src/trt/trt.h"
 
+#if defined(_WIN32)
+#define MONO_DOOR_EXPORT __declspec(dllexport)
+#else
+#define MONO_DOOR_EXPORT
+#endif
+
 extern "C" {
 
 // ---- markers: prove the real bridge is loaded ----
+#if !defined(_WIN32)
 int trt_mono_bridge_is_real(void) { return 1; }
 const char* trt_mono_bridge_name(void) { return "steam-real"; }
+#endif
 
 // ---- helpers ----
 void* steam_client(void) { return &g_steam_client_obj; }
@@ -73,39 +81,39 @@ void steam_read_appid_file(void) {
 }
 
 // ---- flat SteamAPI functions ----
-int Init(void) {
+MONO_DOOR_EXPORT int Init\(void) {
   steam_read_appid_file();
   return trt_SteamAPI_Init();
 }
-void Shutdown(void) { trt_SteamAPI_Shutdown(); }
-int RestartAppIfNecessary(unsigned int appid) {
+MONO_DOOR_EXPORT void Shutdown\(void) { trt_SteamAPI_Shutdown(); }
+MONO_DOOR_EXPORT int RestartAppIfNecessary\(unsigned int appid) {
   return trt_SteamAPI_RestartAppIfNecessary(appid);
 }
-void RunCallbacks(void) { trt_SteamAPI_RunCallbacks(); }
-int IsSteamRunning(void) { return trt_SteamAPI_IsSteamRunning(); }
-void Steam_RunCallbacks_(int pipe, int game_server) {
+MONO_DOOR_EXPORT void RunCallbacks\(void) { trt_SteamAPI_RunCallbacks(); }
+MONO_DOOR_EXPORT int IsSteamRunning\(void) { return trt_SteamAPI_IsSteamRunning(); }
+MONO_DOOR_EXPORT void Steam_RunCallbacks_\(int pipe, int game_server) {
   (void)game_server;  // one dispatch queue in the bridge
   trt_SteamAPI_ManualDispatch_RunFrame(pipe);
 }
-int Steam_GetHSteamUserCurrent_(void) {
+MONO_DOOR_EXPORT int Steam_GetHSteamUserCurrent_\(void) {
   return trt_SteamAPI_GetHSteamUser();
 }
-int GetHSteamPipe_(void) { return trt_SteamAPI_GetHSteamPipe(); }
-int GetHSteamUser_(void) { return trt_SteamAPI_GetHSteamUser(); }
-void GameServer_RunCallbacks(void) { trt_SteamAPI_RunCallbacks(); }
+MONO_DOOR_EXPORT int GetHSteamPipe_\(void) { return trt_SteamAPI_GetHSteamPipe(); }
+MONO_DOOR_EXPORT int GetHSteamUser_\(void) { return trt_SteamAPI_GetHSteamUser(); }
+MONO_DOOR_EXPORT void GameServer_RunCallbacks\(void) { trt_SteamAPI_RunCallbacks(); }
 void* SteamClient_(void) { return steam_client(); }
 
 // ---- ISteamApps ----
-int ISteamApps_BIsSubscribed(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_apps_BIsSubscribed(steam_apps());
 }
-int ISteamApps_BIsLowViolence(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_apps_BIsLowViolence(steam_apps());
 }
-int ISteamApps_BIsCybercafe(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_apps_BIsCybercafe(steam_apps());
 }
-int ISteamApps_BIsVACBanned(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_apps_BIsVACBanned(steam_apps());
 }
 const char* ISteamApps_GetCurrentGameLanguage(void) {
@@ -114,13 +122,13 @@ const char* ISteamApps_GetCurrentGameLanguage(void) {
 const char* ISteamApps_GetAvailableGameLanguages(void) {
   return st_apps_GetAvailLangs(steam_apps());
 }
-int ISteamApps_BIsSubscribedApp(unsigned int appid) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()unsigned int appid) {
   return st_apps_BIsSubscribedApp(steam_apps(), appid);
 }
-int ISteamApps_BIsDlcInstalled(unsigned int appid) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()unsigned int appid) {
   return st_apps_BIsDlcInstalled(steam_apps(), appid);
 }
-int ISteamApps_GetCurrentBetaName(char* buf, int size) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()char* buf, int size) {
   return st_apps_GetCurrentBetaName(steam_apps(), buf, size);
 }
 unsigned int ISteamApps_GetAppInstallDir(unsigned int appid, char* folder,
@@ -130,137 +138,137 @@ unsigned int ISteamApps_GetAppInstallDir(unsigned int appid, char* folder,
 const char* ISteamApps_GetLaunchQueryParam(const char* key) {
   return st_apps_GetLaunchQueryParam(steam_apps(), key);
 }
-int ISteamApps_GetAppBuildId(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_apps_GetAppBuildId(steam_apps());
 }
 
 // ---- ISteamClient ----
 // Managed (user, pipe, version) -> bridge (self, pipe, user, version).
-int ISteamClient_CreateSteamPipe(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_client_CreateSteamPipe(steam_client());
 }
-int ISteamClient_BReleaseSteamPipe(int pipe) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int pipe) {
   return st_client_BReleaseSteamPipe(steam_client(), pipe);
 }
-int ISteamClient_ConnectToGlobalUser(int pipe) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int pipe) {
   return st_client_ConnectToGlobalUser(steam_client(), pipe);
 }
-int ISteamClient_CreateLocalUser(int* pipe, int acct) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int* pipe, int acct) {
   return st_client_CreateLocalUser(steam_client(), pipe, acct);
 }
-void ISteamClient_ReleaseUser(int pipe, int user) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int pipe, int user) {
   st_client_ReleaseUser(steam_client(), pipe, user);
 }
-void* ISteamClient_GetISteamUser(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamUser(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamGameServer(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                        const char* version) {
   return st_client_GetISteamGameServer(steam_client(), pipe, user, version);
 }
-void ISteamClient_SetLocalIPBinding(unsigned int addr, unsigned short port) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()unsigned int addr, unsigned short port) {
   // The bridge takes a pointer to the address; the managed API passes
   // it by value.
   u32 a = addr;
   st_client_SetLocalIPBinding(steam_client(), &a, port);
 }
-void* ISteamClient_GetISteamFriends(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamFriends(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamUtils(int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int pipe, const char* version) {
   return st_client_GetISteamUtils(steam_client(), pipe, version);
 }
-void* ISteamClient_GetISteamMatchmaking(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                         const char* version) {
   return st_client_GetISteamMatchmaking(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamMatchmakingServers(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                                const char* version) {
   return st_client_GetISteamMatchmakingServers(steam_client(), pipe, user,
                                                version);
 }
-void* ISteamClient_GetISteamGenericInterface(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                              const char* version) {
   return st_client_GetISteamGenericInterface(steam_client(), pipe, user,
                                              version);
 }
-void* ISteamClient_GetISteamUserStats(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                       const char* version) {
   return st_client_GetISteamUserStats(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamGameServerStats(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                             const char* version) {
   return st_client_GetISteamGameServerStats(steam_client(), pipe, user,
                                             version);
 }
-void* ISteamClient_GetISteamApps(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamApps(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamNetworking(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                        const char* version) {
   return st_client_GetISteamNetworking(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamRemoteStorage(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                           const char* version) {
   return st_client_GetISteamRemoteStorage(steam_client(), pipe, user,
                                           version);
 }
-void* ISteamClient_GetISteamScreenshots(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                         const char* version) {
   return st_client_GetISteamScreenshots(steam_client(), pipe, user, version);
 }
 unsigned int ISteamClient_GetIPCCallCount(void) {
   return st_client_GetIPCCallCount(steam_client());
 }
-void ISteamClient_SetWarningMessageHook(void* hook) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void* hook) {
   st_client_SetWarningMessageHook(steam_client(), hook);
 }
-int ISteamClient_BShutdownIfAllPipesClosed(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_client_BShutdownIfAllPipesClosed(steam_client());
 }
-void* ISteamClient_GetISteamHTTP(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamHTTP(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamUnifiedMessages(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                             const char* version) {
   return st_client_GetISteamUnifiedMessages(steam_client(), pipe, user,
                                             version);
 }
-void* ISteamClient_GetISteamController(int user, int pipe,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe,
                                        const char* version) {
   return st_client_GetISteamController(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamUGC(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamUGC(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamAppList(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamAppList(steam_client(), pipe, user, version);
 }
-void* ISteamClient_GetISteamMusic(int user, int pipe, const char* version) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int user, int pipe, const char* version) {
   return st_client_GetISteamMusic(steam_client(), pipe, user, version);
 }
 
 // ---- ISteamController (old Steamworks.NET names for the input API) ----
-int ISteamController_Init(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   // bExplicitlyCallRunFrame=false: the bridge runs its own frame pump.
   return st_input_Init(steam_input(), 0);
 }
-int ISteamController_Shutdown(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_input_Shutdown(steam_input());
 }
-void ISteamController_RunFrame(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   st_input_RunFrame(steam_input(), 0);
 }
-int ISteamController_GetConnectedControllers(u64* handles) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()u64* handles) {
   return st_input_GetConnectedControllers(steam_input(), handles);
 }
-int ISteamController_GetGamepadIndexForController(u64 handle) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()u64 handle) {
   return st_input_GetGamepadIndexForController(steam_input(), handle);
 }
-u64 ISteamController_GetControllerForGamepadIndex(int index) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int index) {
   return st_input_GetControllerForGamepadIndex(steam_input(), index);
 }
-void ISteamController_TriggerVibration(u64 handle, unsigned short left,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()u64 handle, unsigned short left,
                                        unsigned short right) {
   st_input_TriggerVibration(steam_input(), handle, left, right);
 }
@@ -287,7 +295,7 @@ static_assert(sizeof(controller_digital_action_data) == 2,
 static_assert(sizeof(controller_analog_action_data) == 16,
               "ControllerAnalogActionData_t must be 16 bytes");
 
-controller_digital_action_data ISteamController_GetDigitalActionData(
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()
     u64 handle, u64 action) {
   (void)handle;
   (void)action;
@@ -301,7 +309,7 @@ controller_digital_action_data ISteamController_GetDigitalActionData(
   controller_digital_action_data out{};
   return out;
 }
-controller_analog_action_data ISteamController_GetAnalogActionData(
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()
     u64 handle, u64 action) {
   (void)handle;
   (void)action;
@@ -325,7 +333,7 @@ struct controller_motion_data {
 static_assert(sizeof(controller_motion_data) == 40,
               "ControllerMotionData_t must be 40 bytes");
 
-controller_motion_data ISteamController_GetMotionData(u64 handle) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()u64 handle) {
   (void)handle;
   static int warned;
   if (!warned) {
@@ -342,7 +350,7 @@ controller_motion_data ISteamController_GetMotionData(u64 handle) {
 const char* ISteamFriends_GetPersonaName(void) {
   return st_friends_GetPersonaName(steam_friends());
 }
-int ISteamFriends_GetPersonaState(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_friends_GetPersonaState(steam_friends());
 }
 const char* ISteamFriends_GetFriendPersonaName(u64 steam_id) {
@@ -375,60 +383,60 @@ const char* ISteamFriends_GetFriendRichPresenceKeyByIndex(u64 steam_id,
 }
 
 // ---- ISteamRemoteStorage (real local cloud-file store in the bridge) ----
-int ISteamRemoteStorage_FileWrite(const char* name, const void* data,
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name, const void* data,
                                   int len) {
   return st_rs_FileWrite(steam_rs(), name, data, len);
 }
-int ISteamRemoteStorage_FileRead(const char* name, void* data, int len) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name, void* data, int len) {
   return st_rs_FileRead(steam_rs(), name, data, len);
 }
-int ISteamRemoteStorage_FileForget(const char* name) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name) {
   return st_rs_FileForget(steam_rs(), name);
 }
-int ISteamRemoteStorage_FileDelete(const char* name) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name) {
   return st_rs_FileDelete(steam_rs(), name);
 }
-int ISteamRemoteStorage_FileExists(const char* name) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name) {
   return st_rs_FileExists(steam_rs(), name);
 }
-int ISteamRemoteStorage_FilePersisted(const char* name) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name) {
   return st_rs_FilePersisted(steam_rs(), name);
 }
-int ISteamRemoteStorage_GetFileSize(const char* name) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()const char* name) {
   return st_rs_GetFileSize(steam_rs(), name);
 }
 long long ISteamRemoteStorage_GetFileTimestamp(const char* name) {
   return st_rs_GetFileTimestamp(steam_rs(), name);
 }
-int ISteamRemoteStorage_GetFileCount(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_rs_GetFileCount(steam_rs());
 }
 const char* ISteamRemoteStorage_GetFileNameAndSize(int index, int* size) {
   return st_rs_GetFileNameAndSize(steam_rs(), index, size);
 }
-int ISteamRemoteStorage_GetQuota(u64* total, u64* avail) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()u64* total, u64* avail) {
   return st_rs_GetQuota(steam_rs(), total, avail);
 }
-int ISteamRemoteStorage_IsCloudEnabledForAccount(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_rs_IsCloudEnabledForAccount(steam_rs());
 }
-int ISteamRemoteStorage_IsCloudEnabledForApp(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_rs_IsCloudEnabledForApp(steam_rs());
 }
-void ISteamRemoteStorage_SetCloudEnabledForApp(int enabled) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()int enabled) {
   st_rs_SetCloudEnabledForApp(steam_rs(), enabled);
 }
 
 // ---- ISteamUser ----
-int ISteamUser_BLoggedOn(void) { return st_user_BLoggedOn(steam_user()); }
-u64 ISteamUser_GetSteamID(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) { return st_user_BLoggedOn(steam_user()); }
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   // The managed signature returns a plain u64 in RAX. The bridge's
   // vtable function ALSO writes the hidden sret slot and returns the id
   // in RAX; call it directly and return the value.
   u64 tmp = 0;
   return st_user_GetSteamID(steam_user(), &tmp);
 }
-int ISteamUser_GetUserDataFolder(char* buf, int size) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()char* buf, int size) {
   return st_user_GetUserDataFolder(steam_user(), buf, size);
 }
 
@@ -453,7 +461,7 @@ unsigned int ISteamUtils_GetSecondsSinceAppActive(void) {
 unsigned int ISteamUtils_GetSecondsSinceComputerActive(void) {
   return st_utils_GetSecondsSinceComputerActive(steam_utils());
 }
-int ISteamUtils_GetConnectedUniverse(void) {
+MONO_DOOR_EXPORT ([a-zA-Z0-9_*]+ ISteam[a-zA-Z0-9_]+\()void) {
   return st_utils_GetConnectedUniverse(steam_utils());
 }
 unsigned int ISteamUtils_GetServerRealTime(void) {

@@ -117,7 +117,7 @@ def generate(implmap, real_file, out_path, tag, door):
             )
         ctype, val, label = cr
         lines.append(f"/* {sig} */")
-        lines.append(f"extern \"C\" {ctype} {name}(void) {{")
+        lines.append(f"extern \"C\" MONO_DOOR_EXPORT {ctype} {name}(void) {{")
         lines.append("  static int logged = 0;")
         lines.append("  if (!logged) {")
         lines.append("    logged = 1;")
