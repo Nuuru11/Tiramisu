@@ -167,14 +167,36 @@ typedef enum {
   TRT_ROUTE_STUB = 3     // exports exist, log when called, return 0
 } trt_route;
 
+// How much of a Win32 symbol Tiramisu actually implements. This is the
+// number that predicts whether a title will work, and it is reported per
+// title by tools/support-matrix.sh. "recorded" means the call is accepted
+// and logged but has no real effect; "named-silent" means the call returns
+// a truthful empty answer (or a named failure) with no payload.
+typedef enum {
+  TRT_IMPL_REAL = 0,        // real semantics, real result
+  TRT_IMPL_RECORDED = 1,    // call accepted + logged, no real effect
+  TRT_IMPL_NAMED_SILENT = 2 // truthful empty answer / named failure
+} trt_impl_class;
+
 typedef struct trt_named_fn {
   const char* name;
   void* fn;
+  unsigned char impl_class; // TRT_IMPL_*, default 0 (REAL) for `{name, fn}`
 } trt_named_fn;
 
 void trt_module_register(const char* name, trt_route route,
                           const trt_named_fn* fns, int fn_count);
 trt_route trt_module_route(const char* name);
+// Override the implementation class of an already-registered symbol.
+// Bridges call this at boot for functions whose behavior is recorded or
+// named-silent. Returns 1 when the symbol was found and marked.
+int trt_module_mark_impl(const char* module, const char* symbol,
+                         trt_impl_class cls);
+// Resolve a module!symbol through the same path the loader uses and report
+// its implementation class. Returns 1 when the symbol is resolvable (and
+// fills *cls_out); 0 when it is not. SYSTEM routes and game-dir exports are
+// REAL; STUB routes are NAMED_SILENT. Used by the support-matrix report.
+int trt_symbol_class(const char* module, const char* symbol, int* cls_out);
 // Offline bind-simulation (corpus dry-run): would this module!symbol bind?
 // BUILTIN -> iff the named fn is registered; STUB/SYSTEM -> always yes
 // (STUB binds fail-visible, SYSTEM binds via the console host). Unknown

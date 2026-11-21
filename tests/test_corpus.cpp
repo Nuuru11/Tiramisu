@@ -522,6 +522,12 @@ struct dry_result {
   char first_gap[224];
 };
 
+// Symbol-level implementation coverage (--coverage mode). Every bound import
+// is counted as real / recorded / named-silent; tools/support-matrix.sh turns
+// these lines into the measured compatibility report.
+bool g_coverage_mode = false;
+int g_cov_real = 0, g_cov_recorded = 0, g_cov_silent = 0;
+
 void append_csv(char* dst, size_t cap, const char* item) {
   if (!dst || !item || cap == 0) return;
   size_t len = strlen(dst);
@@ -609,6 +615,16 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
 
     if (binds) {
       ++out->bound;
+      // Classify the binding. A symbol our module table resolves gets its
+      // declared class; game-dir exports, SYSTEM routes and ordinal-only
+      // binds are REAL by construction (native code / real host DLL).
+      int cls = TRT_IMPL_REAL;
+      int have_cls = 0;
+      if (sym_name && trt_symbol_class(dll_name, sym_name, &have_cls))
+        cls = have_cls;
+      if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
+      else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
+      else ++g_cov_real;
     } else {
       char one[160];
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
@@ -622,6 +638,7 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
 void dry_run_pe(const char* path, const char* name, const u8* file,
                 size_t size) {
   (void)path;
+  g_cov_real = g_cov_recorded = g_cov_silent = 0;
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) {
     printf("  dry-run: PE HEADERS UNREADABLE\n");
@@ -680,6 +697,12 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
            dll_name, route, r.imports, r.bound, stub_count_for(dll_name),
            r.unresolved[0] ? r.unresolved : "-");
   }
+
+  if (g_coverage_mode) {
+    const int total = g_cov_real + g_cov_recorded + g_cov_silent;
+    printf("COVERAGE %s: imports=%d real=%d recorded=%d named-silent=%d\n",
+           name, total, g_cov_real, g_cov_recorded, g_cov_silent);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -697,6 +720,29 @@ int run_corpus(int argc, char** argv) {
   trt_set_system_loader(&console_system_load);
   // Load-only: map/bind/seal game DLLs, never run their DllMain/TLS
   trt_set_image_code_run(0);
+
+  // Self-test: the classification API must agree with the declared seed
+  // table, otherwise the support matrix would silently report a wrong number.
+  {
+    int cls = -1;
+    if (!trt_symbol_class("d3d12.dll", "DrawInstanced", &cls) ||
+        cls != TRT_IMPL_RECORDED) {
+      printf("COVERAGE SELFTEST FAIL: d3d12!DrawInstanced must be RECORDED\n");
+      return 1;
+    }
+    if (!trt_symbol_class("shell32.dll", "ExtractIconExW", &cls) ||
+        cls != TRT_IMPL_NAMED_SILENT) {
+      printf("COVERAGE SELFTEST FAIL: shell32!ExtractIconExW must be "
+             "NAMED_SILENT\n");
+      return 1;
+    }
+    if (!trt_symbol_class("kernel32.dll", "VirtualAlloc", &cls) ||
+        cls != TRT_IMPL_REAL) {
+      printf("COVERAGE SELFTEST FAIL: kernel32!VirtualAlloc must be REAL\n");
+      return 1;
+    }
+    printf("COVERAGE SELFTEST: OK (real / recorded / named-silent)\n");
+  }
 
   printf("tiramisu real-game corpus load matrix\n");
 
@@ -885,9 +931,19 @@ int run_corpus(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
-  if (argc < 2) {
-    printf("usage: test_corpus <pe> [<pe> ...]\n");
+  int first_pe = 1;
+  if (argc > 1 && strcmp(argv[1], "--coverage") == 0) {
+    g_coverage_mode = true;
+    first_pe = 2;
+  }
+  if (first_pe >= argc) {
+    printf("usage: test_corpus [--coverage] <pe> [<pe> ...]\n");
     return 2;
+  }
+  // run_corpus walks argv[1..]; shift the PE list down when the flag was used.
+  if (first_pe == 2) {
+    for (int i = 2; i < argc; ++i) argv[i - 1] = argv[i];
+    --argc;
   }
   return run_corpus(argc, argv);
 }

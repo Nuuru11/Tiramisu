@@ -267,10 +267,70 @@ void* resolve_through_table(void* user, const char* module,
 
 } // namespace
 
+// ---- implementation-class classification --------------------------------
+// A module can be 100% bindable yet useless. These tables turn "registered"
+// into "real / recorded / named-silent", so a per-title report can predict
+// whether a game will actually work. Applied lazily on first query so it is
+// independent of bridge registration order.
+namespace {
+
+struct impl_override {
+  const char* module;
+  const char* symbol; // nullptr = every symbol in the module
+  trt_impl_class cls;
+};
+
+const impl_override k_impl_classes[] = {
+    // D3D12 has a real command-list RECORDING surface; draws are not executed.
+    {"d3d12.dll", nullptr, TRT_IMPL_RECORDED},
+    // Media Foundation hands out metadata + a clean EOS; no frames decode.
+    {"mfplat.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"mfreadwrite.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    // .NET Framework and the Steam auth layer are honest surfaces only.
+    {"mscoree.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"steam_api64.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    {"steam_api.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    // Honest empty answers, not real functionality.
+    {"shell32.dll", "ExtractIconExW", TRT_IMPL_NAMED_SILENT},
+    {"shell32.dll", "ExtractIconExA", TRT_IMPL_NAMED_SILENT},
+    {"shell32.dll", "ExtractIconW", TRT_IMPL_NAMED_SILENT},
+    {"shell32.dll", "ExtractIconA", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "waveOutGetNumDevs", TRT_IMPL_NAMED_SILENT},
+    {"winmm.dll", "midiInGetNumDevs", TRT_IMPL_NAMED_SILENT},
+};
+
+bool g_impl_applied = false;
+
+trt_impl_class module_default_class(const builtin_mod& m) {
+  for (const impl_override& o : k_impl_classes) {
+    if (!o.symbol && name_eq(o.module, m.name)) return o.cls;
+  }
+  return TRT_IMPL_REAL;
+}
+
+void apply_impl_classes() {
+  if (g_impl_applied) return;
+  g_impl_applied = true;
+  for (const impl_override& o : k_impl_classes) {
+    if (!o.symbol) continue; // module defaults are applied at query time
+    const int mi = find_module(o.module);
+    if (mi < 0) continue;
+    builtin_mod& m = g_modules[mi];
+    for (int i = 0; i < m.fn_count; ++i) {
+      if (name_eq(m.fns[i].name, o.symbol)) m.fns[i].impl_class = o.cls;
+    }
+  }
+}
+
+} // namespace
+
 extern "C" {
 
 void trt_module_register(const char* name, trt_route route,
                           const trt_named_fn* fns, int fn_count) {
+  // A new registration can replace or add symbols, so any already-applied
+  // implementation classification is stale; re-apply on the next query.
+  g_impl_applied = false;
   if (!name) return;
   // last registration wins: a bridge registering "kernel32.dll" after the
   // defaults must REPLACE the default entry, not shadow it (find_module
@@ -413,6 +473,46 @@ void* trt_resolve_module(void* user, const char* module, const char* symbol,
 // stub entry point: one shared address; host-side logging wraps real call
 // observation later (v0: presence in the IAT is itself logged per module)
 void trt_stub_thunk(void) {}
+
+int trt_module_mark_impl(const char* module, const char* symbol,
+                         trt_impl_class cls) {
+  if (!module || !symbol) return 0;
+  const int mi = find_module(module);
+  if (mi < 0) return 0;
+  builtin_mod& m = g_modules[mi];
+  for (int i = 0; i < m.fn_count; ++i) {
+    if (strcmp(m.fns[i].name, symbol) == 0) {
+      m.fns[i].impl_class = (unsigned char)cls;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+int trt_symbol_class(const char* module, const char* symbol, int* cls_out) {
+  if (!module || !symbol) return 0;
+  apply_impl_classes();
+  const char* target = trt_apiset_target(module);
+  if (!target) target = module;
+  const int mi = find_module(target);
+  if (mi < 0) return 0;
+  const builtin_mod& m = g_modules[mi];
+  int cls = TRT_IMPL_REAL;
+  if (m.route == TRT_ROUTE_STUB) {
+    cls = TRT_IMPL_NAMED_SILENT;
+  } else if (m.route == TRT_ROUTE_BUILTIN) {
+    cls = module_default_class(m);
+    for (int i = 0; i < m.fn_count; ++i) {
+      if (strcmp(m.fns[i].name, symbol) == 0) {
+        if (m.fns[i].impl_class != TRT_IMPL_REAL)
+          cls = m.fns[i].impl_class;
+        break;
+      }
+    }
+  }
+  if (cls_out) *cls_out = cls;
+  return 1;
+}
 
 // ---------------------------------------------------------------------------
 // Module coverage for real PC games.
