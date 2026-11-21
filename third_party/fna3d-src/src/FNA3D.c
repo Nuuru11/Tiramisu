@@ -226,21 +226,40 @@ FNA3DAPI void FNA3D_GetDrawableSize(void* window, int32_t *w, int32_t *h)
 
 /* Init/Quit */
 
+/* Allocation-free trace writer (host): forward-declared here so FNA3D.c
+ * needs no new include path. Defined in src/host/host_log.cpp. */
+extern void trt_trace(const char* line);
+
 FNA3D_Device* FNA3D_CreateDevice(
 	FNA3D_PresentationParameters *presentationParameters,
 	uint8_t debugMode
 ) {
 	TRACE_CREATEDEVICE
+	{
+		char tb[128];
+		snprintf(tb, sizeof(tb),
+			"TRACE FNA3D_CreateDevice enter selectedDriver=%d",
+			selectedDriver);
+		trt_trace(tb);
+	}
 	if (selectedDriver < 0)
 	{
 		FNA3D_LogError("Call FNA3D_PrepareWindowAttributes first!");
+		trt_trace("TRACE FNA3D_CreateDevice exit NULL (selectedDriver<0)");
 		return NULL;
 	}
 
-	return drivers[selectedDriver]->CreateDevice(
-		presentationParameters,
-		debugMode
-	);
+	{
+		FNA3D_Device* dev = drivers[selectedDriver]->CreateDevice(
+			presentationParameters,
+			debugMode
+		);
+		char tb[128];
+		snprintf(tb, sizeof(tb),
+			"TRACE FNA3D_CreateDevice exit dev=%p", (void*) dev);
+		trt_trace(tb);
+		return dev;
+	}
 }
 
 /* TIRAMISU EXTENSION: create on a host-provided D3D11 device/swapchain.

@@ -86,6 +86,14 @@ int trt_fna3d_is_attached(void);
 // Human-readable detail of the last handoff failure ("" when none).
 const char* trt_fna3d_last_error(void);
 
+// Current app memory usage in bytes (MemoryManager::AppMemoryUsage on
+// UWP; 0 on Linux). Memory instrumentation for the Celeste OOM
+// investigation (oom-analysis.md): the FNA3D D3D11 driver logs this
+// after each large texture upload (patch 08). The driver is C and
+// cannot call WinRT directly, so the host provides it. Returns 0 if
+// the query fails.
+u64 trt_fna3d_app_memory_usage(void);
+
 #ifdef __cplusplus
 }
 #endif

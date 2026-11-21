@@ -25,7 +25,9 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <bcrypt.h>    // brown-line paired-LAN control pairing RNG
   #include <sys/stat.h>  // _stat64 for upload verification
+  #pragma comment(lib, "bcrypt.lib")
   #pragma comment(lib, "ws2_32.lib")
   using sock_t = SOCKET;
   static const sock_t kBadSock = INVALID_SOCKET;
@@ -893,6 +895,104 @@ void send_chunk(sock_t s, const std::string& data) {
   send_all(s, "\r\n", 2);
 }
 
+bool parse_control_events(const std::string& body, std::vector<web_control_event>* events) {
+  std::istringstream input(body);
+  std::string line;
+  while (std::getline(input, line)) {
+    std::istringstream row(line);
+    web_control_event e{};
+    std::string extra;
+    if (!(row >> e.kind >> e.first >> e.second) || (row >> extra) ||
+        events->size() == 128) return false;
+    const bool down = e.second == 0 || e.second == 1;
+    switch (e.kind) {
+      case 'a':
+        if (e.first < 0 || e.first > 1000 || e.second < 0 || e.second > 1000) return false;
+        break;
+      case 'm':
+        if (e.first < -2048 || e.first > 2048 || e.second < -2048 || e.second > 2048) return false;
+        break;
+      case 'b': if (e.first < 0 || e.first > 4 || !down) return false; break;
+      case 'k': if (e.first < 8 || e.first > 254 || !down) return false; break;
+      case 'w': if (e.first != 120 && e.first != -120) return false; break;
+      case 't': if (e.first < 32 || e.first > 65535) return false; break;
+      case 'r': break;
+      default: return false;
+    }
+    events->push_back(e);
+  }
+  return true;
+}
+
+void handle_controls(sock_t s, const std::string& path, const std::string& auth,
+                     const std::string& body) {
+  std::string output;
+  const char* status = "200 OK";
+  {
+    std::lock_guard<std::mutex> lock(g_control_mu);
+    const auto now = control_clock::now();
+    if (path == "/api/controls/pair") {
+      if (now < g_control_retry) {
+        status = "429 Too Many Requests";
+      } else if (g_control_code.empty() || body != g_control_code) {
+        status = "401 Unauthorized";
+        if (++g_control_bad_codes >= 5) {
+          g_control_bad_codes = 0;
+          g_control_retry = now + std::chrono::minutes(1);
+        }
+      } else {
+        unsigned char random[16]{};
+        if (!control_random(random, sizeof(random))) {
+          status = "503 Service Unavailable";
+        } else {
+          constexpr char hex[] = "0123456789abcdef";
+          for (unsigned char byte : random) {
+            output += hex[byte >> 4];
+            output += hex[byte & 15];
+          }
+          g_control_token = "Bearer " + output;
+          g_control_events = {{'r', 0, 0}};
+          g_control_last = now;
+          g_control_bad_codes = 0;
+        }
+      }
+    } else if (g_control_token.empty() || auth != g_control_token) {
+      status = "401 Unauthorized";
+    } else if (path == "/api/controls/leave") {
+      g_control_token.clear();
+      g_control_events = {{'r', 0, 0}};
+      g_control_last = {};
+    } else if (path == "/api/controls/input") {
+      std::vector<web_control_event> events;
+      if (!parse_control_events(body, &events)) {
+        status = "400 Bad Request";
+      } else if (g_control_events.size() + events.size() > 512) {
+        g_control_events = {{'r', 0, 0}};
+        status = "429 Too Many Requests";
+      } else {
+        g_control_events.insert(g_control_events.end(), events.begin(), events.end());
+        g_control_last = now;
+      }
+    } else {
+      status = "404 Not Found";
+    }
+  }
+  respond(s, status, "text/plain; charset=utf-8", output);
+}
+
+std::string read_control_body(sock_t s, const char* pre, size_t pre_len,
+                              size_t size) {
+  std::string body(pre, std::min(size, pre_len));
+  while (body.size() < size) {
+    char buf[512];
+    const int count = recv(s, buf, static_cast<int>(
+        std::min(sizeof(buf), size - body.size())), 0);
+    if (count <= 0) break;
+    body.append(buf, count);
+  }
+  return body;
+}
+
 void handle_client(sock_t s) {
   sock_guard sg{s};
   char req[16384];
@@ -1720,6 +1820,22 @@ std::string webxfer_url() {
 unsigned short webxfer_port() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g.port;
+}
+
+std::vector<web_control_event> webxfer_control_events() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  if (g_control_last != control_clock::time_point{} &&
+      control_clock::now() - g_control_last > std::chrono::seconds(2)) {
+    g_control_last = {};
+    g_control_events = {{'r', 0, 0}};
+  }
+  std::vector<web_control_event> events;
+  events.swap(g_control_events);
+  return events;
+}
+std::string webxfer_control_code() {
+  std::lock_guard<std::mutex> lock(g_control_mu);
+  return g_control_code;
 }
 
 } // namespace longan

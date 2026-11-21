@@ -35,8 +35,10 @@
 extern "C" {
 
 // ---- markers: prove the real bridge is loaded ----
+#ifndef TIRAMISU_UWP_HOST
 int trt_mono_bridge_is_real(void) { return 1; }
 const char* trt_mono_bridge_name(void) { return "fmod-real"; }
+#endif
 
 // ---- PARAMETER_DESCRIPTION_INTERNAL (40 bytes: 36 bytes of fields +
 // 4 bytes of tail padding to 8-byte alignment, matching the C#

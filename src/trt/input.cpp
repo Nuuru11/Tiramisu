@@ -1,5 +1,7 @@
 // tiramisu/src/trt/input.cpp
 #include "input.h"
+#include "trt_trace.h"
+#include <cstdio>
 
 #include <math.h>
 #include <mutex>
@@ -803,10 +805,33 @@ bool trt_msg_post(u32 message, u64 wparam, i64 lparam) {
       return true;
     }
   }
-  if (g.ring_count >= TRT_MSG_RING) return false;
+  if (g.ring_count >= TRT_MSG_RING) {
+    static int drop_logged = 0;
+    if (drop_logged < 5) {
+      ++drop_logged;
+      char line[128];
+      std::snprintf(line, sizeof(line),
+                    "TRACE input: RING FULL drop msg=0x%x wp=%llu",
+                    message, (unsigned long long)wparam);
+      trt_trace(line);
+    }
+    return false;
+  }
   const int tail = (g.ring_head + g.ring_count) % TRT_MSG_RING;
   g.ring[tail] = trt_msg{message, wparam, lparam, 0, 0};
   ++g.ring_count;
+  if (message == 0x0100u || message == 0x0101u || message == 0x0010u ||
+      message == 0x0012u) {
+    static int post_logged = 0;
+    if (post_logged < 30) {
+      ++post_logged;
+      char line[128];
+      std::snprintf(line, sizeof(line),
+                    "TRACE input: post msg=0x%x wp=%llu ring=%d",
+                    message, (unsigned long long)wparam, g.ring_count);
+      trt_trace(line);
+    }
+  }
   return true;
 }
 
@@ -841,6 +866,11 @@ bool trt_msg_peek(trt_msg* out, bool remove) {
 bool trt_msg_pending() {
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
   return g.ring_count > 0;
+}
+
+unsigned trt_msg_count(void) {
+  std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  return (unsigned)g.ring_count;
 }
 
 unsigned trt_msg_dispatched(void) {

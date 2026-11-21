@@ -1,0 +1,10 @@
+--- a/mono/utils/mono-dl-windows.c
++++ b/mono/utils/mono-dl-windows.c
+@@ -47,6 +47,7 @@
+ void*
+ mono_dl_open_file (const char *file, int flags)
+ {
++	fprintf(stderr, "[trt-dl] mono_dl_open_file: %s\n", file ? file : "(null)");
+ 	gpointer hModule = NULL;
+ 	if (file) {
+ 		gunichar2* file_utf16 = g_utf8_to_utf16 (file, strlen (file), NULL, NULL, NULL);

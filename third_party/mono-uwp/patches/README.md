@@ -187,3 +187,44 @@ never called); `g_module_error`, `mono_native_thread_join`
 `mono_security_win_get_token_name`'s only Windows caller is the
 gated GetCurrentToken icall (the unguarded GetTokenName icall is
 handled by patch 15's 0-returning stub).
+
+Patches 31-32 replace the interpreter's two JIT trampoline transitions
+with precompiled, image-backed static stubs (the UWP AppContainer
+forbids executing dynamically generated code -- the .122 Celeste death
+was the first P/Invoke executing the JIT interp->native trampoline;
+see mono-aot-trampoline-analysis.md in the progress docs). The stubs
+live in asm/win64.S (the patches only rewire interp.c to use them);
+both are mechanical translations of the tramp-amd64.c emitters, so the
+C side (which builds and reads the CallContext) is unchanged. Gated on
+`G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)` like the other UWP
+patches; the desktop path is untouched.
+
+- `31-uwp-interp-to-native-static-stub.patch` -- `get_interp_to_native_trampoline`
+  (interp.c) returns `mono_interp_to_native_trampoline_static`
+  (win64.S) on UWP instead of `mono_arch_get_interp_to_native_trampoline`.
+  The stub takes (callme, CallContext*) and performs the Win64 native
+  call. Covers the first-P/Invoke death.
+- `32-uwp-native-to-interp-static-stub.patch` -- `interp_create_method_pointer`
+  (interp.c) on UWP skips the interp_in wrapper JIT compile (leaving
+  entry_wrapper NULL takes the existing native->interp trampoline
+  branch), uses `mono_native_to_interp_trampoline_static` (win64.S)
+  instead of `mono_arch_get_native_to_interp_trampoline`, uses the
+  direct `interp_entry_from_trampoline` entry for every signature
+  (no LMF-wrapper JIT; the LMF wrapper serves mixed JIT+interp mode
+  only), and hands out ftnptr entry points from a fixed pool of 256
+  static thunks (`mono_uwp_alloc_ftnptr_thunk`) instead of
+  `mono_create_ftnptr_arg_trampoline` (JIT). Each thunk loads its
+  MonoFtnDesc* from `mono_ftnptr_table[i]` into r10 and jumps to the
+  static native->interp stub.
+
+- `33-uwp-getmodulehandle.patch` -- `HAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE`
+  (w32subset.h) now includes UWP, like GET_STD_HANDLE / SIGNAL_OBJECT_AND_WAIT
+  (patch 16). It was classic-only, which compiled out the file==NULL branch
+  of `mono_dl_open_file` (mono-dl-windows.c:78-82) and left
+  `g_assert_not_reached()` in its place — so the FIRST `__Internal` pinvoke
+  lookup aborted with "* Assertion: should not be reached at
+  mono-dl-windows.c:81". That was the silent death after
+  `mono image: Steamworks.NET` on .112-.126 (caught by the .126 diagnostic:
+  stderr redirect + SIGABRT handler). GetModuleHandleW is declared under
+  the UWP (APP) family and present in the UWP import libraries (the .126
+  host already links and calls it at runtime for the VEH install).

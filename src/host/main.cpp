@@ -14,6 +14,9 @@
 #include "../trt/trt.h"
 #include "../trt/mono_host.h"
 #include "../trt/fna_platform.h"
+#include "../trt/fna3d_host.h"
+#include "../trt/trt_trace.h"
+#include "FNA3D.h"
 #include "../trt/bridge_res.h"
 #include "../trt/bridge_nvapi.h"
 #include "../trt/iso.h"
@@ -1020,6 +1023,29 @@ extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 extern "C" void trt_mem_budget_reset(void);
 
+
+extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+
+// Brown-line diagnostics: report guest/app memory at boot stages.
+void log_guest_memory(const char* stage) {
+  constexpr u64 mib = 1024ULL * 1024ULL;
+  char budget[192];
+  char line[320];
+  trt_mem_budget_report(budget, sizeof(budget));
+  try {
+    using winrt::Windows::System::MemoryManager;
+    const u64 usage = MemoryManager::AppMemoryUsage();
+    const u64 limit = MemoryManager::AppMemoryUsageLimit();
+    snprintf(line, sizeof(line), "guest memory (%s): app %llu/%llu MiB, %s",
+             stage, (unsigned long long)(usage / mib),
+             (unsigned long long)(limit / mib), budget);
+  } catch (const winrt::hresult_error& ex) {
+    snprintf(line, sizeof(line), "guest memory (%s): app usage query 0x%08lx, %s",
+             stage, (unsigned long)ex.code().value, budget);
+  }
+  longan::log_line(line);
+}
+
 // ---------------- guest launch ----------------
 struct guest_run_result {
   int map_rc;
@@ -1397,6 +1423,35 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     // Console managed games use the Tiramisu FNA backend (host
     // CoreWindow + host input), never SDL.
     mcfg.fna_platform = "tiramisu";
+    // FNA3D device handoff (Celeste hang fix): the Tiramisu backend
+    // never calls FNA3D_PrepareWindowAttributes, so selectedDriver
+    // stays -1 and FNA3D_CreateDevice returns NULL (silent no-render
+    // spin). Attach the host D3D device + install FNA3D log hooks,
+    // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
+    // without the attach takes the stock D3D11 path (garbage-HWND
+    // swapchain -> AV).
+    trt_trace("TRACE fna3d attach enter");
+    {
+      int arc = trt_fna3d_attach_from_hooks(
+          [](const char* l) { longan::log_line(l); });
+      char ab[128];
+      snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
+               arc, trt_fna3d_is_attached());
+      trt_trace(ab);
+      if (!trt_fna3d_is_attached()) {
+        // FATAL guard: a failed attach must stop the launch here. Without
+        // it, PrepareWindowAttributes takes the stock D3D11 probe path
+        // (which succeeds on UWP) and CreateDevice builds a swapchain
+        // against a garbage window handle -> NULL deref AV.
+        longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
+        r.map_rc = TRT_ERR_FNA3D;
+        strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
+        return r;
+      }
+    }
+    trt_trace("TRACE PrepareWindowAttributes enter");
+    FNA3D_PrepareWindowAttributes();
+    trt_trace("TRACE PrepareWindowAttributes ok");
     r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
     if (r.map_rc != TRT_OK) {
       strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);

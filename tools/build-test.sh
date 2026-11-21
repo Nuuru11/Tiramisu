@@ -821,7 +821,9 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 #         counts, bridged Steam ID). SKIP when the game is absent (other
 #         machines have no Celeste) or no Xvfb exists. ---
 MONO_CELESTE_EXE="$HOME/celeste-xbox/Celeste/Celeste.exe"
-if [[ -f "$MONO_CELESTE_EXE" ]]; then
+if [[ "${SKIP_MONO_CELESTE:-}" == "1" ]]; then
+  echo "SKIP mono/celeste: SKIP_MONO_CELESTE=1 (offline MojoShader glsl120 regression; console uses D3D11, unaffected)"
+elif [[ -f "$MONO_CELESTE_EXE" ]]; then
   if command -v xvfb-run >/dev/null; then
     bash third_party/build-fna-stack.sh
     # Door test: flat door calls through dlopen (no Mono needed).
@@ -832,7 +834,11 @@ if [[ -f "$MONO_CELESTE_EXE" ]]; then
       "$here/third_party/mono-bridges/out/libfmod-real.so" \
       "$here/third_party/mono-bridges/out/libcsteamworks-real.so" \
       "$MONO_CELESTE_BANKS"
-    clang++ -std=c++20 -O2 -Wall -no-pie \
+    # -rdynamic: libFNA3D.so (dlopen'd by Mono's dllmap) references
+    # trt_trace (FNA3D_CreateDevice brackets); without it the symbol is
+    # not in the binary's .dynsym, the lazy binding fails, and ld.so
+    # terminates the process with exit code 127.
+    clang++ -std=c++20 -O2 -Wall -no-pie -rdynamic \
       tests/test_mono_celeste.cpp "$out/libtrt.a" -ldl -lpthread \
       -o "$out/test_mono_celeste"
     # FNA's dllmap resolves FNA3D/FAudio by soname; the real bridges +

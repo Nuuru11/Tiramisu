@@ -1,0 +1,18 @@
+--- a/mono/utils/mono-dl-windows.c
++++ b/mono/utils/mono-dl-windows.c
+@@ -66,6 +66,15 @@
+ #endif
+ 		if (!hModule)
+ 			last_error = GetLastError ();
++		/* Tiramisu UWP: P/Invoke libraries exported by the host exe are
++		 * absent as packaged DLLs; resolve them against the exe itself. */
++		if (!hModule && file &&
++		    (strstr (file, "FNA3D") || strstr (file, "FAudio") ||
++		     strstr (file, "steam_api") || strstr (file, "CSteamworks") ||
++		     strstr (file, "fmod") || strstr (file, "System.Native"))) {
++			hModule = GetModuleHandleW (NULL);
++			if (hModule) last_error = 0;
++		}
+ 
+ #if HAVE_API_SUPPORT_WIN32_SET_ERROR_MODE
+ 		SetErrorMode (last_sem);

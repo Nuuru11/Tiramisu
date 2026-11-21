@@ -1,0 +1,24 @@
+--- a/mono/utils/mono-mmap-windows.c
++++ b/mono/utils/mono-mmap-windows.c
+@@ -88,8 +88,21 @@
+ 	int prot = mono_mmap_win_prot_from_flags (flags);
+ 	/* translate the flags */
+ 
+ 	ptr = VirtualAlloc (addr, length, mflags, prot);
++	/* Tiramisu UWP: direct RWX VirtualAlloc is denied by AppContainer.
++	 * Fall back to RW pages then try to flip them to RWX with
++	 * VirtualProtectFromApp (codeGeneration capability). */
++	if (!ptr && prot == PAGE_EXECUTE_READWRITE) {
++		ptr = VirtualAlloc (addr, length, mflags, PAGE_READWRITE);
++		if (ptr) {
++			DWORD old_prot = 0;
++			if (!VirtualProtectFromApp (ptr, length, PAGE_EXECUTE_READWRITE, &old_prot)) {
++				VirtualFree (ptr, 0, MEM_RELEASE);
++				ptr = NULL;
++			}
++		}
++	}
+ 
+ 	mono_account_mem (type, (ssize_t)length);
+ 
+ 	return ptr;

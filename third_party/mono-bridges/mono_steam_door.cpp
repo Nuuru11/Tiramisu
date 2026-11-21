@@ -29,6 +29,7 @@
 //   trt_mono_bridge_is_real() -> 1
 //   trt_mono_bridge_name() -> "steam-real"
 #include <cstdio>
+#include "../../src/trt/thunk.h"
 #include <cstdlib>
 #include <cstring>
 
@@ -74,15 +75,24 @@ void steam_read_appid_file(void) {
 
 // ---- flat SteamAPI functions ----
 int Init(void) {
+  trt_core_log("steam-door: Init called");
   steam_read_appid_file();
-  return trt_SteamAPI_Init();
+  const int r = trt_SteamAPI_Init();
+  char line[96];
+  std::snprintf(line, sizeof(line), "steam-door: Init -> %d", r);
+  trt_core_log(line);
+  return r;
 }
 void Shutdown(void) { trt_SteamAPI_Shutdown(); }
 int RestartAppIfNecessary(unsigned int appid) {
+  trt_core_log("steam-door: RestartAppIfNecessary called");
   return trt_SteamAPI_RestartAppIfNecessary(appid);
 }
 void RunCallbacks(void) { trt_SteamAPI_RunCallbacks(); }
-int IsSteamRunning(void) { return trt_SteamAPI_IsSteamRunning(); }
+int IsSteamRunning(void) {
+  trt_core_log("steam-door: IsSteamRunning called");
+  return trt_SteamAPI_IsSteamRunning();
+}
 void Steam_RunCallbacks_(int pipe, int game_server) {
   (void)game_server;  // one dispatch queue in the bridge
   trt_SteamAPI_ManualDispatch_RunFrame(pipe);

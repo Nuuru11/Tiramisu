@@ -97,6 +97,7 @@ bool trt_msg_post(u32 message, u64 wparam, i64 lparam);
 bool trt_msg_peek(trt_msg* out, bool remove);
 bool trt_msg_peek_range(trt_msg* out, u32 minimum, u32 maximum, bool remove);
 bool trt_msg_pending();
+unsigned trt_msg_count(void);  // diagnostic: current ring depth
 
 #ifdef __cplusplus
 }

@@ -1,0 +1,36 @@
+# 33: mono/metadata/w32subset.h — GetModuleHandle IS available under UWP;
+# the availability table said otherwise.
+#
+# HAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE was classic-only, which compiled
+# out the file==NULL branch of mono_dl_open_file (mono-dl-windows.c:78-82)
+# and left g_assert_not_reached() in its place. Every __Internal pinvoke
+# lookup (all FNA3D/FAudio/Steamworks door functions, resolved through the
+# CSteamworks -> __Internal dllmap) calls mono_dl_open(NULL), so the FIRST
+# pinvoke died with "* Assertion: should not be reached at
+# mono-dl-windows.c:81" -> abort() — the silent death after
+# `mono image: Steamworks.NET` on .112-.126 (caught by the .126 diagnostic:
+# stderr redirect + SIGABRT handler; see stub-reaudit-analysis.md §c and
+# the .126 lane-note entry). GetModuleHandleW is declared under the UWP
+# (APP) family and present in the UWP import libraries — the .126 host
+# build already links and calls it at runtime (VEH install via
+# GetProcAddress) — so the macro now matches the ones that already include
+# UWP (e.g. GET_COMPUTER_NAME), exactly as patch 16 did for
+# GET_STD_HANDLE / SIGNAL_OBJECT_AND_WAIT.
+#
+# NOTE: build-mono-uwp.sh also passes
+# /DHAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE=1 (uncommitted working-tree
+# change), but the 21:53 EST lib rebuild predates that edit somehow — the
+# lib's mono-dl-windows.obj has no GetModuleHandleW import and keeps the
+# line-81 assert. This patch makes the fix durable in the patch set
+# regardless of the command-line define.
+--- a/mono/metadata/w32subset.h
++++ b/mono/metadata/w32subset.h
+@@ -174,7 +174,7 @@
+ #endif
+ 
+ #ifndef HAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE
+-#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT)
++#if G_HAVE_API_SUPPORT(HAVE_CLASSIC_WINAPI_SUPPORT) || G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
+ #define HAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE 1
+ #else
+ #define HAVE_API_SUPPORT_WIN32_GET_MODULE_HANDLE 0

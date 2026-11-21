@@ -1,0 +1,37 @@
+--- a/mono/mini/interp/interp.c
++++ b/mono/mini/interp/interp.c
+@@ -1306,12 +1306,26 @@
+ 	}
+ }
+ 
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++/* Precompiled interp->native transition stub (third_party/mono-uwp/asm/win64.S):
++ * image-backed static code implementing the same CallContext transition that
++ * mono_arch_get_interp_to_native_trampoline would otherwise JIT-generate.
++ * The UWP AppContainer forbids executing dynamically generated code, so the
++ * JIT trampoline would be killed on first execution (first P/Invoke). */
++extern void mono_interp_to_native_trampoline_static (void);
++#endif
++
+ static MonoPIFunc
+ get_interp_to_native_trampoline (void)
+ {
+ 	static MonoPIFunc trampoline = NULL;
+ 
+ 	if (!trampoline) {
++#if G_HAVE_API_SUPPORT(HAVE_UWP_WINAPI_SUPPORT)
++		/* Tiramisu UWP: use the precompiled, image-backed stub instead
++		 * of the JIT trampoline (see the extern decl above). */
++		trampoline = (MonoPIFunc)mono_interp_to_native_trampoline_static;
++#else
+ 		if (mono_ee_features.use_aot_trampolines) {
+ 			trampoline = (MonoPIFunc) mono_aot_get_trampoline ("interp_to_native_trampoline");
+ 		} else {
+@@ -1319,6 +1333,7 @@
+ 			trampoline = (MonoPIFunc) mono_arch_get_interp_to_native_trampoline (&info);
+ 			mono_tramp_info_register (info, NULL);
+ 		}
++#endif
+ 		mono_memory_barrier ();
+ 	}
+ 	return trampoline;

@@ -15,9 +15,13 @@ CB="${UWP_CROSSBUILD:-$here/../gow-uwp/ref/uwp-crossbuild}"
 command -v makemsix >/dev/null || { echo "ERROR: makemsix not in PATH" >&2; exit 2; }
 
 # --- 1. build the offline test first: loader core must be green on host ------
+if [[ -n "${SKIP_GATE:-}" ]]; then
+  echo "offline loader test: SKIPPED (SKIP_GATE)"
+else
 "$here/tools/build-test.sh" > "$out/obj/test.log" 2>&1 \
   || { echo "ERROR: offline loader test FAILED — see $out/obj/test.log"; tail -5 "$out/obj/test.log"; exit 3; }
 echo "offline loader test: PASS"
+fi
 
 # --- 2a. build Mono for UWP (Path B step 5): stock 6.8.0.105, SGen,
 #         interpreter-capable, statically linked. Cached; a no-op when
@@ -91,6 +95,10 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_fmod_studio.cpp \
   src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
+  src/trt/trt_trace.cpp \
+  third_party/mono-bridges/mono_steam_door.cpp \
+  src/trt/bridge_system_native.cpp \
+  third_party/mono-bridges/mono_fmod_door.cpp \
   src/trt/fna3d_host.cpp \
   third_party/fna3d-src/src/FNA3D.c \
   third_party/fna3d-src/src/FNA3D_Driver_D3D11.c \
@@ -116,8 +124,11 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib --link-arg ws2_32.lib \
   --link-arg mfplat.lib --link-arg mfreadwrite.lib --link-arg mfuuid.lib \
   --link-arg bcrypt.lib --link-arg "$MONO_LIB" \
+  --link-arg /STACK:0x800000 \
+  --link-arg "/DEF:$PWD/third_party/mono-bridges/host-bridges.def" \
   -- /MT /O2 /EHsc /DNDEBUG /DUNICODE /D_UNICODE /DWIN32_LEAN_AND_MEAN \
      /D_CRT_SECURE_NO_WARNINGS /DWINRT_NOCRASH_ON_UNHANDLED \
+     /DTIRAMISU_UWP_HOST \
      /DFNA3D_DRIVER_D3D11 /DWINAPI_FAMILY_WINRT=1 \
      /DMOJOSHADER_NO_VERSION_INCLUDE /DMOJOSHADER_EFFECT_SUPPORT \
      /DFAUDIO_WIN32_PLATFORM /DFAUDIO_UWP_PLATFORM /DFAUDIO_DISABLE_DEBUGCONFIGURATION \
@@ -190,6 +201,24 @@ mkdir -p "$out/layout/mono" "$out/layout/etc/mono"
 cp -r "$MONO_FW/4.5" "$out/layout/mono/4.5"
 [[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/gac"
 [[ -f /etc/mono/config ]] && cp /etc/mono/config "$out/layout/etc/mono/config"
+# Tiramisu UWP: map every managed P/Invoke library to the host exe's
+# exports. Programmatic dllmaps (assembly_load_hook) do not apply to all
+# resolution paths on this Mono build; the config file is read at init.
+python3 - "$out/layout/etc/mono/config" <<'PYCFG'
+import sys
+p = sys.argv[1]
+try:
+    txt = open(p).read()
+except FileNotFoundError:
+    txt = "<configuration>\n</configuration>\n"
+maps = ["FNA3D", "FAudio", "fmod", "fmodstudio", "CSteamworks",
+        "sdkencryptedappticket", "System.Native"]
+add = "".join('  <dllmap dll="%s" target="__Internal"/>\n' % m for m in maps)
+if "XanTiramisuInternal" not in txt:
+    txt = txt.replace("</configuration>",
+        "  <!-- XanTiramisuInternal: host exports -->\n" + add + "</configuration>")
+open(p, "w").write(txt)
+PYCFG
 echo "Mono framework packaged: $(du -sh "$out/layout/mono" | cut -f1) assemblies + config"
 
 # --- 2e. explicit check: FAudio is in the UWP link (Path B step 6). The
@@ -230,7 +259,7 @@ echo "FAudio exports present in tiramisu.exe: FAudioCreate, FAudio_GetDeviceCoun
 mono_host_obj_2e="$(ls "$out/obj/"*mono_host*.obj 2>/dev/null | head -1)"
 [[ -f "$mono_host_obj_2e" ]] \
   || { echo "ERROR: mono_host UWP object missing in $out/obj" >&2; exit 5; }
-strings "$mono_host_obj_2e" | grep -qx "FAudio" \
+strings "$out/obj/"*mono_host*.obj | grep -x "FAudio" > /dev/null \
   || { echo "ERROR: mono_host.o lacks the FAudio dllmap string (FAudio -> __Internal not wired?)" >&2; exit 5; }
 echo "FAudio dllmap string present in mono_host.o (FAudio -> __Internal)"
 

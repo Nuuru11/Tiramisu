@@ -1,0 +1,26 @@
+--- a/mono/utils/mono-mmap-windows.c
++++ b/mono/utils/mono-mmap-windows.c
+@@ -113,6 +113,8 @@
+ {
+ 	int prot = mono_mmap_win_prot_from_flags (flags);
+ 	char *mem = (char*)VirtualAlloc (NULL, length + alignment, MEM_RESERVE, prot);
++	if (!mem && prot == PAGE_EXECUTE_READWRITE)
++		mem = (char*)VirtualAlloc (NULL, length + alignment, MEM_RESERVE, PAGE_READWRITE);
+ 	char *aligned;
+ 
+ 	if (!mem)
+@@ -124,6 +126,14 @@
+ 	aligned = mono_aligned_address (mem, length, alignment);
+ 
+ 	aligned = (char*)VirtualAlloc (aligned, length, MEM_COMMIT, prot);
++	if (!aligned && prot == PAGE_EXECUTE_READWRITE) {
++		aligned = (char*)VirtualAlloc (aligned, length, MEM_COMMIT, PAGE_READWRITE);
++		if (aligned) {
++			DWORD old_prot = 0;
++			if (!VirtualProtectFromApp (aligned, length, PAGE_EXECUTE_READWRITE, &old_prot))
++				aligned = NULL;
++		}
++	}
+ 	g_assert (aligned);
+ 
+ 	mono_account_mem (type, (ssize_t)length);
