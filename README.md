@@ -7,7 +7,7 @@
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
 
-![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders%20%7C%20Celeste%20renders-brightgreen)
+![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders%20%7C%20Celeste%20playable-brightgreen)
 ![Gates](https://img.shields.io/badge/offline%20gates-49%2F49%20pass-brightgreen)
 ![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
@@ -51,7 +51,7 @@ Tiramisu UWP host (CoreWindow + D3D11 flip + XInput, 5 GB as a Game package)
 
 ## Console proof (2026-11-19)
 
-RACCOIN and God of War are running on an Xbox Series S in Dev Mode, loaded by
+RACCOIN, God of War and Celeste are running on an Xbox Series S in Dev Mode, loaded by
 the signed Tiramisu MSIX. No CPU emulation, no streaming, no PC in the loop.
 
 ### RACCOIN — playable
@@ -76,6 +76,40 @@ moving. The last frame matches the gameplay still, so both come from the same
 run. The clip is 36 frames captured at 5 fps; that is the capture rate, not
 the game's frame rate.
 
+### Celeste — playable
+
+**Celeste v1.4.0.0** (XNA/Mono, FNA stack) is playable on the Series S — the
+first **managed .NET game** to run on Tiramisu. The 32-bit engine embeds a
+UWP build of Mono 6.8.0.105 and drives FNA3D against the host's real D3D11
+device + CoreWindow swapchain.
+
+<table>
+<tr>
+<td width="50%"><img src="docs/proof/celeste-title.jpg" width="100%" alt="Celeste title screen on Xbox"/><br/>
+<sub><b>Title screen.</b> Mountain logo, icy letters, snow particles. v1.4.0.0.</sub></td>
+<td width="50%"><img src="docs/proof/celeste-menu.jpg" width="100%" alt="Celeste main menu on Xbox"/><br/>
+<sub><b>Main menu.</b> Climb, Options, Credits, Exit — fully navigable.</sub></td>
+</tr>
+</table>
+
+[![Celeste first gameplay test, in greyscale](docs/proof/celeste-greyscale-test.gif)](docs/proof/celeste-greyscale-test.mp4)
+
+**The greyscale bug.** The first gameplay test rendered in full greyscale:
+the PNG decoder computed the wrong bytes-per-pixel for RGB images (2 instead
+of 3), scrambling the color-grading lookup tables Celeste loads as PNGs — so
+the (correct) scene graded to grey and Madeline's red hair showed green.
+Console tests plus a GPU LUT readback pinned it, and a one-line patch fixed
+it ([`e776951`](https://github.com/xanstomper/Tiramisu/commit/e7769512dadd0d71f0dede486e283dfb49046f0f)).
+
+[![Celeste Chapter 1 gameplay, in color](docs/proof/celeste-gameplay.gif)](docs/proof/celeste-gameplay.mp4)
+
+**Chapter 1: Forsaken City, in full color.** Madeline runs, jumps and climbs
+through the opening screen — navy sky, green pines, blue snow, red hair. The
+clip looks low-framerate because it is assembled from Device Portal
+screenshots captured at ~2 fps; the game itself runs smoothly at 50–60 fps
+on the console. Audio is silent — FMOD FSB/Vorbis sample decode is disabled
+on console because it heap-corrupted on the Series S.
+
 ### God of War — boots and renders the forest
 
 God of War is the PC build, running on the same D3D11 path. These are four
@@ -98,25 +132,6 @@ separate boots, ordered by how much of the scene each one rendered.
 
 The captures are 256×144 preview stills. They show the scene and the render
 path, not final resolution or frame pacing.
-
-### Celeste (2026-11-21) — boots and renders on console
-
-**Celeste v1.4.0.0** (XNA/Mono, FNA stack) now boots to its fully rendered,
-animated title screen on the Series S. This is the first **managed .NET game**
-to run — Tiramisu embeds a UWP build of Mono 6.8.0.105 and drives FNA3D
-against the host's real D3D11 device + CoreWindow swapchain.
-
-Evidence: title screen with mountain, icy logo, snow particles, `v1.4.0.0`
-(`docs/proof/celeste-title.png`); log shows `FNA3D_CreateDevice` succeeding,
-all seven FMOD banks parsed, PNG textures decoding, and 240 s+ of stable
-heartbeats with live keyboard input.
-
-What it took: UWP Mono patches (RWX fallback, static interp trampolines,
-P/Invoke host-export resolution), `System.Native` shims, 1470 flat export
-entry points, FNA3D image decode, and a writable CWD. **Audio is silent on
-console** — FMOD FSB/Vorbis sample decode is disabled there because it
-heap-corrupted on the Series S; Linux keeps real decode. Gameplay/menu
-navigation is not yet verified end-to-end.
 
 ### What the evidence does and doesn't cover
 
@@ -222,7 +237,7 @@ RACCOIN.exe (real Unity IL2CPP Steam game) — offline boot ladder:
 |---|---|---|
 | **RACCOIN** | Unity 6 IL2CPP, Steam, D3D11 | **Playable on console.** Menu, live run, coin physics, HUD progression; 7.2 s capture. |
 | **God of War** (PC) | AAA in-house engine, x64, D3D11 | **Boots and renders on console.** The opening forest, across four boots; menu and gameplay next. |
-| **Celeste** (v1.4.0.0) | XNA / Mono + FNA (managed .NET) | **Boots and renders on console.** Animated title screen; first managed game to run. Audio silent; gameplay next. |
+| **Celeste** (v1.4.0.0) | XNA / Mono + FNA (managed .NET) | **Playable on console.** Title, menu, Chapter 1 gameplay; first managed game to run. Audio silent. |
 | **Ultra Pool** | Godot 4.3 + GodotSteam (Vulkan) | **Full lifecycle** — scene load → pump → Godot's own quit chain, exit(0) |
 | **Go Next (demo)** | Unity IL2CPP | boots, reaches `UNITYMAIN2` |
 | OrTMM | PyInstaller / commercial | full CRT→WinMain→window→pump lifecycle |
@@ -313,7 +328,7 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Steam | **BUILT (auth only)** — QR login; `BIsSubscribedApp` answers 0 (no DRM bypass) |
 | ISO / disc images | **BUILT** — `.iso` → read-only `D:` drive, lazy per-file extraction |
 | Input (keyboard/mouse/gamepad, DInput8, XInput, Raw Input) | **PASS (RACCOIN)** — CoreWindow events → guest getters + pump; pad-as-mouse |
-| Console run | **PASS (2026-11-21)** — RACCOIN playable; God of War renders the forest; **Celeste boots to a rendered title screen** |
+| Console run | **PASS (2026-11-21)** — RACCOIN playable; God of War renders the forest; **Celeste playable (title, menu, Chapter 1)** |
 | 32-bit x86 (PE32) | **not supported** — needs an x86 engine; see GAP-MAP W5 |
 
 <details>
@@ -349,9 +364,10 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
   reaches its menu, starts a run and plays; God of War boots and renders the
   forest; Celeste boots and renders its title screen. Evidence:
   [Console proof](#console-proof-2026-11-19).
-- **M1b — Celeste gameplay — in progress.** Verify menu navigation / level
-  entry on console and restore console audio (FSB/Vorbis decode currently
-  disabled due to a heap-corruption fault in the Series S AppContainer).
+- **M1b — Celeste gameplay — done (2026-11-21).** Menu navigation, level
+  entry and Chapter 1 gameplay verified on console. Console audio still to
+  restore (FSB/Vorbis decode currently disabled due to a heap-corruption
+  fault in the Series S AppContainer).
 - **M1 front end + sustained play — in progress.** God of War's normal
   front-end/menu path; RACCOIN soak test and frame-time capture; audio and
   save validation.
@@ -374,7 +390,7 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 | Doc | Contents |
 |---|---|
 | [docs/03-evidence.md](docs/03-evidence.md) | what is proven vs assumed — every fix traces to a measurement |
-| [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots |
+| [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |
 | [GAP-MAP.md](GAP-MAP.md) | live gap table, W-lanes, dependency order, triggers |
 | [docs/](docs/) | architecture notes, stage logs, console playbook |
 
