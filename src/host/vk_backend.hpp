@@ -1291,3 +1291,42 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
 }
 
 }  // namespace vk_rt
+
+// .220 DIAG: periodic video-memory sample -- answers whether the
+// 3809MB video usage at TEX-OOM time is a fixed baseline (a
+// driver/system reservation present from boot) or growth during
+// the run. Same QueryVideoMemoryInfo source as TEX-OOM-DIAG.
+// Called from the watchdog (main.cpp, snapshot-only) every ~5s.
+// Defined here (single-TU header, bound in swapchain.cpp) so no
+// new trt.h declaration is needed; main.cpp declares it locally.
+extern "C" void trt_video_sample_log() {
+  if (!vk_rt::g_vkrt.dev) return;
+  IDXGIDevice* dxgi_dev = nullptr;
+  if (!SUCCEEDED(vk_rt::g_vkrt.dev->QueryInterface(__uuidof(IDXGIDevice),
+                                                    (void**)&dxgi_dev)) ||
+      !dxgi_dev) {
+    return;
+  }
+  IDXGIAdapter* adapter = nullptr;
+  if (SUCCEEDED(dxgi_dev->GetAdapter(&adapter)) && adapter) {
+    IDXGIAdapter3* adapter3 = nullptr;
+    if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                           (void**)&adapter3)) &&
+        adapter3) {
+      DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
+      if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+              0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) {
+        char vb[256];
+        snprintf(vb, sizeof(vb),
+                 "[vk_backend] VIDEO-SAMPLE budget=%lluMB usage=%lluMB avail=%lluMB",
+                 (unsigned long long)(vmi.Budget >> 20),
+                 (unsigned long long)(vmi.CurrentUsage >> 20),
+                 (unsigned long long)(vmi.AvailableForReservation >> 20));
+        trt_core_log(vb);
+      }
+      adapter3->Release();
+    }
+    adapter->Release();
+  }
+  dxgi_dev->Release();
+}

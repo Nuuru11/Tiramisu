@@ -915,7 +915,19 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   // .210 FIX (Sekiro arena allocs): real Windows treats MEM_COMMIT with a NULL address as reserve+commit. Sekiro allocates its arenas as MEM_TOP_DOWN|MEM_COMMIT (type 0x101000, addr NULL); the bridge rejected MEM_COMMIT-alone with NULL, so every arena returned NULL and the game faulted popping the empty arena list at sekiro.exe+0x115c66b. Add MEM_RESERVE so the call takes the reserve+commit path below.
   if ((type & 0x1000u) && !(type & 0x2000u) && !addr) {
     type |= 0x2000u;
-    trt_core_log("kernel32: VirtualAlloc MEM_COMMIT-alone NULL -> reserve+commit (Sekiro arena fix)");
+    // .220 DIAG: log the SIZE of every MEM_COMMIT-alone call -- the
+    // 13 arena allocs in .219 were 1537/240/1536/64/16/100/116/27/
+    // 800/116MB for the >=16MB ones, but 3 were <16MB and never
+    // logged by the .199 diagnostic. With the size on this line,
+    // all 13 sizes are directly countable, and the commit total
+    // at death (gap final dump) tests the 5GB-cap kill.
+    {
+      char mcl[192];
+      snprintf(mcl, sizeof(mcl),
+               "kernel32: VirtualAlloc MEM_COMMIT-alone NULL %lluMB (%llu bytes) -> reserve+commit (Sekiro arena fix)",
+               (unsigned long long)(bytes >> 20), (unsigned long long)bytes);
+      trt_core_log(mcl);
+    }
   }
 
   // MEM_COMMIT alone on a previously-reserved region (Mono/BoehmGC/Unity/CoreCLR)
@@ -5854,9 +5866,19 @@ struct syscall_trap_target {
   u8 orig;
   bool armed;
   bool fired;
+  // .220 DIAG: guest-fire count -- a target re-arms until it has
+  // fired 3 times, so a startup/init burn does not kill the trap
+  // before the death-phase wait; after 3 fires it stays dead.
+  int fires;
 };
-static syscall_trap_target g_syscall_trap_targets[6];
+static syscall_trap_target g_syscall_trap_targets[8];
 static std::atomic<bool> g_syscall_trap_rearm{false};
+// .220 DIAG: trap flap counters (printed on every gap dump) + quiet
+// re-arm flag. The watchdog's own Sleep trips the trap every tick,
+// so each re-install is silent; only the launch arm logs.
+static std::atomic<u64> g_syscall_trap_host_trips{0};
+static std::atomic<u64> g_syscall_trap_rearms{0};
+static bool g_syscall_trap_quiet_rearm = false;
 static bool caller_in_guest_image(u64 caller) {
   const int n = trt_images_count();
   for (int i = 0; i < n; ++i) {
@@ -5898,11 +5920,15 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
       }
     }
-    // .219 DIAG: syscall trap -- same one-shot INT3+VEH mechanism on
-    // the ntdll/kernel32 wait functions (see trt_syscall_trap_install).
-    // Guest caller: log + disarm permanently. Host caller: restore the
-    // byte so the host proceeds, but re-arm on the next watchdog tick.
-    for (int i = 0; i < 6; ++i) {
+    // .220 DIAG: syscall trap -- same INT3+VEH mechanism on the
+    // ntdll/kernel32 wait functions (see trt_syscall_trap_install).
+    // Guest caller: log + count the fire. The target re-arms (via
+    // the watchdog tick) until it has fired 3 times, so a
+    // startup/init burn does not kill the trap before the
+    // death-phase wait; after 3 fires it stays dead. Host caller:
+    // restore the byte so the host proceeds, count the trip,
+    // re-arm on the next watchdog tick.
+    for (int i = 0; i < 8; ++i) {
       if (g_syscall_trap_targets[i].armed &&
           g_syscall_trap_targets[i].addr == addr) {
         u64 caller = 0;
@@ -5916,8 +5942,14 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
                    g_syscall_trap_targets[i].name,
                    (unsigned long long)caller);
           trt_core_log(line);
-          g_syscall_trap_targets[i].fired = true;
+          const int fires = ++g_syscall_trap_targets[i].fires;
+          if (fires < 3) {
+            g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
+          } else {
+            g_syscall_trap_targets[i].fired = true;
+          }
         } else {
+          g_syscall_trap_host_trips.fetch_add(1, std::memory_order_relaxed);
           g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
         }
         DWORD old_prot = 0;
@@ -6040,34 +6072,47 @@ extern "C" void trt_real_exit_hook_install() {
   }
 }
 
-// .219 DIAG: install the syscall trap (6 targets). Called lazily from
-// the gap-trace final dump (2s wall-time quiet) and from the watchdog
-// tick when the VEH asked for a re-arm (host caller restored a byte).
-// Idempotent: already-armed targets are skipped, fired targets stay
-// dead. The OS VEH is already registered by trt_real_exit_hook_install
-// (called at every guest launch before guest code runs).
+// .220 DIAG: install the syscall trap (8 targets). Called at LAUNCH
+// from run_guest_trapped (main.cpp, snapshot-only) and from the
+// first gap-trace dump, and from the watchdog tick when the VEH
+// asked for a re-arm (host caller restored a byte). Idempotent:
+// already-armed targets are skipped, fired targets stay dead.
+// The OS VEH is already registered by trt_real_exit_hook_install
+// (called at every guest launch before guest code runs). The 2
+// SleepConditionVariable targets are new in .220: the guest's
+// terminal wait is most plausibly a CV wait (Ultrapool's stall
+// IS one), and the .219 6-target trap could not catch it.
+// Quiet re-arms: when g_syscall_trap_quiet_rearm is set (watchdog
+// re-arm after a host trip), install silently -- the watchdog's
+// own Sleep trips the trap every tick, and 7 log lines per tick
+// would drown the log. Only the launch arm logs.
 extern "C" void trt_syscall_trap_install() {
+  const bool quiet = g_syscall_trap_quiet_rearm;
+  g_syscall_trap_quiet_rearm = false;
+#define TRAP_LOG(line) do { if (!quiet) trt_core_log(line); } while (0)
   static const struct {
     const wchar_t* mod;
     const char* fn;
     const char* name;
-  } k_targets[6] = {
+  } k_targets[8] = {
       {L"kernel32.dll", "Sleep", "kernel32!Sleep"},
       {L"kernel32.dll", "WaitForSingleObject", "kernel32!WaitForSingleObject"},
       {L"kernel32.dll", "SwitchToThread", "kernel32!SwitchToThread"},
+      {L"kernel32.dll", "SleepConditionVariableSRW", "kernel32!SleepConditionVariableSRW"},
+      {L"kernel32.dll", "SleepConditionVariableCS", "kernel32!SleepConditionVariableCS"},
       {L"ntdll.dll", "NtWaitForSingleObject", "ntdll!NtWaitForSingleObject"},
       {L"ntdll.dll", "NtDelayExecution", "ntdll!NtDelayExecution"},
       {L"ntdll.dll", "NtYieldExecution", "ntdll!NtYieldExecution"},
   };
   int installed = 0;
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < 8; ++i) {
     if (g_syscall_trap_targets[i].fired) continue;
     HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
     if (!mod) {
       char line[192];
       snprintf(line, sizeof(line), "syscall-trap: %s SKIP module not loaded",
                k_targets[i].name);
-      trt_core_log(line);
+      TRAP_LOG(line);
       continue;
     }
     void* addr = (void*)::GetProcAddress(mod, k_targets[i].fn);
@@ -6075,7 +6120,7 @@ extern "C" void trt_syscall_trap_install() {
       char line[192];
       snprintf(line, sizeof(line), "syscall-trap: %s SKIP GetProcAddress null",
                k_targets[i].name);
-      trt_core_log(line);
+      TRAP_LOG(line);
       continue;
     }
     if (g_syscall_trap_targets[i].armed &&
@@ -6084,14 +6129,14 @@ extern "C" void trt_syscall_trap_install() {
       snprintf(line, sizeof(line),
                "syscall-trap: %s at 0x%llx SKIP already-armed",
                k_targets[i].name, (unsigned long long)(uintptr_t)addr);
-      trt_core_log(line);
+      TRAP_LOG(line);
       continue;
     }
     if (*(u8*)addr == 0xCC) {
       char line[192];
       snprintf(line, sizeof(line), "syscall-trap: %s at 0x%llx SKIP already 0xCC",
                k_targets[i].name, (unsigned long long)(uintptr_t)addr);
-      trt_core_log(line);
+      TRAP_LOG(line);
       continue;
     }
     DWORD old_prot = 0;
@@ -6101,7 +6146,7 @@ extern "C" void trt_syscall_trap_install() {
                "syscall-trap: %s at 0x%llx SKIP VirtualProtect failed err=%u",
                k_targets[i].name, (unsigned long long)(uintptr_t)addr,
                (unsigned)::GetLastError());
-      trt_core_log(line);
+      TRAP_LOG(line);
       continue;
     }
     g_syscall_trap_targets[i].name = k_targets[i].name;
@@ -6115,17 +6160,18 @@ extern "C" void trt_syscall_trap_install() {
       char line[192];
       snprintf(line, sizeof(line), "syscall-trap: %s at 0x%llx installed",
                k_targets[i].name, (unsigned long long)(uintptr_t)addr);
-      trt_core_log(line);
+      TRAP_LOG(line);
     }
   }
   int armed = 0;
-  for (int i = 0; i < 6; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
+  for (int i = 0; i < 8; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
   {
     char line[128];
-    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/6 (armed %d)",
+    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/8 (armed %d)",
              installed, armed);
-    trt_core_log(line);
+    TRAP_LOG(line);
   }
+#undef TRAP_LOG
 }
 #endif
 
@@ -6741,9 +6787,13 @@ void gap_trace_dump_if_changed(void) {
   // advancing CPU with zero new bridged calls PROVES spinning (vs
   // dead/blocked). The final dump also arms the syscall trap (below).
   // Re-arm the trap first if the VEH restored a byte for a host caller.
+// .220 DIAG: silent re-arm (see trt_syscall_trap_install) + count it.
 #ifdef _WIN32
-  if (g_syscall_trap_rearm.exchange(false, std::memory_order_relaxed))
+  if (g_syscall_trap_rearm.exchange(false, std::memory_order_relaxed)) {
+    g_syscall_trap_rearms.fetch_add(1, std::memory_order_relaxed);
+    g_syscall_trap_quiet_rearm = true;
     trt_syscall_trap_install();
+  }
 #endif
   using clock = std::chrono::steady_clock;
   static clock::time_point s_last_dump = clock::now();
@@ -6800,22 +6850,62 @@ void gap_trace_dump_if_changed(void) {
            (unsigned long long)guest_cpu, (unsigned long long)proc_cpu,
            (unsigned long long)newcalls, final_dump ? " final" : "");
   trt_core_log(line);
+  // .220 DIAG: trap flap stats on every dump -- how much did the
+  // trap flap (host trips vs re-arms) and how many targets are
+  // still armed? If hosttrips is huge and armed is 0 most of the
+  // time, the launch-arm coverage is thin (re-arm is ~1Hz).
+#ifdef _WIN32
+  // The trap state above (targets + flap counters) only exists on the Win32
+  // trap path, so its diagnostic is compiled out elsewhere.
+  {
+    int armed_n = 0;
+    for (int i = 0; i < 8; ++i)
+      if (g_syscall_trap_targets[i].armed) ++armed_n;
+    char ts[192];
+    snprintf(ts, sizeof(ts),
+             "syscall-trap: stats hosttrips=%llu rearms=%llu armed=%d/8",
+             (unsigned long long)g_syscall_trap_host_trips.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)g_syscall_trap_rearms.load(
+                 std::memory_order_relaxed),
+             armed_n);
+    trt_core_log(ts);
+  }
+#endif
   for (int i = 0; i < n; ++i) {
     snprintf(line, sizeof(line), "gap: trace #%llu tid=%u %s x%u",
              (unsigned long long)snap[i].seq, snap[i].tid,
              snap[i].name ? snap[i].name : "(null)", snap[i].repeats);
     trt_core_log(line);
   }
-  // .219 DIAG: the ring has been quiet for 2s of wall time -- the guest is
-  // either dead or spinning off-bridge. Arm the syscall trap so a
-  // PEB-walked / direct wait call (NtWaitForSingleObject, NtDelayExecution,
-  // NtYieldExecution, kernel32 Sleep / WaitForSingleObject / SwitchToThread)
-  // is caught with its guest caller. One attempt per process: re-arms after
-  // host-caller restores go through g_syscall_trap_rearm above.
+  // .220 DIAG: arm the syscall trap at the FIRST dump, not the final
+  // one -- the .219 trap never armed because the final dump needs 2s
+  // of wall-time quiet and the guest dies first. The launch arm in
+  // run_guest_trapped (main.cpp) is the primary arm; this is the
+  // backup if it was skipped, and logs SKIP already-armed if it ran.
+  // A PEB-walked / direct wait call (NtWaitForSingleObject,
+  // NtDelayExecution, NtYieldExecution, kernel32 Sleep /
+  // WaitForSingleObject / SwitchToThread / SleepConditionVariableSRW
+  // / SleepConditionVariableCS) is then caught with its guest caller.
+  // One attempt per process: re-arms after host-caller restores go
+  // through g_syscall_trap_rearm above.
 #ifdef _WIN32
-  if (final_dump && !s_trap_arm_attempted) {
+  if (!s_trap_arm_attempted) {
     s_trap_arm_attempted = true;
     trt_syscall_trap_install();
+  }
+#endif
+  // .220 DIAG: commit total at death -- the final dump is the last
+  // log line before a silent death, so print the bridge ledger
+  // here. If committed is still ~4668/5120MB with 0 refusals,
+  // the 5GB-cap kill is REFUTED (no growth toward the cap).
+#ifdef _WIN32
+  if (final_dump) {
+    char budget[256];
+    trt_mem_budget_report(budget, sizeof(budget));
+    char bl[512];
+    snprintf(bl, sizeof(bl), "gap: commit-at-death %s", budget);
+    trt_core_log(bl);
   }
 #endif
 }
