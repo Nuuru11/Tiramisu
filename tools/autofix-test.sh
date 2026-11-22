@@ -73,6 +73,10 @@ out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-console-seh-con
 echo "$out" | grep -q 'sekiro-invalid-pointer-named' && \
   echo "OK real console SEH-contained fault matched + named" || { echo "FAIL SEH rule"; rc=1; }
 
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-console-spirv-failure.log)
+echo "$out" | grep -q 'spirv-shader-parse-named' && \
+  echo "OK real console SPIR-V shader failures matched + named" || { echo "FAIL SPIR-V rule"; rc=1; }
+
 echo "== retry loop =="
 $py tools/autopilot.py "$game" --dry-run tests/fixtures/logs --max-attempts 5 >"$tmp/loop.txt" 2>&1
 cat "$tmp/loop.txt" | sed 's/^/    /'

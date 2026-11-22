@@ -218,6 +218,26 @@
       "note": "Real console Sekiro fault: guest reads -0x18 pointer; SEH filter contains it and the app survives (validated on 0.2.2.197)",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "spirv-shader-parse-named",
+      "match": [
+        "Reflection of SPIR-V shader stage",
+        "Failed to compile code to native for SPIR-V"
+      ],
+      "note": "Real console ultrapool: SPIR-V->HLSL translator cannot reflect/compile some Godot shaders; named work item (shader coverage, not a config fix)",
+      "severity": "info",
+      "actions": {}
+    },
+    {
+      "id": "godot-resource-named",
+      "match": [
+        "ERROR: Failed loading resource: res://",
+        "ERROR: Failed to instantiate an autoload"
+      ],
+      "note": "Real console Godot title: staged game is missing resource files (.pck content); named content gap, not a bridge fault",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }

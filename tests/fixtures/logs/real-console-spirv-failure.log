@@ -1,0 +1,23 @@
+guest fault [worker] caller 15: game.exe+0x3cd8cba (pc=000001D9DA8D8CBA)
+guest fault [worker] caller 16: unknown+0xae7bb (pc=00007FF60FB9E7BB)
+guest fault [worker] caller 17: unknown+0xaed3c (pc=00007FF60FB9ED3C)
+guest fault [worker] caller 18: unknown+0xd015e (pc=00007FF60FBC015E)
+guest fault [worker] caller 19: unknown+0xc7db0 (pc=00007FF60FBB7DB0)
+guest fault [worker] caller 20: unknown+0xaac32 (pc=00007FFA0E2EAC32)
+kernel32: GetConsoleMode -> no console (AppContainer); lasterr=6
+ERROR: Reflection of SPIR-V shader stage 'Fragment' failed parsing shader.
+   at: reflect_spirv (servers/rendering/rendering_shader_container.cpp:265)
+kernel32: GetConsoleMode -> no console (AppContainer); lasterr=6
+ERROR: Reflection of SPIR-V shader stage 'Vertex' failed parsing shader.
+   at: reflect_spirv (servers/rendering/rendering_shader_container.cpp:265)
+ERROR: Condition "reflect_spirv(p_shader_name, p_spirv, shader) != OK" is true. Returning: false
+   at: set_code_from_spirv (servers/rendering/rendering_shader_container.cpp:661)
+ERROR: Condition "reflect_spirv(p_shader_name, p_spirv, shader) != OK" is true. Returning: false
+   at: set_code_from_spirv (servers/rendering/rendering_shader_container.cpp:661)
+ERROR: Failed to compile code to native for SPIR-V.
+   at: shader_compile_binary_from_spirv (servers/rendering/rendering_device.cpp:3490)
+ERROR: Condition "shader_data.is_empty()" is true.
+ERROR: Failed to compile code to native for SPIR-V.
+   at: shader_compile_binary_from_spirv (servers/rendering/rendering_device.cpp:3490)
+   at: _compile_variant (servers/rendering/renderer_rd/shader_rd.cpp:309)
+ERROR: Condition "shader_data.is_empty()" is true.
