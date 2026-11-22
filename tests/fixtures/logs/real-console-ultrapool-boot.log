@@ -1,0 +1,19 @@
+wasapi: IMMDevice::Activate -> IAudioClient
+wasapi: IAudioClient::Initialize(rate=48000 ch=2 bits=32 float=1 frames=4800) -> S_OK
+thread: CreateThread tid=21 routine=00000258B18D8CA0
+wasapi: IAudioClient::Start -> S_OK
+
+ole: CoInitializeEx(model=STA) count=2
+kernel32: GetConsoleMode -> no console (AppContainer); lasterr=6
+WARNING: The requested V-Sync mode Adaptive is not available. Falling back to V-Sync mode Enabled.
+   at: swap_chain_resize (drivers/vulkan/rendering_device_driver_vulkan.cpp:3444)
+vulkan: vkCreateSwapchainKHR -> id=1234 1920x1080 fmt=44 imgs=3
+vulkan: BeginRP #1 kind=1 color_cnt=1 color0=1235 depth=0 clear_mask=0x1 area=1920x1080
+vulkan: Draw #1 pipe=1230 idx=1 vtx=6 inst=1 binds=0
+vulkan: vkQueuePresentKHR frame=1 sc=1234 idx=0
+thread: CreateThread tid=23 routine=00000258B16309A0
+gdi32: DeleteObject h=0x67430002 -> TRUE (freed)
+gdi32: DeleteObject h=0x67430001 -> TRUE (freed)
+strtrace: GetEnvironmentVariableA -> name="FREETYPE_PROPERTIES" value=NULL
+strtrace: GetEnvironmentVariableA -> name="HB_FONT_FUNCS" value=NULL
+input: GameInput keyboard hr=0x00000000 seq=0 kind=0x10 active=0

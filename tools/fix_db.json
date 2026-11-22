@@ -188,6 +188,16 @@
       "note": "Real Go Next failure AFTER the mscoree fix: the IAT probe records UnityMain2 but the guest exits rc=1; named work item, not hidden",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "missing-game-data-named",
+      "match": [
+        "CreateFileW open failed on host",
+        "guest: Z:\\\\S\\\\"
+      ],
+      "note": "Real console Sekiro failure: required game data (Z:\\S\\pack.dat) is not staged. Cannot be fixed by a bridge \u2014 stage the file; named, never hidden",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }

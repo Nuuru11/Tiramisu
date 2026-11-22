@@ -1,0 +1,39 @@
+trt: launching Q:\Users\UserMgr1\AppData\Local\Packages\Xan.Tiramisu_x81jywntpvgne\LocalState\games\Sekiro\sekiro.exe (68005448 bytes)
+trt: launching Q:\Users\UserMgr1\AppData\Local\Packages\Xan.Tiramisu_x81jywntpvgne\LocalState\games\Sekiro\sekiro.exe (68005448 bytes)
+trt: sec[0] .text va=1000 sz=291c000 exec
+trt: sec[1] .interpr va=291d000 sz=c000 exec
+trt: sec[2] .rdata va=2929000 sz=11d0000
+trt: sec[3] .data va=3af9000 sz=450000
+trt: sec[4] .pdata va=3f49000 sz=29c000
+trt: sec[5] .gfids va=41e5000 sz=2000
+trt: sec[6] .tls va=41e7000 sz=1000
+trt: sec[7] .rsrc va=41e8000 sz=6000
+trt: sec[8] .reloc va=41ee000 sz=b1000
+trt: sec[9] .bind va=429f000 sz=33000 exec
+trt: reloc delta=2fec0000000 fixed=352307
+trt: bind steam_api64.dll!SteamNetworking -> 00007FF744058150
+trt: bind steam_api64.dll!SteamAPI_RegisterCallResult -> 00007FF743FA9720
+trt: bind steam_api64.dll!SteamMatchmaking -> 00007FF744057D20
+trt: bind steam_api64.dll!SteamAPI_UnregisterCallResult -> 00007FF743FA9720
+trt: bind steam_api64.dll!SteamAPI_RunCallbacks -> 00007FF744055DB0
+trt: bind steam_api64.dll!SteamAPI_Init -> 00007FF744055CE0
+trt: bind steam_api64.dll!SteamClient -> 00007FF744058970
+trt: bind steam_api64.dll!SteamAPI_RestartAppIfNecessary -> 00007FF744055D30
+trt: steam_api64 RestartAppIfNecessary(appid=814380) -> 0 (auth-only, no DRM bypass)
+strtrace: GetCommandLineW -> ptr=00007FF7C33E37B0 ""Z:\sekiro.exe""
+shell: CommandLineToArgvW -> 1 args
+strtrace: GetCurrentDirectoryW -> buf=000000E21FDFDB10 len=1024 value="Z:\"
+thread: CreateThread tid=3 routine=00000300023A1C34 stack=0000000000002000 flags=0x4
+kernel32: ResumeThread(obj=10116662321) -> prev_count=1
+kernel32: GetProcAddress(kernel32.dll!FlsGetValue) -> 00007FF7C1F85000
+kernel32: GetProcAddress(kernel32.dll!FlsGetValue) -> 00007FF7C1F85000
+kernel32: CreateFileW open failed on host (see path)
+  guest: Z:\S\pack.dat
+  host:  Q:/Users/UserMgr1/AppData/Local/Packages/Xan.Tiramisu_x81jywntpvgne/LocalState/games/Sekiro/S/pack.dat (access=0x80000000 disp=3 write=0)
+thread: win_thread_trampoline started obj=10116662321 tid=4 routine=00000300023A1C34
+strtrace: ISteamApps.GetCurrentGameLanguage -> ptr=00007FF7C2411280 "english"
+kernel32: VirtualAlloc(addr=0000000000000000, bytes=0x60100000, type=0x3000, prot=0x4)
+kernel32: VirtualAlloc(DEMAND 1537 MB) -> 000003002E000000 (precommitted 2 MB)
+[trt] mem: demand-commit tid=5468 at 000003008E0FFFF0 (chunk 000003008E000000..000003008E100000)
+kernel32: VirtualAlloc(addr=0000000000000000, bytes=0xf000000, type=0x3000, prot=0x4)
+kernel32: VirtualAlloc(DEMAND 240 MB) -> 0000030090000000 (precommitted 2 MB)
