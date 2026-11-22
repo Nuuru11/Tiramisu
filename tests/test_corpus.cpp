@@ -526,16 +526,31 @@ struct dry_result {
 // is counted as real / recorded / named-silent; tools/support-matrix.sh turns
 // these lines into the measured compatibility report.
 bool g_coverage_mode = false;
+bool g_symbols_mode = false;
+const char* g_sym_pe = "";
 int g_cov_real = 0, g_cov_recorded = 0, g_cov_silent = 0;
 int g_cov_delay = 0;
+
+const char* impl_class_name(int cls) {
+  switch (cls) {
+    case TRT_IMPL_RECORDED: return "recorded";
+    case TRT_IMPL_NAMED_SILENT: return "named-silent";
+    default: return "real";
+  }
+}
 
 // Classify one bound symbol and add it to this PE's coverage totals.
 // Game-dir exports, SYSTEM routes and ordinal-only binds are REAL by
 // construction (native code / a real host DLL).
-void add_coverage(const char* dll, const char* sym) {
+int classify_one(const char* dll, const char* sym) {
   int cls = TRT_IMPL_REAL;
   int have_cls = 0;
   if (sym && trt_symbol_class(dll, sym, &have_cls)) cls = have_cls;
+  return cls;
+}
+
+void add_coverage(const char* dll, const char* sym) {
+  const int cls = classify_one(dll, sym);
   if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
   else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
   else ++g_cov_real;
@@ -629,6 +644,11 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
     if (binds) {
       ++out->bound;
       add_coverage(dll_name, sym_name);
+      if (g_symbols_mode) {
+        printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll_name,
+               sym_name ? sym_name : "#ordinal",
+               impl_class_name(classify_one(dll_name, sym_name)));
+      }
     } else {
       char one[160];
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
@@ -686,6 +706,13 @@ void delay_coverage(const file_pe& pe, const u8* file, size_t size) {
       if (strnlen(sym, 256) == 256) continue;
       ++g_cov_delay;
       add_coverage(dll, sym);
+      if (g_symbols_mode) {
+        int c = TRT_IMPL_REAL, have = 0;
+        const char* cls = trt_symbol_class(dll, sym, &have)
+                              ? impl_class_name(c = have)
+                              : "unresolved";
+        printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll, sym, cls);
+      }
     }
   }
 }
@@ -693,6 +720,7 @@ void delay_coverage(const file_pe& pe, const u8* file, size_t size) {
 void dry_run_pe(const char* path, const char* name, const u8* file,
                 size_t size) {
   (void)path;
+  g_sym_pe = name;
   g_cov_real = g_cov_recorded = g_cov_silent = g_cov_delay = 0;
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) {
@@ -994,19 +1022,17 @@ int run_corpus(int argc, char** argv) {
 } // namespace
 
 int main(int argc, char** argv) {
-  int first_pe = 1;
-  if (argc > 1 && strcmp(argv[1], "--coverage") == 0) {
-    g_coverage_mode = true;
-    first_pe = 2;
+  int pe_start = 1;
+  for (; pe_start < argc; ++pe_start) {
+    if (strcmp(argv[pe_start], "--coverage") == 0) g_coverage_mode = true;
+    else if (strcmp(argv[pe_start], "--symbols") == 0) g_symbols_mode = true;
+    else break;
   }
-  if (first_pe >= argc) {
-    printf("usage: test_corpus [--coverage] <pe> [<pe> ...]\n");
+  int n = 0;
+  for (int i = pe_start; i < argc; ++i) argv[1 + (n++)] = argv[i];
+  if (n == 0) {
+    printf("usage: test_corpus [--coverage] [--symbols] <pe> [<pe> ...]\n");
     return 2;
   }
-  // run_corpus walks argv[1..]; shift the PE list down when the flag was used.
-  if (first_pe == 2) {
-    for (int i = 2; i < argc; ++i) argv[i - 1] = argv[i];
-    --argc;
-  }
-  return run_corpus(argc, argv);
+  return run_corpus(n + 1, argv);
 }
