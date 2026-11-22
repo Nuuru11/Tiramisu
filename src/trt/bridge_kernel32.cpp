@@ -1385,7 +1385,11 @@ extern "C" __attribute__((noinline, used)) void trt_cs_stall_probe_pause(void) {
 }
 
 void TRT_STDCALL trt_Sleep(u32 ms) {
-  if (ms > 0) gap_trace_record("Sleep");
+  // .219 DIAG: record Sleep(0) too -- a Sleep(0) yield spin was
+  // invisible in .218 (ms>0 only). Consecutive duplicates collapse
+  // in the ring, so a yield spin is one entry with a huge repeat
+  // count, not 32 evicted slots.
+  gap_trace_record("Sleep");
 #ifdef _WIN32
   ::Sleep(ms);  // we are inside a Windows process already
 #else
@@ -5833,6 +5837,37 @@ struct real_exit_target {
 static real_exit_target g_real_exit_targets[8];
 static int g_real_exit_armed = 0;
 
+// .219 DIAG: syscall trap -- INT3 patches on the most likely ntdll /
+// kernel32 wait functions Sekiro could be spinning on via a PEB-walked /
+// direct call (the .218 gap trace shows the guest alive and spinning
+// with zero bridged calls after the last SetEvent). Same one-shot
+// INT3+VEH mechanism as the .216 real-exit hook. Armed LAZILY by the
+// gap-trace final dump (2s of wall-time quiet) -- arming at launch
+// would trip on every host Sleep/wait instead. The VEH only logs +
+// disarms when the caller is inside a loaded guest image; a host
+// caller (e.g. the watchdog's own Sleep) restores the byte and
+// re-arms on the next watchdog tick, so the spinning guest -- calling
+// at high frequency -- wins the race to fire first.
+struct syscall_trap_target {
+  const char* name;
+  void* addr;
+  u8 orig;
+  bool armed;
+  bool fired;
+};
+static syscall_trap_target g_syscall_trap_targets[6];
+static std::atomic<bool> g_syscall_trap_rearm{false};
+static bool caller_in_guest_image(u64 caller) {
+  const int n = trt_images_count();
+  for (int i = 0; i < n; ++i) {
+    const trt_image* im = trt_images_nth(i);
+    if (!im || !im->base || !im->size_of_image) continue;
+    const u64 b = (u64)(uintptr_t)im->base;
+    if (caller >= b && caller < b + im->size_of_image) return true;
+  }
+  return false;
+}
+
 static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
   if (ep && ep->ExceptionRecord &&
       ep->ExceptionRecord->ExceptionCode == 0x80000003u /*EXCEPTION_BREAKPOINT*/) {
@@ -5858,6 +5893,39 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
           ::VirtualProtect(addr, 1, old_prot, &old_prot);
         }
         g_real_exit_targets[i].armed = false;
+        if (ep->ContextRecord)
+          ep->ContextRecord->Rip = (u64)(uintptr_t)addr;
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
+    // .219 DIAG: syscall trap -- same one-shot INT3+VEH mechanism on
+    // the ntdll/kernel32 wait functions (see trt_syscall_trap_install).
+    // Guest caller: log + disarm permanently. Host caller: restore the
+    // byte so the host proceeds, but re-arm on the next watchdog tick.
+    for (int i = 0; i < 6; ++i) {
+      if (g_syscall_trap_targets[i].armed &&
+          g_syscall_trap_targets[i].addr == addr) {
+        u64 caller = 0;
+        if (ep->ContextRecord) {
+          const u64 rsp = (u64)ep->ContextRecord->Rsp;
+          if (rsp) caller = *(const u64*)(uintptr_t)rsp;
+        }
+        if (caller_in_guest_image(caller)) {
+          char line[192];
+          snprintf(line, sizeof(line), "syscall-trap: %s called from 0x%llx",
+                   g_syscall_trap_targets[i].name,
+                   (unsigned long long)caller);
+          trt_core_log(line);
+          g_syscall_trap_targets[i].fired = true;
+        } else {
+          g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
+        }
+        DWORD old_prot = 0;
+        if (::VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+          *(u8*)addr = g_syscall_trap_targets[i].orig;
+          ::VirtualProtect(addr, 1, old_prot, &old_prot);
+        }
+        g_syscall_trap_targets[i].armed = false;
         if (ep->ContextRecord)
           ep->ContextRecord->Rip = (u64)(uintptr_t)addr;
         return EXCEPTION_CONTINUE_EXECUTION;
@@ -5967,6 +6035,94 @@ extern "C" void trt_real_exit_hook_install() {
   {
     char line[128];
     snprintf(line, sizeof(line), "real-exit: hook installed %d/8 (armed %d)",
+             installed, armed);
+    trt_core_log(line);
+  }
+}
+
+// .219 DIAG: install the syscall trap (6 targets). Called lazily from
+// the gap-trace final dump (2s wall-time quiet) and from the watchdog
+// tick when the VEH asked for a re-arm (host caller restored a byte).
+// Idempotent: already-armed targets are skipped, fired targets stay
+// dead. The OS VEH is already registered by trt_real_exit_hook_install
+// (called at every guest launch before guest code runs).
+extern "C" void trt_syscall_trap_install() {
+  static const struct {
+    const wchar_t* mod;
+    const char* fn;
+    const char* name;
+  } k_targets[6] = {
+      {L"kernel32.dll", "Sleep", "kernel32!Sleep"},
+      {L"kernel32.dll", "WaitForSingleObject", "kernel32!WaitForSingleObject"},
+      {L"kernel32.dll", "SwitchToThread", "kernel32!SwitchToThread"},
+      {L"ntdll.dll", "NtWaitForSingleObject", "ntdll!NtWaitForSingleObject"},
+      {L"ntdll.dll", "NtDelayExecution", "ntdll!NtDelayExecution"},
+      {L"ntdll.dll", "NtYieldExecution", "ntdll!NtYieldExecution"},
+  };
+  int installed = 0;
+  for (int i = 0; i < 6; ++i) {
+    if (g_syscall_trap_targets[i].fired) continue;
+    HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
+    if (!mod) {
+      char line[192];
+      snprintf(line, sizeof(line), "syscall-trap: %s SKIP module not loaded",
+               k_targets[i].name);
+      trt_core_log(line);
+      continue;
+    }
+    void* addr = (void*)::GetProcAddress(mod, k_targets[i].fn);
+    if (!addr) {
+      char line[192];
+      snprintf(line, sizeof(line), "syscall-trap: %s SKIP GetProcAddress null",
+               k_targets[i].name);
+      trt_core_log(line);
+      continue;
+    }
+    if (g_syscall_trap_targets[i].armed &&
+        g_syscall_trap_targets[i].addr == addr) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "syscall-trap: %s at 0x%llx SKIP already-armed",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+      continue;
+    }
+    if (*(u8*)addr == 0xCC) {
+      char line[192];
+      snprintf(line, sizeof(line), "syscall-trap: %s at 0x%llx SKIP already 0xCC",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+      continue;
+    }
+    DWORD old_prot = 0;
+    if (!::VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "syscall-trap: %s at 0x%llx SKIP VirtualProtect failed err=%u",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr,
+               (unsigned)::GetLastError());
+      trt_core_log(line);
+      continue;
+    }
+    g_syscall_trap_targets[i].name = k_targets[i].name;
+    g_syscall_trap_targets[i].addr = addr;
+    g_syscall_trap_targets[i].orig = *(u8*)addr;
+    g_syscall_trap_targets[i].armed = true;
+    *(u8*)addr = 0xCC;  // INT3
+    ::VirtualProtect(addr, 1, old_prot, &old_prot);
+    ++installed;
+    {
+      char line[192];
+      snprintf(line, sizeof(line), "syscall-trap: %s at 0x%llx installed",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+    }
+  }
+  int armed = 0;
+  for (int i = 0; i < 6; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
+  {
+    char line[128];
+    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/6 (armed %d)",
              installed, armed);
     trt_core_log(line);
   }
@@ -6544,6 +6700,12 @@ std::atomic<u32> g_gap_frame1_tid{0};
 constexpr int k_gap_main_cvs = 16;
 std::atomic<uintptr_t> g_gap_main_cvs[k_gap_main_cvs];
 std::atomic<u64> g_gap_main_cv_n[k_gap_main_cvs];
+// .219 DIAG: guest-CPU proof (fed by the watchdog in main.cpp) +
+// tex-fail correlation counters.
+std::atomic<u64> g_gap_guest_cpu_ms{0};
+std::atomic<u64> g_gap_proc_cpu_ms{0};
+std::atomic<u64> g_gap_tex_fails{0};
+std::atomic<u64> g_gap_main_cv_waits{0};
 }  // namespace
 
 void gap_trace_record(const char* name) {
@@ -6568,27 +6730,59 @@ void gap_trace_record(const char* name) {
 }
 
 void gap_trace_dump_if_changed(void) {
-  // Called every watchdog tick (10ms). Dumps at most once per second while
-  // calls arrive; once the ring goes quiet for ~500ms, dumps one final time
-  // so the last calls before a silent death are not lost.
-  static u64 s_tick = 0;
+  // Called every watchdog tick (nominally 10ms). .219 DIAG: WALL-CLOCK
+  // cadence -- the .218 tick-count cadence (100 ticks periodic, 50 ticks
+  // quiet-window) never fired under watchdog starvation: the Sekiro guest
+  // spins at near-100% CPU on a non-bridged path, so the watchdog only
+  // iterates ~1Hz and 100 ticks take ~100s. Wall clock fires even then:
+  // dump at most once per second while calls arrive, plus one final dump
+  // once the ring has been quiet for 2s of wall time. Each dump prints the
+  // guest main-thread CPU time + process CPU time fed by the watchdog, so
+  // advancing CPU with zero new bridged calls PROVES spinning (vs
+  // dead/blocked). The final dump also arms the syscall trap (below).
+  // Re-arm the trap first if the VEH restored a byte for a host caller.
+#ifdef _WIN32
+  if (g_syscall_trap_rearm.exchange(false, std::memory_order_relaxed))
+    trt_syscall_trap_install();
+#endif
+  using clock = std::chrono::steady_clock;
+  static clock::time_point s_last_dump = clock::now();
+  static clock::time_point s_last_change = clock::now();
   static u64 s_last_dumped_seq = 0;
   static u64 s_last_seen_seq = 0;
-  static u64 s_last_change_tick = 0;
-  ++s_tick;
+  static bool s_final_dumped = false;
+  static bool s_trap_arm_attempted = false;
   gap_entry snap[8];
   u64 seq = 0;
+  u64 newcalls = 0;
+  u64 guest_cpu = 0, proc_cpu = 0;
   int n = 0;
+  bool final_dump = false;
   {
     std::lock_guard<std::mutex> lk(g_gap_mu);
     seq = g_gap_seq;
-    if (seq == s_last_dumped_seq) return;
+    const auto now = clock::now();
     if (seq != s_last_seen_seq) {
       s_last_seen_seq = seq;
-      s_last_change_tick = s_tick;
+      s_last_change = now;
+      s_final_dumped = false;
     }
-    if ((s_tick % 100) != 0 && (s_tick - s_last_change_tick) < 50) return;
+    const bool changed = (seq != s_last_dumped_seq);
+    if (changed && now - s_last_dump >= std::chrono::seconds(1)) {
+      // periodic dump while calls arrive
+    } else if (!changed && !s_final_dumped &&
+               now - s_last_change >= std::chrono::seconds(2)) {
+      // final dump after 2s of wall-time quiet
+      final_dump = true;
+    } else {
+      return;
+    }
+    newcalls = seq - s_last_dumped_seq;
     s_last_dumped_seq = seq;
+    s_last_dump = now;
+    if (final_dump) s_final_dumped = true;
+    guest_cpu = g_gap_guest_cpu_ms.load(std::memory_order_relaxed);
+    proc_cpu = g_gap_proc_cpu_ms.load(std::memory_order_relaxed);
     const u64 total = g_gap_entries < (u64)k_gap_ring_n
                           ? g_gap_entries
                           : (u64)k_gap_ring_n;
@@ -6599,9 +6793,12 @@ void gap_trace_dump_if_changed(void) {
       snap[i] = g_gap_ring[idx];
     }
   }
-  char line[160];
-  snprintf(line, sizeof(line), "gap: trace seq=%llu last %d",
-           (unsigned long long)seq, n);
+  char line[192];
+  snprintf(line, sizeof(line),
+           "gap: trace seq=%llu last %d guestcpu=%llums proccpu=%llums newcalls=%llu%s",
+           (unsigned long long)seq, n,
+           (unsigned long long)guest_cpu, (unsigned long long)proc_cpu,
+           (unsigned long long)newcalls, final_dump ? " final" : "");
   trt_core_log(line);
   for (int i = 0; i < n; ++i) {
     snprintf(line, sizeof(line), "gap: trace #%llu tid=%u %s x%u",
@@ -6609,6 +6806,35 @@ void gap_trace_dump_if_changed(void) {
              snap[i].name ? snap[i].name : "(null)", snap[i].repeats);
     trt_core_log(line);
   }
+  // .219 DIAG: the ring has been quiet for 2s of wall time -- the guest is
+  // either dead or spinning off-bridge. Arm the syscall trap so a
+  // PEB-walked / direct wait call (NtWaitForSingleObject, NtDelayExecution,
+  // NtYieldExecution, kernel32 Sleep / WaitForSingleObject / SwitchToThread)
+  // is caught with its guest caller. One attempt per process: re-arms after
+  // host-caller restores go through g_syscall_trap_rearm above.
+#ifdef _WIN32
+  if (final_dump && !s_trap_arm_attempted) {
+    s_trap_arm_attempted = true;
+    trt_syscall_trap_install();
+  }
+#endif
+}
+
+void gap_trace_set_guest_cpu_ms(u64 guest_ms, u64 proc_ms) {
+  g_gap_guest_cpu_ms.store(guest_ms, std::memory_order_relaxed);
+  g_gap_proc_cpu_ms.store(proc_ms, std::memory_order_relaxed);
+}
+
+u64 gap_trace_note_tex_fail(void) {
+  return g_gap_tex_fails.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+u64 gap_trace_tex_fails(void) {
+  return g_gap_tex_fails.load(std::memory_order_relaxed);
+}
+
+u64 gap_trace_main_cv_waits(void) {
+  return g_gap_main_cv_waits.load(std::memory_order_relaxed);
 }
 
 void gap_trace_note_frame1(u32 tid) {
@@ -6621,36 +6847,62 @@ u32 gap_trace_frame1_tid(void) {
   return g_gap_frame1_tid.load(std::memory_order_relaxed);
 }
 
-void gap_trace_note_main_cv_wait(void* cv) {
+int gap_trace_note_main_cv_wait(void* cv, void* ret) {
   const u32 ftid = g_gap_frame1_tid.load(std::memory_order_relaxed);
-  if (!ftid || trt_GetCurrentThreadId() != ftid) return;
+  if (!ftid || trt_GetCurrentThreadId() != ftid) return 0;
   const uintptr_t key = (uintptr_t)cv;
   for (int i = 0; i < k_gap_main_cvs; ++i) {
     const uintptr_t cur = g_gap_main_cvs[i].load(std::memory_order_relaxed);
     if (cur == key) {
-      g_gap_main_cv_n[i].fetch_add(1, std::memory_order_relaxed);
-      return;
+      const u64 n =
+          g_gap_main_cv_n[i].fetch_add(1, std::memory_order_relaxed) + 1;
+      // .219 DIAG: sampled re-waits -- the AFAFC0 predicate-never-flips
+      // pattern is wake -> re-wait; pair each sampled re-wait with the
+      // texture-failure count so far to test the tex-fail correlation.
+      if (n <= 8 || (n % 64) == 0) {
+        char line[160];
+        snprintf(line, sizeof(line),
+                 "gap: main CV-wait cv=%p n=%llu texfails=%llu",
+                 cv, (unsigned long long)n,
+                 (unsigned long long)g_gap_tex_fails.load(
+                     std::memory_order_relaxed));
+        trt_core_log(line);
+      }
+      return 1;
     }
     if (cur == 0) {
       uintptr_t expect = 0;
       if (g_gap_main_cvs[i].compare_exchange_strong(expect, key,
                                                     std::memory_order_relaxed)) {
         g_gap_main_cv_n[i].store(1, std::memory_order_relaxed);
-        char line[128];
+        // .219 DIAG: WAIT-SITE -- ret is the guest return address of
+        // the SleepConditionVariable call, i.e. the Godot code waiting
+        // on this CV; the main image base turns it into an offset.
+        // First sight only (the site does not move between re-waits).
+        const trt_image* first = trt_images_first();
+        const u64 base =
+            (first && first->base) ? (u64)(uintptr_t)first->base : 0;
+        char line[256];
         snprintf(line, sizeof(line),
-                 "gap: main CV-wait after frame=1 cv=%p tid=%u (first sight)",
-                 cv, ftid);
+                 "gap: main CV-wait after frame=1 cv=%p ret=0x%llx base=0x%llx tid=%u (first sight)",
+                 cv, (unsigned long long)(uintptr_t)ret,
+                 (unsigned long long)base, ftid);
         trt_core_log(line);
-        return;
+        return 1;
       }
     }
   }
+  return 0;
 }
 
-static int cv_wait_locked(cv_slot* s, u32 ms) {
-  // .218 DIAG: Ultrapool main-thread trace -- when the frame-1 thread
-  // waits on a CV after frame=1, log the first sight of each CV.
-  gap_trace_note_main_cv_wait(s ? s->key : nullptr);
+static int cv_wait_locked(cv_slot* s, u32 ms, void* ret) {
+  // .219 DIAG: Ultrapool main-thread trace -- when the frame-1 thread
+  // waits on a CV after frame=1, log the first sight of each CV with the
+  // guest return address (the wait-site) + sampled re-waits with the
+  // tex-fail count. ret is the guest return address of the
+  // SleepConditionVariable call, captured by the caller.
+  if (gap_trace_note_main_cv_wait(s ? s->key : nullptr, ret))
+    g_gap_main_cv_waits.fetch_add(1, std::memory_order_relaxed);
   const u64 wn = g_cv_waits.fetch_add(1, std::memory_order_relaxed) + 1;
   if (s) s->wait_n.fetch_add(1, std::memory_order_relaxed);
   // .217 DIAG: CV summary every 256th wait (.216 never fired: 971 waits < 1024).
@@ -6716,7 +6968,7 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
              srw, flags, trt_GetCurrentThreadId());
     trt_core_log(iw);
   }
-  const int r = cv_wait_locked(s, ms);
+  const int r = cv_wait_locked(s, ms, __builtin_return_address(0));
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke -- log when a waiter EXITS the CV wait (wake->work
   // vs wake->immediate re-wait). Fires for ALL waits (incl. timed), so
@@ -6759,7 +7011,7 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
              cs, trt_GetCurrentThreadId());
     trt_core_log(iw);
   }
-  const int r = cv_wait_locked(s, ms);
+  const int r = cv_wait_locked(s, ms, __builtin_return_address(0));
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke (CS variant) -- see SleepConditionVariableSRW.
   // .216: cap 16 -> 64, same reason as the SRW variant.
@@ -6777,6 +7029,9 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
 }
 
 void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
+  // .219 DIAG: capture the guest return address -- the Godot code that
+  // wakes this CV (the waker side of the AFAFC0 stall).
+  void* ret = __builtin_return_address(0);
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_all.fetch_add(1, std::memory_order_relaxed);
@@ -6786,8 +7041,8 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
     const u64 n = (u64)__atomic_fetch_add(&s->wake_log_n, 1, __ATOMIC_RELAXED) + 1;
     if (n <= 16 || (n % 1024) == 0) {
       char line[128];
-      snprintf(line, sizeof(line), "sync: CV-wake-all cv=%p n=%llu", cv,
-               (unsigned long long)n);
+      snprintf(line, sizeof(line), "sync: CV-wake-all cv=%p ret=0x%llx n=%llu", cv,
+               (unsigned long long)(uintptr_t)ret, (unsigned long long)n);
       trt_core_log(line);
     }
   }
@@ -6803,6 +7058,8 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
 }
 
 void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
+  // .219 DIAG: capture the guest return address -- see WakeAll.
+  void* ret = __builtin_return_address(0);
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
@@ -6811,8 +7068,8 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
     const u64 n = (u64)__atomic_fetch_add(&s->wake_log_n, 1, __ATOMIC_RELAXED) + 1;
     if (n <= 16 || (n % 1024) == 0) {
       char line[128];
-      snprintf(line, sizeof(line), "sync: CV-wake cv=%p n=%llu", cv,
-               (unsigned long long)n);
+      snprintf(line, sizeof(line), "sync: CV-wake cv=%p ret=0x%llx n=%llu", cv,
+               (unsigned long long)(uintptr_t)ret, (unsigned long long)n);
       trt_core_log(line);
     }
   }

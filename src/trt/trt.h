@@ -356,14 +356,40 @@ int trt_steam_load_account(const char* state_dir);
 //     last call, so the final calls before a silent death are logged.
 //   gap_trace_note_frame1(tid) -- remember the thread that presented
 //     frame=1 (the main-thread proxy); gap_trace_frame1_tid() reads it.
-//   gap_trace_note_main_cv_wait(cv) -- called from the CV wait path
-//     when the frame-1 thread waits: logs the first sight of each
-//     distinct CV.
+//   gap_trace_note_main_cv_wait(cv, ret) -- called from the CV wait
+//     path when the frame-1 thread waits: logs the first sight of
+//     each distinct CV with the guest return address (the wait-site)
+//     + the main image base, and sampled re-waits with the tex-fail
+//     count so far. Returns 1 when the wait was counted.
+// .219 DIAG: wall-clock gap trace + guest-CPU proof (Sekiro spin),
+//   syscall trap on ntdll/kernel32 wait functions, AFAFC0 wait-site
+//   + tex-fail correlation (Ultrapool). Implemented in
+//   bridge_kernel32.cpp (gap ring, trap) and bridge_thread.cpp
+//   (SwitchToThread record); the tex-fail note is called from
+//   src/host/vk_backend.hpp; the CPU times are fed from the
+//   watchdog in main.cpp (snapshot-only).
+//   gap_trace_set_guest_cpu_ms(guest_ms, proc_ms) -- watchdog feeds
+//     the guest main-thread CPU time + whole-process CPU time (ms)
+//     each tick; the next gap dump prints them, so advancing CPU
+//     with zero new bridged calls proves spinning (vs dead/blocked).
+//   gap_trace_note_tex_fail() -- count one CreateTexture2D failure;
+//     returns the running total (for the correlation line).
+//   gap_trace_tex_fails() / gap_trace_main_cv_waits() -- counters
+//     for the tex-fail correlation lines.
+//   trt_syscall_trap_install() -- INT3+VEH trap on the 6 most likely
+//     ntdll/kernel32 wait functions (armed lazily when the gap goes
+//     quiet for 2s of wall time; guest callers only, host callers
+//     restore the byte and re-arm on the next watchdog tick).
 void gap_trace_record(const char* name);
 void gap_trace_dump_if_changed(void);
 void gap_trace_note_frame1(u32 tid);
 u32 gap_trace_frame1_tid(void);
-void gap_trace_note_main_cv_wait(void* cv);
+int gap_trace_note_main_cv_wait(void* cv, void* ret);
+void gap_trace_set_guest_cpu_ms(u64 guest_ms, u64 proc_ms);
+u64 gap_trace_note_tex_fail(void);
+u64 gap_trace_tex_fails(void);
+u64 gap_trace_main_cv_waits(void);
+void trt_syscall_trap_install(void);
 
 #ifdef __cplusplus
 }

@@ -1342,6 +1342,10 @@ u32 TRT_STDCALL trt_SleepEx(u32 ms, int alertable) {
 }
 
 int TRT_STDCALL trt_SwitchToThread(void) {
+  // .219 DIAG: a SwitchToThread yield spin was invisible in .218
+  // (not in the gap record list); consecutive duplicates collapse,
+  // so a yield spin is one entry with a huge repeat count.
+  gap_trace_record("SwitchToThread");
 #if defined(_WIN32)
   SwitchToThread();
   return 1;

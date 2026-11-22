@@ -743,6 +743,19 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
                  "[vk_backend] CreateTexture2D failed vk_fmt=%u dxgi=%u %ux%u mips=%u layers=%u bind=0x%x hr=0x%08x rem=0x%08x",
                  desc->vk_format, (unsigned)tex_fmt, td.Width, td.Height, mips, layers, bind_flags, (unsigned)hr, (unsigned)rem);
         trt_core_log(buf);
+        // .219 DIAG: tex-fail correlation -- count this failure and
+        // pair it with the main-thread CV-wait count so far. If the
+        // main thread's AFAFC0 waits only start after a burst of
+        // failures, the OOM is upstream of the stall: the frame task
+        // waits on a texture that can never arrive.
+        {
+          const uint64_t tex_n = gap_trace_note_tex_fail();
+          char tb[128];
+          snprintf(tb, sizeof(tb), "gap: texfail#%llu maincvwaits=%llu",
+                   (unsigned long long)tex_n,
+                   (unsigned long long)gap_trace_main_cv_waits());
+          trt_core_log(tb);
+        }
         // First-failure census: is this app memory, device memory, or a leak?
         static bool tex_oom_diag_done = false;
         if (!tex_oom_diag_done) {
