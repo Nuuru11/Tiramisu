@@ -94,6 +94,38 @@ int find_module(const char* name) {
   return -1;
 }
 
+// ---- generated per-title shims --------------------------------------------
+// titlebuild.py writes <game>/.tiramisu/shims.txt listing the DLLs whose
+// imports could not be resolved for this title. Pre-registering them as STUB
+// at first query means every unknown import binds to a fail-visible thunk
+// BEFORE the loader walks the IAT, so a new game reaches its own code instead
+// of dying at load. Never downgrades a real BUILTIN/SYSTEM route.
+static char g_shims_dir[600] = "";
+static void load_shims_if_needed() {
+  const char* dir = trt_runtime_search_dir();
+  if (!dir || !dir[0] || strcmp(dir, g_shims_dir) == 0) return;
+  snprintf(g_shims_dir, sizeof(g_shims_dir), "%s", dir);
+  const char sep = strchr(dir, '\\') ? '\\' : '/';
+  char path[700];
+  snprintf(path, sizeof(path), "%s%c.tiramisu%cshims.txt", dir, sep, sep);
+  FILE* f = fopen(path, "r");
+  if (!f) return;
+  char line[192];
+  while (fgets(line, sizeof(line), f)) {
+    size_t n = strlen(line);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (!n || line[0] == '#') continue;
+    if (find_module(line) >= 0) continue;  // never override a real bridge
+    trt_module_register(line, TRT_ROUTE_STUB, nullptr, 0);
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "trt: title shim registered %s (generated STUB, fail-visible)",
+             line);
+    trt_core_log(msg);
+  }
+  fclose(f);
+}
+
 // alias routing: desktop DLL name -> console system DLL name (case-insensitive)
 const char* dll_alias_lookup(const char* name) {
   for (const dll_alias& a : k_dll_aliases) {
@@ -163,6 +195,7 @@ void* try_native_override(const char* module, const char* symbol,
 void* resolve_through_table(void* user, const char* module,
                             const char* symbol, u16 ordinal) {
   (void)user;
+  load_shims_if_needed();
 
   // ---- native DLL override -------------------------------------------
   // A game-shipped DLL shadows our builtin bridge for overridable API
@@ -410,6 +443,7 @@ void trt_module_register(const char* name, trt_route route,
 }
 
 trt_route trt_module_route(const char* name) {
+  load_shims_if_needed();
   const int mi = find_module(name);
   return mi < 0 ? TRT_ROUTE_MISSING : g_modules[mi].route;
 }
@@ -421,6 +455,7 @@ trt_route trt_module_route(const char* name) {
 // Unknown module or unknown BUILTIN symbol -> 0: the caller decides via its
 // SYSTEM whitelist / game-dir search, exactly like the live loader would.
 int trt_module_query(const char* module, const char* symbol) {
+  load_shims_if_needed();
   if (!module) return 0;
   const char* target = trt_apiset_target(module);
   if (!target) target = module;
@@ -448,6 +483,7 @@ int trt_module_query(const char* module, const char* symbol) {
 }
 
 int trt_module_query_ordinal(const char* module, u16 ordinal) {
+  load_shims_if_needed();
   if (!module || !ordinal) return 0;
   const char* target = trt_apiset_target(module);
   if (!target) target = module;
