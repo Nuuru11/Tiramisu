@@ -911,6 +911,12 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   const u32 pclean = (prot & 0xFFu) ? (prot & 0xFFu) : 0x04u;
   const unsigned tprot = va_prot_bits(pclean);
 
+  // .210 FIX (Sekiro arena allocs): real Windows treats MEM_COMMIT with a NULL address as reserve+commit. Sekiro allocates its arenas as MEM_TOP_DOWN|MEM_COMMIT (type 0x101000, addr NULL); the bridge rejected MEM_COMMIT-alone with NULL, so every arena returned NULL and the game faulted popping the empty arena list at sekiro.exe+0x115c66b. Add MEM_RESERVE so the call takes the reserve+commit path below.
+  if ((type & 0x1000u) && !(type & 0x2000u) && !addr) {
+    type |= 0x2000u;
+    trt_core_log("kernel32: VirtualAlloc MEM_COMMIT-alone NULL -> reserve+commit (Sekiro arena fix)");
+  }
+
   // MEM_COMMIT alone on a previously-reserved region (Mono/BoehmGC/Unity/CoreCLR)
   if (!(type & 0x2000u)) {
     if (!addr) {
