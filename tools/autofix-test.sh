@@ -53,6 +53,12 @@ out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-corpus-failure.
 echo "$out" | grep -q 'guest-fault-named' && \
   echo "OK real SIGSEGV/RUN FAILED recorded as named work item" || { echo "FAIL real crash rule"; rc=1; }
 
+# Real failed boot of a NON-booting TITLE (Go Next demo), captured from
+# tools/corpus-run.sh on this tree — not a synthetic fixture.
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-title-boot-failure.log)
+echo "$out" | grep -q 'mscoree-stub-named' && \
+  echo "OK real non-booting title (Go Next) failure matched + named" || { echo "FAIL real title rule"; rc=1; }
+
 echo "== retry loop =="
 $py tools/autopilot.py "$game" --dry-run tests/fixtures/logs --max-attempts 5 >"$tmp/loop.txt" 2>&1
 cat "$tmp/loop.txt" | sed 's/^/    /'

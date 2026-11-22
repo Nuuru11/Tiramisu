@@ -150,6 +150,34 @@
       "note": "Real corpus failure: guest fault is a named crash report, not a config repair",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "mscoree-stub-named",
+      "match": [
+        "BOOT EXITED .*mscoree\\.dll!CorExitProcess",
+        "STUB mscoree\\.dll!CorExitProcess"
+      ],
+      "note": "Real Go Next demo failed boot: managed exit landed in the unimplemented mscoree shim; no CLR on console, named work item (not hidden)",
+      "severity": "info",
+      "actions": {}
+    },
+    {
+      "id": "boot-fault-named",
+      "match": [
+        "BOOT FAILED .*guest fault/hang backstop"
+      ],
+      "note": "Real RACCOIN failed boot: guest fault/hang backstop, named crash report",
+      "severity": "info",
+      "actions": {}
+    },
+    {
+      "id": "dbghelp-named-gap",
+      "match": [
+        "GetProcAddress\\(dbghelp\\.dll!.*NULL \\(not in the bridge surface"
+      ],
+      "note": "Real RACCOIN crash path: dbghelp exports absent from the bridge, named gap",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }

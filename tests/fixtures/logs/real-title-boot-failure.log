@@ -1,0 +1,19 @@
+==== TIRAMISU BOOT DEPTH LADDER: Go Next demo.exe ====
+  CRT-STARTUP OK        : REACHED (CRT init called; trap-eligible)
+  WINMAIN ENTERED       : REACHED
+  UNITYMAIN2 CALLED     : REACHED (IAT-probed)
+  WINDOW CREATED        : -
+  D3D11 DEVICE ACQUIRED : -
+  PUMP ENTERED          : -
+  PUMP QUIT             : -
+  messages dispatched   : 0
+  mock gpu calls        : dev=0 ctx=0 sc=0
+  mock ctx top slots    :
+  mock sc hit slots     :
+
+BOOT EXITED Go Next demo.exe: ExitProcess(rc=1) at last bridge: trt: STUB mscoree.dll!CorExitProcess called (unimplemented)
+last trt log lines:
+  [trt] guest-dbg:  [1] 
+  [trt] guest-dbg: Unknown Vendor
+  [trt] guest-dbg: 
+
