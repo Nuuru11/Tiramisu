@@ -202,6 +202,38 @@ int main(void) {
     }
   }
 
+  // --- real OGG/Vorbis: ffmpeg-generated fixture, decoded by stb_vorbis ---
+  {
+    const char* paths[] = {"tests/fixtures/audio/sine22050.ogg",
+                           "../tests/fixtures/audio/sine22050.ogg"};
+    FILE* of = nullptr;
+    for (int i = 0; i < 2 && !of; ++i) of = fopen(paths[i], "rb");
+    if (!of) {
+      printf("  FAIL ogg fixture missing (tests/fixtures/audio/sine22050.ogg)\n");
+      ++failures;
+    } else {
+      static u8 oggbuf[64 * 1024];
+      const size_t oggot = fread(oggbuf, 1, sizeof(oggbuf), of);
+      fclose(of);
+      void* osnd = nullptr;
+      u32 oex[2] = {64, (u32)oggot};
+      CHECK(oggot > 0 &&
+                fmod_System_CreateSound(sys, oggbuf, 0x800u /*OPENMEMORY*/, oex,
+                                        &osnd) == 0 &&
+                osnd != nullptr,
+            "CreateSound(ogg memory) -> handle");
+      const u32 pre_ogg2 = g_cap.count;
+      void* och = nullptr;
+      CHECK(fmod_System_PlaySound(sys, osnd, nullptr, 0, &och) == 0 && och,
+            "ogg sound plays a real channel");
+      CHECK(g_cap.count > pre_ogg2 && g_cap.bytes > 0 &&
+                g_cap.rate == 22050 && g_cap.channels == 1 && g_cap.bps == 2,
+            "ogg decoded to PCM via stb_vorbis (22050 Hz mono s16)");
+      fmod_Channel_Stop(och);
+      fmod_Sound_Release(osnd);
+    }
+  }
+
   // --- compressed: named-silent, handle still real ---
   static u8 ogg[8] = {'O', 'g', 'g', 'S', 0, 0, 0, 0};
   void* osnd = nullptr;
