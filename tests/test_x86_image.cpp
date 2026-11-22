@@ -100,8 +100,8 @@ static size_t make_pe32(u8* out) {
 }
 
 static FILE* g_trace = nullptr;
-static void trace_op(u32 va, unsigned op) {
-  if (g_trace) fprintf(g_trace, "%08x %02x\n", va, op);
+static void trace_op(u32 va, unsigned op, u32 esp) {
+  if (g_trace) fprintf(g_trace, "%08x %02x esp=%08x\n", va, op, esp);
 }
 
 static u64 dummy_bridge(u64, u64, u64, u64) { return 0; }

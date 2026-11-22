@@ -5,6 +5,7 @@
 #include "x86_32.h"
 
 #include <string.h>
+#include <stdio.h>
 
 namespace {
 
@@ -171,8 +172,8 @@ bool jcc(int cond, u32 flags) {
 
 }  // namespace
 
-static void (*g_x86_trace)(u32, unsigned) = nullptr;
-void trt_x86_set_trace(void (*fn)(u32, unsigned)) { g_x86_trace = fn; }
+static void (*g_x86_trace)(u32, unsigned, u32) = nullptr;
+void trt_x86_set_trace(void (*fn)(u32, unsigned, u32)) { g_x86_trace = fn; }
 
 static unsigned g_last_opcode = 0;
 static u32 g_last_fault_va = 0;
@@ -213,7 +214,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
     d.ops16 = false;
     while (op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2e ||
            op == 0x36 || op == 0x3e || op == 0xf2 || op == 0xf3 ||
-           op == 0x66) {
+           op == 0x66 || op == 0xf0) {
       if (op == 0x64) d.seg_base = c->fs_base;
       if (op == 0x65) d.seg_base = c->gs_base;
       if (op == 0x66) d.ops16 = true;
@@ -221,8 +222,18 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
       if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
     }
     if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
-    if (g_x86_trace) g_x86_trace(op_va, op);
+    if (g_x86_trace) g_x86_trace(op_va, op, c->r[X86_ESP]);
     switch (op) {
+      case 0x40: case 0x41: case 0x42: case 0x43:          // inc r32
+      case 0x44: case 0x45: case 0x46: case 0x47:
+        c->r[op & 7] += 1;
+        set_logic_flags(c, c->r[op & 7]);
+        break;
+      case 0x48: case 0x49: case 0x4a: case 0x4b:          // dec r32
+      case 0x4c: case 0x4d: case 0x4e: case 0x4f:
+        c->r[op & 7] -= 1;
+        set_logic_flags(c, c->r[op & 7]);
+        break;
       case 0x0d: {                                        // or eax, imm32 (no ModRM)
         u32 imm = d.i32();
         c->r[X86_EAX] |= imm;
@@ -232,6 +243,14 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
       case 0x90: break;                                   // nop
       case 0xf4: return 0;                                // hlt
       case 0xcc: c->stop_code = 0x80000003u; return 1;    // int3
+      case 0xc2: {                                        // ret imm16
+        u32 sp = c->r[X86_ESP], dest = 0;
+        if (trt_x86_mem_read(c, sp, 4, &dest)) { c->stop_code = sp; return 2; }
+        u16 extra = d.i16();
+        c->r[X86_ESP] = sp + 4 + extra;
+        c->eip = dest;
+        break;
+      }
       case 0xc3: {                                        // ret
         u32 sp = c->r[X86_ESP];
         u32 dest = 0;
@@ -380,7 +399,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
         } else if ((op & 0xf8) == 0xb8) {                 // mov r32/r16, imm
           if (d.ops16) set_reg_op(d, op & 7, d.i16());
           else c->r[op & 7] = d.i32();
-        } else if ((op & 0xf0) == 0x50) {                 // push r32
+        } else if ((op & 0xf8) == 0x50) {                 // push r32
           u32 sp = c->r[X86_ESP] - 4;
           if (trt_x86_mem_write(c, sp, 4, &c->r[op & 7])) { c->stop_code = sp; return 2; }
           c->r[X86_ESP] = sp;
@@ -392,7 +411,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
                    op == 0x03 || op == 0x29 || op == 0x2b ||
                    op == 0x31 || op == 0x33 || op == 0x39 ||
                    op == 0x3b || op == 0x09 || op == 0x0b ||
-                   op == 0x85 || op == 0xc7 ||
+                   op == 0x85 || op == 0x81 || op == 0xc7 ||
                    op == 0x8d || op == 0x83 || op == 0xff) {
           modrm_t m; decode_modrm(d, m);
           if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
@@ -425,7 +444,20 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
                 c->eip = a;
               } else if (m.reg == 4) {              // jmp near r/m32
                 c->eip = a;
+              } else if (m.reg == 6) {              // push r/m32
+                u32 sp = c->r[X86_ESP] - 4;
+                if (trt_x86_mem_write(c, sp, 4, &a)) { c->stop_code = sp; return 2; }
+                c->r[X86_ESP] = sp;
               } else { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
+              break; }
+            case 0x81: { u32 imm = d.i32();                    // group-1 imm32
+              if (m.reg == 0) { res = a + imm; write_rm(d, m, res); set_add_flags(c, a, imm, res); }
+              else if (m.reg == 1) { res = a | imm; write_rm(d, m, res); set_logic_flags(c, res); }
+              else if (m.reg == 4) { res = a & imm; write_rm(d, m, res); set_logic_flags(c, res); }
+              else if (m.reg == 5) { res = a - imm; write_rm(d, m, res); set_sub_flags(c, a, imm, res); }
+              else if (m.reg == 6) { res = a ^ imm; write_rm(d, m, res); set_logic_flags(c, res); }
+              else if (m.reg == 7) set_sub_flags(c, a, imm, a - imm);
+              else { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
               break; }
             case 0x83: { u8 imm = d.byte();                    // group-1 imm8
               if (m.reg == 0) { res = a + (u32)(i8)imm; write_rm(d, m, res); set_add_flags(c, a, (u32)(i8)imm, res); }
