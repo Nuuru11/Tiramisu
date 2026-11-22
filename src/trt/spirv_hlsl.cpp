@@ -621,6 +621,21 @@ struct spv_ctx {
     }
     return "0";
   }
+
+  // .217 DIAG/FIX: X4000 -- struct-typed function locals (OpVariable) are
+  // declared WITHOUT an initializer (hlsl_var_decl skips zero-init for
+  // structs), and D3DCompile rejects any read of a struct that is not
+  // completely initialized on all paths (SPIR-V permits undef reads, HLSL
+  // does not). Return the name of a file-scope static const zero of the
+  // struct type (HLSL zero-initializes globals), creating it once.
+  std::string zero_const_for(u32 tid) {
+    std::string zname = "_zero_" + get_name(tid, "_Struct");
+    if (!declared_temps.count(tid ^ 0xA5A5A5A5u)) {
+      declared_temps.insert(tid ^ 0xA5A5A5A5u);
+      decls_hlsl += "static const " + hlsl_local_type(tid) + " " + zname + ";\n";
+    }
+    return zname;
+  }
 };
 
 static std::string builtin_semantic(u32 bi, spirv_stage st, bool is_out) {
@@ -888,6 +903,13 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
                               (ainit.empty() ? "" : (" = " + ainit)) + ";\n";
           } else {
             ctx.main_body_hlsl += "  " + ctx.hlsl_var_decl(pte, nm, true) + ";\n";
+            // .217: struct locals are NOT zero-initialized by hlsl_var_decl
+            // (it skips structs), so a read before every member is stored
+            // fails D3DCompile with X4000. Assign the zero const at
+            // declaration time so the variable is definitely initialized.
+            if (ctx.types.count(pte) && ctx.types[pte].kind == spv_type::T_STRUCT) {
+              ctx.main_body_hlsl += "  " + nm + " = " + ctx.zero_const_for(pte) + ";\n";
+            }
           }
         }
         if (!is_arr && w.size() >= 4) {

@@ -5822,14 +5822,14 @@ struct real_exit_target {
   u8 orig;
   bool armed;
 };
-static real_exit_target g_real_exit_targets[6];
+static real_exit_target g_real_exit_targets[8];
 static int g_real_exit_armed = 0;
 
 static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
   if (ep && ep->ExceptionRecord &&
       ep->ExceptionRecord->ExceptionCode == 0x80000003u /*EXCEPTION_BREAKPOINT*/) {
     void* addr = ep->ExceptionRecord->ExceptionAddress;
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 8; ++i) {
       if (g_real_exit_targets[i].armed && g_real_exit_targets[i].addr == addr) {
         u64 caller = 0;
         if (ep->ContextRecord) {
@@ -5859,8 +5859,9 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
   return (LONG)trt_dispatch_win32_exception((void*)ep);
 }
 
-// .216 DIAG: install the real-exit INT3 hook. Called once from the host
-// guest-launch path before guest code runs. Also registers the OS VEH
+// .217 DIAG: install the real-exit INT3 hook (8 targets: kernel32 /
+// kernelbase / ntdll). Called from the host guest-launch path before guest
+// code runs, once per guest launch. Also registers the OS VEH
 // above directly, so the hook works even if the guest never calls
 // AddVectoredExceptionHandler.
 extern "C" void trt_real_exit_hook_install() {
@@ -5868,13 +5869,15 @@ extern "C" void trt_real_exit_hook_install() {
     const wchar_t* mod;
     const char* fn;
     const char* name;
-  } k_targets[6] = {
+  } k_targets[8] = {
       {L"kernel32.dll", "ExitProcess", "kernel32!ExitProcess"},
       {L"kernel32.dll", "TerminateProcess", "kernel32!TerminateProcess"},
       {L"kernel32.dll", "FatalExit", "kernel32!FatalExit"},
       {L"kernelbase.dll", "ExitProcess", "kernelbase!ExitProcess"},
       {L"kernelbase.dll", "TerminateProcess", "kernelbase!TerminateProcess"},
       {L"kernelbase.dll", "FatalExit", "kernelbase!FatalExit"},
+      {L"ntdll.dll", "RtlExitUserProcess", "ntdll!RtlExitUserProcess"},
+      {L"ntdll.dll", "NtTerminateProcess", "ntdll!NtTerminateProcess"},
   };
   static std::once_flag s_real_exit_veh_once;
   std::call_once(s_real_exit_veh_once, []() {
@@ -5887,17 +5890,50 @@ extern "C" void trt_real_exit_hook_install() {
     }
   });
   int installed = 0;
-  for (int i = 0; i < 6; ++i) {
+  for (int i = 0; i < 8; ++i) {
     HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
-    if (!mod) continue;
+    if (!mod) {
+      char line[192];
+      snprintf(line, sizeof(line), "real-exit: %s SKIP module not loaded",
+               k_targets[i].name);
+      trt_core_log(line);
+      continue;
+    }
     void* addr = (void*)::GetProcAddress(mod, k_targets[i].fn);
-    if (!addr) continue;
+    if (!addr) {
+      char line[192];
+      snprintf(line, sizeof(line), "real-exit: %s SKIP GetProcAddress null",
+               k_targets[i].name);
+      trt_core_log(line);
+      continue;
+    }
+    // .217 FIX: never re-patch an already-armed target. On a second guest
+    // launch in the same process the old code saved orig=0xCC (the INT3
+    // byte itself) and re-armed; the VEH would then restore 0xCC on fire
+    // and the breakpoint would never clear. Skip armed targets entirely.
+    if (g_real_exit_targets[i].armed && g_real_exit_targets[i].addr == addr) {
+      char line[192];
+      snprintf(line, sizeof(line), "real-exit: %s at 0x%llx SKIP already-armed",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+      continue;
+    }
+    if (*(u8*)addr == 0xCC) {
+      // A foreign patch already sits here; saving it as orig would corrupt
+      // the restore. Do not touch this target.
+      char line[192];
+      snprintf(line, sizeof(line), "real-exit: %s at 0x%llx SKIP already 0xCC",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+      continue;
+    }
     DWORD old_prot = 0;
     if (!::VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
       char line[192];
       snprintf(line, sizeof(line),
-               "real-exit: VirtualProtect failed %s err=%u",
-               k_targets[i].name, (unsigned)::GetLastError());
+               "real-exit: %s at 0x%llx SKIP VirtualProtect failed err=%u",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr,
+               (unsigned)::GetLastError());
       trt_core_log(line);
       continue;
     }
@@ -5908,11 +5944,22 @@ extern "C" void trt_real_exit_hook_install() {
     *(u8*)addr = 0xCC;  // INT3
     ::VirtualProtect(addr, 1, old_prot, &old_prot);
     ++installed;
+    {
+      char line[192];
+      snprintf(line, sizeof(line), "real-exit: %s at 0x%llx installed",
+               k_targets[i].name, (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+    }
   }
-  g_real_exit_armed = installed;
+  // Recompute the armed total: re-installs mostly SKIP, so the newly
+  // installed count alone understates coverage.
+  int armed = 0;
+  for (int i = 0; i < 8; ++i) if (g_real_exit_targets[i].armed) ++armed;
+  g_real_exit_armed = armed;
   {
     char line[128];
-    snprintf(line, sizeof(line), "real-exit: hook installed %d/6", installed);
+    snprintf(line, sizeof(line), "real-exit: hook installed %d/8 (armed %d)",
+             installed, armed);
     trt_core_log(line);
   }
 }
@@ -6422,7 +6469,7 @@ void TRT_STDCALL trt_InitializeConditionVariable(void* cv) {
   if (cv) memset(cv, 0, sizeof(void*));
 }
 
-// .216 DIAG: CV summary -- every 1024th CV wait, log global totals plus
+// .216 DIAG: CV summary -- every 256th CV wait (.217), log global totals plus
 // the top 5 CVs by wait count (names the livelock participants instead of
 // forcing a full-log grep). Lock-free reads only; safe from the wait path.
 static void cv_log_summary() {
@@ -6464,8 +6511,8 @@ static void cv_log_summary() {
 static int cv_wait_locked(cv_slot* s, u32 ms) {
   const u64 wn = g_cv_waits.fetch_add(1, std::memory_order_relaxed) + 1;
   if (s) s->wait_n.fetch_add(1, std::memory_order_relaxed);
-  // .216 DIAG: CV summary every 1024th wait.
-  if ((wn % 1024) == 0) cv_log_summary();
+  // .217 DIAG: CV summary every 256th wait (.216 never fired: 971 waits < 1024).
+  if ((wn % 256) == 0) cv_log_summary();
 #if defined(_WIN32)
   const BOOL ok = ::SleepConditionVariableCS(&s->cv, &s->cs, ms);
   ::LeaveCriticalSection(&s->cs);
