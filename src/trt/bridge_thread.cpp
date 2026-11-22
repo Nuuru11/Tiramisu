@@ -1770,6 +1770,20 @@ u64 TRT_STDCALL trt_CreateEventW(void* attrs, bool manual, bool initial,
     o->name = "E:" + key;
     g_named_objects[o->name] = h;
   }
+  {
+    // .208 diagnostic: log event creation (first 64) so the lifecycle of
+    // the event the Sekiro worker waits on is visible.
+    static unsigned s_create_event_logged = 0;
+    if (s_create_event_logged < 64) {
+      ++s_create_event_logged;
+      char el[256];
+      snprintf(el, sizeof(el),
+               "sync: CreateEvent handle=%llx manual=%u initial=%u name=%s",
+               (unsigned long long)h, manual ? 1u : 0u, initial ? 1u : 0u,
+               key.empty() ? "(anon)" : key.c_str());
+      trt_core_log(el);
+    }
+  }
   trt_SetLastError(0);
   return h;
 }
@@ -1814,6 +1828,17 @@ int TRT_STDCALL trt_SetEvent(u64 handle) {
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
   o->signalled = true;
+  {
+    // .208 diagnostic: log event signals (first 64).
+    static unsigned s_set_event_logged = 0;
+    if (s_set_event_logged < 64) {
+      ++s_set_event_logged;
+      char el[128];
+      snprintf(el, sizeof(el), "sync: SetEvent handle=%llx",
+               (unsigned long long)handle);
+      trt_core_log(el);
+    }
+  }
   g_sync_cv.notify_all();
   return 1;
 }
@@ -1823,6 +1848,17 @@ int TRT_STDCALL trt_ResetEvent(u64 handle) {
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
   o->signalled = false;
+  {
+    // .208 diagnostic: log event resets (first 64).
+    static unsigned s_reset_event_logged = 0;
+    if (s_reset_event_logged < 64) {
+      ++s_reset_event_logged;
+      char el[128];
+      snprintf(el, sizeof(el), "sync: ResetEvent handle=%llx",
+               (unsigned long long)handle);
+      trt_core_log(el);
+    }
+  }
   return 1;
 }
 
@@ -1831,6 +1867,18 @@ int TRT_STDCALL trt_PulseEvent(u64 handle) {
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
   o->signalled = true;
+  {
+    // .208 diagnostic: log event pulses (first 64). A Pulse before any
+    // thread waits LOSES the signal (set then immediately cleared).
+    static unsigned s_pulse_event_logged = 0;
+    if (s_pulse_event_logged < 64) {
+      ++s_pulse_event_logged;
+      char el[128];
+      snprintf(el, sizeof(el), "sync: PulseEvent handle=%llx",
+               (unsigned long long)handle);
+      trt_core_log(el);
+    }
+  }
   g_sync_cv.notify_all();
   o->signalled = false;
   return 1;
