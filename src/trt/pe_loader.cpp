@@ -844,6 +844,18 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           return fail(&img, be, TRT_ERR_IMPORT, det);
         }
         memcpy(img.base + t, &fn, 8);  // bind IAT
+        // .214 DIAG: IAT-bind exit-name -- does this image import an exit
+        // path? (Sekiro silent death: no bridge-visible ExitProcess call,
+        // so find out whether it even imports one.)
+        if (sym_name && (strcmp(sym_name, "ExitProcess") == 0 ||
+                         strcmp(sym_name, "FatalExit") == 0 ||
+                         strcmp(sym_name, "TerminateProcess") == 0 ||
+                         strcmp(sym_name, "RtlExitUserProcess") == 0)) {
+          char line[256];
+          snprintf(line, sizeof(line), "iat-bind: %s!%s -> %p", mod_name,
+                   sym_name, fn);
+          logf_be(be, line);
+        }
         if (n_symbols == 0) {
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,

@@ -6405,6 +6405,13 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_all.fetch_add(1, std::memory_order_relaxed);
+  // .214 DIAG: CV-wake-all -- correlate waits to wakes (Ultrapool
+  // stall: are the parked CVs ever woken, or does nobody signal them?).
+  {
+    char line[128];
+    snprintf(line, sizeof(line), "sync: CV-wake-all cv=%p", cv);
+    trt_core_log(line);
+  }
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
   ::WakeAllConditionVariable(&s->cv);
@@ -6420,6 +6427,12 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
+  // .214 DIAG: CV-wake -- see CV-wake-all.
+  {
+    char line[128];
+    snprintf(line, sizeof(line), "sync: CV-wake cv=%p", cv);
+    trt_core_log(line);
+  }
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
   ::WakeConditionVariable(&s->cv);
