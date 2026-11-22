@@ -94,7 +94,8 @@ int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
   const u32 isz = (u32)img->size_of_image;
   if (!isz || isz > 64u * 1024u * 1024u) return 2;
   const u32 stack_size = 0x10000;
-  const size_t total = (size_t)isz + stack_size;
+  const u32 teb_size = 0x2000;  // FS-segment TEB page for 32-bit guests
+  const size_t total = (size_t)isz + stack_size + teb_size;
   u8* mem = (u8*)calloc(total, 1);
   if (!mem) return 2;
   memcpy(mem, img->base, isz);
@@ -102,6 +103,14 @@ int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
   trt_x86_ctx c{};
   c.mem = mem; c.mem_va = img->guest_base; c.mem_size = (u32)total;
   c.eip = entry_va;
+  // 32-bit Windows: FS:0x18 is the TEB self-pointer, FS:0x28 the stack guard.
+  c.fs_base = img->guest_base + isz + stack_size + 0x1000;
+  {
+    u32 self = c.fs_base;
+    u32 guard = 0x0abbccddu;
+    trt_x86_mem_write(&c, c.fs_base + 0x18, 4, &self);
+    trt_x86_mem_write(&c, c.fs_base + 0x28, 4, &guard);
+  }
   const u32 sp = img->guest_base + isz + stack_size - 64;
   c.r[X86_ESP] = sp;
   c.r[X86_EBP] = sp;

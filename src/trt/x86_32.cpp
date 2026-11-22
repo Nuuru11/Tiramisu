@@ -18,6 +18,7 @@ const u32 OF = 1u << 11;
 struct decoder {
   trt_x86_ctx* c;
   bool fault = false;
+  u32 seg_base = 0;  // active FS/GS prefix base for this instruction
 
   u8 byte() {
     if (trt_x86_mem_read(c, c->eip, 1, &v8)) { fault = true; return 0; }
@@ -65,7 +66,7 @@ int decode_modrm(decoder& d, modrm_t& m) {
   }
   if (m.mod == 1) disp = (u32)(i8)d.byte();
   else if (m.mod == 2) disp = d.d32();
-  m.va = disp;
+  m.va = disp + d.seg_base;
   if (base >= 0) m.va += d.c->r[base];
   if (index >= 0 && index != 4) m.va += d.c->r[index] * (u32)scale;
   return 0;
@@ -185,9 +186,13 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
     }
     const u32 op_va = c->eip;
     u8 op = d.byte();
-    // Segment/operand/REP prefixes: accepted and skipped (flat guest model).
+    // Segment/operand/REP prefixes. FS/GS are real on 32-bit Windows (TEB /
+    // TLS), so their bases are applied to the effective address.
+    d.seg_base = 0;
     while (op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2e ||
            op == 0x36 || op == 0x3e || op == 0xf2 || op == 0xf3) {
+      if (op == 0x64) d.seg_base = c->fs_base;
+      if (op == 0x65) d.seg_base = c->gs_base;
       op = d.byte();
       if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
     }

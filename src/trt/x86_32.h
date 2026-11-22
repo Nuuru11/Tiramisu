@@ -22,6 +22,8 @@ typedef struct trt_x86_ctx {
   u8* mem;       // host bytes backing [mem_va, mem_va + mem_size)
   u32 mem_va;
   u32 mem_size;
+  u32 fs_base;   // 32-bit Windows FS -> TEB (set by the image runner)
+  u32 gs_base;   // 32-bit Windows GS -> TLS (set by the image runner)
   // Called when EIP is outside the mapped window (a trap/import thunk).
   // Return 0 to continue, nonzero to stop with *stop_code set.
   int (*trap)(struct trt_x86_ctx* c, u32 va, void* user);
