@@ -176,6 +176,7 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
                                       int x, int y, int w, int h,
                                       void* parent, void* menu, void* inst,
                                       void* param) {
+  gap_trace_record("CreateWindowExW");
   // .215 DIAG: Sekiro silent death -- does the game reach window creation?
   // (Death window is after GameInput init, before ANY window/D3D call.)
   {
@@ -295,6 +296,7 @@ int TRT_STDCALL trt_DestroyWindow(void* hwnd) {
 }
 
 int TRT_STDCALL trt_ShowWindow(void* hwnd, int cmd) {
+  gap_trace_record("ShowWindow");
   if (!hwnd) return 0;
   const u64 hv = (u64)(uintptr_t)hwnd;
   const i64 old_style = trt_GetWindowLongPtrW(hv, -16 /*GWL_STYLE*/);
@@ -412,6 +414,7 @@ static bool fill_msg(guest_msg* m, void* filter_hwnd, u32 min, u32 max,
 }
 
 int TRT_STDCALL trt_GetMessageW(guest_msg* out, void* hwnd, u32 min, u32 max) {
+  gap_trace_record("GetMessageW");
   for (;;) {
     if (g_pump) g_pump();  // keep CoreWindow/XInput alive inside the guest
     if (fill_msg(out, hwnd, min, max, true))
@@ -439,6 +442,7 @@ void trt_bridge_set_focus(void* hwnd) { g_focus_window = hwnd; }
 
 int TRT_STDCALL trt_PeekMessageW(guest_msg* out, void* hwnd, u32 min, u32 max,
                                  u32 remove) {
+  gap_trace_record("PeekMessageW");
   const bool do_remove = (remove & 1u) != 0;
   if (fill_msg(out, hwnd, min, max, do_remove)) return 1;
   if (g_pump) g_pump();
@@ -516,6 +520,7 @@ int TRT_STDCALL trt_ClipCursor(const void* lpRect) {
 }
 
 int TRT_STDCALL trt_GetSystemMetrics(int idx) {
+  gap_trace_record("GetSystemMetrics");
   int w = 0, h = 0;
   trt_display_size(&w, &h);
   switch (idx) {

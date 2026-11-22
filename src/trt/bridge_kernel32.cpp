@@ -887,6 +887,7 @@ u32 TRT_STDCALL trt_ResetWriteWatch(void* addr, u64 bytes) {
 }
 
 void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
+  gap_trace_record("VirtualAlloc");
   // MEM_WRITE_WATCH is a REQUEST modifier, not an allocation type: real
   // Windows accepts it silently alongside MEM_RESERVE|COMMIT (bdwgc probes
   // with exactly this combination). Rejecting it fails the whole GC probe.
@@ -1338,6 +1339,7 @@ u32 TRT_STDCALL trt_GetCurrentThreadId(void) {
 
 // the monotonic clock games use for timing (GetTickCount64 since Win7)
 u64 TRT_STDCALL trt_GetTickCount64(void) {
+  gap_trace_record("GetTickCount64");
   const i64 t = now_qpc_ticks();
   // our QPC source is nanoseconds; Windows' GetTickCount64 is milliseconds
   return (u64)(t / 1000000ll);
@@ -1347,6 +1349,7 @@ u32 TRT_STDCALL trt_GetTickCount(void) { return (u32)trt_GetTickCount64(); }
 void* TRT_STDCALL trt_GetCurrentProcess(void) { return (void*)(uintptr_t)-1; }
 
 int TRT_STDCALL trt_QueryPerformanceCounter(i64* out) {
+  gap_trace_record("QueryPerformanceCounter");
   if (!out) return 0;
   *out = now_qpc_ticks();
   return 1;
@@ -1382,6 +1385,7 @@ extern "C" __attribute__((noinline, used)) void trt_cs_stall_probe_pause(void) {
 }
 
 void TRT_STDCALL trt_Sleep(u32 ms) {
+  if (ms > 0) gap_trace_record("Sleep");
 #ifdef _WIN32
   ::Sleep(ms);  // we are inside a Windows process already
 #else
@@ -2654,6 +2658,7 @@ static void* load_library_impl(const u16* path, u32 flags) {
 }
 
 void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
+  gap_trace_record("LoadLibraryW");
   void* h = load_library_impl(path, 0);
   static u32 s_llw_log = 0;
   if (++s_llw_log <= 64) { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
@@ -2661,6 +2666,7 @@ void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
 }
 
 void* TRT_STDCALL trt_LoadLibraryExW(const u16* path, void* file, u32 flags) {
+  gap_trace_record("LoadLibraryExW");
   (void)file;
   void* h = load_library_impl(path, flags);
   { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=%p", st_n, flags, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=NULL", st_n, flags); trt_core_log(st_line); }
@@ -2685,6 +2691,7 @@ int TRT_STDCALL trt_DisableThreadLibraryCalls(void* handle) {
 }
 
 void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
+  gap_trace_record("GetProcAddress");
   if (!name) return nullptr;
   // .213 DIAG: log when the game resolves an exit/terminate entry point
   // (dynamic exit path -- a static CRT or PEB-walked exit bypasses this,
@@ -2742,6 +2749,7 @@ void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
 }
 
 void* TRT_STDCALL trt_GetModuleHandleW(const u16* name) {
+  gap_trace_record("GetModuleHandleW");
   void* h = nullptr;
   const char* st_base = "(null)";
   char st_u8[256];
@@ -6508,7 +6516,141 @@ static void cv_log_summary() {
   trt_core_log(line);
 }
 
+// ---- .218 DIAG: gap API-call trace (Sekiro silent death) -----------------
+// Ring of the last 32 bridged calls (name + tid + seq + repeat count),
+// dumped by the watchdog (main.cpp, snapshot-only). The Sekiro death
+// leaves no bridged call between the last SetEvent / input-init and the
+// silence; if the ring shows the game called NOTHING bridged in the gap,
+// the exit is a direct syscall or a platform kill. If it shows a last
+// call, that call is the next lead. Consecutive duplicates collapse into
+// a repeat count, so a QPC / GetTickCount spin loop is one entry, not 32
+// evicted slots. Names are string literals (pointer-compared).
+namespace {
+struct gap_entry {
+  const char* name;
+  u32 tid;
+  u64 seq;
+  u32 repeats;
+};
+constexpr int k_gap_ring_n = 32;
+gap_entry g_gap_ring[k_gap_ring_n];
+int g_gap_ring_head = 0;  // next slot to write
+u64 g_gap_seq = 0;        // total records (seq of the last entry)
+u64 g_gap_entries = 0;    // non-duplicate entries ever written
+std::mutex g_gap_mu;
+// The thread that presented frame=1 (the main-thread proxy for Ultrapool).
+std::atomic<u32> g_gap_frame1_tid{0};
+// First-sight distinct CVs the frame-1 thread waits on after frame=1.
+constexpr int k_gap_main_cvs = 16;
+std::atomic<uintptr_t> g_gap_main_cvs[k_gap_main_cvs];
+std::atomic<u64> g_gap_main_cv_n[k_gap_main_cvs];
+}  // namespace
+
+void gap_trace_record(const char* name) {
+  if (!name) return;
+  const u32 tid = trt_GetCurrentThreadId();
+  std::lock_guard<std::mutex> lk(g_gap_mu);
+  if (g_gap_seq > 0) {
+    const int last = (g_gap_ring_head + k_gap_ring_n - 1) % k_gap_ring_n;
+    if (g_gap_ring[last].name == name && g_gap_ring[last].tid == tid) {
+      ++g_gap_ring[last].repeats;
+      ++g_gap_seq;
+      return;
+    }
+  }
+  gap_entry& e = g_gap_ring[g_gap_ring_head];
+  e.name = name;
+  e.tid = tid;
+  e.seq = ++g_gap_seq;
+  e.repeats = 1;
+  g_gap_ring_head = (g_gap_ring_head + 1) % k_gap_ring_n;
+  if (g_gap_entries < (u64)k_gap_ring_n) ++g_gap_entries;
+}
+
+void gap_trace_dump_if_changed(void) {
+  // Called every watchdog tick (10ms). Dumps at most once per second while
+  // calls arrive; once the ring goes quiet for ~500ms, dumps one final time
+  // so the last calls before a silent death are not lost.
+  static u64 s_tick = 0;
+  static u64 s_last_dumped_seq = 0;
+  static u64 s_last_seen_seq = 0;
+  static u64 s_last_change_tick = 0;
+  ++s_tick;
+  gap_entry snap[8];
+  u64 seq = 0;
+  int n = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_gap_mu);
+    seq = g_gap_seq;
+    if (seq == s_last_dumped_seq) return;
+    if (seq != s_last_seen_seq) {
+      s_last_seen_seq = seq;
+      s_last_change_tick = s_tick;
+    }
+    if ((s_tick % 100) != 0 && (s_tick - s_last_change_tick) < 50) return;
+    s_last_dumped_seq = seq;
+    const u64 total = g_gap_entries < (u64)k_gap_ring_n
+                          ? g_gap_entries
+                          : (u64)k_gap_ring_n;
+    n = total < 8 ? (int)total : 8;
+    for (int i = 0; i < n; ++i) {
+      const int idx =
+          (g_gap_ring_head - n + i + 2 * k_gap_ring_n) % k_gap_ring_n;
+      snap[i] = g_gap_ring[idx];
+    }
+  }
+  char line[160];
+  snprintf(line, sizeof(line), "gap: trace seq=%llu last %d",
+           (unsigned long long)seq, n);
+  trt_core_log(line);
+  for (int i = 0; i < n; ++i) {
+    snprintf(line, sizeof(line), "gap: trace #%llu tid=%u %s x%u",
+             (unsigned long long)snap[i].seq, snap[i].tid,
+             snap[i].name ? snap[i].name : "(null)", snap[i].repeats);
+    trt_core_log(line);
+  }
+}
+
+void gap_trace_note_frame1(u32 tid) {
+  u32 expect = 0;
+  g_gap_frame1_tid.compare_exchange_strong(expect, tid,
+                                           std::memory_order_relaxed);
+}
+
+u32 gap_trace_frame1_tid(void) {
+  return g_gap_frame1_tid.load(std::memory_order_relaxed);
+}
+
+void gap_trace_note_main_cv_wait(void* cv) {
+  const u32 ftid = g_gap_frame1_tid.load(std::memory_order_relaxed);
+  if (!ftid || trt_GetCurrentThreadId() != ftid) return;
+  const uintptr_t key = (uintptr_t)cv;
+  for (int i = 0; i < k_gap_main_cvs; ++i) {
+    const uintptr_t cur = g_gap_main_cvs[i].load(std::memory_order_relaxed);
+    if (cur == key) {
+      g_gap_main_cv_n[i].fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+    if (cur == 0) {
+      uintptr_t expect = 0;
+      if (g_gap_main_cvs[i].compare_exchange_strong(expect, key,
+                                                    std::memory_order_relaxed)) {
+        g_gap_main_cv_n[i].store(1, std::memory_order_relaxed);
+        char line[128];
+        snprintf(line, sizeof(line),
+                 "gap: main CV-wait after frame=1 cv=%p tid=%u (first sight)",
+                 cv, ftid);
+        trt_core_log(line);
+        return;
+      }
+    }
+  }
+}
+
 static int cv_wait_locked(cv_slot* s, u32 ms) {
+  // .218 DIAG: Ultrapool main-thread trace -- when the frame-1 thread
+  // waits on a CV after frame=1, log the first sight of each CV.
+  gap_trace_note_main_cv_wait(s ? s->key : nullptr);
   const u64 wn = g_cv_waits.fetch_add(1, std::memory_order_relaxed) + 1;
   if (s) s->wait_n.fetch_add(1, std::memory_order_relaxed);
   // .217 DIAG: CV summary every 256th wait (.216 never fired: 971 waits < 1024).

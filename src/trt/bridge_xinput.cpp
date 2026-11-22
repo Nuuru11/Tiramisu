@@ -82,6 +82,7 @@ u16 read_buttons(u32 user_index) {
 extern "C" {
 
 u32 TRT_GUEST_ABI trt_XInputGetState(u32 user_index, void* state_out) {
+  gap_trace_record("XInputGetState");
   if (!trt_pad_connected(user_index)) return k_err_device_not_connected;
   if (!state_out) return 87u;  // ERROR_INVALID_PARAMETER
   xinput_state* s = (xinput_state*)state_out;

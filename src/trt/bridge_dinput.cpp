@@ -546,6 +546,7 @@ void TRT_GUEST_ABI trt_di_feed_key(u16 vk, u32 down) {
 int TRT_GUEST_ABI trt_DirectInput8Create(void* hinst, u32 version,
                                          const u8* riid, void** out,
                                          void* unk) {
+  gap_trace_record("DirectInput8Create");
   (void)hinst; (void)version; (void)riid; (void)unk;
   if (!out) return E_NOTIMPL_;
   *out = &g_di8_obj;

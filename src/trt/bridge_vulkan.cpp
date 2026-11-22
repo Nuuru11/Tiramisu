@@ -1714,6 +1714,7 @@ i32 TRT_GUEST_ABI trt_vkGetSwapchainImagesKHR(void* dev_v, u64 sc, u32* pCount, 
   return VK_SUCCESS_V;
 }
 i32 TRT_GUEST_ABI trt_vkAcquireNextImageKHR(void* dev_v, u64 sc, u64, u64, u64, u32* pIdx) {
+  gap_trace_record("vkAcquireNextImageKHR");
   // .216 DIAG: frame-loop trace -- log every acquire with tid.
   vk_logf("vulkan: vkAcquireNextImageKHR ENTRY tid=%u sc=%llu",
           trt_GetCurrentThreadId(), (unsigned long long)sc);
@@ -1735,6 +1736,10 @@ i32 TRT_GUEST_ABI trt_vkQueuePresentKHR(void*, const vk_present_info* pi) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
   static u64 s_presents = 0;
   ++s_presents;
+  // .218 DIAG: remember the presenting thread (main-thread proxy) +
+  // record the present in the gap trace.
+  if (s_presents == 1) gap_trace_note_frame1(trt_GetCurrentThreadId());
+  gap_trace_record("vkQueuePresentKHR");
   // .216 DIAG: log EVERY present with tid (was first 10 + every 60th).
   vk_logf("vulkan: vkQueuePresentKHR frame=%llu sc=%llu idx=%u tid=%u",
           (unsigned long long)s_presents,
@@ -2462,6 +2467,7 @@ void TRT_GUEST_ABI trt_vkDestroyFence(void* dev_v, u64 f, const void*) {
 }
 i32 TRT_GUEST_ABI trt_vkResetFences(void*, u32, const u64*) { return VK_SUCCESS_V; }
 i32 TRT_GUEST_ABI trt_vkWaitForFences(void*, u32 cnt, const u64*, u32, u64) {
+  gap_trace_record("vkWaitForFences");
   // .216 DIAG: frame-loop trace -- fence waits are the other half of the
   // present loop (acquire -> submit -> wait -> present).
   static u64 s_fence_waits = 0;
@@ -2930,6 +2936,7 @@ void TRT_GUEST_ABI trt_vkCmdExecuteCommands(void* cb_v, u32 cnt, void* const* pC
 }
 
 i32 TRT_GUEST_ABI trt_vkQueueSubmit(void* q_v, u32 cnt, const vk_submit_info* subs, u64) {
+  gap_trace_record("vkQueueSubmit");
   // .216 DIAG: frame-loop trace (first 20 + every 60th).
   static u64 s_submits = 0;
   const u64 n = ++s_submits;

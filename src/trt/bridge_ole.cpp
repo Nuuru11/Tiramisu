@@ -121,6 +121,7 @@ void trt_ole_register_class(const void* clsid, trt_com_factory factory,
 
 // ---- CoInitializeEx / CoInitialize / CoUninitialize ----
 int TRT_GUEST_ABI ole_CoInitializeEx(void* reserved, u32 model) {
+  gap_trace_record("CoInitializeEx");
   (void)reserved;
   ++g_init_count;
   g_last_init_mta = (model & COINIT_APARTMENTTHREADED) ? 0 : 1;

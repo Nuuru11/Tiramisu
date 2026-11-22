@@ -1316,6 +1316,7 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
                           u32 flags, const void* feature_levels,
                           u32 feature_level_count, u32 sdk_version,
                           void** out_device, u32* out_level, void** out_context) {
+  gap_trace_record("D3D11CreateDevice");
   // .215 DIAG: Sekiro silent death -- does the game reach D3D11 device creation?
   {
     char line[160];

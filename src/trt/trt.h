@@ -346,6 +346,25 @@ int trt_steam_owned_app_count(void);
 // library, then install both into the bridge. Returns the app count found.
 int trt_steam_load_account(const char* state_dir);
 
+// .218 DIAG: gap API-call trace (Sekiro silent death) + Ultrapool
+// main-thread trace after frame=1. Implemented in bridge_kernel32.cpp.
+//   gap_trace_record(name) -- record one bridged call (name is a static
+//     literal) into the last-32 ring; consecutive duplicates collapse.
+//   gap_trace_dump_if_changed() -- watchdog-driven (main.cpp,
+//     snapshot-only): dumps the last 8 ring entries at most once per
+//     second while calls arrive, plus one final dump ~500ms after the
+//     last call, so the final calls before a silent death are logged.
+//   gap_trace_note_frame1(tid) -- remember the thread that presented
+//     frame=1 (the main-thread proxy); gap_trace_frame1_tid() reads it.
+//   gap_trace_note_main_cv_wait(cv) -- called from the CV wait path
+//     when the frame-1 thread waits: logs the first sight of each
+//     distinct CV.
+void gap_trace_record(const char* name);
+void gap_trace_dump_if_changed(void);
+void gap_trace_note_frame1(u32 tid);
+u32 gap_trace_frame1_tid(void);
+void gap_trace_note_main_cv_wait(void* cv);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1296,6 +1296,7 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
 
 // WaitForSingleObject(handle, ms): 0 signalled, 0x102 timeout, 0xFFFFFFFF failed
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
+  gap_trace_record("WaitForSingleObject");
   return wait_single_impl(handle, ms, false);
 }
 
@@ -1824,6 +1825,7 @@ u64 TRT_STDCALL trt_OpenEventA(u32 access, int inherit, const char* name) {
 }
 
 int TRT_STDCALL trt_SetEvent(u64 handle) {
+  gap_trace_record("SetEvent");
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
