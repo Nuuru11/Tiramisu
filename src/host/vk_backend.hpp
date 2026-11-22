@@ -6,6 +6,7 @@
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
+#include <dxgi1_5.h>
 
 #include "../trt/bridge_vulkan.h"
 #include "../trt/spirv_hlsl.h"
@@ -533,6 +534,12 @@ inline void hk_destroy_pipeline(u64 pipeline_id, void*) {
 
 inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, void*) {
   if (!g_vkrt.initialized || !g_vkrt.dev) return 0;
+  if (bytes > (16ull * 1024ull * 1024ull)) {
+    char bb[128];
+    snprintf(bb, sizeof(bb), "[vk_backend] hk_sync_buffer LARGE buf=%llu bytes=%llu usage=0x%x",
+             (unsigned long long)buf_id, (unsigned long long)bytes, usage);
+    trt_core_log(bb);
+  }
   const uint64_t sz = std::max<uint64_t>(16ull, bytes);
   buf_rec& b = g_vkrt.bufs[buf_id];
 
@@ -559,12 +566,19 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
 
     std::vector<uint8_t> init_pad;
     D3D11_SUBRESOURCE_DATA init{};
-    if (data && bytes) {
+    // Prefer UpdateSubresource over a full-size init_pad copy (the
+    // transient 3rd copy of every buffer). Fall back to init data
+    // only if no immediate context is available.
+    if (data && bytes && !g_vkrt.ctx) {
       init_pad.assign(bd.ByteWidth, 0);
       memcpy(init_pad.data(), data, (size_t)std::min<uint64_t>(bytes, bd.ByteWidth));
       init.pSysMem = init_pad.data();
     }
     g_vkrt.dev->CreateBuffer(&bd, init.pSysMem ? &init : nullptr, &b.buf);
+    if (b.buf && data && bytes && g_vkrt.ctx && !init.pSysMem) {
+      D3D11_BOX box{0, 0, 0, (UINT)std::min<uint64_t>(bytes, bd.ByteWidth), 1, 1};
+      g_vkrt.ctx->UpdateSubresource(b.buf, 0, &box, data, 0, 0);
+    }
 
     if (b.buf && (bind_flags & D3D11_BIND_SHADER_RESOURCE)) {
       D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
@@ -587,13 +601,22 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
       cbd.ByteWidth = (UINT)std::min<uint64_t>((sz + 15ull) & ~15ull, 65536ull);
       cbd.Usage = D3D11_USAGE_DEFAULT;
       cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-      if (data && bytes) {
+      if (data && bytes && !g_vkrt.ctx) {
         init_pad.assign(cbd.ByteWidth, 0);
         memcpy(init_pad.data(), data, (size_t)std::min<uint64_t>(bytes, cbd.ByteWidth));
         init.pSysMem = init_pad.data();
         g_vkrt.dev->CreateBuffer(&cbd, &init, &b.cb);
       } else {
         g_vkrt.dev->CreateBuffer(&cbd, nullptr, &b.cb);
+        if (b.cb && data && bytes && g_vkrt.ctx) {
+          if (bytes >= cbd.ByteWidth) {
+            g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, data, 0, 0);
+          } else {
+            std::vector<uint8_t> pad(cbd.ByteWidth, 0);
+            memcpy(pad.data(), data, (size_t)bytes);
+            g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, pad.data(), 0, 0);
+          }
+        }
       }
     }
   } else if (data && bytes && g_vkrt.ctx) {
@@ -676,7 +699,15 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Format = tex_fmt;
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-      if (SUCCEEDED(g_vkrt.dev->CreateTexture3D(&td, nullptr, &im.tex3d)) && im.tex3d) {
+      HRESULT hr3d = g_vkrt.dev->CreateTexture3D(&td, nullptr, &im.tex3d);
+      if (FAILED(hr3d)) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "[vk_backend] CreateTexture3D failed vk_fmt=%u dxgi=%u %ux%ux%u mips=%u bind=0x%x hr=0x%08x",
+                 desc->vk_format, (unsigned)tex_fmt, td.Width, td.Height, td.Depth, mips, bind_flags, (unsigned)hr3d);
+        trt_core_log(buf);
+      }
+      if (SUCCEEDED(hr3d) && im.tex3d) {
         if (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
           g_vkrt.dev->CreateShaderResourceView(im.tex3d, nullptr, &im.srv);
         }
@@ -708,6 +739,47 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
                  "[vk_backend] CreateTexture2D failed vk_fmt=%u dxgi=%u %ux%u mips=%u layers=%u bind=0x%x hr=0x%08x rem=0x%08x",
                  desc->vk_format, (unsigned)tex_fmt, td.Width, td.Height, mips, layers, bind_flags, (unsigned)hr, (unsigned)rem);
         trt_core_log(buf);
+        // First-failure census: is this app memory, device memory, or a leak?
+        static bool tex_oom_diag_done = false;
+        if (!tex_oom_diag_done) {
+          tex_oom_diag_done = true;
+          MEMORYSTATUSEX ms{};
+          ms.dwLength = sizeof(ms);
+          GlobalMemoryStatusEx(&ms);
+          size_t n_img = g_vkrt.imgs.size(), n_buf = g_vkrt.bufs.size(), n_pipe = g_vkrt.pipes.size();
+          uint64_t sum_buf = 0, sum_img = 0;
+          for (const auto& kv : g_vkrt.bufs) sum_buf += kv.second.bytes;
+          for (const auto& kv : g_vkrt.imgs) sum_img += (uint64_t)kv.second.desc.w * kv.second.desc.h * 4;
+          char db[512];
+          snprintf(db, sizeof(db),
+                   "[vk_backend] TEX-OOM-DIAG avail_phys=%lluMB total_phys=%lluMB imgs=%zu(~%lluMB) bufs=%zu(%lluMB) pipes=%zu",
+                   (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
+                   n_img, (unsigned long long)(sum_img >> 20), n_buf, (unsigned long long)(sum_buf >> 20), n_pipe);
+          trt_core_log(db);
+          // Video-memory budget vs usage, via the adapter (IDXGIAdapter3
+          // owns QueryVideoMemoryInfo; it is not a device method).
+          IDXGIDevice* dxgi_dev = nullptr;
+          if (g_vkrt.dev && SUCCEEDED(g_vkrt.dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev)) && dxgi_dev) {
+            IDXGIAdapter* adapter = nullptr;
+            if (SUCCEEDED(dxgi_dev->GetAdapter(&adapter)) && adapter) {
+              IDXGIAdapter3* adapter3 = nullptr;
+              if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter3)) && adapter3) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
+                if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) {
+                  char vb[256];
+                  snprintf(vb, sizeof(vb),
+                           "[vk_backend] TEX-OOM-DIAG video LOCAL budget=%lluMB usage=%lluMB avail=%lluMB",
+                           (unsigned long long)(vmi.Budget >> 20), (unsigned long long)(vmi.CurrentUsage >> 20),
+                           (unsigned long long)(vmi.AvailableForReservation >> 20));
+                  trt_core_log(vb);
+                }
+                adapter3->Release();
+              }
+              adapter->Release();
+            }
+            dxgi_dev->Release();
+          }
+        }
       }
       if (SUCCEEDED(hr) && im.tex2d) {
         if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {

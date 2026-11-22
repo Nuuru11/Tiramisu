@@ -2025,6 +2025,8 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
                (unsigned long long)g_wa_timed_out.load(std::memory_order_relaxed));
       wrc = ::write(2, wl, strlen(wl));
       (void)wrc;
+#else
+      trt_core_log(line);
 #endif
       trt_cs_stall_probe_pause();
     }

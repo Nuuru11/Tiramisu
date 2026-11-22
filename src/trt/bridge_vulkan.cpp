@@ -142,6 +142,7 @@ static constexpr i32 VK_EVENT_RESET_V = 4;
 static constexpr i32 VK_INCOMPLETE_V = 5;
 static constexpr i32 VK_ERROR_OUT_OF_HOST_MEMORY_V = -1;
 static constexpr i32 VK_ERROR_OUT_OF_DEVICE_MEMORY_V = -2;
+static constexpr i32 VK_ERROR_MEMORY_MAP_FAILED_V = -8;
 static constexpr i32 VK_ERROR_INITIALIZATION_FAILED_V = -3;
 static constexpr i32 VK_ERROR_EXTENSION_NOT_PRESENT_V = -7;
 static constexpr i32 VK_ERROR_FEATURE_NOT_PRESENT_V = -8;
@@ -649,15 +650,20 @@ static bool write_buf_mem(vk_device_obj* d, u64 bid, u64 off, const void* src, s
   const auto& b = bit->second;
   if (!b.mem_id || !d->mems.count(b.mem_id)) return false;
   auto& m = d->mems[b.mem_id];
-  if (m.data.size() < m.size && m.size > 0) {
+  u64 pos = b.mem_off + off;
+  if (off >= b.size) return false;
+  // Grow-to-need: never allocate the whole block for a small write
+  // (a 256MB device-local block used to cost a 256MB host vector).
+  u64 need = pos + (u64)bytes;
+  if (need > m.size) need = m.size;
+  if (m.data.size() < need && need > 0) {
     try {
-      m.data.resize((size_t)std::max<u64>(m.size, 16u));
+      m.data.resize((size_t)std::max<u64>(need, 16u));
     } catch (...) {
       return false;
     }
   }
-  u64 pos = b.mem_off + off;
-  if (pos >= m.data.size() || off >= b.size) return false;
+  if (pos >= m.data.size()) return false;
   size_t avail = (size_t)std::min<u64>({(u64)bytes, b.size - off, (u64)(m.data.size() - pos)});
   if (!avail) return false;
   memcpy(m.data.data() + pos, src, avail);
@@ -1759,14 +1765,21 @@ void TRT_GUEST_ABI trt_vkFreeMemory(void* dev_v, u64 mem, const void*) {
     d->mems.erase(mem);
   }
 }
-i32 TRT_GUEST_ABI trt_vkMapMemory(void* dev_v, u64 mem, u64 offset, u64, u32, void** ppData) {
+i32 TRT_GUEST_ABI trt_vkMapMemory(void* dev_v, u64 mem, u64 offset, u64 size, u32, void** ppData) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
   if (!d || !d->mems.count(mem) || !ppData) return VK_ERROR_OUT_OF_DEVICE_MEMORY_V;
   auto& m = d->mems[mem];
-  if (m.data.size() < m.size && m.size > 0) {
+  // Device-local memory (type 0) is not host-visible: mapping it is an
+  // application error in real Vulkan. Refuse instead of allocating a
+  // whole-block host vector for a map that must never happen.
+  if (m.mem_type == 0) return VK_ERROR_MEMORY_MAP_FAILED_V;
+  // Grow-to-need: map only the requested range (VK_WHOLE_SIZE = to end).
+  u64 need = (size == ~0ULL) ? m.size : offset + size;
+  if (need > m.size) need = m.size;
+  if (m.data.size() < need && need > 0) {
     try {
-      m.data.resize((size_t)std::max<u64>(m.size, 16u));
+      m.data.resize((size_t)std::max<u64>(need, 16u));
     } catch (...) {
       return VK_ERROR_OUT_OF_HOST_MEMORY_V;
     }
