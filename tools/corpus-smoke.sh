@@ -26,6 +26,7 @@ mkdir -p "$cobj"
 "$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$cobj/miniz_tinfl.o" || exit 1
 "$CLANG" -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$cobj/mojo_hlsl.o" || exit 1
 "$CLANG" -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$cobj/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO || exit 1
+"$CLANG" -O2 -Wall -fno-pie -c src/trt/vendor_dr_mp3.c -o "$cobj/vendor_dr_mp3.o" || exit 1
 
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_corpus.cpp \
@@ -40,7 +41,8 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
   src/trt/bridge_gdiplus.cpp src/trt/bridge_nvapi.cpp src/trt/bridge_res.cpp src/trt/bridge_fmod.cpp src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
-  "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" "$cobj/vendor_stb_vorbis.o" \
+  src/trt/bridge_dstorage.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
+  "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" "$cobj/vendor_stb_vorbis.o" "$cobj/vendor_dr_mp3.o" \
   -o "$out/test_corpus" || exit 1
 
 # --- collect every PE under corpus-local/ (up to depth 2) ---

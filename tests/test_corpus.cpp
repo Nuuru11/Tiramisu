@@ -868,6 +868,7 @@ int run_corpus(int argc, char** argv) {
     // Calling it must post a clean guest quit — the real Go Next failed boot
     // ended at the old fail-visible STUB for this exact symbol.
     void* cor = trt_resolve_module(nullptr, "mscoree.dll", "CorExitProcess", 0);
+    if (cor) ((void(TRT_STDCALL *)(int))cor)(7);
     if (!cor || !trt_bridge_quit_posted()) {
       printf("MSCOREE SELFTEST FAIL: CorExitProcess did not post clean quit\n");
       return 1;
