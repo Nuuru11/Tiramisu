@@ -198,6 +198,16 @@
       "note": "Real console Sekiro failure: required game data (Z:\\S\\pack.dat) is not staged. Cannot be fixed by a bridge \u2014 stage the file; named, never hidden",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "vulkan-present-stall-named",
+      "match": [
+        "vkQueuePresentKHR frame=1",
+        "No loader found for resource"
+      ],
+      "note": "Real console ultrapool: one frame presents then stalls while Godot fails to load res://sticker.png \u2014 missing/incomplete staged content, named not hidden",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }
