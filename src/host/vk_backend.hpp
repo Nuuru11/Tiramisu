@@ -20,6 +20,10 @@
 #include <map>
 #include <vector>
 
+// Guest memory-budget ledger (bridge_membudget.cpp); declared extern "C"
+// here as in main.cpp:1034 / bridge_kernel32.cpp:75.
+extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+
 namespace vk_rt {
 
 struct pipe_rec {
@@ -756,6 +760,14 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
                    (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
                    n_img, (unsigned long long)(sum_img >> 20), n_buf, (unsigned long long)(sum_buf >> 20), n_pipe);
           trt_core_log(db);
+          // Guest ledger at the OOM point: the decisive H1 vs H2 line.
+          // ledger ~=300-800MB => the 3.8GB video usage is the consumer
+          // (H1); ledger ~=3.9GB => Godot's heap is the consumer (H2).
+          char db2[512];
+          trt_mem_budget_report(db2, sizeof(db2));
+          char db2p[640];
+          snprintf(db2p, sizeof(db2p), "[vk_backend] TEX-OOM-DIAG ledger: %s", db2);
+          trt_core_log(db2p);
           // Video-memory budget vs usage, via the adapter (IDXGIAdapter3
           // owns QueryVideoMemoryInfo; it is not a device method).
           IDXGIDevice* dxgi_dev = nullptr;

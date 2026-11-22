@@ -277,7 +277,7 @@ void* resolve_through_table(void* user, const char* module,
             // console DLL means the bridge lacks it — the _fseeki64 class
             // of gap. Rate-limited so import-heavy loads don't flood.
             static unsigned s_fallback_logged = 0;
-            if (s_fallback_logged < 32) {
+            if (s_fallback_logged < 128) {
               ++s_fallback_logged;
               char fb[256];
               snprintf(fb, sizeof(fb), "modtrace: fallback %s!%s -> system (no bridge impl)",

@@ -391,6 +391,34 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   r.feature_level = g_fl;
   g_device = dev.as<ID3D11Device1>();
   g_ctx = ctx.as<ID3D11DeviceContext1>();
+  // Video-memory baseline at boot: is the 3.8GB video usage seen in
+  // TEX-OOM-DIAG (ultrapool) a driver/system reservation, or game-
+  // allocated? Logged once at device creation, before any game runs.
+  // If boot-time usage is already GBs, the video number is driver/
+  // system memory, not the game (and H2 becomes the lead).
+  {
+    IDXGIDevice* dxgi_dev0 = nullptr;
+    if (dev && SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev0)) && dxgi_dev0) {
+      IDXGIAdapter* adapter0 = nullptr;
+      if (SUCCEEDED(dxgi_dev0->GetAdapter(&adapter0)) && adapter0) {
+        IDXGIAdapter3* adapter30 = nullptr;
+        if (SUCCEEDED(adapter0->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter30)) && adapter30) {
+          DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
+          if (SUCCEEDED(adapter30->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) {
+            char vb[256];
+            snprintf(vb, sizeof(vb),
+                     "[swapchain] VIDEO-BASELINE budget=%lluMB usage=%lluMB avail=%lluMB",
+                     (unsigned long long)(vmi.Budget >> 20), (unsigned long long)(vmi.CurrentUsage >> 20),
+                     (unsigned long long)(vmi.AvailableForReservation >> 20));
+            log_line(vb);
+          }
+          adapter30->Release();
+        }
+        adapter0->Release();
+      }
+      dxgi_dev0->Release();
+    }
+  }
 
   winrt::com_ptr<IDXGIDevice1> dxgi_dev;
   g_device.as(dxgi_dev);

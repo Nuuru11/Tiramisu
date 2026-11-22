@@ -657,6 +657,15 @@ static bool write_buf_mem(vk_device_obj* d, u64 bid, u64 off, const void* src, s
   u64 need = pos + (u64)bytes;
   if (need > m.size) need = m.size;
   if (m.data.size() < need && need > 0) {
+    if (need > (16ull << 20)) {
+      char gb[192];
+      snprintf(gb, sizeof(gb),
+               "[vulkan] write_buf_mem GROW mem=%llu type=%u need=%lluMB (was %zuMB)",
+               (unsigned long long)m.id, m.mem_type,
+               (unsigned long long)(need >> 20),
+               (size_t)(m.data.size() >> 20));
+      trt_core_log(gb);
+    }
     try {
       m.data.resize((size_t)std::max<u64>(need, 16u));
     } catch (...) {
