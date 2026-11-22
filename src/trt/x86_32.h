@@ -42,6 +42,11 @@ int trt_x86_mem_write(trt_x86_ctx* c, u32 va, u32 len, const void* in);
 // PE32 import traps are dispatched by name (trt_pe32_trap_info) and return a
 // truthful zero — never a silent success. Returns 0 on HLT, 1 on named trap
 // stop, 2 on fault. Out params receive the final EAX and the last trap name.
+// Install the resolver used to dispatch 32-bit import traps to host bridges.
+// The PE32 mapper's resolver is the source of truth; traps must use the same
+// one rather than guessing from the module table.
+void trt_x86_set_resolver(const trt_resolver* rs);
+
 int trt_x86_run_image(struct trt_image* img, u32 entry_va,
                       u32 stack_size, u64 max_instructions,
                       u32* out_eax, char* trap_out, size_t trap_cap);

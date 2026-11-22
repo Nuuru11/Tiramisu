@@ -13,7 +13,27 @@ namespace {
 
 struct trap_ctx {
   char last[160];
+  trt_x86_ctx* c;
 };
+
+static trt_resolver g_trap_rs{};
+
+typedef u64 (*host_call4)(u64, u64, u64, u64);
+
+// A normal C call passes the first four integer args in the platform's ABI
+// registers (Win64: rcx/rdx/r8/r9; SysV: rdi/rsi/rdx/rcx), so the compiler
+// handles the 32->64 widening for us. The 32-bit guest's arguments live on
+// its stack: [esp] is the return address, [esp+4..] the arguments.
+u64 call_host_bridge(u64 fn, trt_x86_ctx* c) {
+  u64 args[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; ++i) {
+    u32 v = 0;
+    if (!trt_x86_mem_read(c, c->r[X86_ESP] + 4u + 4u * (u32)i, 4, &v)) {
+      args[i] = v;  // zero-extended, like a 32-bit push
+    }
+  }
+  return ((host_call4)fn)(args[0], args[1], args[2], args[3]);
+}
 
 int image_trap(trt_x86_ctx* c, u32 va, void* user) {
   trap_ctx* t = (trap_ctx*)user;
@@ -26,13 +46,27 @@ int image_trap(trt_x86_ctx* c, u32 va, void* user) {
                        &trap_va);
     snprintf(t->last, sizeof(t->last), "%s!%s", mod, sym);
     char line[256];
-    snprintf(line, sizeof(line),
-             "x86-32: NAMED trap %s!%s -> 0 (no 32-bit bridge call yet)",
-             mod, sym);
+    snprintf(line, sizeof(line), "x86-32: trap %s!%s", mod, sym);
     trt_core_log(line);
-    // cdecl/stdcall: a 32-bit return value lives in EAX; leave it zero.
-    c->r[X86_EAX] = 0;
-    c->eip += 4;  // the trap VA is one 4-byte call target
+
+    // Resolve the SAME function the 64-bit loader would use, then call it
+    // with the guest's 32-bit stack arguments widened to 64 bits.
+    void* fn = g_trap_rs.resolve
+                  ? g_trap_rs.resolve(g_trap_rs.user, mod, sym, ord)
+                  : trt_resolve_module(nullptr, mod, sym, ord);
+    u32 ret_va = 0;
+    trt_x86_mem_read(c, c->r[X86_ESP], 4, &ret_va);
+    if (!fn) {
+      snprintf(t->last, sizeof(t->last), "%s!%s (unresolved -> 0)", mod, sym);
+      c->r[X86_EAX] = 0;
+    } else {
+      u64 r = call_host_bridge((u64)fn, c);
+      c->r[X86_EAX] = (u32)r;
+      snprintf(t->last, sizeof(t->last), "%s!%s -> %u", mod, sym,
+               (unsigned)(u32)r);
+    }
+    c->r[X86_ESP] += 4;
+    c->eip = ret_va;  // the guest's own return address, never a guess
     return 0;
   }
   snprintf(t->last, sizeof(t->last), "out-of-window 0x%08x", va);
@@ -43,6 +77,10 @@ int image_trap(trt_x86_ctx* c, u32 va, void* user) {
 }
 
 }  // namespace
+
+void trt_x86_set_resolver(const trt_resolver* rs) {
+  if (rs) g_trap_rs = *rs;
+}
 
 int trt_x86_run_image(trt_image* img, u32 entry_va, u32 stack_size,
                       u64 max_instructions, u32* out_eax,
@@ -67,6 +105,7 @@ int trt_x86_run_image(trt_image* img, u32 entry_va, u32 stack_size,
   c.r[X86_EBP] = c.r[X86_ESP];
 
   trap_ctx t{};
+  t.c = &c;
   c.trap = &image_trap;
   c.trap_user = &t;
 

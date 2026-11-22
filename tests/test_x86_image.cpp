@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -40,15 +41,21 @@ static int be_protect(void* p, size_t n, unsigned prot) {
 static void be_release(void* p, size_t n) { munmap(p, n); }
 static void be_log(const char* line) { (void)line; }
 static trt_backend be{be_alloc, be_protect, be_release, be_log, nullptr};
-static void* rs_resolve(void*, const char*, const char*, u16) { return nullptr; }
+static u64 test_bridge(u64, u64, u64, u64) { return 42; }
+static void* rs_resolve(void*, const char* mod, const char* sym, u16) {
+  if (mod && sym && !strcasecmp(mod, "testdll.dll") && !strcasecmp(sym, "TestFn"))
+    return (void*)&test_bridge;
+  return nullptr;
+}
 static trt_resolver rs{nullptr, rs_resolve};
 
 static void put16(u8* p, u16 v) { memcpy(p, &v, 2); }
 static void put32(u8* p, u32 v) { memcpy(p, &v, 4); }
 
-// Minimal PE32: one .text section at RVA 0x1000, entry = mov eax,7 ; hlt.
+// Minimal PE32: one .text section at RVA 0x1000 with one import. Entry calls
+// [IAT] -> testdll.dll!TestFn, whose host bridge returns 42; then HLT.
 static size_t make_pe32(u8* out) {
-  memset(out, 0, 0x400);
+  memset(out, 0, 0x600);
   out[0] = 'M'; out[1] = 'Z';
   put32(out + 0x3c, 0x40);
   u8* pe = out + 0x40;
@@ -66,23 +73,34 @@ static size_t make_pe32(u8* out) {
   put32(opt + 60, 0x200);           // SizeOfHeaders
   put16(opt + 68, 3); put16(opt + 70, 0);  // subsystem = console
   put32(opt + 92, 16);              // NumberOfRvaAndSizes
-  // import dir (index 1) left empty: no imports, so no traps
+  put32(opt + 96 + 8, 0x1300);      // import directory RVA
+  put32(opt + 96 + 12, 20);         // import directory size
   u8* sec = opt + 224;
   memcpy(sec, ".text\0\0", 8);
-  put32(sec + 8, 0x200);            // VirtualSize
+  put32(sec + 8, 0x400);            // VirtualSize
   put32(sec + 12, 0x1000);          // VirtualAddress
-  put32(sec + 16, 0x200);           // SizeOfRawData
+  put32(sec + 16, 0x400);           // SizeOfRawData
   put32(sec + 20, 0x200);           // PointerToRawData
   put32(sec + 36, 0x60000020);      // code | execute | read
   u8* code = out + 0x200;
-  code[0] = 0xb8; put32(code + 1, 7);
-  code[5] = 0xf4;                   // hlt
-  return 0x400;
+  code[0] = 0xff; code[1] = 0x15; put32(code + 2, 0x10001360u);  // call [guest-VA IAT]
+  code[6] = 0xf4;                   // hlt
+
+  // Import descriptor at RVA 0x1300 (file 0x300).
+  u8* imp = out + 0x500;
+  put32(imp + 0, 0x1320);   // OriginalFirstThunk
+  put32(imp + 12, 0x1380);  // Dll name RVA
+  put32(imp + 16, 0x1360);  // FirstThunk / IAT
+  put32(out + 0x520, 0x1340);                      // INT slot -> hint/name
+  put16(out + 0x540, 0); memcpy(out + 0x542, "TestFn", 7);  // hint/name
+  memcpy(out + 0x580, "testdll.dll", 12);                   // dll name
+  put32(out + 0x560, 0x1340);                      // IAT initially -> hint/name
+  return 0x600;
 }
 
 int main() {
   trt_runtime_init(&be, "");
-  u8 file[0x400];
+  u8 file[0x600];
   size_t n = make_pe32(file);
 
   trt_image* img = nullptr;
@@ -92,12 +110,15 @@ int main() {
   CHECK(img->is_pe32 == 1, "image flagged PE32");
   CHECK(img->entry_rva == 0x1000, "entry RVA parsed from PE32 header");
 
+    trt_x86_set_resolver(&rs);
   u32 eax = 0;
   char trap[160] = "";
   rc = trt_x86_run_image(img, img->guest_base + (u32)img->entry_rva,
                          0x10000, 64, &eax, trap, sizeof(trap));
   CHECK(rc == 0, "PE32 entry ran to HLT through the interpreter");
-  CHECK(eax == 7, "PE32 entry produced EAX=7 from real x86-32 code");
+  CHECK(eax == 42, "PE32 import trap called the real host bridge (EAX=42)");
+  CHECK(strstr(trap, "testdll.dll!TestFn") != nullptr,
+        "trap dispatched by exact dll!symbol name");
 
   trt_images_reset();
   printf("  result: %s\n", fails ? "FAIL" : "ALL PASS");

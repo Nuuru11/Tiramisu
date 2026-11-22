@@ -57,6 +57,11 @@ int decode_modrm(decoder& d, modrm_t& m) {
     }
   } else {
     base = m.rm;
+    // mod=00 rm=101 is disp32 with NO base register (not [ebp]).
+    if (m.mod == 0 && m.rm == 5) {
+      disp = d.d32();
+      base = -1;
+    }
   }
   if (m.mod == 1) disp = (u32)(i8)d.byte();
   else if (m.mod == 2) disp = d.d32();
@@ -205,7 +210,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
                    op == 0x03 || op == 0x29 || op == 0x2b ||
                    op == 0x31 || op == 0x33 || op == 0x39 ||
                    op == 0x3b || op == 0x85 || op == 0xc7 ||
-                   op == 0x8d || op == 0x83) {
+                   op == 0x8d || op == 0x83 || op == 0xff) {
           modrm_t m; decode_modrm(d, m);
           if (d.fault) { c->stop_code = op_va; return 2; }
           u32 a = read_rm(d, m), b = c->r[m.reg], res = 0;
@@ -224,6 +229,16 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
             case 0x85: set_logic_flags(c, a & b); break;       // test
             case 0x8d: c->r[m.reg] = m.va; break;              // lea
             case 0xc7: res = d.i32(); write_rm(d, m, res); break;
+            case 0xff: {                            // group-5 call/jmp r/m32
+              if (m.reg == 2) {                     // call near r/m32
+                u32 sp = c->r[X86_ESP] - 4;
+                if (trt_x86_mem_write(c, sp, 4, &c->eip)) { c->stop_code = sp; return 2; }
+                c->r[X86_ESP] = sp;
+                c->eip = a;
+              } else if (m.reg == 4) {              // jmp near r/m32
+                c->eip = a;
+              } else { c->stop_code = op_va; return 2; }
+              break; }
             case 0x83: { u8 imm = d.byte();                    // group-1 imm8
               if (m.reg == 0) { res = a + (u32)(i8)imm; write_rm(d, m, res); set_add_flags(c, a, (u32)(i8)imm, res); }
               else if (m.reg == 5) { res = a - (u32)(i8)imm; write_rm(d, m, res); set_sub_flags(c, a, (u32)(i8)imm, res); }
