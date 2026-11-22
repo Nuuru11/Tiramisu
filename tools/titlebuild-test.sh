@@ -28,6 +28,8 @@ for d in corpus-local/*/; do
       grep -q '^engine: *unity-il2cpp' <<<"$out" || { echo "FAIL engine detection: $d"; rc=1; } ;;
     botw-native)
       grep -q '^engine: *godot-sdl3' <<<"$out" || { echo "FAIL engine detection: $d"; rc=1; } ;;
+    sekiro)
+      grep -q '^engine: *fromsoftware' <<<"$out" || { echo "FAIL engine detection: $d"; rc=1; } ;;
   esac
   if [[ $r -gt 1 || -z "$verdict" ]]; then
     echo "FAIL $d: expected a measured verdict (got exit $r)"; sed 's/^/    /' <<<"$out"; rc=1

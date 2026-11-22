@@ -155,6 +155,14 @@ ENGINE_SIGNATURES = [
      {'default_input': 'controller', 'frame_rate_cap': 60}),
     ('fna-mono', ('fna.dll', 'mono.dll'),
      {'default_input': 'controller', 'frame_rate_cap': 60}),
+    # Real staged titles on the Series S: ultrapool ships libgodotsteam,
+    # Sekiro ships Bink + FMOD Ex + Steam. Both are measured signatures.
+    ('godot-steam', ('libgodotsteam.windows.template_release.x86_64.dll',),
+     {'default_input': 'controller', 'frame_rate_cap': 60,
+      'vsync': 1}),
+    ('fromsoftware', ('bink2w64.dll', 'fmodex64.dll', 'steam_api64.dll'),
+     {'default_input': 'controller', 'memory_budget_mb': 4096,
+      'frame_rate_cap': 60}),
 ]
 
 
