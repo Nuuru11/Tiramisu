@@ -103,13 +103,26 @@ int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
   trt_x86_ctx c{};
   c.mem = mem; c.mem_va = img->guest_base; c.mem_size = (u32)total;
   c.eip = entry_va;
-  // 32-bit Windows: FS:0x18 is the TEB self-pointer, FS:0x28 the stack guard.
+  // 32-bit Windows process model: FS -> TEB with a real SEH chain, stack
+  // bounds, self pointer and stack guard. CRT thunks walk FS:[0] and read
+  // TEB stack fields; a zeroed page makes them return through garbage.
   c.fs_base = img->guest_base + isz + stack_size + 0x1000;
   {
+    const u32 stack_top = img->guest_base + isz + stack_size;
+    const u32 stack_bot = img->guest_base + isz;
     u32 self = c.fs_base;
     u32 guard = 0x0abbccddu;
-    trt_x86_mem_write(&c, c.fs_base + 0x18, 4, &self);
-    trt_x86_mem_write(&c, c.fs_base + 0x28, 4, &guard);
+    u32 endchain = 0xffffffffu;
+    // EXCEPTION_REGISTRATION_RECORD just below the TEB.
+    const u32 seh_rec = c.fs_base - 16;
+    u32 handler = 0xfffffff0u;  // sentinel: a guest SEH dispatch is named
+    trt_x86_mem_write(&c, seh_rec, 4, &endchain);
+    trt_x86_mem_write(&c, seh_rec + 4, 4, &handler);
+    trt_x86_mem_write(&c, c.fs_base + 0x00, 4, &seh_rec);   // ExceptionList
+    trt_x86_mem_write(&c, c.fs_base + 0x04, 4, &stack_top); // StackBase
+    trt_x86_mem_write(&c, c.fs_base + 0x08, 4, &stack_bot); // StackLimit
+    trt_x86_mem_write(&c, c.fs_base + 0x18, 4, &self);      // Self
+    trt_x86_mem_write(&c, c.fs_base + 0x28, 4, &guard);     // guard cookie
   }
   const u32 sp = img->guest_base + isz + stack_size - 64;
   c.r[X86_ESP] = sp;

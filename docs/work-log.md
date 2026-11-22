@@ -32,6 +32,11 @@ Entries are appended as work lands; every claim points at a gate or a file.
   added missing build-list entries; full gate links with 0 undefined refs,
   `CORPUS: 40 ok, 0 failed`, final `RESULT: ALL PASS`.
 
+## 2026-11-23 — fuller PE32 process model
+- `trt_x86_run_cdecl` now seeds a real 32-bit TEB: ExceptionList chain,
+  StackBase/StackLimit, Self pointer, stack guard. Gates stay green; binkw32
+  still returns through its inherited EBP (exact wrapper at 0x2240 analyzed).
+
 ## Current named gaps (not hidden)
 1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
    cdecl frame does not provide; needs fuller process/SEH setup.
