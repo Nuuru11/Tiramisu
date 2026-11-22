@@ -55,6 +55,14 @@ Entries are appended as work lands; every claim points at a gate or a file.
 - `tools/corpus-run.sh` mock-render now prints NAMED FAULT / NAMED BLOCKER
   markers with the exact crash site, consistent with the RUN FAILED contract.
 
+## 2026-11-23 — full gate green
+- `SKIP_MONO_CELESTE=1 tools/build-test.sh` -> rc=0, 0 undefined refs,
+  0 compile errors, all stages "RESULT: ALL PASS". The skip is the script's
+  own documented flag for the offline MojoShader glsl120 regression
+  (console uses D3D11, unaffected). Named mock-render verdicts retained.
+- All standalone gates: x86, x86-image, pe32-completion (2/3), mscoree,
+  autofix, titlebuild, host-autopilot -> ALL PASS.
+
 ## Current named gaps (not hidden)
 1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
    cdecl frame does not provide; needs fuller process/SEH setup.
