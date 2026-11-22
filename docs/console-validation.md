@@ -26,6 +26,13 @@ from 10.0.0.23) matched these real signatures:
 `vulkan-present-stall-named`, `godot-resource-named`, `dstorage-missing-named`,
 `mscoree-stub-named` — all named work items, no hidden gaps.
 
+## D3D12 host hook regression check (build 0.2.2.200)
+
+Packed and deployed the build carrying the D3D12 host submit hook to the
+Series S, relaunched ultrapool: `vkQueuePresentKHR frame=1` still appears, so
+the D3D11/Vulkan path is unaffected. No D3D12 title is staged, so the submit
+hook itself is only gated offline (triangle gate: HOST SUBMIT PASS).
+
 ## What is proven on hardware
 
 - Signed `Xan.Tiramisu_0.2.2.192` is installed and launches via Device Portal.
