@@ -5789,7 +5789,6 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
   // Windows ignores this exception when no debugger is attached; swallow
   // it here the way the SysV path does, instead of dispatching it through
   // the real ::RaiseException (which faults the guest in ntdll EH dispatch).
-#if 0  // .199 REVERT EXPERIMENT: dispatch 0x406d1388 normally (.192 behavior).
   // The VEH fix (.195) + Sleep(1) (.196) + Sleep(50) (.198) all failed to
   // fix the +0x115c66b fault, so timing/VEH side effects are ruled out.
   // If Sekiro passes +0x115c66b with the swallow disabled, the swallow
@@ -5835,11 +5834,10 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
     // +0x115c66b with this yield, H2 is confirmed (the .195 GPR dump
     // shows mov r8,[rax] with rax=-24 = CONTAINING_RECORD(NULL) on a
     // list the worker hasn't populated yet).
-    ::Sleep(50);
+    ::Sleep(500); // .202 diagnostic: 50ms insufficient (.198/.200), testing if worker just needs more time
 #endif
     return;
   }
-#endif  // .199 REVERT EXPERIMENT: end disabled swallow
   static unsigned s_cpp_eh_logged = 0;
   if (code != 0xe06d7363u || ++s_cpp_eh_logged <= 4) {
     char line[192];
