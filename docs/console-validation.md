@@ -18,6 +18,14 @@ The log shows `guest fault: 0xc0000005 at sekiro.exe+0x115c66b ... read address
 FFFFFFFFFFFFFFE8` followed by the GPR/stack dump and a clean return to shelf.
 Extracted as `tests/fixtures/logs/real-console-seh-contained.log`.
 
+## Live autofix match on a real console log
+
+`python3 tools/autofix.py <tmp> logs/20261122-063452-tiramisu.log` (pulled live
+from 10.0.0.23) matched these real signatures:
+`sekiro-invalid-pointer-named`, `missing-game-data-named`,
+`vulkan-present-stall-named`, `godot-resource-named`, `dstorage-missing-named`,
+`mscoree-stub-named` — all named work items, no hidden gaps.
+
 ## What is proven on hardware
 
 - Signed `Xan.Tiramisu_0.2.2.192` is installed and launches via Device Portal.
