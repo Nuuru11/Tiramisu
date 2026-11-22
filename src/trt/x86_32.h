@@ -51,6 +51,14 @@ int trt_x86_run_image(struct trt_image* img, u32 entry_va,
                       u32 stack_size, u64 max_instructions,
                       u32* out_eax, char* trap_out, size_t trap_cap);
 
+// Like trt_x86_run_image but sets up a cdecl call with up to three 32-bit
+// arguments (DllMain/TLS convention: hinstance, reason, reserved) and a
+// sentinel return address, so a normal `ret` ends the run cleanly.
+// Returns 0 on a HLT, 1 on the sentinel RET (stop_code == 0x100), 2 on fault.
+int trt_x86_run_cdecl(struct trt_image* img, u32 entry_va,
+                      const u32 args[3], u64 max_instructions,
+                      u32* out_eax);
+
 #ifdef __cplusplus
 }
 #endif

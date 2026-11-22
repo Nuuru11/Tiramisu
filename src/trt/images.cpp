@@ -3,6 +3,7 @@
 #include "images.h"
 #include "pe_exports.h"
 #include "thunk.h"
+#include "x86_32.h"
 
 #include <mutex>
 #include <stdio.h>
@@ -558,21 +559,39 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
     return nullptr;
   }
 
-  // M7 Phase 1: 32-bit code cannot run natively (no x86 engine yet).
-  // A PE32 image's TLS callbacks / DllMain are collected at map time
-  // and deferred to the Phase 2 emulator — calling them through
-  // trt_call_guest_img (a 64-bit call) would execute 32-bit bytes as
-  // 64-bit code. Skip, loudly; load-only in Phase 1.
-  if (img->is_pe32) {
+  // PE32 code runs through the clean-room x86 interpreter. In load-only mode
+  // (corpus dry-run) nothing executes, exactly like the PE64 path.
+  if (img->is_pe32 && !g_run_image_code) {
     char line[320];
     snprintf(line, sizeof(line),
-             "trt: %s is PE32: entry/TLS deferred to the M7 emulator "
-             "(Phase 2); load-only in Phase 1",
+             "trt: %s is PE32: load-only (x86 engine armed, code not run)",
              base);
     trt_core_log(line);
   }
-  // TLS callbacks, then the entry point (DllMain for a DLL) — skipped in
-  // load-only mode (corpus dry-run proves binding without executing code)
+  // TLS callbacks, then the entry point (DllMain for a DLL).
+  if (img->is_pe32 && g_run_image_code) {
+    const u32 hinst = img->guest_base;
+    for (int i = 0; i < img->tls_callback_count; ++i) {
+      const u32 args[3] = {hinst, 1, 0};
+      const u32 cb_va = img->guest_base + (u32)img->tls_callback_rvas[i];
+      u32 eax = 0;
+      const int rc = trt_x86_run_cdecl(img, cb_va, args, 200000, &eax);
+      char line[288];
+      snprintf(line, sizeof(line),
+               "trt: PE32 TLS callback %d on %s rc=%d eax=%u", i, base, rc, eax);
+      trt_core_log(line);
+    }
+    if (run_entry && img->entry_rva) {
+      const u32 args[3] = {hinst, 1u, 0};  // DLL_PROCESS_ATTACH
+      u32 eax = 0;
+      const int rc = trt_x86_run_cdecl(
+          img, img->guest_base + (u32)img->entry_rva, args, 1000000, &eax);
+      char line[320];
+      snprintf(line, sizeof(line),
+               "trt: PE32 %s entry call rc=%d eax=%u", base, rc, eax);
+      trt_core_log(line);
+    }
+  }
   if (!img->is_pe32 && g_run_image_code)
     for (int i = 0; i < img->tls_callback_count; ++i) {
       void* cb = img->base + img->tls_callback_rvas[i];

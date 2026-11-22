@@ -120,6 +120,18 @@ int main() {
   CHECK(strstr(trap, "testdll.dll!TestFn") != nullptr,
         "trap dispatched by exact dll!symbol name");
 
+  // DllMain-style cdecl call: mov eax,[esp+8]; ret -> reason argument (1).
+  {
+    const u8 dllmain[] = {0x8b, 0x44, 0x24, 0x08, 0xc3};
+    memcpy(img->base + 0x1000, dllmain, sizeof(dllmain));
+    const u32 args[3] = {img->guest_base, 1, 0};
+    u32 dll_rc = 0;
+    const int r = trt_x86_run_cdecl(img, img->guest_base + 0x1000,
+                                    args, 32, &dll_rc);
+    CHECK(r == 1 && dll_rc == 1,
+          "PE32 DllMain(cdecl) got its args and returned via sentinel RET");
+  }
+
   trt_images_reset();
   printf("  result: %s\n", fails ? "FAIL" : "ALL PASS");
   return fails ? 1 : 0;

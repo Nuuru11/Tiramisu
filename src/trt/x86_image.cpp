@@ -35,7 +35,13 @@ u64 call_host_bridge(u64 fn, trt_x86_ctx* c) {
   return ((host_call4)fn)(args[0], args[1], args[2], args[3]);
 }
 
+static const u32 kReturnSentinel = 0xfffffff0u;  // clean RET from a guest proc
+
 int image_trap(trt_x86_ctx* c, u32 va, void* user) {
+  if (va == kReturnSentinel) {
+    c->stop_code = 0x100;
+    return 0x100;  // end the run; the guest returned from its function
+  }
   trap_ctx* t = (trap_ctx*)user;
   if (trt_pe32_is_trap(va)) {
     int idx = (int)((va - TRT_PE32_TRAP_BASE) >> 2);
@@ -80,6 +86,38 @@ int image_trap(trt_x86_ctx* c, u32 va, void* user) {
 
 void trt_x86_set_resolver(const trt_resolver* rs) {
   if (rs) g_trap_rs = *rs;
+}
+
+int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
+                      u64 max_instructions, u32* out_eax) {
+  if (!img || !img->is_pe32 || !img->base) return 2;
+  const u32 isz = (u32)img->size_of_image;
+  if (!isz || isz > 64u * 1024u * 1024u) return 2;
+  const u32 stack_size = 0x10000;
+  const size_t total = (size_t)isz + stack_size;
+  u8* mem = (u8*)calloc(total, 1);
+  if (!mem) return 2;
+  memcpy(mem, img->base, isz);
+
+  trt_x86_ctx c{};
+  c.mem = mem; c.mem_va = img->guest_base; c.mem_size = (u32)total;
+  c.eip = entry_va;
+  const u32 sp = img->guest_base + isz + stack_size - 64;
+  c.r[X86_ESP] = sp;
+  c.r[X86_EBP] = sp;
+  trt_x86_mem_write(&c, sp, 4, &kReturnSentinel);           // return address
+  for (int i = 0; i < 3; ++i) {
+    u32 a = args ? args[i] : 0;
+    trt_x86_mem_write(&c, sp + 4u + 4u * (u32)i, 4, &a);  // cdecl args
+  }
+  trap_ctx t{}; t.c = &c;
+  c.trap = &image_trap; c.trap_user = &t;
+
+  int rc = trt_x86_run(&c, max_instructions);
+  memcpy(img->base, mem, isz);
+  if (out_eax) *out_eax = c.r[X86_EAX];
+  free(mem);
+  return rc;
 }
 
 int trt_x86_run_image(trt_image* img, u32 entry_va, u32 stack_size,

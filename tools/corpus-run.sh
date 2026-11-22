@@ -39,6 +39,7 @@ mkdir -p "$cobj"
 
 clang++ -std=c++17 -O2 -Wall -no-pie \
   tests/test_corpus_run.cpp tests/corpus_ucrt_wrappers.c \
+  src/trt/x86_exec.cpp src/trt/x86_jit.cpp src/trt/x86_bridge.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/apiset.cpp \
   src/trt/thunk.cpp src/trt/vfs.cpp src/trt/iso.cpp src/trt/images.cpp src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_d3d12.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_membudget.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
@@ -49,7 +50,7 @@ clang++ -std=c++17 -O2 -Wall -no-pie \
   src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/bridge_hid.cpp src/trt/bridge_xinput.cpp \
   src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
-  src/trt/bridge_gdiplus.cpp src/trt/bridge_nvapi.cpp src/trt/bridge_res.cpp src/trt/bridge_fmod.cpp src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
+  src/trt/bridge_gdiplus.cpp src/trt/bridge_nvapi.cpp src/trt/bridge_res.cpp src/trt/bridge_fmod.cpp src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp src/trt/x86_32.cpp src/trt/x86_image.cpp \
   src/trt/bridge_dstorage.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
   "$cobj/miniz_tinfl.o" "$cobj/mojo_hlsl.o" "$cobj/vendor_stb_vorbis.o" "$cobj/vendor_dr_mp3.o" \
   -o "$out/test_corpus_run" || exit 1

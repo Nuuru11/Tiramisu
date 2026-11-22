@@ -80,6 +80,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
   src/trt/bridge_res.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp \
+  src/trt/x86_32.cpp src/trt/x86_image.cpp \
   src/trt/pe_exports.cpp src/trt/bridge_d3d.cpp src/trt/bridge_d3d12.cpp src/trt/bridge_reg.cpp \
   src/trt/bridge_mem.cpp src/trt/bridge_thread.cpp src/trt/bridge_sys.cpp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
