@@ -176,6 +176,15 @@ void* TRT_STDCALL trt_CreateWindowExW(u32 exstyle, const wchar_t* cls,
                                       int x, int y, int w, int h,
                                       void* parent, void* menu, void* inst,
                                       void* param) {
+  // .215 DIAG: Sekiro silent death -- does the game reach window creation?
+  // (Death window is after GameInput init, before ANY window/D3D call.)
+  {
+    char line[192];
+    snprintf(line, sizeof(line),
+             "win32: CreateWindowExW ENTRY cls=%p style=0x%x x=%d y=%d w=%d h=%d",
+             (void*)cls, style, x, y, w, h);
+    trt_core_log(line);
+  }
   u64 hwnd = 0;
   createstruct_w* cs_ptr = nullptr;
   const wchar_t* title_ptr = title;

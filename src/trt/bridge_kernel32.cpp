@@ -6126,6 +6126,9 @@ struct cv_slot {
   pthread_cond_t cv;
   bool init;
 #endif
+  // .215 DIAG: per-CV log counters (rate-limit wake/woke lines).
+  u64 wake_log_n;
+  u64 woke_log_n;
 };
 constexpr int k_max_cvs = 512;
 cv_slot g_cv_slots[k_max_cvs];
@@ -6148,6 +6151,7 @@ cv_slot* cv_get(void* key) {
   if (!key) return nullptr;
   while (g_cv_table_lock.test_and_set(std::memory_order_acquire)) {}
   cv_slot* found = nullptr;
+  bool created = false;
   for (int i = 0; i < k_max_cvs; ++i) {
     if (g_cv_slots[i].init && g_cv_slots[i].key == key) { found = &g_cv_slots[i]; break; }
   }
@@ -6163,6 +6167,9 @@ cv_slot* cv_get(void* key) {
         pthread_cond_init(&g_cv_slots[i].cv, nullptr);
 #endif
         g_cv_slots[i].init = true;
+        g_cv_slots[i].wake_log_n = 0;
+        g_cv_slots[i].woke_log_n = 0;
+        created = true;
         found = &g_cv_slots[i];
         break;
       }
@@ -6176,6 +6183,12 @@ cv_slot* cv_get(void* key) {
     }
   }
   g_cv_table_lock.clear(std::memory_order_release);
+  if (created && found) {
+    // .215 DIAG: log each CV first appearance (once per CV).
+    char line[128];
+    snprintf(line, sizeof(line), "sync: CV-new cv=%p", key);
+    trt_core_log(line);
+  }
   return found;
 }
 } // namespace
@@ -6368,6 +6381,19 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
     trt_core_log(iw);
   }
   const int r = cv_wait_locked(s, ms);
+  // .215 DIAG: CV-woke -- log when a waiter EXITS the CV wait (wake->work
+  // vs wake->immediate re-wait). Fires for ALL waits (incl. timed), so
+  // timed waiters on a CV become visible. Rate-limited: first 16 exits
+  // per CV + every 256th.
+  {
+    const u64 n = (u64)__atomic_fetch_add(&s->woke_log_n, 1, __ATOMIC_RELAXED) + 1;
+    if (n <= 16 || (n % 256) == 0) {
+      char line[128];
+      snprintf(line, sizeof(line), "sync: CV-woke cv=%p r=%d n=%llu", cv, r,
+               (unsigned long long)n);
+      trt_core_log(line);
+    }
+  }
   if (srw) {
     if (shared) trt_AcquireSRWLockShared(srw);
     else trt_AcquireSRWLockExclusive(srw);
@@ -6397,6 +6423,16 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
     trt_core_log(iw);
   }
   const int r = cv_wait_locked(s, ms);
+  // .215 DIAG: CV-woke (CS variant) -- see SleepConditionVariableSRW.
+  {
+    const u64 n = (u64)__atomic_fetch_add(&s->woke_log_n, 1, __ATOMIC_RELAXED) + 1;
+    if (n <= 16 || (n % 256) == 0) {
+      char line[128];
+      snprintf(line, sizeof(line), "sync: CV-woke-CS cv=%p r=%d n=%llu", cv, r,
+               (unsigned long long)n);
+      trt_core_log(line);
+    }
+  }
   if (cs) trt_EnterCriticalSection(cs);
   return r;
 }
@@ -6405,12 +6441,16 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_all.fetch_add(1, std::memory_order_relaxed);
-  // .214 DIAG: CV-wake-all -- correlate waits to wakes (Ultrapool
-  // stall: are the parked CVs ever woken, or does nobody signal them?).
+  // .215 DIAG: rate-limit the wake log (was 91k lines / 14.9MB in .214).
+  // First 16 wakes per CV + every 1024th (heartbeat).
   {
-    char line[128];
-    snprintf(line, sizeof(line), "sync: CV-wake-all cv=%p", cv);
-    trt_core_log(line);
+    const u64 n = (u64)__atomic_fetch_add(&s->wake_log_n, 1, __ATOMIC_RELAXED) + 1;
+    if (n <= 16 || (n % 1024) == 0) {
+      char line[128];
+      snprintf(line, sizeof(line), "sync: CV-wake-all cv=%p n=%llu", cv,
+               (unsigned long long)n);
+      trt_core_log(line);
+    }
   }
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
@@ -6427,11 +6467,15 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
-  // .214 DIAG: CV-wake -- see CV-wake-all.
+  // .215 DIAG: rate-limit (see CV-wake-all).
   {
-    char line[128];
-    snprintf(line, sizeof(line), "sync: CV-wake cv=%p", cv);
-    trt_core_log(line);
+    const u64 n = (u64)__atomic_fetch_add(&s->wake_log_n, 1, __ATOMIC_RELAXED) + 1;
+    if (n <= 16 || (n % 1024) == 0) {
+      char line[128];
+      snprintf(line, sizeof(line), "sync: CV-wake cv=%p n=%llu", cv,
+               (unsigned long long)n);
+      trt_core_log(line);
+    }
   }
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
