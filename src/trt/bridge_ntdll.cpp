@@ -58,6 +58,7 @@ int TRT_STDCALL trt_SetEvent(u64 handle);
 int TRT_STDCALL trt_ResetEvent(u64 handle);
 u32 TRT_STDCALL trt_WaitForSingleObjectEx(u64 handle, u32 ms, int alertable);
 void TRT_STDCALL trt_ExitProcess(u32 code);
+int TRT_STDCALL trt_TerminateProcess(void* proc, u32 code);
 void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                                   void* sa, u32 disposition, u32 flags,
                                   void* tmpl);
@@ -617,6 +618,29 @@ u32 TRT_GUEST_ABI nt_RaiseFailFastException(void* exrec, void* ctx,
   return k_status_ok;  // unreachable when the exit path is honest
 }
 
+// ---- .212 DIAG: RtlExitUserProcess / NtTerminateProcess intercepts ----
+// Neither was in the ntdll bridge table, so a guest calling them (import or
+// GetProcAddress) got the REAL ntdll function and died with zero logging.
+// Log + route onto the honest trt_ExitProcess / trt_TerminateProcess path.
+// If the .211 silent death is one of these, the log line names it.
+void TRT_GUEST_ABI nt_RtlExitUserProcess(u32 code) {
+  char line[128];
+  snprintf(line, sizeof(line), "ntdll: RtlExitUserProcess(0x%08x) called", code);
+  trt_core_log(line);
+  trt_ExitProcess(code);
+}
+u32 TRT_GUEST_ABI nt_NtTerminateProcess(void* proc, u32 code) {
+  char line[128];
+  snprintf(line, sizeof(line), "ntdll: NtTerminateProcess(proc=%p code=0x%08x) called", proc, code);
+  trt_core_log(line);
+  if (!proc || proc == (void*)-1) {
+    trt_TerminateProcess(proc, code);
+    return 0;  // unreachable when the terminate path is honest
+  }
+  trt_core_log("ntdll: NtTerminateProcess foreign handle -> honest fail (no bridge kill)");
+  return 0xC0000008u;  // STATUS_INVALID_HANDLE
+}
+
 std::mutex g_nt_str_mu;
 std::unordered_set<void*> g_nt_str_allocs;
 
@@ -1033,6 +1057,9 @@ int trt_bridge_register_ntdll(void) {
       {"NtQueryInformationProcess", (void*)&nt_NtQueryInformationProcess},
       {"NtQueryVirtualMemory", (void*)&nt_NtQueryVirtualMemory},
       {"RaiseFailFastException", (void*)&nt_RaiseFailFastException},
+      {"RtlExitUserProcess", (void*)&nt_RtlExitUserProcess},
+      {"NtTerminateProcess", (void*)&nt_NtTerminateProcess},
+      {"ZwTerminateProcess", (void*)&nt_NtTerminateProcess},
       {"EtwEventRegister", (void*)&nt_EtwEventRegister},
       {"EtwEventUnregister", (void*)&nt_EtwEventUnregister},
       {"EtwEventWrite", (void*)&nt_EtwEventWrite},

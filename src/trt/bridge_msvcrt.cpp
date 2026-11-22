@@ -390,6 +390,34 @@ void TRT_GUEST_ABI crt_exit(i32 code) {
   _exit(code);
 }
 
+// .212 DIAG: _exit/_Exit/quick_exit were NOT in the msvcrt bridge table, so
+// a guest calling them fell through to the real CRT and died with zero
+// logging. Log + exit via the logged ExitProcess path (no atexit: _exit
+// semantics). If the .211 silent death is one of these, the log line names it.
+void TRT_GUEST_ABI crt__exit(i32 code) {
+  char line[64];
+  snprintf(line, sizeof(line), "msvcrt: _exit(%d) called (no atexit)", code);
+  trt_core_log(line);
+  if (auto fn = (pfn_ExitProcess)k32_sym("ExitProcess")) fn((u32)code);
+  _exit(code);
+}
+void TRT_GUEST_ABI crt__Exit(i32 code) {
+  char line[64];
+  snprintf(line, sizeof(line), "msvcrt: _Exit(%d) called (no atexit)", code);
+  trt_core_log(line);
+  if (auto fn = (pfn_ExitProcess)k32_sym("ExitProcess")) fn((u32)code);
+  _exit(code);
+}
+void TRT_GUEST_ABI crt_quick_exit(i32 code) {
+  // quick_exit runs at_quick_exit handlers, then _exit. The bridge has no
+  // at_quick_exit registry, so this is _exit with a distinct log line.
+  char line[64];
+  snprintf(line, sizeof(line), "msvcrt: quick_exit(%d) called", code);
+  trt_core_log(line);
+  if (auto fn = (pfn_ExitProcess)k32_sym("ExitProcess")) fn((u32)code);
+  _exit(code);
+}
+
 void TRT_GUEST_ABI crt_abort(void) {
   trt_core_log("msvcrt: abort() called -> ExitProcess(3)");
   if (auto fn = (pfn_ExitProcess)k32_sym("ExitProcess")) fn(3);
@@ -2674,6 +2702,9 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"atexit",             (void*)&crt_atexit},
     {"_cexit",             (void*)&crt__cexit},
     {"exit",               (void*)&crt_exit},
+    {"_exit",              (void*)&crt__exit},
+    {"_Exit",              (void*)&crt__Exit},
+    {"quick_exit",         (void*)&crt_quick_exit},
     {"abort",              (void*)&crt_abort},
     {"_amsg_exit",         (void*)&crt__amsg_exit},
     {"_assert",            (void*)&crt__assert},
