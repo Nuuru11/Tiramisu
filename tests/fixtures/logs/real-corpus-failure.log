@@ -1,0 +1,50 @@
+-- steam_api64.dll --
+  [trt] ole: ole32 + oleaut32 BUILTIN (4 CLSID personalities)
+  [trt] gdiplus: registered 32 functions (launcher UI surface, recorded)
+  [trt] fmod: registered 28 functions across 5 module names (wav/pcm real, compressed named-silent)
+  [trt] trt: sec[0] WUS0 va=1000 sz=a7000 exec
+  [trt] trt: sec[1] WUS1 va=a8000 sz=49000 exec
+  [trt] trt: sec[2] .rsrc va=f1000 sz=f000
+  [trt] trt: loaded at preferred base, no reloc pass
+  [trt] trt: bind KERNEL32.DLL!LoadLibraryA -> 0x4b8d50
+  [trt] trt: import KERNEL32.DLL bound=3
+  [trt] trt: import ntdll.dll bound=1
+  [trt] trt: import PSAPI.DLL bound=1
+  [trt] trt: import SHELL32.dll bound=1
+  [trt] trt: import SHLWAPI.dll bound=1
+  [trt] trt: import USER32.dll bound=1
+  [trt] trt: import WS2_32.dll bound=1
+  [trt] trt: MAPPED base=180000000 preferred=180000000 size=100000 entry=f0310
+  [trt] trt: SEALED (W^X: code pages now RX, no RWX ever)
+  [trt] trt: unwind .pdata registered funcs=1659 rc=0 (RtlAddFunctionTable)
+  [trt] trt: steam_api64.dll entry call handle=0x180000000 reason=1 (DLL_PROCESS_ATTACH)
+
+==== TIRAMISU CRASH REPORT (discovery artifact) ====
+PE: steam_api64.dll
+signal: SIGSEGV (code 2)
+fault address: 0x180001000  (outside the guest image — host-side or thunk fault)
+faulting RIP: 0x1800f03a0  (outside the guest image)
+last bridge: trt: steam_api64.dll entry call handle=0x180000000 reason=1 (DLL_PROCESS_ATTACH)
+last trt log lines:
+  [trt] ole: ole32 + oleaut32 BUILTIN (4 CLSID personalities)
+  [trt] gdiplus: registered 32 functions (launcher UI surface, recorded)
+  [trt] fmod: registered 28 functions across 5 module names (wav/pcm real, compressed named-silent)
+  [trt] trt: sec[0] WUS0 va=1000 sz=a7000 exec
+  [trt] trt: sec[1] WUS1 va=a8000 sz=49000 exec
+  [trt] trt: sec[2] .rsrc va=f1000 sz=f000
+  [trt] trt: loaded at preferred base, no reloc pass
+  [trt] trt: bind KERNEL32.DLL!LoadLibraryA -> 0x4b8d50
+  [trt] trt: import KERNEL32.DLL bound=3
+  [trt] trt: import ntdll.dll bound=1
+  [trt] trt: import PSAPI.DLL bound=1
+  [trt] trt: import SHELL32.dll bound=1
+  [trt] trt: import SHLWAPI.dll bound=1
+  [trt] trt: import USER32.dll bound=1
+  [trt] trt: import WS2_32.dll bound=1
+  [trt] trt: MAPPED base=180000000 preferred=180000000 size=100000 entry=f0310
+  [trt] trt: SEALED (W^X: code pages now RX, no RWX ever)
+  [trt] trt: unwind .pdata registered funcs=1659 rc=0 (RtlAddFunctionTable)
+  [trt] trt: steam_api64.dll entry call handle=0x180000000 reason=1 (DLL_PROCESS_ATTACH)
+==== end crash report ====
+RUN FAILED steam_api64.dll: guest fault (named crash report above, exit 42)
+-- bink2w64.dll --

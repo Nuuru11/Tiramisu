@@ -119,6 +119,37 @@
       "note": "Named-silent audio is work, not a setting; recorded in the manifest, never hidden",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "input-mouse-callback-failed",
+      "match": [
+        "GameInput mouse callback failed hr=0x80004001"
+      ],
+      "note": "Real console probe: GameInput mouse callback returns E_NOTIMPL; switch the title to controller input instead of the broken desktop mouse path",
+      "actions": {
+        "profile": {
+          "default_input": "controller"
+        }
+      }
+    },
+    {
+      "id": "dstorage-missing-named",
+      "match": [
+        "probe: dll dstorage.dll -> MISSING"
+      ],
+      "note": "Real console probe: no DStorage DLL in the AppContainer; named work item, NOT hidden",
+      "severity": "info",
+      "actions": {}
+    },
+    {
+      "id": "guest-fault-named",
+      "match": [
+        "RUN FAILED .*guest fault",
+        "signal: SIGSEGV"
+      ],
+      "note": "Real corpus failure: guest fault is a named crash report, not a config repair",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }

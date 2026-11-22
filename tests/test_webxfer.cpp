@@ -342,6 +342,70 @@ int main() {
           "dashboard HTML ships settings + connect cards");
   }
 
+  // 9. In-console autopilot: armed by transfer, driven by the launch result,
+  //    applies a real repair and re-queues; stops named when no fix is known.
+  {
+    std::string stale;
+    while (longan::webxfer_poll_launch(&stale)) {}  // clear earlier test state
+
+    const std::string game = "AutopilotGame";
+    const std::string gdir = root + "/games/" + game;
+    {
+      std::string mk = "mkdir -p '" + gdir + "/.tiramisu'";
+      (void)system(mk.c_str());
+    }
+    // A failed boot's log, with a signature declared in tools/fix_db.json.
+    {
+      FILE* lf = fopen((root + "/tiramisu.log").c_str(), "wb");
+      if (lf) {
+        fputs("trt: FAIL IMPORT msvcp140.dll!?_Xlength_error@std@@YAXPEBD@Z\n"
+              "trt: STUB d3dcompiler_47.dll!D3DCompile -> fail-visible thunk\n"
+              "host: guest did not reach PUMP\n", lf);
+        fclose(lf);
+      }
+    }
+
+    longan::webxfer_autopilot_begin(game);
+    std::string res; int attempt = -1;
+    longan::webxfer_autopilot_state(nullptr, &attempt, &res);
+    CHECK(attempt == 0 && res == "armed",
+          "transfer arms the in-console autopilot");
+
+    longan::webxfer_set_launch_result(game, "started");
+    longan::webxfer_autopilot_state(nullptr, &attempt, &res);
+    CHECK(attempt == 1 && res == "fix",
+          "launch outcome matched a declared failure and applied a fix");
+    std::string queued;
+    CHECK(longan::webxfer_poll_launch(&queued) && queued == game,
+          "repaired title is re-queued through main.cpp's launch handoff");
+
+    const std::string aliases = read_str_file(gdir + "/.tiramisu/aliases.json");
+    CHECK(aliases.find("msvcp140_app.dll") != std::string::npos &&
+              aliases.find("d3dcompiler_47.dll") != std::string::npos,
+          "real DLL forwarders written into the title package");
+    const std::string hist = read_str_file(gdir + "/.tiramisu/autopilot.json");
+    CHECK(hist.find("\"result\":\"fix\"") != std::string::npos,
+          "attempt history records the applied fix");
+    std::string status = http_req(port, "GET", "/api/status", "");
+    CHECK(status.find("\"autopilot_game\":\"AutopilotGame\"") != std::string::npos &&
+              status.find("\"autopilot_attempt\":1") != std::string::npos &&
+              status.find("\"autopilot_result\":\"fix\"") != std::string::npos,
+          "/api/status exposes in-console autopilot state");
+
+    // A failure with no declared repair must stop named, not retry forever.
+    {
+      FILE* lf = fopen((root + "/tiramisu.log").c_str(), "wb");
+      if (lf) { fputs("trt: FAIL IMPORT mystery.dll!MysteryFn\n", lf); fclose(lf); }
+    }
+    longan::webxfer_set_launch_result(game, "started");
+    longan::webxfer_autopilot_state(nullptr, &attempt, &res);
+    CHECK(res == "no-fix" && !longan::webxfer_poll_launch(&stale),
+          "unknown failure stops named with no retry");
+    const std::string hist2 = read_str_file(gdir + "/.tiramisu/autopilot.json");
+    CHECK(hist2.find("no-fix") != std::string::npos,
+          "named stopping point persisted in attempt history");
+  }
+
   longan::webxfer_shutdown();
   std::string cmd = "rm -rf " + root;
   (void)system(cmd.c_str());

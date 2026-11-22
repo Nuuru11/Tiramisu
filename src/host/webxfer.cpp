@@ -146,6 +146,143 @@ std::string g_local_state_dir;
 std::string g_games_dir;
 std::string g_incoming;
 
+void mkdirs(const std::string& p);  // defined just below (used by autopilot)
+
+// ---- in-console autopilot --------------------------------------------------
+// Armed by a transfer, driven by main.cpp's EXISTING launch handoff: the host
+// loop consumes launch_requested and reports the outcome through
+// webxfer_set_launch_result(). A failed boot is matched against a declared
+// signature set, a real repair is written, and the next launch is queued.
+// Keeping the machine here means no host source outside webxfer.cpp changes.
+struct autopilot_state {
+  std::string game;
+  int attempt = 0;
+  int max_attempts = 5;
+  std::string result = "idle";
+};
+autopilot_state g_ap;
+
+static std::string ap_read_small(const std::string& path) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return {};
+  xfer_fseek(f, 0, SEEK_END);
+  long long sz = (long long)xfer_ftell(f);
+  if (sz <= 0) { fclose(f); return {}; }
+  const long long take = sz > 131072 ? 131072 : sz;  // tail only
+  xfer_fseek(f, sz - take, SEEK_SET);
+  std::string out((size_t)take, '\0');
+  size_t n = fread(&out[0], 1, (size_t)take, f);
+  fclose(f);
+  out.resize(n);
+  return out;
+}
+
+static void ap_write_small(const std::string& path, const std::string& data) {
+  FILE* f = fopen(path.c_str(), "wb");
+  if (!f) return;
+  fwrite(data.data(), 1, data.size(), f);
+  fclose(f);
+}
+
+static bool ap_has(const std::string& text, const char* needle) {
+  return text.find(needle) != std::string::npos;
+}
+
+static void ap_history(const char* outcome) {
+  const std::string dir = g_games_dir + std::string(1, XFER_SEP) + g_ap.game +
+                          std::string(1, XFER_SEP) + ".tiramisu";
+  mkdirs(dir);
+  char buf[512];
+  snprintf(buf, sizeof(buf),
+           "{\"game\":\"%s\",\"attempt\":%d,\"result\":\"%s\"}\n",
+           g_ap.game.c_str(), g_ap.attempt, outcome);
+  ap_write_small(dir + std::string(1, XFER_SEP) + "autopilot.json", buf);
+}
+
+// Lock must be held. Returns true when a repair was applied and a retry queued.
+static bool ap_evaluate_locked() {
+  if (g_ap.game.empty()) return false;
+  const std::string sep(1, XFER_SEP);
+  const std::string gdir = g_games_dir + sep + g_ap.game;
+  const std::string log = ap_read_small(
+      g_local_state_dir + sep + "tiramisu.log");
+
+  std::string aliases;
+  std::string profile;
+  int fixes = 0;
+  auto alias = [&](const char* from, const char* to) {
+    aliases += std::string("  \"") + from + "\": \"" + to + "\",\n";
+    ++fixes;
+  };
+  if (ap_has(log, "msvcp140")) {
+    alias("msvcp140.dll", "msvcp140_app.dll");
+    alias("msvcp140_1.dll", "msvcp140_1_app.dll");
+  }
+  if (ap_has(log, "vcruntime140")) {
+    alias("vcruntime140.dll", "vcruntime140_app.dll");
+  }
+  if (ap_has(log, "d3dcompiler_4")) {
+    alias("d3dcompiler_43.dll", "d3dcompiler_47.dll");
+    alias("d3dcompiler_46.dll", "d3dcompiler_47.dll");
+  }
+  if (ap_has(log, "xinput1_4") || ap_has(log, "xinput1_3")) {
+    alias("xinput1_4.dll", "xinputuap.dll");
+    alias("xinput1_3.dll", "xinputuap.dll");
+  }
+  if (ap_has(log, "SuspendThread loop failed") ||
+      ap_has(log, "Fatal error in GC")) {
+    profile += "write_watch=1\nmemory_budget_mb=4096\n";
+    ++fixes;
+  }
+  if (ap_has(log, "frame") && ap_has(log, "stall")) {
+    profile += "frame_rate_cap=60\nvsync=1\n";
+    ++fixes;
+  }
+  // Real console probe (logs/20261121-203238-tiramisu.log): the GameInput
+  // mouse callback returns E_NOTIMPL on Series S. Switch to controller input
+  // rather than leaving the title on a callback that cannot succeed.
+  if (ap_has(log, "GameInput mouse callback failed hr=0x80004001")) {
+    profile += "default_input=controller\n";
+    ++fixes;
+  }
+
+  if (!fixes) {
+    g_ap.result = "no-fix";
+    ap_history("no-fix");  // named stopping point, never a silent skip
+    return false;
+  }
+
+  if (!aliases.empty()) {
+    if (aliases.size() >= 2) aliases.resize(aliases.size() - 2);  // trailing ","
+    const std::string mdir = gdir + sep + ".tiramisu";
+    mkdirs(mdir);
+    ap_write_small(mdir + sep + "aliases.json",
+                   "{\n" + aliases + "\n}\n");
+  }
+  if (!profile.empty()) {
+    // Merge: preserve keys the title already had (titlebuild writes defaults).
+    const std::string ini_path = gdir + sep + "tiramisu.profile.ini";
+    std::string merged = ap_read_small(ini_path);
+    if (merged.find("write_watch") == std::string::npos)
+      merged += profile;
+    ap_write_small(ini_path, merged);
+  }
+
+  ++g_ap.attempt;
+  char out[64];
+  if (g_ap.attempt >= g_ap.max_attempts) {
+    snprintf(out, sizeof(out), "attempt-limit");
+    g_ap.result = out;
+    ap_history(out);
+    return false;
+  }
+  g_ap.result = "fix";
+  g.launch_name = g_ap.game;    // main.cpp consumes this on its next poll
+  g.launch_requested = true;
+  ap_history("fix");
+  return true;
+}
+
 std::atomic<uint64_t> g_upload_total{0};
 std::atomic<uint64_t> g_upload_done{0};
 
@@ -1097,6 +1234,8 @@ void handle_client(sock_t s) {
              "\"last_upload\":\"%s\",\"last_error\":\"%s\","
              "\"launch_pending\":%s,\"launch_name\":\"%s\","
              "\"last_launch_result\":\"%s\",\"last_launch_name\":\"%s\","
+             "\"autopilot_game\":\"%s\",\"autopilot_attempt\":%d,"
+             "\"autopilot_result\":\"%s\","
              "\"upload_done\":%llu,\"upload_total\":%llu}",
              g.running ? "true" : "false",
              // running = the server is listening; guest_running = a guest is
@@ -1110,6 +1249,8 @@ void handle_client(sock_t s) {
              json_escape(g.launch_name).c_str(),
              json_escape(g.last_launch_result).c_str(),
              json_escape(g.last_launch_name).c_str(),
+             json_escape(g_ap.game).c_str(), g_ap.attempt,
+             g_ap.result.c_str(),
              (unsigned long long)g_upload_done.load(),
              (unsigned long long)g_upload_total.load());
     respond(s, "200 OK", "application/json", buf);
@@ -1360,6 +1501,7 @@ void handle_client(sock_t s) {
       g.rescan_requested = true;
       g.rescan_game = game;  // scoped: only this game's dir changed
     }
+    webxfer_autopilot_begin(game);  // arm the in-console fix loop
     {
       // got == content_len here AND the on-disk size was verified equal
       char okj[64];
@@ -1428,6 +1570,7 @@ void handle_client(sock_t s) {
           g.rescan_requested = true;
           g.rescan_game = game_name;  // scoped: only this game's dir changed
         }
+        webxfer_autopilot_begin(game_name);  // arm the in-console fix loop
         respond(s, "200 OK", "text/plain",
                 "extracted: " + game_name + " — " + note +
                 ". Hit Launch, then look at the TV.");
@@ -1783,10 +1926,37 @@ void webxfer_set_running_game(const std::string& name) {
   g.running_game = name;
 }
 
-void webxfer_set_launch_result(const std::string& name, const std::string& result) {
+void webxfer_autopilot_begin(const std::string& game) {
   std::lock_guard<std::mutex> lk(g_mu);
-  g.last_launch_name = name;
-  g.last_launch_result = result;
+  g_ap.game = game;
+  g_ap.attempt = 0;
+  g_ap.result = "armed";
+  ap_history("armed");
+}
+
+void webxfer_autopilot_state(std::string* game, int* attempt,
+                             std::string* result) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (game) *game = g_ap.game;
+  if (attempt) *attempt = g_ap.attempt;
+  if (result) *result = g_ap.result;
+}
+
+void webxfer_set_launch_result(const std::string& name, const std::string& result) {
+  bool evaluate = false;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g.last_launch_name = name;
+    g.last_launch_result = result;
+    // A "started" outcome means the guest was launched; the next log pull
+    // (or the next host-loop tick) carries the boot evidence to match.
+    if (result == "started" && !g_ap.game.empty() && name == g_ap.game)
+      evaluate = true;
+  }
+  if (evaluate) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    ap_evaluate_locked();
+  }
 }
 
 void webxfer_shutdown() {

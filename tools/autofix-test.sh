@@ -37,6 +37,22 @@ else
   echo "FAIL rebuild lost repairs"; rc=1
 fi
 
+echo "== real captured logs (not synthetic) =="
+real_game="$tmp/real"; mkdir -p "$real_game"
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-console-probe.log --apply)
+echo "$out" | grep -q 'input-mouse-callback-failed' && \
+  echo "OK real console probe -> GameInput repair matched" || { echo "FAIL real console rule"; rc=1; }
+echo "$out" | grep -q 'dstorage-missing-named' && \
+  echo "OK real DStorage gap recorded as named (not hidden)" || { echo "FAIL named DStorage"; rc=1; }
+if grep -q '^default_input=controller' "$real_game/tiramisu.profile.ini"; then
+  echo "OK real repair applied to profile"
+else
+  echo "FAIL real repair not applied"; rc=1
+fi
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-corpus-failure.log)
+echo "$out" | grep -q 'guest-fault-named' && \
+  echo "OK real SIGSEGV/RUN FAILED recorded as named work item" || { echo "FAIL real crash rule"; rc=1; }
+
 echo "== retry loop =="
 $py tools/autopilot.py "$game" --dry-run tests/fixtures/logs --max-attempts 5 >"$tmp/loop.txt" 2>&1
 cat "$tmp/loop.txt" | sed 's/^/    /'

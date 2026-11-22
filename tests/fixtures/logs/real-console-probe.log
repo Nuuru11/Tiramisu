@@ -1,0 +1,50 @@
+setup: d3d11 ready (swapchain created in SetWindow)
+probe: memory avail=5073 MB / 5120 MB
+probe: jit RWX alloc -> DENIED (err=87)
+probe: jit W->RX transition -> ALLOWED (err=0)
+probe: dll d3d11.dll -> PRESENT
+probe: dll d3dcompiler_47.dll -> PRESENT
+probe: dll dstorage.dll -> MISSING
+probe: dll gdi32.dll -> PRESENT
+probe: dll shlwapi.dll -> PRESENT
+probe: dll ws2_32.dll -> PRESENT
+probe: dll bcrypt.dll -> PRESENT
+probe: dll winmm.dll -> PRESENT
+probe: CreateProcessW -> BLOCKED (expected)
+probe: gamepads=0
+audio: XAudio2 2.8 multi-voice mixer OK (48000 Hz stereo)
+audio: 0 voices, 0 bufs, 0 dropped, 48000 Hz stereo
+webxfer: serving http://10.0.0.23:9127 -> Q:\Users\UserMgr1\AppData\Local\Packages\Xan.Tiramisu_x81jywntpvgne\LocalState\games
+transfer: http://10.0.0.23:9127 (QR on TV)
+input: Xbox device query keyboard=0 mouse=0 (-1 unavailable)
+input: PointerDevices count=0
+input: RawGameControllers count=0
+input: WinRT HID interfaces count=0
+ole: ole32 + oleaut32 BUILTIN (4 CLSID personalities)
+gdiplus: registered 32 functions (launcher UI surface, recorded)
+fmod: registered 28 functions across 5 module names (wav/pcm real, compressed named-silent)
+res: 11 resource APIs registered on kernel32 (.rsrc walk live)
+profile: 0 keys applied from S:\Program Files\WindowsApps\Xan.Tiramisu_0.2.2.160_x64__x81jywntpvgne\tiramisu.profile.ini
+trt: launching S:\Program Files\WindowsApps\Xan.Tiramisu_0.2.2.160_x64__x81jywntpvgne\guest_hello.exe (3072 bytes)
+trt: launching S:\Program Files\WindowsApps\Xan.Tiramisu_0.2.2.160_x64__x81jywntpvgne\guest_hello.exe (3072 bytes)
+trt: sec[0] .text va=1000 sz=80 exec
+trt: sec[1] .rdata va=2000 sz=aa
+trt: sec[2] .data va=3000 sz=10
+trt: sec[3] .reloc va=4000 sz=c
+trt: reloc delta=29da8fa0000 fixed=2
+trt: bind tiramisu_host.dll!TiramisuHostLogU32 -> 00007FF71AA2EDB0
+trt: import tiramisu_host.dll bound=2
+trt: MAPPED base=29ee8fa0000 preferred=140000000 size=5000 entry=1000
+guest memory (after image load): app 113/5120 MiB, memory budget: 0/5120 MB committed (0 MB mapped views, peak 0 MB, 0 refusals; VA 0/65536 MB reserved, peak 0 MB, 0 refusals)
+trt: SEALED (W^X: code pages now RX, no RWX ever)
+guest marker: tag=7658 value=131072
+selftest: rc=OK (guest returned 3903741903)
+input: native GameInput ready (hasInit=0)
+input: GameInput dev enum(mouse) hr=0x00000000
+input: GameInput dev enum(keyboard) hr=0x00000000
+input: GameInput dev enum(all) hr=0x00000000
+input: GameInput mouse callback failed hr=0x80004001
+input: MouseDevice relative listener registered
+input: CoreWindow initially enabled
+input: MouseDevice relative listener registered
+input: foreground keyboard interception enabled

@@ -62,6 +62,12 @@ void webxfer_set_running_game(const std::string& name);
 // Record the outcome of a launch the host loop acted on ("started",
 // "not found", ...). Surfaced in /api/status as last_launch_result.
 void webxfer_set_launch_result(const std::string& name, const std::string& result);
+// In-console autopilot: a transfer arms it; the host loop's existing launch
+// outcome callback drives a match -> repair -> retry loop. Surfaced in
+// /api/status as autopilot_game / autopilot_attempt / autopilot_result.
+void webxfer_autopilot_begin(const std::string& game);
+void webxfer_autopilot_state(std::string* game, int* attempt,
+                             std::string* result);
 
 // One-line status for the TV overlay ("transfer: http://...", last upload, err).
 std::string webxfer_status_line();
