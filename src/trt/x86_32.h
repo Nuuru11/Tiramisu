@@ -24,6 +24,7 @@ typedef struct trt_x86_ctx {
   u32 mem_size;
   u32 fs_base;   // 32-bit Windows FS -> TEB (set by the image runner)
   u32 gs_base;   // 32-bit Windows GS -> TLS (set by the image runner)
+  u32 xmm[16][4];  // SSE registers (four 32-bit lanes each), flat guest model
   // Called when EIP is outside the mapped window (a trap/import thunk).
   // Return 0 to continue, nonzero to stop with *stop_code set.
   int (*trap)(struct trt_x86_ctx* c, u32 va, void* user);

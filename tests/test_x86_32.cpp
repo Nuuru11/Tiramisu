@@ -122,6 +122,20 @@ int main() {
     CHECK(w == 0x5678, "66h prefix wrote exactly 2 bytes to memory");
   }
 
+  // SSE: movups load from 0xa080 -> xmm0 -> store at 0xa100.
+  {
+    u8 code[] = {0x0f,0x10,0x05,0x80,0xa0,0x00,0x00,
+                 0x0f,0x11,0x05,0x60,0xa0,0x00,0x00, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0xa000);
+    const u32 src[4] = {1, 2, 3, 4};
+    trt_x86_mem_write(&c, 0xa080, 16, src);
+    CHECK(trt_x86_run(&c, 32) == 0, "SSE movups guest halted");
+    u32 dst[4] = {};
+    trt_x86_mem_read(&c, 0xa060, 16, dst);
+    CHECK(dst[0] == 1 && dst[1] == 2 && dst[2] == 3 && dst[3] == 4,
+          "SSE movups moved 16 bytes through xmm0");
+  }
+
   printf("  result: %s\n", fails ? "FAIL" : "ALL PASS");
   return fails ? 1 : 0;
 }

@@ -43,6 +43,11 @@ Entries are appended as work lands; every claim points at a gate or a file.
   Added 8-bit shift group (D0/D2). SDL2/discord complete on layout 0; binkw32
   still faults on both layouts (last named stop recorded).
 
+## 2026-11-23 — SSE expansion
+- Added xmm registers (16x128-bit) and SSE movups/movaps (0F 10/11/28/29)
+  plus xorps (0F 57) to the clean-room x86 core; gated by a real 16-byte
+  load/store fixture in tests/test_x86_32.cpp. All gates green.
+
 ## Current named gaps (not hidden)
 1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
    cdecl frame does not provide; needs fuller process/SEH setup.

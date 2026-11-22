@@ -384,6 +384,29 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
           static u64 ticks = 0;
           c->r[X86_EAX] = (u32)ticks;
           c->r[X86_EDX] = (u32)(ticks++ >> 32);
+        } else if (sub == 0x10 || sub == 0x11 || sub == 0x28 ||
+                   sub == 0x29 || sub == 0x57) {
+          // SSE moves/xor: movups/movaps (10/28 load, 11/29 store), xorps 57.
+          modrm_t m; decode_modrm(d, m);
+          if (d.fault) { c->stop_code = op_va; return 2; }
+          const int xi = m.reg, xm = m.rm;
+          if (sub == 0x11 || sub == 0x29) {
+            if (trt_x86_mem_write(c, m.va, 16, c->xmm[xi])) d.fault = true;
+          } else {
+            if (m.mod == 3) {
+              u32 tmp[4];
+              for (int k = 0; k < 4; ++k) tmp[k] = c->xmm[xm][k];
+              if (sub == 0x57)
+                for (int k = 0; k < 4; ++k) c->xmm[xi][k] ^= tmp[k];
+              else
+                for (int k = 0; k < 4; ++k) c->xmm[xi][k] = tmp[k];
+            } else {
+              u32 tmp[4] = {};
+              if (trt_x86_mem_read(c, m.va, 16, tmp)) d.fault = true;
+              for (int k = 0; k < 4; ++k)
+                c->xmm[xi][k] = (sub == 0x57) ? (c->xmm[xi][k] ^ tmp[k]) : tmp[k];
+            }
+          }
         } else if (sub == 0xb6 || sub == 0xb7 || sub == 0xbe || sub == 0xbf) {
           modrm_t m; decode_modrm(d, m);
           if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
