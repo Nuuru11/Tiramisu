@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "description": "Declared failure-signature -> remediation rules. Every rule is idempotent and fail-visible: it never hides a gap, it supplies a real alias or a measured setting. Matched against tiramisu.log by tools/autofix.py.",
+  "rules": [
+    {
+      "id": "redist-msvcp140",
+      "match": [
+        "FAIL IMPORT .*msvcp140.*\\.dll",
+        "LoadLibrary[^\"]*msvcp140"
+      ],
+      "note": "VC runtime is not installable in the AppContainer; forward to the console UWP CRT",
+      "actions": {
+        "aliases": {
+          "msvcp140.dll": "msvcp140_app.dll",
+          "msvcp140_1.dll": "msvcp140_1_app.dll",
+          "msvcp140_2.dll": "msvcp140_2_app.dll"
+        }
+      }
+    },
+    {
+      "id": "redist-vcruntime140",
+      "match": [
+        "FAIL IMPORT .*vcruntime140.*\\.dll",
+        "LoadLibrary[^\"]*vcruntime140"
+      ],
+      "note": "VC runtime forwarder to the console UWP CRT",
+      "actions": {
+        "aliases": {
+          "vcruntime140.dll": "vcruntime140_app.dll",
+          "vcruntime140_1.dll": "vcruntime140_1_app.dll"
+        }
+      }
+    },
+    {
+      "id": "shader-compiler-forward",
+      "match": [
+        "FAIL IMPORT .*d3dcompiler_4[367]\\.dll",
+        "D3DCompile[^\"]*FAILED",
+        "STUB .*d3dcompiler_4[367]\\.dll"
+      ],
+      "note": "Desktop d3dcompiler is not loadable; forward to the real UWP d3dcompiler_47",
+      "actions": {
+        "aliases": {
+          "d3dcompiler_43.dll": "d3dcompiler_47.dll",
+          "d3dcompiler_46.dll": "d3dcompiler_47.dll",
+          "d3dcompiler_47.dll": "d3dcompiler_47.dll"
+        },
+        "profile": {
+          "shader_cache": 1
+        }
+      }
+    },
+    {
+      "id": "xinput-forward",
+      "match": [
+        "FAIL IMPORT .*xinput1_[34].*\\.dll",
+        "FAIL IMPORT .*xinput9_1_0.*\\.dll"
+      ],
+      "note": "Desktop XInput maps to XINPUTUAP on console",
+      "actions": {
+        "aliases": {
+          "xinput1_4.dll": "xinputuap.dll",
+          "xinput1_3.dll": "xinputuap.dll",
+          "xinput9_1_0.dll": "xinputuap.dll"
+        }
+      }
+    },
+    {
+      "id": "gc-suspend-loop",
+      "match": [
+        "Fatal error in GC",
+        "SuspendThread loop failed",
+        "GC.*assert"
+      ],
+      "note": "Boehm GC thread adoption / write-watch: give the collector a real write-watch surface and headroom",
+      "actions": {
+        "profile": {
+          "write_watch": 1,
+          "memory_budget_mb": 4096
+        }
+      }
+    },
+    {
+      "id": "frame-pacing",
+      "match": [
+        "present.*stutter",
+        "frame.*stall",
+        "PUMP.*hitch"
+      ],
+      "note": "Cap to the console's stable present rate",
+      "actions": {
+        "profile": {
+          "frame_rate_cap": 60,
+          "vsync": 1
+        }
+      }
+    },
+    {
+      "id": "d3d12-recorded",
+      "match": [
+        "d3d12:.*recorded",
+        "D3D12.*not executed"
+      ],
+      "note": "D3D12 draws are recorded, not executed; keep the profile on the D3D11 path where the title allows it",
+      "actions": {
+        "profile": {
+          "shader_cache": 1
+        }
+      },
+      "severity": "warn"
+    },
+    {
+      "id": "audio-silent-named",
+      "match": [
+        "audio silent \\(named\\)",
+        "SILENT \\(named\\)",
+        "decoder pending"
+      ],
+      "note": "Named-silent audio is work, not a setting; recorded in the manifest, never hidden",
+      "severity": "info",
+      "actions": {}
+    }
+  ]
+}
