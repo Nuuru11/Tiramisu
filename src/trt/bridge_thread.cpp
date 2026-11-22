@@ -1159,6 +1159,21 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
           ? std::chrono::steady_clock::time_point::max()
           : std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 
+  {
+    // .207 diagnostic: log the first WaitForSingleObject waits (first 64)
+    // so a worker parked on an Event/Mutex/Semaphore is visible. The wait
+    // parks on g_sync_cv, not a lock word, so .206 never saw it. kind:
+    // 1=EVENT 2=MUTEX 3=SEMAPHORE 4=THREAD 5=IOCP. ms=4294967295=INFINITE.
+    static unsigned s_wait_single_logged = 0;
+    if (s_wait_single_logged < 64) {
+      ++s_wait_single_logged;
+      char wl[192];
+      snprintf(wl, sizeof(wl),
+               "sync: WaitForSingleObject handle=%llx kind=%u ms=%u",
+               (unsigned long long)handle, (unsigned)o->kind, ms);
+      trt_core_log(wl);
+    }
+  }
   for (;;) {
     if (ms == 0xFFFFFFFFu) {
       g_sync_cv.wait(lk);
@@ -1203,6 +1218,21 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
           ? std::chrono::steady_clock::time_point::max()
           : std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
 
+  {
+    // .207 diagnostic: log the first WaitForMultipleObjects waits (first
+    // 64). Same g_sync_cv park as the single-object wait.
+    static unsigned s_wait_multi_logged = 0;
+    if (s_wait_multi_logged < 64) {
+      ++s_wait_multi_logged;
+      char wl[256];
+      sync_object* o0 = object_for_locked(hs[0]);
+      snprintf(wl, sizeof(wl),
+               "sync: WaitForMultipleObjects count=%u wait_all=%u ms=%u first_handle=%llx first_kind=%u",
+               count, wait_all ? 1u : 0u, ms,
+               (unsigned long long)hs[0], o0 ? (unsigned)o0->kind : 99u);
+      trt_core_log(wl);
+    }
+  }
   for (;;) {
     u32 signalled = 0;
     u32 first_idx = 0xFFFFFFFFu;
