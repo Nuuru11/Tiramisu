@@ -272,7 +272,20 @@ void* resolve_through_table(void* user, const char* module,
         }
         // builtin module, unknown symbol: fall through to system by alias
         if (g_system_load) {
-          if (void* fn = g_system_load(target, symbol)) return fn;
+          if (void* fn = g_system_load(target, symbol)) {
+            // Log the fall-through (first 32): a symbol reaching the real
+            // console DLL means the bridge lacks it — the _fseeki64 class
+            // of gap. Rate-limited so import-heavy loads don't flood.
+            static unsigned s_fallback_logged = 0;
+            if (s_fallback_logged < 32) {
+              ++s_fallback_logged;
+              char fb[256];
+              snprintf(fb, sizeof(fb), "modtrace: fallback %s!%s -> system (no bridge impl)",
+                       target ? target : "?", symbol ? symbol : "?");
+              trt_core_log(fb);
+            }
+            return fn;
+          }
           if (target != module)
             if (void* fn2 = g_system_load(module, symbol)) return fn2;
           if (const char* alias = dll_alias_lookup(target))

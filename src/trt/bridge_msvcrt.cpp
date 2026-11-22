@@ -1210,6 +1210,24 @@ i32 TRT_GUEST_ABI crt_fsetpos(void* gf, const i64* pos) {
   return fseeko(osf, (off_t)*pos, SEEK_SET);
 #endif
 }
+i64 TRT_GUEST_ABI crt__ftelli64(void* gf) {
+  FILE* osf = os_file_of(gf);
+  if (!osf) return -1;
+#ifdef _WIN32
+  return (i64)_ftelli64(osf);
+#else
+  return (i64)ftello(osf);
+#endif
+}
+i32 TRT_GUEST_ABI crt__fseeki64(void* gf, i64 off, i32 whence) {
+  FILE* osf = os_file_of(gf);
+  if (!osf) return -1;
+#ifdef _WIN32
+  return _fseeki64(osf, off, whence);
+#else
+  return fseeko(osf, (off_t)off, whence);
+#endif
+}
 char* TRT_GUEST_ABI crt_fgets(char* s, i32 n, void* gf) {
   FILE* osf = os_file_of(gf);
   return osf ? fgets(s, n, osf) : nullptr;
@@ -2768,6 +2786,8 @@ const trt_named_fn k_msvcrt_fns[] = {
     {"rewind",             (void*)&crt_rewind},
     {"fgetpos",            (void*)&crt_fgetpos},
     {"fsetpos",            (void*)&crt_fsetpos},
+    {"_fseeki64",          (void*)&crt__fseeki64},
+    {"_ftelli64",          (void*)&crt__ftelli64},
     {"fgets",              (void*)&crt_fgets},
     {"getc",               (void*)&crt_getc},
     {"ungetc",             (void*)&crt_ungetc},
