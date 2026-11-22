@@ -275,6 +275,27 @@ int main(int argc, char** argv) {
            (unsigned long long)queue_ptr, recorded);
   CHECK(recorded == 1, rec_det);
 
+  // Submission replay: the ECL must snapshot the guest's real draw parameters
+  // into a D3D11-equivalent descriptor, not just remember a list pointer.
+  {
+    const int subs = trt_d3d12_submission_count((void*)(uintptr_t)queue_ptr);
+    const int sub_draws = trt_d3d12_submission_draws(
+        (void*)(uintptr_t)queue_ptr, 0);
+    const unsigned verts = trt_d3d12_submission_vertices(
+        (void*)(uintptr_t)queue_ptr, 0, 0);
+    const unsigned insts = trt_d3d12_submission_instances(
+        (void*)(uintptr_t)queue_ptr, 0, 0);
+    MARKER(subs == 1 && sub_draws == 1 && verts == 3 && insts == 1,
+           "SUBMISSION REPLAY",
+           "recorded draw did not become a D3D11-equivalent submission "
+           "descriptor (verts/instances lost)");
+    char sdet[128];
+    snprintf(sdet, sizeof(sdet),
+             "submissions=%d draws=%d verts=%u insts=%u", subs, sub_draws,
+             verts, insts);
+    CHECK(subs == 1 && sub_draws == 1 && verts == 3 && insts == 1, sdet);
+  }
+
   MARKER(ret & 0x400u, "FENCE SIGNALED",
          "fence SetEventOnCompletion/Signal chain failed in guest");
   MARKER(ret & 0x800u, "", "CreateSwapChainForCoreWindow failed in guest");

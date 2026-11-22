@@ -1116,6 +1116,8 @@ struct d3d12_cmd_list : com_base {
   u32 type = 0;
   bool closed = false;
   u32 draws = 0;
+  struct draw_rec { u32 verts, insts, sv, siv; };
+  std::vector<draw_rec> recorded_draws;  // submission replay payload
   u32 dispatches = 0;
   u32 clears = 0;
   u32 barriers = 0;
@@ -1223,6 +1225,7 @@ void TRT_GUEST_ABI cmd_draw_inst(void* self, u32 verts, u32 insts, u32 sv,
                                  u32 siv) {
   auto* cl = (d3d12_cmd_list*)self;
   ++cl->draws;
+  cl->recorded_draws.push_back({verts, insts, sv, siv});
   // fail-visible: the draw is RECORDED into the list (offline never renders);
   // the TRIANGLE GATE asserts this line exists in the host log.
   char line[96];
@@ -1821,6 +1824,11 @@ static_assert(sizeof(g_cmdlist_vtbl) / sizeof(g_cmdlist_vtbl[0]) == 84,
 //   12   GetClockCalibration
 // The vtbl below must stay in exactly this order; d3d12_vtbl_selfcheck()
 // enforces it at registration time.
+struct d3d12_submission {
+  u32 topology = 0;
+  std::vector<d3d12_cmd_list::draw_rec> draws;
+};
+
 struct d3d12_queue : com_base {
   d3d12_queue_desc_t desc{};
   std::atomic<u64> executed_lists{0};
@@ -1828,6 +1836,7 @@ struct d3d12_queue : com_base {
   // lists here so offline tests can assert the game's submission landed.
   std::mutex mu;
   std::vector<void*> recorded_lists;
+  std::vector<d3d12_submission> submissions;  // replay payload per ECL list
 };
 
 void queue_destroy(com_base* b) {
@@ -1857,7 +1866,14 @@ void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
   {
     std::lock_guard<std::mutex> lk(q->mu);
     for (u32 i = 0; i < count; ++i) {
-      if (lists[i]) q->recorded_lists.push_back(lists[i]);
+      if (!lists[i]) continue;
+      q->recorded_lists.push_back(lists[i]);
+      // Snapshot the list's recorded draws as a D3D11-equivalent submission.
+      d3d12_submission sub;
+      auto* cl = (d3d12_cmd_list*)lists[i];
+      sub.topology = cl->topology;
+      sub.draws = cl->recorded_draws;
+      q->submissions.push_back(std::move(sub));
     }
   }
   // fail-visible: submission landed; the TRIANGLE GATE asserts this line.
@@ -3428,6 +3444,49 @@ int trt_d3d12_queue_recorded_count(void* obj) {
   std::lock_guard<std::mutex> lk2(q->mu);
   return (int)q->recorded_lists.size();
 }
+
+int trt_d3d12_submission_count(void* obj) {
+  if (!obj) return -1;
+  std::lock_guard<std::mutex> lk(g_track_mu);
+  if (g_queues.count(obj) == 0) return -1;
+  auto* q = (d3d12_queue*)obj;
+  std::lock_guard<std::mutex> lk2(q->mu);
+  return (int)q->submissions.size();
+}
+
+static const d3d12_submission* d3d12_submission_at(void* obj, int index) {
+  if (!obj || index < 0) return nullptr;
+  if (g_queues.count(obj) == 0) return nullptr;
+  auto* q = (d3d12_queue*)obj;
+  if (index >= (int)q->submissions.size()) return nullptr;
+  return &q->submissions[(size_t)index];
+}
+
+int trt_d3d12_submission_draws(void* obj, int index) {
+  std::lock_guard<std::mutex> lk(g_track_mu);
+  const auto* s = d3d12_submission_at(obj, index);
+  return s ? (int)s->draws.size() : -1;
+}
+
+unsigned trt_d3d12_submission_vertices(void* obj, int index, int draw) {
+  std::lock_guard<std::mutex> lk(g_track_mu);
+  const auto* s = d3d12_submission_at(obj, index);
+  if (!s || draw < 0 || draw >= (int)s->draws.size()) return 0;
+  return s->draws[(size_t)draw].verts;
+}
+
+unsigned trt_d3d12_submission_instances(void* obj, int index, int draw) {
+  std::lock_guard<std::mutex> lk(g_track_mu);
+  const auto* s = d3d12_submission_at(obj, index);
+  if (!s || draw < 0 || draw >= (int)s->draws.size()) return 0;
+  return s->draws[(size_t)draw].insts;
+}
+
+// ---- D3D11-equivalent submission descriptors ------------------------------
+// ExecuteCommandLists snapshots each list's recorded draws into a queue-local
+// vector. This is the replay payload a host D3D11 submission would consume;
+// it is intentionally data-only so it is gateable without a GPU, and never
+// claims that pixels reached the screen.
 
 // Descriptor-wave test accessors: host-side introspection of the descriptor
 // heap record store and the command list's binding/copy state (same

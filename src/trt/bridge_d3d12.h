@@ -65,6 +65,15 @@ int TRT_GUEST_ABI trt_D3D12GetInterface(const void* rclsid, const void* riid,
 // Returns the recorded-list count, or -1 if the pointer is not a queue.
 int trt_d3d12_queue_recorded_count(void* queue);
 
+// Submission replay: a recorded list is snapshotted into a D3D11-equivalent
+// draw descriptor when ExecuteCommandLists lands. These accessors let the
+// triangle gate assert that the submission carries the guest's real draw
+// parameters (not just a list pointer). GPU execution still needs hardware.
+int trt_d3d12_submission_count(void* queue);
+int trt_d3d12_submission_draws(void* queue, int index);
+unsigned trt_d3d12_submission_vertices(void* queue, int index, int draw);
+unsigned trt_d3d12_submission_instances(void* queue, int index, int draw);
+
 // Descriptor-wave test accessors (host-side introspection; see
 // bridge_d3d12.cpp). Record kind: 0=CBV 1=SRV 2=UAV 3=RTV 4=DSV 5=SAMPLER
 // 0xffffffff=empty; -1 = bad pointer or out-of-range index.
