@@ -1,0 +1,19 @@
+modtrace: LoadLibraryExW -> "api-ms-win-appmodel-runtime-l1-1-1" flags=0x800 handle=00007FF635FE77E0
+kernel32: RaiseException(0x406d1388) thread-name exception swallowed (no debugger attached)
+guest fault: 0xc0000005 at sekiro.exe+0x115c66b (pc=0000020A6995C66B), read address FFFFFFFFFFFFFFE8
+  GPRs: rip=20a6995c66b rsp=12807beae0 rbp=20a6c31b258 rax=ffffffffffffffe8 rbx=78 rcx=20a6c31b258 rdx=78 rsi=20a6c31b258 rdi=20a6c31b388
+  GPRs2: r8=8 r9=20a6c31b248 r10=d r11=0 r12=20a518be040 r13=7ff634bc5b30 r14=8 r15=80
+  code [pc..pc+32]: 4c 8b 00 48 ff 40 08 49 8b 08 48 89 08 48 85 c9 75 0f 48 8b 48 18 48 8b 50 20 48 89 51 08 48 89
+guest fault caller 1: sekiro.exe+0x1159f5a (pc=0000020A69959F5A)
+guest fault caller 2: sekiro.exe+0x115b131 (pc=0000020A6995B131)
+guest fault caller 3: sekiro.exe+0x1195adc (pc=0000020A69995ADC)
+guest fault caller 4: sekiro.exe+0x11e40f9 (pc=0000020A699E40F9)
+guest fault caller 5: sekiro.exe+0x11e439c (pc=0000020A699E439C)
+guest fault caller 6: sekiro.exe+0x235a237 (pc=0000020A6AB5A237)
+guest fault caller 7: tiramisu.exe+0xaf4ab (pc=00007FF6346AF4AB)
+guest fault caller 8: tiramisu.exe+0x2604b (pc=00007FF63462604B)
+guest fault caller 9: tiramisu.exe+0x227b0 (pc=00007FF6346227B0)
+guest fault caller 10: tiramisu.exe+0x45f66 (pc=00007FF634645F66)
+guest fault caller 11: tiramisu.exe+0x5925d1 (pc=00007FF634B925D1)
+guest fault caller 12: ntdll.dll+0xaac32 (pc=00007FFA0E2EAC32)
+launch Sekiro: rc=OK (guest unhandled exception 0xc0000005)

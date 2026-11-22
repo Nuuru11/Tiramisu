@@ -208,6 +208,16 @@
       "note": "Real console ultrapool: one frame presents then stalls while Godot fails to load res://sticker.png \u2014 missing/incomplete staged content, named not hidden",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "sekiro-invalid-pointer-named",
+      "match": [
+        "guest fault: 0xc0000005 at sekiro.exe",
+        "read address FFFFFFFFFFFFFFE8"
+      ],
+      "note": "Real console Sekiro fault: guest reads -0x18 pointer; SEH filter contains it and the app survives (validated on 0.2.2.197)",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }

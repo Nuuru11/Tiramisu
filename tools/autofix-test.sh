@@ -69,6 +69,10 @@ out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-console-ultrapo
 echo "$out" | grep -q 'vulkan-present-stall-named' && \
   echo "OK real console ultrapool boot + present stall matched + named" || { echo "FAIL console ultrapool rule"; rc=1; }
 
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-console-seh-contained.log)
+echo "$out" | grep -q 'sekiro-invalid-pointer-named' && \
+  echo "OK real console SEH-contained fault matched + named" || { echo "FAIL SEH rule"; rc=1; }
+
 echo "== retry loop =="
 $py tools/autopilot.py "$game" --dry-run tests/fixtures/logs --max-attempts 5 >"$tmp/loop.txt" 2>&1
 cat "$tmp/loop.txt" | sed 's/^/    /'

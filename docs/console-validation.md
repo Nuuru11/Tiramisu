@@ -9,6 +9,15 @@ not an offline simulation. Evidence files:
 - `tests/fixtures/logs/real-console-ultrapool-boot.log` — extracted boot.
 - `docs/proof/ultrapool-autopilot-console.png` — TV screenshot during the run.
 
+## Crash containment — validated 2026-11-22 (build 0.2.2.197)
+
+Deployed freshly packed `out/Tiramisu.msix` (0.2.2.197), launched Sekiro via
+`/api/launch/Sekiro`, waited 45 s. Result: **the app survived** — `/api/status`
+still returned `running:true`, dashboard responsive, `guest_running:false`.
+The log shows `guest fault: 0xc0000005 at sekiro.exe+0x115c66b ... read address
+FFFFFFFFFFFFFFE8` followed by the GPR/stack dump and a clean return to shelf.
+Extracted as `tests/fixtures/logs/real-console-seh-contained.log`.
+
 ## What is proven on hardware
 
 - Signed `Xan.Tiramisu_0.2.2.192` is installed and launches via Device Portal.
