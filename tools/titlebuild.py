@@ -141,6 +141,37 @@ PROFILE_DEFAULTS = {
     'shader_cache': 1,
 }
 
+# Engine signatures are detected from the game's OWN binaries, not from a
+# filename list. The profile each one gets is the measured starting point from
+# docs/game-profiles.md + COMPATIBILITY.md; the title can still override it.
+ENGINE_SIGNATURES = [
+    ('unity-il2cpp', ('unityplayer.dll', 'gameassembly.dll'),
+     {'write_watch': 1, 'memory_budget_mb': 4096, 'os_build': 19045}),
+    ('unity-mono', ('unityplayer.dll', 'mono.dll'),
+     {'write_watch': 1, 'memory_budget_mb': 3072}),
+    ('godot-sdl3', ('sdl3.dll',),
+     {'default_input': 'controller', 'frame_rate_cap': 60}),
+    ('godot-sdl2', ('sdl2.dll',),
+     {'default_input': 'controller', 'frame_rate_cap': 60}),
+    ('fna-mono', ('fna.dll', 'mono.dll'),
+     {'default_input': 'controller', 'frame_rate_cap': 60}),
+]
+
+
+def detect_engine(dlls, exes):
+    """Return (engine_id, profile_overrides) or (None, {})."""
+    names = set(lower(d) for d in dlls)
+    for engine, sig, overrides in ENGINE_SIGNATURES:
+        if all(any(name == s or name.endswith('/' + s) for name in names)
+               for s in sig):
+            return engine, dict(overrides)
+    for exe in exes:
+        e = lower(os.path.basename(exe))
+        if e.endswith('-win64-shipping.exe'):
+            return 'unreal', {'memory_budget_mb': 4096,
+                              'frame_rate_cap': 60}
+    return None, {}
+
 
 def find_pes(root):
     out = []
@@ -255,7 +286,13 @@ def build(root):
                 cls[c] += 1
 
     dlls = sorted(set(lower(d) for d in dlls))
-    title = {'root': root, 'pes': [{'path': p['path'], 'bits': p['bits']}
+    engine, engine_profile = detect_engine(
+        [os.path.basename(p) for p in files], [p['path'] for p in pes])
+    shim_modules = sorted(set(g['symbol'].split('!', 1)[0].lower()
+                              for g in gaps))
+    title = {'root': root, 'engine': engine, 'engine_profile': engine_profile,
+             'shim_modules': shim_modules,
+             'pes': [{'path': p['path'], 'bits': p['bits']}
                                    for p in pes],
              'exe': pick_exe(pes, root), 'dlls': dlls, 'symbols': syms,
              'cls': cls, 'gaps': gaps, 'skipped': skipped,
@@ -276,10 +313,12 @@ def build(root):
     return title
 
 
-def emit_profile(path):
+def emit_profile(path, engine_profile=None):
     # Merge, never clobber: autofix writes real repairs into this file and a
-    # later rebuild must preserve them.
+    # later rebuild must preserve them. Engine overrides sit between the
+    # generic defaults and the user's / autofix's explicit keys.
     values = dict(PROFILE_DEFAULTS)
+    values.update(engine_profile or {})
     if os.path.exists(path):
         with open(path) as f:
             for line in f:
@@ -309,7 +348,10 @@ def main(argv):
         os.makedirs(outdir, exist_ok=True)
         with open(manifest, 'w') as f:
             json.dump(t, f, indent=2, sort_keys=True)
-        emit_profile(profile)
+        emit_profile(profile, t['engine_profile'])
+        with open(os.path.join(outdir, 'shims.txt'), 'w') as f:
+            for mod in t['shim_modules']:
+                f.write(mod + '\n')
 
     c = t['cls']
     total = sum(c.values())
@@ -318,6 +360,8 @@ def main(argv):
                                 if t['exe'] else '(none)'))
     print('PEs:          %d (%s)' % (
         len(t['pes']), ', '.join('%db' % p['bits'] for p in t['pes'][:6])))
+    print('engine:       %s' % (t['engine'] or 'unknown'))
+    print('shim modules: %d' % len(t['shim_modules']))
     print('classifier:   %s' % t['classifier'])
     print('imports:      %d  real=%d recorded=%d named-silent=%d' %
           (total, c['real'], c['recorded'], c['named-silent']))

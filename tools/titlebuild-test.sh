@@ -20,8 +20,15 @@ for d in corpus-local/*/; do
   [[ "$n" -gt 0 ]] || { echo "SKIP $d (no PEs)"; continue; }
   out=$($tb --check "$d" 2>&1); r=$?
   verdict=$(sed -n 's/^verdict: *//p' <<<"$out")
-  printf '%-28s %-9s %s\n' "$(basename "$d")" "$verdict" \
+  printf '%-28s %-9s %-14s %s\n' "$(basename "$d")" "$verdict" \
+    "$(sed -n 's/^engine: *//p' <<<"$out")" \
     "$(sed -n 's/^imports: */imp=/p' <<<"$out")"
+  case "$(basename "$d")" in
+    gonext|raccoin)
+      grep -q '^engine: *unity-il2cpp' <<<"$out" || { echo "FAIL engine detection: $d"; rc=1; } ;;
+    botw-native)
+      grep -q '^engine: *godot-sdl3' <<<"$out" || { echo "FAIL engine detection: $d"; rc=1; } ;;
+  esac
   if [[ $r -gt 1 || -z "$verdict" ]]; then
     echo "FAIL $d: expected a measured verdict (got exit $r)"; sed 's/^/    /' <<<"$out"; rc=1
   fi
@@ -39,6 +46,22 @@ if [[ -f "$tmp/game/.tiramisu/manifest.json" ]] && \
   echo "OK manifest.json + tiramisu.profile.ini written"
 else
   echo "FAIL package generation"; rc=1
+fi
+if [[ -f "$tmp/game/.tiramisu/shims.txt" ]]; then
+  echo "OK shims.txt written ($(wc -l < "$tmp/game/.tiramisu/shims.txt") modules)"
+else
+  echo "FAIL shims.txt"; rc=1
+fi
+engine_game="$tmp/engine"; mkdir -p "$engine_game"
+find corpus-local/raccoin -maxdepth 1 -type f \( -name '*.exe' -o -name '*.dll' \) \
+  -exec cp {} "$engine_game/" \; 2>/dev/null
+python3 tools/titlebuild.py "$engine_game" >/dev/null 2>&1
+if grep -q '"engine": "unity-il2cpp"' "$engine_game/.tiramisu/manifest.json" && \
+   grep -q '^write_watch=1' "$engine_game/tiramisu.profile.ini" && \
+   grep -q '^memory_budget_mb=4096' "$engine_game/tiramisu.profile.ini"; then
+  echo "OK detected engine generated its own profile overrides"
+else
+  echo "FAIL engine profile generation"; rc=1
 fi
 
 echo "== block rules fire =="
