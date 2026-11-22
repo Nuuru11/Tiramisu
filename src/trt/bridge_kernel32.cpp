@@ -5811,8 +5811,110 @@ extern "C" int TRT_STDCALL trt_dispatch_win32_exception(void* ep_v) {
 }
 
 #ifdef _WIN32
+// .216 DIAG: real-exit hook state -- INT3 patches on the REAL ExitProcess /
+// TerminateProcess / FatalExit in kernel32.dll + kernelbase.dll. If Sekiro
+// exits via a PEB-walked or direct real call (bypassing the bridge trt_
+// imports, which it binds but never calls), the breakpoint fires here with
+// the caller RIP. One shot per target: the byte is restored on first fire.
+struct real_exit_target {
+  const char* name;
+  void* addr;
+  u8 orig;
+  bool armed;
+};
+static real_exit_target g_real_exit_targets[6];
+static int g_real_exit_armed = 0;
+
 static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
+  if (ep && ep->ExceptionRecord &&
+      ep->ExceptionRecord->ExceptionCode == 0x80000003u /*EXCEPTION_BREAKPOINT*/) {
+    void* addr = ep->ExceptionRecord->ExceptionAddress;
+    for (int i = 0; i < 6; ++i) {
+      if (g_real_exit_targets[i].armed && g_real_exit_targets[i].addr == addr) {
+        u64 caller = 0;
+        if (ep->ContextRecord) {
+          const u64 rsp = (u64)ep->ContextRecord->Rsp;
+          if (rsp) caller = *(const u64*)(uintptr_t)rsp;
+        }
+        char line[192];
+        snprintf(line, sizeof(line), "real-exit: %s called from 0x%llx",
+                 g_real_exit_targets[i].name, (unsigned long long)caller);
+        trt_core_log(line);
+        // Restore the original byte and re-execute the real function.
+        // NOTE: at an INT3 the context RIP points past the breakpoint
+        // byte, so reset it to the patched address or the first
+        // instruction would be entered mid-opcode.
+        DWORD old_prot = 0;
+        if (::VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+          *(u8*)addr = g_real_exit_targets[i].orig;
+          ::VirtualProtect(addr, 1, old_prot, &old_prot);
+        }
+        g_real_exit_targets[i].armed = false;
+        if (ep->ContextRecord)
+          ep->ContextRecord->Rip = (u64)(uintptr_t)addr;
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
+  }
   return (LONG)trt_dispatch_win32_exception((void*)ep);
+}
+
+// .216 DIAG: install the real-exit INT3 hook. Called once from the host
+// guest-launch path before guest code runs. Also registers the OS VEH
+// above directly, so the hook works even if the guest never calls
+// AddVectoredExceptionHandler.
+extern "C" void trt_real_exit_hook_install() {
+  static const struct {
+    const wchar_t* mod;
+    const char* fn;
+    const char* name;
+  } k_targets[6] = {
+      {L"kernel32.dll", "ExitProcess", "kernel32!ExitProcess"},
+      {L"kernel32.dll", "TerminateProcess", "kernel32!TerminateProcess"},
+      {L"kernel32.dll", "FatalExit", "kernel32!FatalExit"},
+      {L"kernelbase.dll", "ExitProcess", "kernelbase!ExitProcess"},
+      {L"kernelbase.dll", "TerminateProcess", "kernelbase!TerminateProcess"},
+      {L"kernelbase.dll", "FatalExit", "kernelbase!FatalExit"},
+  };
+  static std::once_flag s_real_exit_veh_once;
+  std::call_once(s_real_exit_veh_once, []() {
+    using pfn_add_veh = PVOID (WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+    HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+    if (!kb) kb = ::GetModuleHandleW(L"kernel32.dll");
+    if (kb) {
+      auto fn = (pfn_add_veh)::GetProcAddress(kb, "AddVectoredExceptionHandler");
+      if (fn) fn(1u, &trt_win32_os_veh);
+    }
+  });
+  int installed = 0;
+  for (int i = 0; i < 6; ++i) {
+    HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
+    if (!mod) continue;
+    void* addr = (void*)::GetProcAddress(mod, k_targets[i].fn);
+    if (!addr) continue;
+    DWORD old_prot = 0;
+    if (!::VirtualProtect(addr, 1, PAGE_EXECUTE_READWRITE, &old_prot)) {
+      char line[192];
+      snprintf(line, sizeof(line),
+               "real-exit: VirtualProtect failed %s err=%u",
+               k_targets[i].name, (unsigned)::GetLastError());
+      trt_core_log(line);
+      continue;
+    }
+    g_real_exit_targets[i].name = k_targets[i].name;
+    g_real_exit_targets[i].addr = addr;
+    g_real_exit_targets[i].orig = *(u8*)addr;
+    g_real_exit_targets[i].armed = true;
+    *(u8*)addr = 0xCC;  // INT3
+    ::VirtualProtect(addr, 1, old_prot, &old_prot);
+    ++installed;
+  }
+  g_real_exit_armed = installed;
+  {
+    char line[128];
+    snprintf(line, sizeof(line), "real-exit: hook installed %d/6", installed);
+    trt_core_log(line);
+  }
 }
 #endif
 
@@ -6129,6 +6231,8 @@ struct cv_slot {
   // .215 DIAG: per-CV log counters (rate-limit wake/woke lines).
   u64 wake_log_n;
   u64 woke_log_n;
+  // .216 DIAG: per-CV wait count (top-5 in the CV summary).
+  std::atomic<u64> wait_n;
 };
 constexpr int k_max_cvs = 512;
 cv_slot g_cv_slots[k_max_cvs];
@@ -6140,7 +6244,7 @@ std::atomic_flag g_cv_table_lock = ATOMIC_FLAG_INIT;
 // CS, wedging the whole boot). Counters + the g_cv_wake_mu-serialized wait
 // below make the window impossible instead of invisible.
 std::atomic<u64> g_cv_waits{0}, g_cv_wake_single{0}, g_cv_wake_all{0},
-    g_cv_wake_no_waiter{0}, g_cv_timeouts{0};
+    g_cv_wake_no_waiter{0}, g_cv_timeouts{0}, g_cv_wokes{0};
 // Serializes "release the user lock -> register as waiter" against Wake*,
 // closing the lost-wakeup window. Global (not per-slot): wake frequency is
 // low and correctness beats contention here.
@@ -6169,6 +6273,7 @@ cv_slot* cv_get(void* key) {
         g_cv_slots[i].init = true;
         g_cv_slots[i].wake_log_n = 0;
         g_cv_slots[i].woke_log_n = 0;
+        g_cv_slots[i].wait_n.store(0, std::memory_order_relaxed);
         created = true;
         found = &g_cv_slots[i];
         break;
@@ -6317,8 +6422,50 @@ void TRT_STDCALL trt_InitializeConditionVariable(void* cv) {
   if (cv) memset(cv, 0, sizeof(void*));
 }
 
+// .216 DIAG: CV summary -- every 1024th CV wait, log global totals plus
+// the top 5 CVs by wait count (names the livelock participants instead of
+// forcing a full-log grep). Lock-free reads only; safe from the wait path.
+static void cv_log_summary() {
+  u64 top_n[5] = {0, 0, 0, 0, 0};
+  void* top_cv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+  for (int i = 0; i < k_max_cvs; ++i) {
+    if (!g_cv_slots[i].init) continue;
+    const u64 n = g_cv_slots[i].wait_n.load(std::memory_order_relaxed);
+    if (n == 0) continue;
+    for (int j = 0; j < 5; ++j) {
+      if (n > top_n[j]) {
+        for (int k = 4; k > j; --k) {
+          top_n[k] = top_n[k - 1];
+          top_cv[k] = top_cv[k - 1];
+        }
+        top_n[j] = n;
+        top_cv[j] = g_cv_slots[i].key;
+        break;
+      }
+    }
+  }
+  char line[512];
+  snprintf(line, sizeof(line),
+           "sync: CV-summary waits=%llu wakes=%llu wokes=%llu timeouts=%llu "
+           "top: %p=%llu %p=%llu %p=%llu %p=%llu %p=%llu",
+           (unsigned long long)g_cv_waits.load(std::memory_order_relaxed),
+           (unsigned long long)(g_cv_wake_single.load(std::memory_order_relaxed) +
+                                g_cv_wake_all.load(std::memory_order_relaxed)),
+           (unsigned long long)g_cv_wokes.load(std::memory_order_relaxed),
+           (unsigned long long)g_cv_timeouts.load(std::memory_order_relaxed),
+           top_cv[0], (unsigned long long)top_n[0],
+           top_cv[1], (unsigned long long)top_n[1],
+           top_cv[2], (unsigned long long)top_n[2],
+           top_cv[3], (unsigned long long)top_n[3],
+           top_cv[4], (unsigned long long)top_n[4]);
+  trt_core_log(line);
+}
+
 static int cv_wait_locked(cv_slot* s, u32 ms) {
-  g_cv_waits.fetch_add(1, std::memory_order_relaxed);
+  const u64 wn = g_cv_waits.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (s) s->wait_n.fetch_add(1, std::memory_order_relaxed);
+  // .216 DIAG: CV summary every 1024th wait.
+  if ((wn % 1024) == 0) cv_log_summary();
 #if defined(_WIN32)
   const BOOL ok = ::SleepConditionVariableCS(&s->cv, &s->cs, ms);
   ::LeaveCriticalSection(&s->cs);
@@ -6381,13 +6528,14 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
     trt_core_log(iw);
   }
   const int r = cv_wait_locked(s, ms);
+  g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke -- log when a waiter EXITS the CV wait (wake->work
   // vs wake->immediate re-wait). Fires for ALL waits (incl. timed), so
-  // timed waiters on a CV become visible. Rate-limited: first 16 exits
-  // per CV + every 256th.
+  // timed waiters on a CV become visible. Rate-limited: first 64 exits
+  // per CV + every 256th (.216: 16 -> 64, the first 16 hid the re-wait).
   {
     const u64 n = (u64)__atomic_fetch_add(&s->woke_log_n, 1, __ATOMIC_RELAXED) + 1;
-    if (n <= 16 || (n % 256) == 0) {
+    if (n <= 64 || (n % 256) == 0) {
       char line[128];
       snprintf(line, sizeof(line), "sync: CV-woke cv=%p r=%d n=%llu", cv, r,
                (unsigned long long)n);
@@ -6423,10 +6571,12 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
     trt_core_log(iw);
   }
   const int r = cv_wait_locked(s, ms);
+  g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke (CS variant) -- see SleepConditionVariableSRW.
+  // .216: cap 16 -> 64, same reason as the SRW variant.
   {
     const u64 n = (u64)__atomic_fetch_add(&s->woke_log_n, 1, __ATOMIC_RELAXED) + 1;
-    if (n <= 16 || (n % 256) == 0) {
+    if (n <= 64 || (n % 256) == 0) {
       char line[128];
       snprintf(line, sizeof(line), "sync: CV-woke-CS cv=%p r=%d n=%llu", cv, r,
                (unsigned long long)n);

@@ -25,6 +25,8 @@
 // The real definition (settings.cpp) returns the bool getter as int; weak
 // missing resolves to 0 handled by check_enabled()'s default-on logic.
 extern "C" int trt_settings_shader_cache_int(void) __attribute__((weak));
+// .216 DIAG: thread id for the Vulkan frame-loop trace.
+extern "C" u32 TRT_STDCALL trt_GetCurrentThreadId(void);
 
 // ---- shader compile cache (settings knob: shader_cache) -------------------
 // SPIR-V -> HLSL compilation is the single most expensive path on the Vulkan
@@ -1712,24 +1714,33 @@ i32 TRT_GUEST_ABI trt_vkGetSwapchainImagesKHR(void* dev_v, u64 sc, u32* pCount, 
   return VK_SUCCESS_V;
 }
 i32 TRT_GUEST_ABI trt_vkAcquireNextImageKHR(void* dev_v, u64 sc, u64, u64, u64, u32* pIdx) {
+  // .216 DIAG: frame-loop trace -- log every acquire with tid.
+  vk_logf("vulkan: vkAcquireNextImageKHR ENTRY tid=%u sc=%llu",
+          trt_GetCurrentThreadId(), (unsigned long long)sc);
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
-  if (!d || !d->swapchains.count(sc) || !pIdx) return VK_ERROR_INITIALIZATION_FAILED_V;
+  if (!d || !d->swapchains.count(sc) || !pIdx) {
+    vk_logf("vulkan: vkAcquireNextImageKHR rc=%d idx=-1 tid=%u",
+            VK_ERROR_INITIALIZATION_FAILED_V, trt_GetCurrentThreadId());
+    return VK_ERROR_INITIALIZATION_FAILED_V;
+  }
   auto& s = d->swapchains[sc];
   *pIdx = s.next_img % (u32)s.images.size();
   s.next_img++;
+  vk_logf("vulkan: vkAcquireNextImageKHR rc=%d idx=%u tid=%u",
+          VK_SUCCESS_V, *pIdx, trt_GetCurrentThreadId());
   return VK_SUCCESS_V;
 }
 i32 TRT_GUEST_ABI trt_vkQueuePresentKHR(void*, const vk_present_info* pi) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
   static u64 s_presents = 0;
   ++s_presents;
-  if (s_presents <= 10 || s_presents % 60 == 0) {
-    vk_logf("vulkan: vkQueuePresentKHR frame=%llu sc=%llu idx=%u",
-            (unsigned long long)s_presents,
-            (unsigned long long)((pi && pi->swapchainCount && pi->pSwapchains) ? pi->pSwapchains[0] : 0),
-            (pi && pi->swapchainCount && pi->pImageIndices) ? pi->pImageIndices[0] : 0u);
-  }
+  // .216 DIAG: log EVERY present with tid (was first 10 + every 60th).
+  vk_logf("vulkan: vkQueuePresentKHR frame=%llu sc=%llu idx=%u tid=%u",
+          (unsigned long long)s_presents,
+          (unsigned long long)((pi && pi->swapchainCount && pi->pSwapchains) ? pi->pSwapchains[0] : 0),
+          (pi && pi->swapchainCount && pi->pImageIndices) ? pi->pImageIndices[0] : 0u,
+          trt_GetCurrentThreadId());
   if (pi && pi->swapchainCount > 0 && pi->pSwapchains && g_vk_hooks_set && g_vk_hooks.present) {
     u32 idx = pi->pImageIndices ? pi->pImageIndices[0] : 0;
     g_vk_hooks.present(pi->pSwapchains[0], idx, g_vk_hooks.user);
@@ -2450,7 +2461,17 @@ void TRT_GUEST_ABI trt_vkDestroyFence(void* dev_v, u64 f, const void*) {
   if (vk_device_obj* d = dev_from(dev_v)) d->fences.erase(f);
 }
 i32 TRT_GUEST_ABI trt_vkResetFences(void*, u32, const u64*) { return VK_SUCCESS_V; }
-i32 TRT_GUEST_ABI trt_vkWaitForFences(void*, u32, const u64*, u32, u64) { return VK_SUCCESS_V; }
+i32 TRT_GUEST_ABI trt_vkWaitForFences(void*, u32 cnt, const u64*, u32, u64) {
+  // .216 DIAG: frame-loop trace -- fence waits are the other half of the
+  // present loop (acquire -> submit -> wait -> present).
+  static u64 s_fence_waits = 0;
+  const u64 n = ++s_fence_waits;
+  if (n <= 20 || n % 60 == 0) {
+    vk_logf("vulkan: vkWaitForFences ENTRY tid=%u count=%u",
+            trt_GetCurrentThreadId(), cnt);
+  }
+  return VK_SUCCESS_V;
+}
 i32 TRT_GUEST_ABI trt_vkGetFenceStatus(void*, u64) { return VK_SUCCESS_V; }
 i32 TRT_GUEST_ABI trt_vkCreateSemaphore(void* dev_v, const vk_sem_type_ci* ci, const void*, u64* pS) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
@@ -2909,6 +2930,13 @@ void TRT_GUEST_ABI trt_vkCmdExecuteCommands(void* cb_v, u32 cnt, void* const* pC
 }
 
 i32 TRT_GUEST_ABI trt_vkQueueSubmit(void* q_v, u32 cnt, const vk_submit_info* subs, u64) {
+  // .216 DIAG: frame-loop trace (first 20 + every 60th).
+  static u64 s_submits = 0;
+  const u64 n = ++s_submits;
+  if (n <= 20 || n % 60 == 0) {
+    vk_logf("vulkan: vkQueueSubmit ENTRY tid=%u cnt=%u",
+            trt_GetCurrentThreadId(), cnt);
+  }
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_queue_obj* q = (vk_queue_obj*)q_v;
   vk_device_obj* d = dev_from(q ? q->device : nullptr);
@@ -2923,6 +2951,13 @@ i32 TRT_GUEST_ABI trt_vkQueueSubmit(void* q_v, u32 cnt, const vk_submit_info* su
   return VK_SUCCESS_V;
 }
 i32 TRT_GUEST_ABI trt_vkQueueSubmit2(void* q_v, u32 cnt, const vk_submit_info2* subs, u64) {
+  // .216 DIAG: frame-loop trace (first 20 + every 60th).
+  static u64 s_submits2 = 0;
+  const u64 n = ++s_submits2;
+  if (n <= 20 || n % 60 == 0) {
+    vk_logf("vulkan: vkQueueSubmit2 ENTRY tid=%u cnt=%u",
+            trt_GetCurrentThreadId(), cnt);
+  }
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_queue_obj* q = (vk_queue_obj*)q_v;
   vk_device_obj* d = dev_from(q ? q->device : nullptr);
