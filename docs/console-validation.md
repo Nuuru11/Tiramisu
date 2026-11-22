@@ -33,6 +33,18 @@ Series S, relaunched ultrapool: `vkQueuePresentKHR frame=1` still appears, so
 the D3D11/Vulkan path is unaffected. No D3D12 title is staged, so the submit
 hook itself is only gated offline (triangle gate: HOST SUBMIT PASS).
 
+## D3D12 host submit hook on hardware — staged and launched
+
+Uploaded `tests/out/guest_triangle.exe` as game `d3d12triangle` via
+`PUT /api/upload-file`, launched it via `POST /api/launch/d3d12triangle`.
+Console log shows `launching ...games\d3d12triangle\guest_triangle.exe`,
+`d3d: guest presented its first frame`, `launch d3d12triangle: rc=OK`.
+No `d3d12:` bridge lines appeared: the console routes `d3d12.dll` to the
+REAL UWP system library (`module_table.cpp` default `TRT_ROUTE_SYSTEM`), so
+the guest used hardware D3D12 and never entered our bridge's submit hook.
+The hook remains gated offline (triangle gate: HOST SUBMIT PASS). A per-title
+route override would be needed to force the bridge path on console.
+
 ## What is proven on hardware
 
 - Signed `Xan.Tiramisu_0.2.2.192` is installed and launches via Device Portal.
