@@ -5769,6 +5769,15 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
 
 // RaiseException: run registered guest VEHs first, then native OS RaiseException on UWP.
 void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
+  // MS_VC_EXCEPTION (0x406D1388): the legacy SetThreadName trick. Real
+  // Windows ignores this exception when no debugger is attached; swallow
+  // it here the way the SysV path does, instead of dispatching it through
+  // the real ::RaiseException (which faults the guest in ntdll EH dispatch).
+  if (code == 0x406d1388u) {
+    boot_log("kernel32: RaiseException(0x406d1388) thread-name exception "
+             "swallowed (no debugger attached)");
+    return;
+  }
   static unsigned s_cpp_eh_logged = 0;
   if (code != 0xe06d7363u || ++s_cpp_eh_logged <= 4) {
     char line[192];
