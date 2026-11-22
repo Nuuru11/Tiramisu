@@ -151,6 +151,14 @@ bool log_has(const char* needle) {
 }
 }  // namespace
 
+static u32 g_host_submit_calls = 0;
+static u32 g_host_submit_draws = 0;
+static int TRT_GUEST_ABI test_host_submit(const trt_d3d12_submit_desc* sd) {
+  ++g_host_submit_calls;
+  if (sd) g_host_submit_draws += sd->count;
+  return 0;
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
@@ -169,6 +177,11 @@ int main(int argc, char** argv) {
   if (trt_bridge_register_d3d12() != 0) {
     printf("  FAIL d3d12 registration (vtbl selfcheck refused)\n");
     return 1;
+  }
+  {
+    trt_d3d12_hooks h{};
+    h.submit = &test_host_submit;
+    trt_d3d12_set_hooks(&h);
   }
   trt_resolver def;
   trt_resolver_default(&def);
@@ -294,6 +307,15 @@ int main(int argc, char** argv) {
              "submissions=%d draws=%d verts=%u insts=%u", subs, sub_draws,
              verts, insts);
     CHECK(subs == 1 && sub_draws == 1 && verts == 3 && insts == 1, sdet);
+
+    MARKER(g_host_submit_calls >= 1 && g_host_submit_draws >= 1,
+           "HOST SUBMIT",
+           "ExecuteCommandLists did not reach the host submit hook");
+    char hdet[96];
+    snprintf(hdet, sizeof(hdet),
+             "host submit calls=%u draws=%u", g_host_submit_calls,
+             g_host_submit_draws);
+    CHECK(g_host_submit_calls >= 1 && g_host_submit_draws >= 1, hdet);
   }
 
   MARKER(ret & 0x400u, "FENCE SIGNALED",

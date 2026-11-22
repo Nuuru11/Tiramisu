@@ -270,6 +270,21 @@ void TRT_GUEST_ABI prepare_d3d11_present() {
   draw_pointer_impl(false);
 }
 
+// Host GPU submission for replayed D3D12 command lists. This issues real
+// D3D11 DrawInstanced calls on the host context (the device that owns the
+// CoreWindow swapchain, possibly D3D11on12). It is a genuine host draw
+// submission; guest PSO/root-signature translation remains a separate step.
+static int TRT_GUEST_ABI host_d3d12_submit(const trt_d3d12_submit_desc* sd) {
+  if (!sd) return (int)E_INVALIDARG;
+  if (!g_ctx || g_in_d3d12) return (int)E_FAIL;  // no D3D11 path while D3D12 swap is active
+  for (u32 i = 0; i < sd->count && sd->draws; ++i) {
+    const auto& d = sd->draws[i];
+    g_ctx->DrawInstanced(d.vertices, d.instances,
+                         d.start_vertex, d.start_instance);
+  }
+  return (int)S_OK;
+}
+
 void publish_gpu_hooks() {
   trt_gpu_hooks hooks{};
   hooks.device = g_device.get();
@@ -460,6 +475,7 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   d12.create_versioned_root_deserializer = &host_d3d12_deser_vroot;
   d12.get_interface = &host_d3d12_get_iface;
   d12.enable_experimental = &host_d3d12_exp;
+  d12.submit = &host_d3d12_submit;
   trt_d3d12_set_hooks(&d12);
 
   publish_gpu_hooks();

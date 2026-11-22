@@ -1882,6 +1882,28 @@ void TRT_GUEST_ABI queue_exec_lists(void* self, u32 count, void* const* lists) {
            "d3d12: queue ExecuteCommandLists(%u) recorded (total=%llu)", count,
            (unsigned long long)q->executed_lists.load());
   trt_core_log(line);
+
+  // Hand the replay payload to the host GPU path when one is installed.
+  const trt_d3d12_hooks* hooks = trt_d3d12_hooks_get();
+  if (hooks && hooks->submit) {
+    std::vector<trt_d3d12_draw_desc> draws;
+    {
+      std::lock_guard<std::mutex> lk2(q->mu);
+      for (const auto& sub : q->submissions) {
+        for (const auto& dr : sub.draws) {
+          draws.push_back({sub.topology, dr.verts, dr.insts, dr.sv, dr.siv});
+        }
+      }
+    }
+    trt_d3d12_submit_desc sd{(u32)draws.size(), draws.data()};
+    const int hr = hooks->submit(&sd);
+    snprintf(line, sizeof(line),
+             "d3d12: host submit of %u draw(s) hr=0x%08x", sd.count,
+             (unsigned)hr);
+    trt_core_log(line);
+  } else {
+    trt_core_log("d3d12: no host submit hook — submission recorded only");
+  }
 }
 
 void TRT_GUEST_ABI queue_marker_evt(void*, u32, const void*, u32) {}

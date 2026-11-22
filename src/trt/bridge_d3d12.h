@@ -15,6 +15,20 @@
 extern "C" {
 #endif
 
+// A recorded command list reduced to host-drawable parameters.
+typedef struct trt_d3d12_draw_desc {
+  u32 topology;
+  u32 vertices;
+  u32 instances;
+  u32 start_vertex;
+  u32 start_instance;
+} trt_d3d12_draw_desc;
+
+typedef struct trt_d3d12_submit_desc {
+  u32 count;
+  const trt_d3d12_draw_desc* draws;
+} trt_d3d12_submit_desc;
+
 typedef struct trt_d3d12_hooks {
   int (TRT_GUEST_ABI *create_device)(void* adapter, u32 min_fl, const void* riid,
                                      void** out_dev);
@@ -34,6 +48,9 @@ typedef struct trt_d3d12_hooks {
                                      void** out_iface);
   int (TRT_GUEST_ABI *enable_experimental)(u32 num_features, const void* iids,
                                            void* config_structs, const u32* sizes);
+  // Host-side draw submission for a replayed command list. NULL = no host
+  // GPU path; the submission is still recorded and named (never silent).
+  int (TRT_GUEST_ABI *submit)(const trt_d3d12_submit_desc* desc);
 } trt_d3d12_hooks;
 
 void trt_d3d12_set_hooks(const trt_d3d12_hooks* hooks);
