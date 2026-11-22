@@ -696,6 +696,17 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
     }
   }
 
+  {
+    // .199 diagnostic: did the worker thread start? (First 32.)
+    static unsigned s_tramp_logged = 0;
+    if (s_tramp_logged < 32) {
+      ++s_tramp_logged;
+      char tl[192];
+      snprintf(tl, sizeof(tl), "thread: win_thread_trampoline started tid=%u routine=0x%llx arg=0x%llx",
+               my_tid, (unsigned long long)routine, (unsigned long long)arg);
+      trt_core_log(tl);
+    }
+  }
   trt_guest_tls_sync_thread();
   trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
   const u64 ret = win_call_guest_seh(routine, arg);
@@ -1423,7 +1434,19 @@ u32 TRT_STDCALL trt_ResumeThread(u64 thread) {
     trt_SetLastError(6);
     return (u32)-1;
   }
-  return ::ResumeThread(h);
+  u32 prev_count = ::ResumeThread(h);
+  {
+    // .199 diagnostic: is the arena worker ever resumed? (First 32.)
+    static unsigned s_resume_logged = 0;
+    if (s_resume_logged < 32) {
+      ++s_resume_logged;
+      char rl[160];
+      snprintf(rl, sizeof(rl), "thread: ResumeThread obj=0x%llx -> prev_count=%u",
+               (unsigned long long)thread, prev_count);
+      trt_core_log(rl);
+    }
+  }
+  return prev_count;
 #else
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(thread);

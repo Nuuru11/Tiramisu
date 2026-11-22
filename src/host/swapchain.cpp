@@ -394,29 +394,50 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
   // Video-memory baseline at boot: is the 3.8GB video usage seen in
   // TEX-OOM-DIAG (ultrapool) a driver/system reservation, or game-
   // allocated? Logged once at device creation, before any game runs.
-  // If boot-time usage is already GBs, the video number is driver/
-  // system memory, not the game (and H2 becomes the lead).
+  // .199: uses trt_core_log (the .197/.198 log_line version never
+  // logged) + a probe line + per-step failure logging.
   {
+    trt_core_log("[swapchain] VIDEO-BASELINE probing...");
     IDXGIDevice* dxgi_dev0 = nullptr;
-    if (dev && SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev0)) && dxgi_dev0) {
+    HRESULT hr_qi = dev ? dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi_dev0) : E_POINTER;
+    if (SUCCEEDED(hr_qi) && dxgi_dev0) {
       IDXGIAdapter* adapter0 = nullptr;
-      if (SUCCEEDED(dxgi_dev0->GetAdapter(&adapter0)) && adapter0) {
+      HRESULT hr_ad = dxgi_dev0->GetAdapter(&adapter0);
+      if (SUCCEEDED(hr_ad) && adapter0) {
         IDXGIAdapter3* adapter30 = nullptr;
-        if (SUCCEEDED(adapter0->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter30)) && adapter30) {
+        HRESULT hr_a3 = adapter0->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&adapter30);
+        if (SUCCEEDED(hr_a3) && adapter30) {
           DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
-          if (SUCCEEDED(adapter30->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) {
+          HRESULT hr_vmi = adapter30->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi);
+          if (SUCCEEDED(hr_vmi)) {
             char vb[256];
             snprintf(vb, sizeof(vb),
                      "[swapchain] VIDEO-BASELINE budget=%lluMB usage=%lluMB avail=%lluMB",
                      (unsigned long long)(vmi.Budget >> 20), (unsigned long long)(vmi.CurrentUsage >> 20),
                      (unsigned long long)(vmi.AvailableForReservation >> 20));
-            log_line(vb);
+            trt_core_log(vb);
+          } else {
+            char vb[128];
+            snprintf(vb, sizeof(vb), "[swapchain] VIDEO-BASELINE QueryVideoMemoryInfo failed hr=0x%08x", (unsigned)hr_vmi);
+            trt_core_log(vb);
           }
           adapter30->Release();
+        } else {
+          char vb[128];
+          snprintf(vb, sizeof(vb), "[swapchain] VIDEO-BASELINE IDXGIAdapter3 QI failed hr=0x%08x", (unsigned)hr_a3);
+          trt_core_log(vb);
         }
         adapter0->Release();
+      } else {
+        char vb[128];
+        snprintf(vb, sizeof(vb), "[swapchain] VIDEO-BASELINE GetAdapter failed hr=0x%08x", (unsigned)hr_ad);
+        trt_core_log(vb);
       }
       dxgi_dev0->Release();
+    } else {
+      char vb[160];
+      snprintf(vb, sizeof(vb), "[swapchain] VIDEO-BASELINE IDXGIDevice QI failed hr=0x%08x dev=%p", (unsigned)hr_qi, (void*)dev.get());
+      trt_core_log(vb);
     }
   }
 
