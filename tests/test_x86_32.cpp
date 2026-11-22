@@ -105,6 +105,23 @@ int main() {
           "loop decremented ECX to zero and exited");
   }
 
+  // 0x66 operand-size prefix: mov ax,imm16 preserves the upper half of eax.
+  {
+    u8 code[] = {0xb8,0x00,0x00,0xff,0xff, 0x66,0xb8,0x34,0x12, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0xa000);
+    CHECK(trt_x86_run(&c, 32) == 0 && c.r[X86_EAX] == 0xffff1234u,
+          "66h prefix wrote only AX (upper EAX preserved)");
+  }
+  // 66 89 /r: mov word [mem], ax via a 16-bit memory write.
+  {
+    u8 code[] = {0x66,0x89,0x05,0x80,0xa1,0x00,0x00, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0xa100);
+    c.r[X86_EAX] = 0xffff5678u;
+    CHECK(trt_x86_run(&c, 32) == 0, "66h word memory write halted");
+    u16 w = 0; trt_x86_mem_read(&c, 0xa180, 2, &w);
+    CHECK(w == 0x5678, "66h prefix wrote exactly 2 bytes to memory");
+  }
+
   printf("  result: %s\n", fails ? "FAIL" : "ALL PASS");
   return fails ? 1 : 0;
 }

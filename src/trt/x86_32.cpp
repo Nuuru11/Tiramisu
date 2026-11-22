@@ -19,6 +19,8 @@ struct decoder {
   trt_x86_ctx* c;
   bool fault = false;
   u32 seg_base = 0;  // active FS/GS prefix base for this instruction
+  bool ops16 = false;  // 0x66 operand-size prefix
+  u16 i16() { u16 v = 0; for (int i = 0; i < 2; ++i) v |= (u16)byte() << (8 * i); return v; }
 
   u8 byte() {
     if (trt_x86_mem_read(c, c->eip, 1, &v8)) { fault = true; return 0; }
@@ -72,7 +74,18 @@ int decode_modrm(decoder& d, modrm_t& m) {
   return 0;
 }
 
+void set_reg_op(decoder& d, int i, u32 v) {
+  if (d.ops16) d.c->r[i] = (d.c->r[i] & 0xffff0000u) | (v & 0xffffu);
+  else d.c->r[i] = v;
+}
+
 u32 read_rm(decoder& d, const modrm_t& m) {
+  if (d.ops16) {
+    if (m.mod == 3) return d.c->r[m.rm] & 0xffffu;
+    u16 v = 0;
+    if (trt_x86_mem_read(d.c, m.va, 2, &v)) d.fault = true;
+    return v;
+  }
   if (m.mod == 3) return d.c->r[m.rm];
   u32 v = 0;
   if (trt_x86_mem_read(d.c, m.va, 4, &v)) d.fault = true;
@@ -80,8 +93,13 @@ u32 read_rm(decoder& d, const modrm_t& m) {
 }
 
 void write_rm(decoder& d, const modrm_t& m, u32 v) {
-  if (m.mod == 3) d.c->r[m.rm] = v;
-  else if (trt_x86_mem_write(d.c, m.va, 4, &v)) d.fault = true;
+  if (m.mod == 3) {
+    if (d.ops16) d.c->r[m.rm] = (d.c->r[m.rm] & 0xffff0000u) | (v & 0xffffu);
+    else d.c->r[m.rm] = v;
+    return;
+  }
+  if (d.ops16) { u16 w = (u16)v; trt_x86_mem_write(d.c, m.va, 2, &w); }
+  else trt_x86_mem_write(d.c, m.va, 4, &v);
 }
 
 void set_logic_flags(trt_x86_ctx* c, u32 v) {
@@ -189,10 +207,13 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
     // Segment/operand/REP prefixes. FS/GS are real on 32-bit Windows (TEB /
     // TLS), so their bases are applied to the effective address.
     d.seg_base = 0;
+    d.ops16 = false;
     while (op == 0x64 || op == 0x65 || op == 0x26 || op == 0x2e ||
-           op == 0x36 || op == 0x3e || op == 0xf2 || op == 0xf3) {
+           op == 0x36 || op == 0x3e || op == 0xf2 || op == 0xf3 ||
+           op == 0x66) {
       if (op == 0x64) d.seg_base = c->fs_base;
       if (op == 0x65) d.seg_base = c->gs_base;
+      if (op == 0x66) d.ops16 = true;
       op = d.byte();
       if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
     }
@@ -346,8 +367,9 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
         if ((op & 0xf0) == 0x70) {                        // jcc rel8
           u8 r = d.byte();
           if (jcc(op & 0xf, c->eflags)) c->eip += (u32)(i8)r;
-        } else if ((op & 0xf8) == 0xb8) {                 // mov r32, imm32
-          c->r[op & 7] = d.i32();
+        } else if ((op & 0xf8) == 0xb8) {                 // mov r32/r16, imm
+          if (d.ops16) set_reg_op(d, op & 7, d.i16());
+          else c->r[op & 7] = d.i32();
         } else if ((op & 0xf0) == 0x50) {                 // push r32
           u32 sp = c->r[X86_ESP] - 4;
           if (trt_x86_mem_write(c, sp, 4, &c->r[op & 7])) { c->stop_code = sp; return 2; }
@@ -364,25 +386,27 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
                    op == 0x8d || op == 0x83 || op == 0xff) {
           modrm_t m; decode_modrm(d, m);
           if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
-          u32 a = read_rm(d, m), b = c->r[m.reg], res = 0;
+          u32 a = read_rm(d, m);
+          u32 b = d.ops16 ? (c->r[m.reg] & 0xffffu) : c->r[m.reg];
+          u32 res = 0;
           if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
           switch (op) {
             case 0x89: write_rm(d, m, b); break;          // mov r/m, r
-            case 0x8b: c->r[m.reg] = a; break;            // mov r, r/m
+            case 0x8b: set_reg_op(d, m.reg, a); break;            // mov r, r/m
             case 0x09: res = a | b; write_rm(d, m, res); set_logic_flags(c, res); break;
-            case 0x0b: res = b | a; c->r[m.reg] = res; set_logic_flags(c, res); break;
+            case 0x0b: res = b | a; set_reg_op(d, m.reg, res); set_logic_flags(c, res); break;
             case 0x0d: res = a | d.i32(); write_rm(d, m, res); set_logic_flags(c, res); break;
             case 0x01: res = a + b; write_rm(d, m, res); set_add_flags(c, a, b, res); break;
-            case 0x03: res = b + a; c->r[m.reg] = res; set_add_flags(c, b, a, res); break;
+            case 0x03: res = b + a; set_reg_op(d, m.reg, res); set_add_flags(c, b, a, res); break;
             case 0x29: res = a - b; write_rm(d, m, res); set_sub_flags(c, a, b, res); break;
-            case 0x2b: res = b - a; c->r[m.reg] = res; set_sub_flags(c, b, a, res); break;
+            case 0x2b: res = b - a; set_reg_op(d, m.reg, res); set_sub_flags(c, b, a, res); break;
             case 0x31: res = a ^ b; write_rm(d, m, res); set_logic_flags(c, res); break;
-            case 0x33: res = b ^ a; c->r[m.reg] = res; set_logic_flags(c, res); break;
+            case 0x33: res = b ^ a; set_reg_op(d, m.reg, res); set_logic_flags(c, res); break;
             case 0x39: set_sub_flags(c, a, b, a - b); break;   // cmp r/m, r
             case 0x3b: set_sub_flags(c, b, a, b - a); break;   // cmp r, r/m
             case 0x85: set_logic_flags(c, a & b); break;       // test
-            case 0x8d: c->r[m.reg] = m.va; break;              // lea
-            case 0xc7: res = d.i32(); write_rm(d, m, res); break;
+            case 0x8d: set_reg_op(d, m.reg, m.va); break;              // lea
+            case 0xc7: res = d.ops16 ? d.i16() : d.i32(); write_rm(d, m, res); break;
             case 0xff: {                            // group-5 call/jmp r/m32
               if (m.reg == 2) {                     // call near r/m32
                 u32 sp = c->r[X86_ESP] - 4;
