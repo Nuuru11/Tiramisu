@@ -5834,7 +5834,6 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
     // +0x115c66b with this yield, H2 is confirmed (the .195 GPR dump
     // shows mov r8,[rax] with rax=-24 = CONTAINING_RECORD(NULL) on a
     // list the worker hasn't populated yet).
-    ::Sleep(500); // .202 diagnostic: 50ms insufficient (.198/.200), testing if worker just needs more time
 #endif
     return;
   }
