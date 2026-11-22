@@ -98,7 +98,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
   src/trt/bridge_fmod_studio.cpp \
-  src/trt/x86_exec.cpp src/trt/x86_bridge.cpp src/trt/x86_image.cpp src/trt/x86_32.cpp src/trt/x86_jit.cpp \
+  src/trt/x86_exec.cpp src/trt/x86_bridge.cpp src/trt/x86_image.cpp src/trt/x86_32.cpp src/trt/x86_jit.cpp src/trt/x86_heap.cpp \
   src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
   src/trt/trt_trace.cpp \
   third_party/mono-bridges/mono_steam_door.cpp \
