@@ -9,6 +9,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+
+// Guest object width, defined in bridge_thread.cpp: 32 makes the sync bridges
+// initialize the 24-byte i386 CRITICAL_SECTION instead of Win64's 40 bytes.
+extern "C" void trt_set_guest_ptr_bits(int bits);
+
 static int g_seg_override = -1;
 
 // ---- ModRM byte helpers ----
@@ -40,64 +45,51 @@ uint32_t* x86_reg_ptr(x86_context* ctx, int idx) {
 // ---- Effective address calculation ----
 // Returns the effective address for a ModRM byte. Handles mod, SIB, displacements.
 static uint32_t calc_ea(x86_context* ctx, uint8_t modrm, int* bytes_consumed) {
+    // CONTRACT: on entry EIP already points just past the ModRM byte, so all
+    // SIB/displacement bytes are read from EIP itself. *bytes_consumed is
+    // chosen so the caller's `eip += consumed - 1` advances exactly over the
+    // bytes that follow ModRM.
     int mod = modrm_mod(modrm);
     int rm = modrm_rm(modrm);
     uint32_t addr = 0;
-    int consumed = 1; // modrm byte itself
 
     if (mod == 3) {
-        // register operand, no memory address
-        *bytes_consumed = consumed;
-        return 0; // caller checks mod==3
+        *bytes_consumed = 1;
+        return 0;
     }
 
-    // Base register
-    if (rm == 4 && mod != 0) {
-        // SIB follows
-        uint8_t sib = x86_mem_read8(ctx, ctx->regs.eip + consumed);
-        consumed++;
+    int extra = 0; // bytes after ModRM (SIB + displacement)
+    if (rm == 4) {
+        // SIB byte follows
+        uint8_t sib = x86_mem_read8(ctx, ctx->regs.eip);
+        extra = 1;
         int scale = 1 << sib_scale(sib);
         int index = sib_index(sib);
         int base = sib_base(sib);
-
-        if (index != 4) { // index not ESP
-            addr += *x86_reg_ptr(ctx, index) * scale;
-        }
-        if (base != 5 || mod != 0) {
-            addr += *x86_reg_ptr(ctx, base);
-        }
-    } else if (rm != 5 || mod != 0) {
+        if (index != 4) addr += *x86_reg_ptr(ctx, index) * scale;
+        if (base != 5 || mod != 0) addr += *x86_reg_ptr(ctx, base);
+        if (mod == 0 && base == 5) { addr += x86_mem_read32(ctx, ctx->regs.eip + 1); extra += 4; }
+    } else if (mod == 0 && rm == 5) {
+        // disp32 only
+        addr = x86_mem_read32(ctx, ctx->regs.eip);
+        extra = 4;
+    } else {
         addr += *x86_reg_ptr(ctx, rm);
     }
 
-    // Displacement
-    if (mod == 0 && rm == 5) {
-        // disp32 only
-        addr = x86_mem_read32(ctx, ctx->regs.eip + consumed);
-        consumed += 4;
-    } else if (mod == 0 && rm == 4) {
-        // SIB with disp32 if base==5
-        uint8_t sib = x86_mem_read8(ctx, ctx->regs.eip + 1); // re-read
-        if (sib_base(sib) == 5) {
-            uint32_t disp = x86_mem_read32(ctx, ctx->regs.eip + consumed);
-            addr += disp;
-            consumed += 4;
-        }
-    } else if (mod == 1) {
-        int8_t disp = (int8_t)x86_mem_read8(ctx, ctx->regs.eip + consumed);
-        addr += disp;
-        consumed += 1;
+    if (mod == 1) {
+        addr += (uint32_t)(int32_t)(int8_t)x86_mem_read8(ctx, ctx->regs.eip + extra);
+        extra += 1;
     } else if (mod == 2) {
-        uint32_t disp = x86_mem_read32(ctx, ctx->regs.eip + consumed);
-        addr += disp;
-        consumed += 4;
+        addr += x86_mem_read32(ctx, ctx->regs.eip + extra);
+        extra += 4;
     }
 
     // FS segment override: add FS base
     if (g_seg_override == 4) {
         addr += ctx->regs.fs_base;
     }
-    *bytes_consumed = consumed;
+    *bytes_consumed = extra + 1;
     return addr;
 }
 
@@ -352,6 +344,10 @@ static inline void vec_op32(int op, uint8_t* d, const uint8_t* s, int n) {
     }
 }
 
+static inline void sse_fetch_ivec(x86_context* ctx, uint8_t modrm, int use_mmx, uint8_t* out16) {
+    if (use_mmx) sse_fetch64(ctx, modrm, 1, out16);
+    else sse_fetch(ctx, modrm, out16);
+}
 static inline void sse_store_n(x86_context* ctx, uint8_t modrm, const uint8_t* in, int n) {
     int rm = modrm_rm(modrm);
     if (modrm_mod(modrm) == 3) {
@@ -429,6 +425,55 @@ static inline void sse_shift64(uint8_t* d, int count, int left) {
     memcpy(d, &r, 8);
 }
 
+
+// ---- 8-bit register access and flag updates ----
+static inline uint8_t* r8p(x86_context* ctx, int i) {
+    switch (i) {
+        case 0: return (uint8_t*)&ctx->regs.eax;
+        case 1: return (uint8_t*)&ctx->regs.ecx;
+        case 2: return (uint8_t*)&ctx->regs.edx;
+        case 3: return (uint8_t*)&ctx->regs.ebx;
+        case 4: return ((uint8_t*)&ctx->regs.eax) + 1;
+        case 5: return ((uint8_t*)&ctx->regs.ecx) + 1;
+        case 6: return ((uint8_t*)&ctx->regs.edx) + 1;
+        case 7: return ((uint8_t*)&ctx->regs.ebx) + 1;
+    }
+    return (uint8_t*)&ctx->regs.eax;
+}
+static inline void flag_szp8(x86_context* ctx, uint8_t r) {
+    ctx->regs.eflags &= ~(X86_ZF | X86_SF | X86_PF);
+    if (r == 0) ctx->regs.eflags |= X86_ZF;
+    if (r & 0x80) ctx->regs.eflags |= X86_SF;
+    if (__builtin_popcount(r) % 2 == 0) ctx->regs.eflags |= X86_PF;
+}
+static inline void flag_add8(x86_context* ctx, uint8_t a, uint8_t b, unsigned carry, unsigned r) {
+    ctx->regs.eflags &= ~(X86_CF | X86_OF | X86_AF);
+    if (r > 0xFF) ctx->regs.eflags |= X86_CF;
+    if (((a ^ b ^ r) & 0x10)) ctx->regs.eflags |= X86_AF;
+    if (~(a ^ b) & (a ^ r) & 0x80) ctx->regs.eflags |= X86_OF;
+    flag_szp8(ctx, (uint8_t)r);
+    (void)carry;
+}
+static inline void flag_sub8(x86_context* ctx, uint8_t a, uint8_t b, unsigned borrow, unsigned r) {
+    ctx->regs.eflags &= ~(X86_CF | X86_OF | X86_AF);
+    if ((int)r < 0) ctx->regs.eflags |= X86_CF;
+    if (((a ^ b ^ r) & 0x10)) ctx->regs.eflags |= X86_AF;
+    if ((a ^ b) & (a ^ r) & 0x80) ctx->regs.eflags |= X86_OF;
+    flag_szp8(ctx, (uint8_t)r);
+    (void)borrow;
+}
+static inline void flag_logic8(x86_context* ctx, uint8_t r) {
+    ctx->regs.eflags &= ~(X86_CF | X86_OF | X86_AF);
+    flag_szp8(ctx, r);
+}
+
+// Low byte addressed by an 8-bit register operand: rm 0-3 are AL/CL/DL/BL and
+// rm 4-7 are AH/CH/DH/BH (the second byte of EAX/ECX/EDX/EBX).
+static uint8_t read_r8(x86_context* ctx, int idx) {
+    uint32_t v = *x86_reg_ptr(ctx, idx);
+    return (idx < 4) ? (uint8_t)v : (uint8_t)(v >> 8);
+}
+
 // ---- Main execution step ----
 // ---- 32-bit import trap dispatch (PE32 Phase 2) ----
 // Imported 32-bit calls land on a reserved trap address. Dispatch to the
@@ -456,6 +501,7 @@ static int x86_trap_dispatch(x86_context* ctx) {
         ctx->last_error = 3;
         return -1;
     }
+    ctx->insn_count++;
     int nargs = 0, cdecl_call = 0;
     uint32_t result = x86_dispatch_import(ctx, index, mod, sym, &nargs, &cdecl_call);
     ctx->regs.eax = result;
@@ -466,8 +512,124 @@ static int x86_trap_dispatch(x86_context* ctx) {
     return 1;
 }
 
+// ---- Structured Exception Handling ----
+// Call a guest function with __cdecl arguments. Returns EAX. The sentinel page
+// holds HLT, so the run loop stops when the callee returns into it.
+uint32_t x86_call_guest(x86_context* ctx, uint32_t fn, const uint32_t* args, int nargs) {
+    if (!ctx->seh_sentinel || !ctx->running) return 0;
+    uint32_t saved_eip = ctx->regs.eip;
+    uint32_t saved_esp = ctx->regs.esp;
+
+    uint32_t sp = ctx->regs.esp;
+    for (int i = nargs - 1; i >= 0; i--) {
+        sp -= 4;
+        x86_mem_write32(ctx, sp, args ? args[i] : 0);
+    }
+    sp -= 4;
+    x86_mem_write32(ctx, sp, ctx->seh_sentinel);
+    ctx->regs.esp = sp;
+    ctx->regs.eip = fn;
+
+    // Handlers are short; a bound keeps a broken handler from wedging us.
+    long guard = 0;
+    while (ctx->running && ctx->regs.eip != ctx->seh_sentinel && guard++ < 2000000L) {
+        int r = x86_jit_step(ctx);
+        if (r < 0) break;
+        if (r == 0 && x86_step(ctx) != 0) break;
+    }
+
+    uint32_t ret = ctx->regs.eax;
+    ctx->regs.eip = saved_eip;
+    ctx->regs.esp = saved_esp;
+    return ret;
+}
+
+// CONTEXT (x86) field offsets used by MSVC's exception handlers.
+static const uint32_t XC_CONTEXT_FLAGS = 0x00, XC_SEG_GS = 0x90, XC_SEG_FS = 0x94;
+static const uint32_t XC_EDI = 0xA0, XC_ESI = 0xA4, XC_EBX = 0xA8, XC_EDX = 0xAC;
+static const uint32_t XC_ECX = 0xB0, XC_EAX = 0xB4, XC_EBP = 0xB8, XC_EIP = 0xBC;
+static const uint32_t XC_SEG_CS = 0xC0, XC_EFLAGS = 0xC4, XC_ESP = 0xC8, XC_SEG_SS = 0xCC;
+static const uint32_t XC_SIZE = 716;
+static const uint32_t XR_CODE = 0x00, XR_FLAGS = 0x04, XR_RECORD = 0x08, XR_ADDR = 0x0C;
+static const uint32_t XR_NPARAMS = 0x10, XR_INFO = 0x18, XR_SIZE = 80;
+
+static void seh_fill_context(x86_context* ctx, uint32_t c) {
+    x86_mem_write32(ctx, c + XC_CONTEXT_FLAGS, 0x0001003F); // CONTROL|INTEGER|SEGMENTS
+    x86_mem_write32(ctx, c + XC_SEG_GS, ctx->regs.gs);
+    x86_mem_write32(ctx, c + XC_SEG_FS, ctx->regs.fs);
+    x86_mem_write32(ctx, c + XC_EDI, ctx->regs.edi);
+    x86_mem_write32(ctx, c + XC_ESI, ctx->regs.esi);
+    x86_mem_write32(ctx, c + XC_EBX, ctx->regs.ebx);
+    x86_mem_write32(ctx, c + XC_EDX, ctx->regs.edx);
+    x86_mem_write32(ctx, c + XC_ECX, ctx->regs.ecx);
+    x86_mem_write32(ctx, c + XC_EAX, ctx->regs.eax);
+    x86_mem_write32(ctx, c + XC_EBP, ctx->regs.ebp);
+    x86_mem_write32(ctx, c + XC_EIP, ctx->regs.eip);
+    x86_mem_write32(ctx, c + XC_SEG_CS, ctx->regs.cs);
+    x86_mem_write32(ctx, c + XC_EFLAGS, ctx->regs.eflags);
+    x86_mem_write32(ctx, c + XC_ESP, ctx->regs.esp);
+    x86_mem_write32(ctx, c + XC_SEG_SS, ctx->regs.ss);
+}
+
+int x86_raise_seh(x86_context* ctx, uint32_t code, uint32_t flags,
+                  uint32_t addr, uint32_t nparams, const uint32_t* params) {
+    if (!ctx->regs.fs_base || !ctx->seh_sentinel) return -1;
+
+    // ExceptionList is the first dword of the TEB; FS:[0] holds its head.
+    uint32_t rec = x86_mem_read32(ctx, ctx->regs.fs_base);
+    if (rec == 0 || rec == 0xFFFFFFFF) return -1;
+
+    uint32_t slot = (ctx->regs.esp - XC_SIZE - XR_SIZE - 16u) & ~15u;
+    uint32_t ctxrec = slot;
+    uint32_t exrec = slot + XC_SIZE;
+    for (uint32_t i = 0; i < XC_SIZE + XR_SIZE; i += 4)
+        x86_mem_write32(ctx, slot + i, 0);
+
+    x86_mem_write32(ctx, exrec + XR_CODE, code);
+    x86_mem_write32(ctx, exrec + XR_FLAGS, flags);
+    x86_mem_write32(ctx, exrec + XR_RECORD, 0);
+    x86_mem_write32(ctx, exrec + XR_ADDR, addr);
+    uint32_t n = nparams > 15 ? 15 : nparams;
+    x86_mem_write32(ctx, exrec + XR_NPARAMS, n);
+    for (uint32_t i = 0; i < n; i++)
+        x86_mem_write32(ctx, exrec + XR_INFO + i * 4, params ? params[i] : 0);
+
+    for (int depth = 0; depth < 32 && rec != 0 && rec != 0xFFFFFFFF; depth++) {
+        uint32_t prev = x86_mem_read32(ctx, rec);
+        uint32_t handler = x86_mem_read32(ctx, rec + 4);
+        if (!handler) break;
+
+        seh_fill_context(ctx, ctxrec);
+        uint32_t args[4] = { exrec, rec, ctxrec, 0 };
+        uint32_t r = x86_call_guest(ctx, handler, args, 4);
+        if (r == 0) { // ExceptionContinueExecution
+            ctx->regs.edi = x86_mem_read32(ctx, ctxrec + XC_EDI);
+            ctx->regs.esi = x86_mem_read32(ctx, ctxrec + XC_ESI);
+            ctx->regs.ebx = x86_mem_read32(ctx, ctxrec + XC_EBX);
+            ctx->regs.edx = x86_mem_read32(ctx, ctxrec + XC_EDX);
+            ctx->regs.ecx = x86_mem_read32(ctx, ctxrec + XC_ECX);
+            ctx->regs.eax = x86_mem_read32(ctx, ctxrec + XC_EAX);
+            ctx->regs.ebp = x86_mem_read32(ctx, ctxrec + XC_EBP);
+            ctx->regs.eip = x86_mem_read32(ctx, ctxrec + XC_EIP);
+            ctx->regs.eflags = x86_mem_read32(ctx, ctxrec + XC_EFLAGS);
+            ctx->regs.esp = x86_mem_read32(ctx, ctxrec + XC_ESP);
+            return 0;
+        }
+        rec = prev; // ExceptionContinueSearch
+    }
+    return -1;
+}
+
 int x86_step(x86_context* ctx) {
     if (!ctx->running) return -1;
+    static const bool trace_insn = getenv("TRT_X86_TRACE_I") != nullptr;
+    if (trace_insn) {
+        u32 e = ctx->regs.eip;
+        fprintf(stderr, "I %08X %02X %02X %02X %02X %02X %02X  esp=%08X eax=%08X ecx=%08X\n",
+                e, x86_mem_read8(ctx, e), x86_mem_read8(ctx, e + 1), x86_mem_read8(ctx, e + 2),
+                x86_mem_read8(ctx, e + 3), x86_mem_read8(ctx, e + 4), x86_mem_read8(ctx, e + 5),
+                ctx->regs.esp, ctx->regs.eax, ctx->regs.ecx);
+    }
     if (ctx->insn_count >= ctx->insn_limit) {
         if (ctx->log) ctx->log("x86: instruction limit reached");
         ctx->running = 0;
@@ -478,6 +640,21 @@ int x86_step(x86_context* ctx) {
     {
         int t = x86_trap_dispatch(ctx);
         if (t != 0) return t < 0 ? -1 : 0;
+    }
+
+    // Executing from an uncommitted page is an access violation. Deliver it to
+    // the guest's SEH chain before failing.
+    if (!x86_page_mapped(ctx, ctx->regs.eip >> X86_PAGE_SHIFT)) {
+        uint32_t info[2] = { 0, ctx->regs.eip }; // 0 = read (no write to report)
+        if (x86_raise_seh(ctx, 0xC0000005u, 0, ctx->regs.eip, 2, info) == 0) return 0;
+        char buf[160];
+        snprintf(buf, sizeof(buf),
+                 "x86: unhandled access violation executing 0x%08X (insn #%llu, no SEH handler)",
+                 ctx->regs.eip, (unsigned long long)ctx->insn_count);
+        if (ctx->log) ctx->log(buf);
+        ctx->running = 0;
+        ctx->last_error = 5;
+        return -1;
     }
 
     uint32_t eip_start = ctx->regs.eip;
@@ -491,7 +668,10 @@ int x86_step(x86_context* ctx) {
     (void)operand_size; (void)addr_size; (void)rep;
 
     while (op == 0x66 || op == 0x67 || op == 0xF3 || op == 0xF2 ||
+           op == 0xF0 ||
            op == 0x26 || op == 0x2E || op == 0x36 || op == 0x3E || op == 0x64 || op == 0x65) {
+        // 0xF0 LOCK: the guest is single-threaded here, so the atomicity the
+        // prefix buys is already true. Consume it and run the instruction.
         if (op == 0x66) operand_size = 16;
         if (op == 0x67) addr_size = 16;
         if (op == 0xF3) rep = 1;
@@ -518,10 +698,41 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
-    // ---- PUSH r/m32 (0xFF /6) ----
+    // ---- CLI / STI (0xFA / 0xFB) ----
+    // The guest never receives a hardware interrupt here, so the interrupt
+    // flag is bookkeeping only: set/clear it and continue.
+    if (op == 0xFA) { ctx->regs.eflags &= ~(uint32_t)X86_IF; return 0; }
+    if (op == 0xFB) { ctx->regs.eflags |= (uint32_t)X86_IF; return 0; }
+
+    // ---- 0xFF group ----
     if (op == 0xFF) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
         int ext = modrm_reg(modrm); // extension opcode
+        if (ext == 0 || ext == 1) { // INC / DEC r/m32 (CF is not touched)
+            uint32_t val, addr = 0;
+            uint32_t* dst;
+            if (modrm_mod(modrm) == 3) {
+                dst = x86_reg_ptr(ctx, modrm_rm(modrm));
+                val = *dst;
+            } else {
+                int consumed = 0;
+                addr = calc_ea(ctx, modrm, &consumed);
+                ctx->regs.eip += consumed - 1;
+                dst = nullptr;
+                val = x86_mem_read32(ctx, addr);
+            }
+            uint32_t cf = ctx->regs.eflags & X86_CF;
+            uint32_t result = (ext == 0) ? val + 1 : val - 1;
+            // Both INC and DEC raise OF/SF/ZF/AF/PF and leave CF alone. The
+            // add/sub helpers compute SF as the sign bit of the result, which
+            // is exactly what the CPU does for both.
+            if (ext == 0) x86_update_flags_add(ctx, val, 1, result);
+            else          x86_update_flags_sub(ctx, val, 1, result);
+            ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | cf;
+            if (dst) *dst = result;
+            else x86_mem_write32(ctx, addr, result);
+            return 0;
+        }
         if (ext == 6) { // PUSH r/m32
             uint32_t val;
             if (modrm_mod(modrm) == 3) {
@@ -598,8 +809,41 @@ int x86_step(x86_context* ctx) {
 
     // ---- INT 3 (breakpoint) ----
     if (op == 0xCC) {
-        if (ctx->log) ctx->log("x86: INT3 breakpoint");
+        uint32_t info = eip_start;
+        if (x86_raise_seh(ctx, 0x80000003u, 0, eip_start, 1, &info) == 0) return 0;
+        if (ctx->log) ctx->log("x86: INT3 breakpoint (unhandled: no SEH handler)");
         ctx->running = 0;
+        ctx->last_error = 2;
+        return -1;
+    }
+
+    // ---- STC / CLC / CMC (0xF9 / 0xF8 / 0xF5) ----
+    if (op == 0xF9) { ctx->regs.eflags |= X86_CF; return 0; }
+    if (op == 0xF8) { ctx->regs.eflags &= ~X86_CF; return 0; }
+    if (op == 0xF5) { ctx->regs.eflags ^= X86_CF; return 0; }
+
+    // ---- INT imm8 (0xCD) ----
+    // 0xCD 0x03 is a breakpoint; any other vector (0x29 = MSVC __fastfail, the
+    // /GS stack-cookie and __report_gsfailure path) terminates the process in
+    // user mode, so stop there and say which vector it was.
+    if (op == 0xCD) {
+        uint8_t vec = x86_mem_read8(ctx, ctx->regs.eip++);
+        if (vec == 3) {
+            uint32_t info = eip_start;
+            if (x86_raise_seh(ctx, 0x80000003u, 0, eip_start, 1, &info) == 0) return 0;
+            if (ctx->log) ctx->log("x86: INT3 breakpoint (unhandled: no SEH handler)");
+            ctx->running = 0;
+            ctx->last_error = 2;
+            return -1;
+        }
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "x86: INT 0x%02X at EIP=0x%08X -> guest asked for termination "
+                 "(0x29 = __fastfail; no Win32 user-mode handler exists)",
+                 vec, eip_start);
+        if (ctx->log) ctx->log(buf);
+        ctx->running = 0;
+        ctx->last_error = 3;
         return -1;
     }
 
@@ -682,7 +926,7 @@ int x86_step(x86_context* ctx) {
         if (op2 == 0xB6) {
             uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
             if (modrm_mod(modrm) == 3) {
-                uint32_t val = x86_mem_read8(ctx, *x86_reg_ptr(ctx, modrm_rm(modrm)));
+                uint32_t val = read_r8(ctx, modrm_rm(modrm));
                 *x86_reg_ptr(ctx, modrm_reg(modrm)) = val;
             } else {
                 int consumed = 0;
@@ -696,7 +940,7 @@ int x86_step(x86_context* ctx) {
         if (op2 == 0xB7) {
             uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
             if (modrm_mod(modrm) == 3) {
-                uint32_t val = x86_mem_read16(ctx, *x86_reg_ptr(ctx, modrm_rm(modrm)));
+                uint32_t val = *x86_reg_ptr(ctx, modrm_rm(modrm)) & 0xFFFF;
                 *x86_reg_ptr(ctx, modrm_reg(modrm)) = val;
             } else {
                 int consumed = 0;
@@ -712,7 +956,7 @@ int x86_step(x86_context* ctx) {
             uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
             uint32_t val;
             if (modrm_mod(modrm) == 3) {
-                val = (int32_t)(int8_t)x86_mem_read8(ctx, *x86_reg_ptr(ctx, modrm_rm(modrm)));
+                val = (uint32_t)(int32_t)(int8_t)read_r8(ctx, modrm_rm(modrm));
             } else {
                 int consumed = 0;
                 uint32_t addr = calc_ea(ctx, modrm, &consumed);
@@ -726,7 +970,7 @@ int x86_step(x86_context* ctx) {
             uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
             uint32_t val;
             if (modrm_mod(modrm) == 3) {
-                val = (int32_t)(int16_t)x86_mem_read16(ctx, *x86_reg_ptr(ctx, modrm_rm(modrm)));
+                val = (uint32_t)(int32_t)(int16_t)(*x86_reg_ptr(ctx, modrm_rm(modrm)) & 0xFFFF);
             } else {
                 int consumed = 0;
                 uint32_t addr = calc_ea(ctx, modrm, &consumed);
@@ -964,6 +1208,23 @@ int x86_step(x86_context* ctx) {
                 sse_store(ctx, modrm, buf);
                 return 0;
             }
+            // ---- Bitwise packed single/double: 0x54 AND, 0x55 ANDN,
+            //      0x56 OR, 0x57 XOR (prefix-independent: these are bitwise) ----
+            if (op2 == 0x54 || op2 == 0x55 || op2 == 0x56 || op2 == 0x57) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                uint8_t src[16] = {0};
+                sse_fetch(ctx, modrm, src);
+                for (int i = 0; i < 16; i++) {
+                    switch (op2) {
+                        case 0x54: ctx->regs.xmm[dst][i] &= src[i]; break;
+                        case 0x55: ctx->regs.xmm[dst][i] = (uint8_t)(~ctx->regs.xmm[dst][i] & src[i]); break;
+                        case 0x56: ctx->regs.xmm[dst][i] |= src[i]; break;
+                        default:   ctx->regs.xmm[dst][i] ^= src[i]; break;
+                    }
+                }
+                return 0;
+            }
             // ---- Packed/scalar arithmetic: 0x51 sqrt, 0x58 add, 0x59 mul,
             //      0x5C sub, 0x5D min, 0x5E div, 0x5F max ----
             if (op2 == 0x51 || op2 == 0x58 || op2 == 0x59 || op2 == 0x5C ||
@@ -1073,6 +1334,141 @@ int x86_step(x86_context* ctx) {
                 return 0;
             }
 
+            // ---- Multi-byte NOP and prefetch hints (0x0F 0x18-0x1F) ----
+            if (op2 >= 0x18 && op2 <= 0x1F) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                if (modrm_mod(modrm) != 3) {
+                    int c = 0;
+                    (void)calc_ea(ctx, modrm, &c);
+                    ctx->regs.eip += c - 1;
+                }
+                return 0;
+            }
+            // ---- SHUFPS / SHUFPD (0x0F 0xC6) ----
+            if (op2 == 0xC6) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                int imm = x86_mem_read8(ctx, ctx->regs.eip++);
+                uint8_t src[16] = {0};
+                sse_fetch(ctx, modrm, src);
+                uint8_t d[16];
+                memcpy(d, ctx->regs.xmm[dst], 16);
+                uint8_t out[16] = {0};
+                if (p66) { // SHUFPD
+                    int s0 = imm & 1, s1 = (imm >> 1) & 1;
+                    memcpy(out + 0, d + (s0 ? 8 : 0), 8);
+                    memcpy(out + 8, src + (s1 ? 8 : 0), 8);
+                } else { // SHUFPS
+                    uint32_t dv[4], sv[4], ov[4];
+                    memcpy(dv, d, 16); memcpy(sv, src, 16);
+                    ov[0] = dv[imm & 3];
+                    ov[1] = dv[(imm >> 2) & 3];
+                    ov[2] = sv[(imm >> 4) & 3];
+                    ov[3] = sv[(imm >> 6) & 3];
+                    memcpy(out, ov, 16);
+                }
+                memcpy(ctx->regs.xmm[dst], out, 16);
+                return 0;
+            }
+            // ---- UNPCKLPS/PD (0x14), UNPCKHPS/PD (0x15) ----
+            if (op2 == 0x14 || op2 == 0x15) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                uint8_t src[16] = {0};
+                sse_fetch(ctx, modrm, src);
+                uint8_t d[16];
+                memcpy(d, ctx->regs.xmm[dst], 16);
+                uint8_t out[16] = {0};
+                if (p66) { // doubles: 2 lanes
+                    if (op2 == 0x14) { memcpy(out, d, 8); memcpy(out + 8, src, 8); }
+                    else { memcpy(out, d + 8, 8); memcpy(out + 8, src + 8, 8); }
+                } else { // singles: 4 lanes
+                    if (op2 == 0x14) {
+                        memcpy(out + 0, d + 0, 4); memcpy(out + 4, src + 0, 4);
+                        memcpy(out + 8, d + 4, 4); memcpy(out + 12, src + 4, 4);
+                    } else {
+                        memcpy(out + 0, d + 8, 4); memcpy(out + 4, src + 8, 4);
+                        memcpy(out + 8, d + 12, 4); memcpy(out + 12, src + 12, 4);
+                    }
+                }
+                memcpy(ctx->regs.xmm[dst], out, 16);
+                return 0;
+            }
+            // ---- MOVLPS / MOVHPS / MOVLPD / MOVHPD (0x12 load, 0x13 store) ----
+            if (op2 == 0x12 || op2 == 0x13) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                int high = (op2 == 0x13) ? 1 : 0;
+                if (modrm_mod(modrm) == 3) {
+                    // MOVHLPS/MOVLHPS register form
+                    uint8_t src[16];
+                    memcpy(src, ctx->regs.xmm[modrm_rm(modrm)], 16);
+                    uint8_t out[16];
+                    memcpy(out, ctx->regs.xmm[dst], 16);
+                    if (op2 == 0x12) memcpy(out, src + 8, 8);      // MOVHLPS
+                    else memcpy(out + 8, src, 8);                    // MOVLHPS
+                    memcpy(ctx->regs.xmm[dst], out, 16);
+                    return 0;
+                }
+                int c = 0;
+                uint32_t addr = calc_ea(ctx, modrm, &c);
+                ctx->regs.eip += c - 1;
+                uint8_t buf[16] = {0};
+                if (op2 == 0x12) {
+                    xg_read(ctx, addr, buf, 8);
+                    memcpy(ctx->regs.xmm[dst], buf, 8);
+                } else {
+                    memcpy(buf, ctx->regs.xmm[dst] + 8, 8);
+                    xg_write(ctx, addr, buf, 8);
+                }
+                (void)high;
+                return 0;
+            }
+            // ---- PUNPCKLQDQ / PUNPCKHQDQ (0x0F 0x6C/0x6D with 66) ----
+            if ((op2 == 0x6C || op2 == 0x6D) && p66) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                uint8_t src[16] = {0};
+                sse_fetch(ctx, modrm, src);
+                uint8_t out[16];
+                if (op2 == 0x6C) { memcpy(out, ctx->regs.xmm[dst], 8); memcpy(out + 8, src, 8); }
+                else { memcpy(out, ctx->regs.xmm[dst] + 8, 8); memcpy(out + 8, src + 8, 8); }
+                memcpy(ctx->regs.xmm[dst], out, 16);
+                return 0;
+            }
+            // ---- CMPPS / CMPSS / CMPPD / CMPSD (0x0F 0xC2 + imm8) ----
+            if (op2 == 0xC2) {
+                uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+                int dst = modrm_reg(modrm);
+                int imm = x86_mem_read8(ctx, ctx->regs.eip++);
+                uint8_t src[16] = {0};
+                sse_fetch(ctx, modrm, src);
+                int lanes = (rep == 1 || rep == 2) ? 1 : (p66 ? 2 : 4);
+                int dbl = (p66 || rep == 2);
+                uint8_t out[16] = {0};
+                memcpy(out, ctx->regs.xmm[dst], 16);
+                for (int i = 0; i < lanes; i++) {
+                    double a, b;
+                    if (dbl) { memcpy(&a, ctx->regs.xmm[dst] + i * 8, 8); memcpy(&b, src + i * 8, 8); }
+                    else { float fa, fb; memcpy(&fa, ctx->regs.xmm[dst] + i * 4, 4); memcpy(&fb, src + i * 4, 4); a = fa; b = fb; }
+                    int r = 0;
+                    switch (imm & 7) {
+                        case 0: r = (a == b); break; // EQ
+                        case 1: r = (a < b); break;  // LT
+                        case 2: r = (a <= b); break; // LE
+                        case 3: r = (a != a || b != b); break; // UNORD
+                        case 4: r = !(a == b); break; // NEQ
+                        case 5: r = !(a < b); break;  // NLT
+                        case 6: r = !(a <= b); break; // NLE
+                        default: r = (a == a && b == b); break; // ORD
+                    }
+                    if (dbl) { uint64_t m = r ? ~0ull : 0ull; memcpy(out + i * 8, &m, 8); }
+                    else { uint32_t m = r ? 0xFFFFFFFFu : 0u; memcpy(out + i * 4, &m, 4); }
+                }
+                memcpy(ctx->regs.xmm[dst], out, 16);
+                return 0;
+            }
+
             // ---- Integer SIMD (MMX when no prefix, XMM with 66) ----
             {
                 int use_mmx = !p66;
@@ -1106,7 +1502,7 @@ int x86_step(x86_context* ctx) {
                     uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
                     int dst = modrm_reg(modrm);
                     uint8_t src[16] = {0};
-                    sse_fetch64(ctx, modrm, use_mmx, src);
+                    sse_fetch_ivec(ctx, modrm, use_mmx, src);
                     uint8_t d[16] = {0};
                     if (use_mmx) memcpy(d, &ctx->regs.mm[dst], 8); else memcpy(d, ctx->regs.xmm[dst], 16);
                     if (esz == 1) vec_op8(op, d, src, elems8);
@@ -1125,7 +1521,7 @@ int x86_step(x86_context* ctx) {
                     uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
                     int dst = modrm_reg(modrm);
                     uint8_t src[16] = {0};
-                    sse_fetch64(ctx, modrm, use_mmx, src);
+                    sse_fetch_ivec(ctx, modrm, use_mmx, src);
                     uint8_t d[16] = {0};
                     if (use_mmx) memcpy(d, &ctx->regs.mm[dst], 8); else memcpy(d, ctx->regs.xmm[dst], 16);
                     for (int i = 0; i < (use_mmx ? 8 : 16); i++) d[i] = (uint8_t)(~d[i] & src[i]);
@@ -1137,7 +1533,7 @@ int x86_step(x86_context* ctx) {
                     uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
                     int dst = modrm_reg(modrm);
                     uint8_t src[16] = {0};
-                    sse_fetch64(ctx, modrm, use_mmx, src);
+                    sse_fetch_ivec(ctx, modrm, use_mmx, src);
                     uint8_t d[16] = {0};
                     if (use_mmx) memcpy(d, &ctx->regs.mm[dst], 8); else memcpy(d, ctx->regs.xmm[dst], 16);
                     int units = (op2 == 0x60 || op2 == 0x68) ? 1 : (op2 == 0x61 || op2 == 0x69) ? 2 : 4;
@@ -1157,7 +1553,7 @@ int x86_step(x86_context* ctx) {
                     uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
                     int dst = modrm_reg(modrm);
                     uint8_t src[16] = {0};
-                    sse_fetch64(ctx, modrm, use_mmx, src);
+                    sse_fetch_ivec(ctx, modrm, use_mmx, src);
                     uint8_t d[16] = {0};
                     if (use_mmx) memcpy(d, &ctx->regs.mm[dst], 8); else memcpy(d, ctx->regs.xmm[dst], 16);
                     int fmt = (use_mmx ? 8 : 16);
@@ -1196,7 +1592,7 @@ int x86_step(x86_context* ctx) {
                     uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
                     int dst = modrm_reg(modrm);
                     uint8_t src[16] = {0};
-                    sse_fetch64(ctx, modrm, use_mmx, src);
+                    sse_fetch_ivec(ctx, modrm, use_mmx, src);
                     uint64_t cnt64; memcpy(&cnt64, src, 8);
                     int count = (int)(cnt64 & 0xFF);
                     uint8_t d[16] = {0};
@@ -1598,6 +1994,24 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
+    // ---- MOV AL/EAX, moffs (0xA0/0xA1) and MOV moffs, AL/EAX (0xA2/0xA3) ----
+    // Absolute-addressed forms the compiler emits for globals: OpenTTD's CRT
+    // entry hits 0xA1 (`mov eax, ds:0x11bacc0`) right after the QPC probe.
+    if (op >= 0xA0 && op <= 0xA3) {
+        uint32_t addr = read_imm32(ctx);
+        if (op == 0xA0) {
+            uint32_t v = x86_mem_read8(ctx, addr);
+            ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00) | v;
+        } else if (op == 0xA1) {
+            ctx->regs.eax = x86_mem_read32(ctx, addr);
+        } else if (op == 0xA2) {
+            x86_mem_write8(ctx, addr, (uint8_t)(ctx->regs.eax & 0xFF));
+        } else {
+            x86_mem_write32(ctx, addr, ctx->regs.eax);
+        }
+        return 0;
+    }
+
     // ---- MOV r32, imm32 (0xB8-0xBF) ----
     if (op >= 0xB8 && op <= 0xBF) {
         int reg = op - 0xB8;
@@ -1915,10 +2329,10 @@ int x86_step(x86_context* ctx) {
     if (op >= 0x40 && op <= 0x47) {
         int reg = op - 0x40;
         uint32_t* r = x86_reg_ptr(ctx, reg);
+        uint32_t cf = ctx->regs.eflags & X86_CF; // INC leaves CF untouched
         uint32_t result = *r + 1;
         x86_update_flags_add(ctx, *r, 1, result);
-        // INC doesn't change CF
-        // (flags already updated, but restore CF from before)
+        ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | cf;
         *r = result;
         return 0;
     }
@@ -1927,8 +2341,10 @@ int x86_step(x86_context* ctx) {
     if (op >= 0x48 && op <= 0x4F) {
         int reg = op - 0x48;
         uint32_t* r = x86_reg_ptr(ctx, reg);
+        uint32_t cf = ctx->regs.eflags & X86_CF; // DEC leaves CF untouched
         uint32_t result = *r - 1;
         x86_update_flags_sub(ctx, *r, 1, result);
+        ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | cf;
         *r = result;
         return 0;
     }
@@ -2075,6 +2491,34 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
+    // ---- ALU EAX, imm32 (0x05/0x0D/0x15/0x1D/0x25/0x2D/0x35/0x3D) ----
+    // ---- ALU AL, imm8  (0x04/0x0C/0x14/0x1C/0x24/0x2C/0x34/0x3C) ----
+    // The short accumulator forms: same /r extension numbering as 0x81, no
+    // ModRM. OpenTTD's CRT hits 0x35 (`xor eax, imm32`) checking the CPU id.
+    if (((op & 7) == 5 || (op & 7) == 4) && op <= 0x3D) {
+        const int regop = op >> 3;      // 0 ADD 1 OR 2 ADC 3 SBB 4 AND 5 SUB 6 XOR 7 CMP
+        const int bits = (op & 7) == 5 ? 32 : 8;
+        const uint32_t imm = (op & 7) == 5 ? read_imm32(ctx) : (uint32_t)read_imm8(ctx);
+        const uint32_t dst = bits == 32 ? ctx->regs.eax : (ctx->regs.eax & 0xFF);
+        uint32_t result = dst;
+        const uint32_t cf = (ctx->regs.eflags & X86_CF) ? 1u : 0u;
+        switch (regop) {
+            case 0: result = dst + imm; x86_update_flags_add(ctx, dst, imm, result); break;
+            case 1: result = dst | imm; x86_update_flags_logic(ctx, result); ctx->regs.eflags &= ~(X86_CF | X86_OF); break;
+            case 2: result = dst + imm + cf; x86_update_flags_add(ctx, dst, imm + cf, result); break;
+            case 3: result = dst - imm - cf; x86_update_flags_sub(ctx, dst, imm + cf, result); break;
+            case 4: result = dst & imm; x86_update_flags_logic(ctx, result); ctx->regs.eflags &= ~(X86_CF | X86_OF); break;
+            case 5: result = dst - imm; x86_update_flags_sub(ctx, dst, imm, result); break;
+            case 6: result = dst ^ imm; x86_update_flags_logic(ctx, result); ctx->regs.eflags &= ~(X86_CF | X86_OF); break;
+            case 7: x86_update_flags_sub(ctx, dst, imm, dst - imm); result = dst; break;
+        }
+        if (regop != 7) {
+            if (bits == 32) ctx->regs.eax = result;
+            else ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00) | (result & 0xFF);
+        }
+        return 0;
+    }
+
     // ---- SHL/SHR/SAR (0xC1 /4,5,7 with imm8; 0xD3 with CL) ----
     if (op == 0xC1) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
@@ -2172,83 +2616,86 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
-    // ---- NOT (0xF7 /2) ----
+    // ---- 0xF7 group: TEST/NOT/NEG/MUL/IMUL/DIV/IDIV r/m32 ----
+    // Every extension, register and memory form. The old version only handled
+    // the register forms of /2../7, so `test ebx, 0x200` (OpenTTD's CPU probe,
+    // F7 C3 00 02 00 00) fell off the end as UNHANDLED.
     if (op == 0xF7) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        int regop = modrm_reg(modrm);
-        if (regop == 2) { // NOT
-            if (modrm_mod(modrm) == 3) {
-                *x86_reg_ptr(ctx, modrm_rm(modrm)) = ~*x86_reg_ptr(ctx, modrm_rm(modrm));
-            } else {
-                int consumed = 0;
-                uint32_t addr = calc_ea(ctx, modrm, &consumed);
-                ctx->regs.eip += consumed - 1;
-                uint32_t v = x86_mem_read32(ctx, addr);
-                x86_mem_write32(ctx, addr, ~v);
-            }
-            return 0;
+        const int regop = modrm_reg(modrm);
+        const bool is_reg = (modrm_mod(modrm) == 3);
+        uint32_t addr = 0;
+        if (!is_reg) {
+            int consumed = 0;
+            addr = calc_ea(ctx, modrm, &consumed);
+            ctx->regs.eip += consumed - 1;
         }
-        if (regop == 3) { // NEG
-            if (modrm_mod(modrm) == 3) {
-                uint32_t* r = x86_reg_ptr(ctx, modrm_rm(modrm));
-                uint32_t result = 0 - *r;
-                x86_update_flags_sub(ctx, 0, *r, result);
-                *r = result;
-            } else {
-                int consumed = 0;
-                uint32_t addr = calc_ea(ctx, modrm, &consumed);
-                ctx->regs.eip += consumed - 1;
-                uint32_t v = x86_mem_read32(ctx, addr);
-                uint32_t result = 0 - v;
-                x86_update_flags_sub(ctx, 0, v, result);
-                x86_mem_write32(ctx, addr, result);
+        const uint32_t v = is_reg ? *x86_reg_ptr(ctx, modrm_rm(modrm))
+                                  : x86_mem_read32(ctx, addr);
+        switch (regop) {
+            case 0: case 1: { // TEST r/m32, imm32 (flags only)
+                const uint32_t imm = read_imm32(ctx);
+                x86_update_flags_logic(ctx, v & imm);
+                ctx->regs.eflags &= ~(X86_CF | X86_OF);
+                break;
             }
-            return 0;
-        }
-        if (regop == 4) { // MUL (unsigned)
-            if (modrm_mod(modrm) == 3) {
-                uint64_t result = (uint64_t)ctx->regs.eax * *x86_reg_ptr(ctx, modrm_rm(modrm));
-                ctx->regs.eax = (uint32_t)result;
-                ctx->regs.edx = (uint32_t)(result >> 32);
+            case 2: { // NOT (flags unaffected)
+                const uint32_t r = ~v;
+                if (is_reg) *x86_reg_ptr(ctx, modrm_rm(modrm)) = r;
+                else x86_mem_write32(ctx, addr, r);
+                break;
             }
-            return 0;
-        }
-        if (regop == 5) { // IMUL (signed, EDX:EAX)
-            if (modrm_mod(modrm) == 3) {
-                int64_t result = (int64_t)(int32_t)ctx->regs.eax * (int64_t)(int32_t)*x86_reg_ptr(ctx, modrm_rm(modrm));
-                ctx->regs.eax = (uint32_t)result;
-                ctx->regs.edx = (uint32_t)(result >> 32);
+            case 3: { // NEG
+                const uint32_t r = 0u - v;
+                x86_update_flags_sub(ctx, 0, v, r);
+                ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | (v ? X86_CF : 0);
+                if (is_reg) *x86_reg_ptr(ctx, modrm_rm(modrm)) = r;
+                else x86_mem_write32(ctx, addr, r);
+                break;
             }
-            return 0;
-        }
-        if (regop == 6) { // DIV (unsigned)
-            if (modrm_mod(modrm) == 3) {
-                uint64_t dividend = ((uint64_t)ctx->regs.edx << 32) | ctx->regs.eax;
-                uint32_t divisor = *x86_reg_ptr(ctx, modrm_rm(modrm));
-                if (divisor == 0) {
+            case 4: { // MUL: EDX:EAX = EAX * v
+                const uint64_t r = (uint64_t)ctx->regs.eax * v;
+                ctx->regs.eax = (uint32_t)r;
+                ctx->regs.edx = (uint32_t)(r >> 32);
+                ctx->regs.eflags &= ~(X86_CF | X86_OF);
+                if (ctx->regs.edx) ctx->regs.eflags |= X86_CF | X86_OF;
+                break;
+            }
+            case 5: { // IMUL (signed, EDX:EAX)
+                const int64_t r = (int64_t)(int32_t)ctx->regs.eax * (int64_t)(int32_t)v;
+                ctx->regs.eax = (uint32_t)r;
+                ctx->regs.edx = (uint32_t)(r >> 32);
+                const bool overflow = ((int64_t)(int32_t)ctx->regs.eax != r);
+                ctx->regs.eflags &= ~(X86_CF | X86_OF);
+                if (overflow) ctx->regs.eflags |= X86_CF | X86_OF;
+                break;
+            }
+            case 6: { // DIV (unsigned)
+                if (v == 0) {
                     if (ctx->log) ctx->log("x86: DIV by zero");
                     ctx->running = 0;
                     return -1;
                 }
-                ctx->regs.eax = (uint32_t)(dividend / divisor);
-                ctx->regs.edx = (uint32_t)(dividend % divisor);
+                const uint64_t dividend = ((uint64_t)ctx->regs.edx << 32) | ctx->regs.eax;
+                ctx->regs.eax = (uint32_t)(dividend / v);
+                ctx->regs.edx = (uint32_t)(dividend % v);
+                break;
             }
-            return 0;
-        }
-        if (regop == 7) { // IDIV (signed)
-            if (modrm_mod(modrm) == 3) {
-                int64_t dividend = ((int64_t)(int32_t)ctx->regs.edx << 32) | (int64_t)(int32_t)ctx->regs.eax;
-                int32_t divisor = (int32_t)*x86_reg_ptr(ctx, modrm_rm(modrm));
-                if (divisor == 0) {
+            case 7: { // IDIV (signed)
+                if (v == 0) {
                     if (ctx->log) ctx->log("x86: IDIV by zero");
                     ctx->running = 0;
                     return -1;
                 }
+                const int64_t dividend = ((int64_t)(int32_t)ctx->regs.edx << 32) |
+                                         (uint32_t)ctx->regs.eax;
+                const int32_t divisor = (int32_t)v;
                 ctx->regs.eax = (uint32_t)(dividend / divisor);
                 ctx->regs.edx = (uint32_t)(dividend % divisor);
+                break;
             }
-            return 0;
         }
+        return 0;
     }
 
     // ---- 0xFE group (INC/DEC r/m8) ----
@@ -2320,83 +2767,88 @@ int x86_step(x86_context* ctx) {
     // Handled partially above via prefix; check here
     // Actually handled by prefix detection + op check below
 
-    // ---- MOVSB (0xA4) ----
-    if (op == 0xA4) {
-        uint8_t val = x86_mem_read8(ctx, ctx->regs.esi);
-        x86_mem_write8(ctx, ctx->regs.edi, val);
-        if (ctx->regs.eflags & X86_DF) {
-            ctx->regs.esi--;
-            ctx->regs.edi--;
-        } else {
-            ctx->regs.esi++;
-            ctx->regs.edi++;
+    // ---- String instructions (MOVS/STOS/LODS/SCAS/CMPS) with REP prefixes ----
+    if (op == 0xA4 || op == 0xA5) { // MOVSB / MOVSD
+        uint32_t step = (op == 0xA4) ? 1u : 4u;
+        uint32_t n = rep ? ctx->regs.ecx : 1u;
+        int df = (ctx->regs.eflags & X86_DF) != 0;
+        while (n) {
+            if (step == 1) x86_mem_write8(ctx, ctx->regs.edi, x86_mem_read8(ctx, ctx->regs.esi));
+            else x86_mem_write32(ctx, ctx->regs.edi, x86_mem_read32(ctx, ctx->regs.esi));
+            if (df) { ctx->regs.esi -= step; ctx->regs.edi -= step; }
+            else { ctx->regs.esi += step; ctx->regs.edi += step; }
+            if (!rep) break;
+            n--; ctx->regs.ecx = n;
         }
-        ctx->regs.ecx--;
         return 0;
     }
-
-    // ---- MOVSD (0xA5) ----
-    if (op == 0xA5) {
-        uint32_t val = x86_mem_read32(ctx, ctx->regs.esi);
-        x86_mem_write32(ctx, ctx->regs.edi, val);
-        if (ctx->regs.eflags & X86_DF) {
-            ctx->regs.esi -= 4;
-            ctx->regs.edi -= 4;
-        } else {
-            ctx->regs.esi += 4;
-            ctx->regs.edi += 4;
+    if (op == 0xAA || op == 0xAB) { // STOSB / STOSD
+        uint32_t step = (op == 0xAA) ? 1u : 4u;
+        uint32_t n = rep ? ctx->regs.ecx : 1u;
+        int df = (ctx->regs.eflags & X86_DF) != 0;
+        while (n) {
+            if (step == 1) x86_mem_write8(ctx, ctx->regs.edi, (uint8_t)ctx->regs.eax);
+            else x86_mem_write32(ctx, ctx->regs.edi, ctx->regs.eax);
+            if (df) ctx->regs.edi -= step; else ctx->regs.edi += step;
+            if (!rep) break;
+            n--; ctx->regs.ecx = n;
         }
-        ctx->regs.ecx--;
         return 0;
     }
-
-    // ---- STOSB (0xAA) ----
-    if (op == 0xAA) {
-        x86_mem_write8(ctx, ctx->regs.edi, (uint8_t)ctx->regs.eax);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.edi--;
-        else ctx->regs.edi++;
+    if (op == 0xAC || op == 0xAD) { // LODSB / LODSD
+        uint32_t step = (op == 0xAC) ? 1u : 4u;
+        uint32_t n = rep ? ctx->regs.ecx : 1u;
+        int df = (ctx->regs.eflags & X86_DF) != 0;
+        while (n) {
+            if (step == 1) ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | x86_mem_read8(ctx, ctx->regs.esi);
+            else ctx->regs.eax = x86_mem_read32(ctx, ctx->regs.esi);
+            if (df) ctx->regs.esi -= step; else ctx->regs.esi += step;
+            if (!rep) break;
+            n--; ctx->regs.ecx = n;
+        }
         return 0;
     }
-
-    // ---- STOSD (0xAB) ----
-    if (op == 0xAB) {
-        x86_mem_write32(ctx, ctx->regs.edi, ctx->regs.eax);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.edi -= 4;
-        else ctx->regs.edi += 4;
+    if (op == 0xAE || op == 0xAF) { // SCASB / SCASD
+        uint32_t step = (op == 0xAE) ? 1u : 4u;
+        uint32_t n = rep ? ctx->regs.ecx : 1u;
+        int df = (ctx->regs.eflags & X86_DF) != 0;
+        while (n) {
+            if (step == 1) {
+                uint32_t val = x86_mem_read8(ctx, ctx->regs.edi);
+                uint32_t acc = ctx->regs.eax & 0xFF;
+                x86_update_flags_sub(ctx, acc, val, acc - val);
+            } else {
+                uint32_t val = x86_mem_read32(ctx, ctx->regs.edi);
+                x86_update_flags_sub(ctx, ctx->regs.eax, val, ctx->regs.eax - val);
+            }
+            if (df) ctx->regs.edi -= step; else ctx->regs.edi += step;
+            if (!rep) break;
+            n--; ctx->regs.ecx = n;
+            if (n == 0) break;
+            int zf = (ctx->regs.eflags & X86_ZF) != 0;
+            if (rep == 1 && !zf) break; // REPE
+            if (rep == 2 && zf) break;  // REPNE
+        }
         return 0;
     }
-
-    // ---- LODSB (0xAC) ----
-    if (op == 0xAC) {
-        ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00) | x86_mem_read8(ctx, ctx->regs.esi);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.esi--;
-        else ctx->regs.esi++;
-        return 0;
-    }
-
-    // ---- LODSD (0xAD) ----
-    if (op == 0xAD) {
-        ctx->regs.eax = x86_mem_read32(ctx, ctx->regs.esi);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.esi -= 4;
-        else ctx->regs.esi += 4;
-        return 0;
-    }
-
-    // ---- SCASB (0xAE) ----
-    if (op == 0xAE) {
-        uint8_t val = x86_mem_read8(ctx, ctx->regs.edi);
-        x86_update_flags_sub(ctx, ctx->regs.eax & 0xFF, val, (ctx->regs.eax & 0xFF) - val);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.edi--;
-        else ctx->regs.edi++;
-        return 0;
-    }
-
-    // ---- SCASD (0xAF) ----
-    if (op == 0xAF) {
-        uint32_t val = x86_mem_read32(ctx, ctx->regs.edi);
-        x86_update_flags_sub(ctx, ctx->regs.eax, val, ctx->regs.eax - val);
-        if (ctx->regs.eflags & X86_DF) ctx->regs.edi -= 4;
-        else ctx->regs.edi += 4;
+    if (op == 0xA6 || op == 0xA7) { // CMPSB / CMPSD
+        uint32_t step = (op == 0xA6) ? 1u : 4u;
+        uint32_t n = rep ? ctx->regs.ecx : 1u;
+        int df = (ctx->regs.eflags & X86_DF) != 0;
+        while (n) {
+            uint32_t a, b;
+            if (step == 1) { a = x86_mem_read8(ctx, ctx->regs.esi); b = x86_mem_read8(ctx, ctx->regs.edi); }
+            else { a = x86_mem_read32(ctx, ctx->regs.esi); b = x86_mem_read32(ctx, ctx->regs.edi); }
+            x86_update_flags_sub(ctx, a, b, a - b);
+            if (df) { ctx->regs.esi -= step; ctx->regs.edi -= step; }
+            else { ctx->regs.esi += step; ctx->regs.edi += step; }
+            if (!rep) break;
+            n--; ctx->regs.ecx = n;
+            if (n == 0) break;
+            int zf = (ctx->regs.eflags & X86_ZF) != 0;
+            if (rep == 1 && !zf) break;
+            if (rep == 2 && zf) break;
+        }
         return 0;
     }
 
@@ -2762,6 +3214,283 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
+    // ---- 8-bit / immediate-form arithmetic (0x00-0x3D, 0x80, 0x84, 0xA8, 0xA9) ----
+    if (op <= 0x3D && (op & 7) <= 4 && ((op & 0x07) == 0 || (op & 0x07) == 2 || (op & 0x07) == 4 || (op & 0x07) == 1 || (op & 0x07) == 3)) {
+        int kind = (op >> 3) & 7; // 0 add 1 or 2 adc 3 sbb 4 and 5 sub 6 xor 7 cmp
+        int form = op & 7;        // 0 r/m8,r8 | 1 r/m32,r32 | 2 r8,r/m8 | 3 r32,r/m32 | 4 AL,imm8
+        if (form == 0 || form == 2) {
+            uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+            int is_reg = (modrm_mod(modrm) == 3);
+            uint8_t* dptr = nullptr;
+            uint32_t daddr = 0;
+            if (is_reg) dptr = r8p(ctx, modrm_rm(modrm));
+            else { int c = 0; daddr = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
+            uint8_t srcv = is_reg ? *r8p(ctx, modrm_reg(modrm)) : 0;
+            uint8_t dstv = is_reg ? *dptr : x86_mem_read8(ctx, daddr);
+            if (form == 2) { // r8 <- r/m8: operands swap
+                uint8_t t = dstv; dstv = srcv; srcv = t;
+                // destination is the reg field
+                dptr = r8p(ctx, modrm_reg(modrm));
+                is_reg = 1;
+            }
+            unsigned r;
+            switch (kind) {
+                case 0: r = (unsigned)dstv + srcv; flag_add8(ctx, dstv, srcv, 0, r); break;
+                case 1: r = dstv | srcv; flag_logic8(ctx, (uint8_t)r); break;
+                case 2: r = (unsigned)dstv + srcv + ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_add8(ctx, dstv, srcv, 0, r); break;
+                case 3: r = (unsigned)dstv - srcv - ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_sub8(ctx, dstv, srcv, 0, r); break;
+                case 4: r = dstv & srcv; flag_logic8(ctx, (uint8_t)r); break;
+                case 5: r = (unsigned)dstv - srcv; flag_sub8(ctx, dstv, srcv, 0, r); break;
+                case 6: r = dstv ^ srcv; flag_logic8(ctx, (uint8_t)r); break;
+                default: r = (unsigned)dstv - srcv; flag_sub8(ctx, dstv, srcv, 0, r); break;
+            }
+            if (kind != 7) { // CMP writes nothing
+                if (is_reg) *dptr = (uint8_t)r;
+                else x86_mem_write8(ctx, daddr, (uint8_t)r);
+            }
+            return 0;
+        }
+        if (form == 4) { // AL, imm8
+            uint8_t imm = x86_mem_read8(ctx, ctx->regs.eip++);
+            uint8_t a = (uint8_t)ctx->regs.eax;
+            unsigned r;
+            switch (kind) {
+                case 0: r = (unsigned)a + imm; flag_add8(ctx, a, imm, 0, r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 1: r = a | imm; flag_logic8(ctx, (uint8_t)r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 2: r = (unsigned)a + imm + ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_add8(ctx, a, imm, 0, r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 3: r = (unsigned)a - imm - ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_sub8(ctx, a, imm, 0, r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 4: r = a & imm; flag_logic8(ctx, (uint8_t)r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 5: r = (unsigned)a - imm; flag_sub8(ctx, a, imm, 0, r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                case 6: r = a ^ imm; flag_logic8(ctx, (uint8_t)r); ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)r; break;
+                default: r = (unsigned)a - imm; flag_sub8(ctx, a, imm, 0, r); break;
+            }
+            return 0;
+        }
+    }
+    // segment push/pop (0x06/07/0E/16/17/1E/1F) - 16-bit segments, no-ops
+    if (op == 0x06 || op == 0x07 || op == 0x0E || op == 0x16 || op == 0x17 ||
+        op == 0x1E || op == 0x1F) {
+        return 0;
+    }
+    // ---- TEST r/m8, r8 (0x84) ----
+    if (op == 0x84) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        uint8_t a, b;
+        if (modrm_mod(modrm) == 3) { a = *r8p(ctx, modrm_rm(modrm)); b = *r8p(ctx, modrm_reg(modrm)); }
+        else { int c = 0; uint32_t ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; a = x86_mem_read8(ctx, ad); b = *r8p(ctx, modrm_reg(modrm)); }
+        flag_logic8(ctx, (uint8_t)(a & b));
+        return 0;
+    }
+    // ---- TEST AL, imm8 (0xA8) / TEST EAX, imm32 (0xA9) ----
+    if (op == 0xA8) {
+        uint8_t imm = x86_mem_read8(ctx, ctx->regs.eip++);
+        flag_logic8(ctx, (uint8_t)((uint8_t)ctx->regs.eax & imm));
+        return 0;
+    }
+    if (op == 0xA9) {
+        uint32_t imm = read_imm32(ctx);
+        x86_update_flags_logic(ctx, ctx->regs.eax & imm);
+        return 0;
+    }
+    // ---- 0x80 group: r/m8, imm8 ----
+    if (op == 0x80) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        int ext = modrm_reg(modrm);
+        uint8_t imm = x86_mem_read8(ctx, ctx->regs.eip++);
+        int is_reg = (modrm_mod(modrm) == 3);
+        uint8_t* p = is_reg ? r8p(ctx, modrm_rm(modrm)) : nullptr;
+        uint32_t ad = 0;
+        if (!is_reg) { int c = 0; ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
+        uint8_t a = is_reg ? *p : x86_mem_read8(ctx, ad);
+        unsigned r;
+        switch (ext) {
+            case 0: r = (unsigned)a + imm; flag_add8(ctx, a, imm, 0, r); break;
+            case 1: r = a | imm; flag_logic8(ctx, (uint8_t)r); break;
+            case 2: r = (unsigned)a + imm + ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_add8(ctx, a, imm, 0, r); break;
+            case 3: r = (unsigned)a - imm - ((ctx->regs.eflags & X86_CF) ? 1 : 0); flag_sub8(ctx, a, imm, 0, r); break;
+            case 4: r = a & imm; flag_logic8(ctx, (uint8_t)r); break;
+            case 5: r = (unsigned)a - imm; flag_sub8(ctx, a, imm, 0, r); break;
+            case 6: r = a ^ imm; flag_logic8(ctx, (uint8_t)r); break;
+            default: r = (unsigned)a - imm; flag_sub8(ctx, a, imm, 0, r); break;
+        }
+        if (ext != 7) {
+            if (is_reg) *p = (uint8_t)r;
+            else x86_mem_write8(ctx, ad, (uint8_t)r);
+        }
+        return 0;
+    }
+    // ---- Shifts: 0xC0 (r/m8,imm8) 0xD0 (r/m8,1) 0xD1 (r/m32,1) 0xD2 (r/m8,CL) ----
+    if (op == 0xC0 || op == 0xD0 || op == 0xD1 || op == 0xD2) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        int ext = modrm_reg(modrm);
+        int width = (op == 0xD1) ? 32 : 8;
+        uint32_t count;
+        if (op == 0xC0) count = x86_mem_read8(ctx, ctx->regs.eip++);
+        else if (op == 0xD0 || op == 0xD1) count = 1;
+        else count = ctx->regs.ecx & 0xFF;
+        int is_reg = (modrm_mod(modrm) == 3);
+        uint32_t ad = 0;
+        if (!is_reg) { int c = 0; ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
+        uint32_t v = is_reg ? (width == 8 ? *r8p(ctx, modrm_rm(modrm)) : *x86_reg_ptr(ctx, modrm_rm(modrm)))
+                            : (width == 8 ? x86_mem_read8(ctx, ad) : x86_mem_read32(ctx, ad));
+        if (width == 8) {
+            uint8_t x = (uint8_t)v;
+            if (count) {
+                count &= 31;
+                switch (ext) {
+                    case 0: x = (uint8_t)((x << count) | (count ? (x >> (8 - count)) : 0)); break; // ROL
+                    case 1: x = (uint8_t)((x >> count) | (count ? (x << (8 - count)) : 0)); break; // ROR
+                    case 2: case 3: break; // RCL/RCR approximate as ROL/ROR
+                    case 4: case 6: { uint8_t cf = x >> (8 - count); x = (uint8_t)(x << count); ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | ((cf & 1) ? X86_CF : 0); break; }
+                    case 5: { uint8_t cf = (x >> (count - 1)) & 1; x = (uint8_t)(x >> count); ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | (cf ? X86_CF : 0); break; }
+                    default: { uint8_t cf = (x >> (count - 1)) & 1; x = (uint8_t)((int8_t)x >> count); ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | (cf ? X86_CF : 0); break; }
+                }
+                flag_szp8(ctx, x);
+            }
+            if (is_reg) *r8p(ctx, modrm_rm(modrm)) = x; else x86_mem_write8(ctx, ad, x);
+        } else {
+            uint32_t x = v;
+            if (count) {
+                count &= 31;
+                switch (ext) {
+                    case 0: x = (x << count) | (count ? (x >> (32 - count)) : 0); break;
+                    case 1: x = (x >> count) | (count ? (x << (32 - count)) : 0); break;
+                    case 2: case 3: break;
+                    case 4: case 6: { uint32_t cf = (count ? (x >> (32 - count)) : 0); x <<= count; ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | ((cf & 1) ? X86_CF : 0); break; }
+                    case 5: { uint32_t cf = (x >> (count - 1)) & 1; x >>= count; ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | (cf ? X86_CF : 0); break; }
+                    default: { uint32_t cf = (x >> (count - 1)) & 1; x = (uint32_t)((int32_t)x >> count); ctx->regs.eflags = (ctx->regs.eflags & ~X86_CF) | (cf ? X86_CF : 0); break; }
+                }
+                x86_update_flags_logic(ctx, x);
+            }
+            if (is_reg) *x86_reg_ptr(ctx, modrm_rm(modrm)) = x; else x86_mem_write32(ctx, ad, x);
+        }
+        return 0;
+    }
+    // ---- 0xF6 group: r/m8 ----
+    if (op == 0xF6) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        int ext = modrm_reg(modrm);
+        int is_reg = (modrm_mod(modrm) == 3);
+        uint32_t ad = 0;
+        if (!is_reg) { int c = 0; ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; }
+        uint8_t v = is_reg ? *r8p(ctx, modrm_rm(modrm)) : x86_mem_read8(ctx, ad);
+        switch (ext) {
+            case 0: { uint8_t imm = x86_mem_read8(ctx, ctx->regs.eip++); flag_logic8(ctx, (uint8_t)(v & imm)); break; }
+            case 2: { uint8_t r = (uint8_t)~v; if (is_reg) *r8p(ctx, modrm_rm(modrm)) = r; else x86_mem_write8(ctx, ad, r); break; }
+            case 3: { uint8_t r = (uint8_t)(0 - v); flag_sub8(ctx, 0, v, 0, (unsigned)(0 - (int)v)); flag_szp8(ctx, r); if (is_reg) *r8p(ctx, modrm_rm(modrm)) = r; else x86_mem_write8(ctx, ad, r); break; }
+            case 4: { uint16_t r = (uint16_t)((uint16_t)ctx->regs.eax * v); ctx->regs.eax = (ctx->regs.eax & 0xFFFF0000u) | (r & 0xFFFF); break; } // MUL
+            case 5: { int16_t r = (int16_t)((int8_t)ctx->regs.eax * (int8_t)v); ctx->regs.eax = (ctx->regs.eax & 0xFFFF0000u) | ((uint16_t)r & 0xFFFF); break; } // IMUL
+            case 6: { if (v) { uint16_t ax = (uint16_t)ctx->regs.eax; ctx->regs.eax = (ctx->regs.eax & 0xFFFF0000u) | (ax / v); } break; } // DIV
+            case 7: { if (v) { int16_t ax = (int16_t)ctx->regs.eax; int16_t q = (int16_t)(ax / (int8_t)v); ctx->regs.eax = (ctx->regs.eax & 0xFFFF0000u) | ((uint16_t)q & 0xFFFF); } break; } // IDIV
+            default: break;
+        }
+        return 0;
+    }
+    // ---- PUSHF / POPF (0x9C / 0x9D) ----
+    if (op == 0x9C) { ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.eflags); return 0; }
+    if (op == 0x9D) { ctx->regs.eflags = x86_mem_read32(ctx, ctx->regs.esp) | 0x00000002; ctx->regs.esp += 4; return 0; }
+    // ---- PUSHA / POPA (0x60 / 0x61) ----
+    if (op == 0x60) {
+        uint32_t sp = ctx->regs.esp;
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.eax);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.ecx);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.edx);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.ebx);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, sp);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.ebp);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.esi);
+        ctx->regs.esp -= 4; x86_mem_write32(ctx, ctx->regs.esp, ctx->regs.edi);
+        return 0;
+    }
+    if (op == 0x61) {
+        ctx->regs.edi = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.esi = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.ebp = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.esp += 4; // skip saved SP
+        ctx->regs.ebx = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.edx = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.ecx = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        ctx->regs.eax = x86_mem_read32(ctx, ctx->regs.esp); ctx->regs.esp += 4;
+        return 0;
+    }
+
+    // ---- XCHG r/m8, r8 (0x86) ----
+    if (op == 0x86) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        uint8_t* r = r8p(ctx, modrm_reg(modrm));
+        if (modrm_mod(modrm) == 3) { uint8_t* p = r8p(ctx, modrm_rm(modrm)); uint8_t t = *p; *p = *r; *r = t; }
+        else { int c = 0; uint32_t ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; uint8_t t = x86_mem_read8(ctx, ad); x86_mem_write8(ctx, ad, *r); *r = t; }
+        return 0;
+    }
+    // ---- MOV r/m16, Sreg (0x8C) / MOV Sreg, r/m16 (0x8E) ----
+    if (op == 0x8C || op == 0x8E) {
+        uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        int sreg = modrm_reg(modrm);
+        uint16_t val = 0;
+        if (op == 0x8C) {
+            switch (sreg) {
+                case 0: val = ctx->regs.es; break;
+                case 1: val = ctx->regs.cs; break;
+                case 2: val = ctx->regs.ss; break;
+                case 3: val = ctx->regs.ds; break;
+                case 4: val = ctx->regs.fs; break;
+                case 5: val = ctx->regs.gs; break;
+            }
+            if (modrm_mod(modrm) == 3) {
+                uint32_t* d = x86_reg_ptr(ctx, modrm_rm(modrm));
+                *d = (*d & 0xFFFF0000u) | val;
+            } else {
+                int c = 0; uint32_t ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1;
+                x86_mem_write16(ctx, ad, val);
+            }
+        } else {
+            if (modrm_mod(modrm) == 3) val = (uint16_t)*x86_reg_ptr(ctx, modrm_rm(modrm));
+            else { int c = 0; uint32_t ad = calc_ea(ctx, modrm, &c); ctx->regs.eip += c - 1; val = x86_mem_read16(ctx, ad); }
+            switch (sreg) {
+                case 0: ctx->regs.es = val; break;
+                case 2: ctx->regs.ss = val; break;
+                case 3: ctx->regs.ds = val; break;
+                case 4: ctx->regs.fs = val; break;
+                case 5: ctx->regs.gs = val; break;
+                default: break;
+            }
+        }
+        return 0;
+    }
+    // ---- FWAIT (0x9B), LAHF (0x9F), SAHF (0x9E) ----
+    if (op == 0x9B) return 0;
+    if (op == 0x9F) {
+        ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | (uint8_t)((ctx->regs.eflags & 0xD5) | 2);
+        return 0;
+    }
+    if (op == 0x9E) {
+        uint8_t ah = (uint8_t)(ctx->regs.eax >> 8);
+        ctx->regs.eflags = (ctx->regs.eflags & ~0xD5u) | (ah & 0xD5);
+        return 0;
+    }
+    // ---- XLATB (0xD7) ----
+    if (op == 0xD7) {
+        uint8_t v = x86_mem_read8(ctx, ctx->regs.ebx + (ctx->regs.eax & 0xFF));
+        ctx->regs.eax = (ctx->regs.eax & 0xFFFFFF00u) | v;
+        return 0;
+    }
+    // ---- LOOPNE/LOOPE/LOOP (0xE0-0xE2) and JECXZ (0xE3) ----
+    if (op >= 0xE0 && op <= 0xE2) {
+        int8_t rel = (int8_t)x86_mem_read8(ctx, ctx->regs.eip++);
+        ctx->regs.ecx--;
+        int zf = (ctx->regs.eflags & X86_ZF) != 0;
+        int take = (op == 0xE2) ? (ctx->regs.ecx != 0)
+                 : (op == 0xE1) ? (ctx->regs.ecx != 0 && zf)
+                 : (ctx->regs.ecx != 0 && !zf); // LOOPNE
+        if (take) ctx->regs.eip += rel;
+        return 0;
+    }
+    if (op == 0xE3) {
+        int8_t rel = (int8_t)x86_mem_read8(ctx, ctx->regs.eip++);
+        if (ctx->regs.ecx == 0) ctx->regs.eip += rel;
+        return 0;
+    }
+
     // ---- Unknown instruction ----
     char buf[256];
     snprintf(buf, sizeof(buf), "x86: UNHANDLED opcode 0x%02X at EIP=0x%08X (insn #%llu)",
@@ -2804,9 +3533,18 @@ static void xg_release4g(void* base, size_t size) {
 static int xg_ensure_reserved(x86_context* ctx) {
     if (ctx->mem.base) return 0;
     ctx->mem.base = (uint8_t*)xg_reserve4g((size_t)X86_PAGE_COUNT * X86_PAGE_SIZE);
-    memset(ctx->mem.map, 0, sizeof(ctx->mem.map));
-    ctx->mem.committed = 0;
-    return ctx->mem.base ? 0 : -1;
+    if (!ctx->mem.base) return -1;
+    // Commit the entire 4 GB reservation up front so that guest writes (and
+    // host bridges writing through guest pointers) never SIGSEGV on an
+    // uncommitted page. mprotect on the whole range is a single syscall and
+    // allocates no physical memory (pages are demand-zeroed by the kernel).
+    if (xg_commit_pages(ctx->mem.base, 0, (size_t)X86_PAGE_COUNT * X86_PAGE_SIZE) != 0)
+        return -1;
+    // Mark every page as committed in the bitmap.
+    for (size_t i = 0; i < sizeof(ctx->mem.map) / sizeof(ctx->mem.map[0]); i++)
+        ctx->mem.map[i] = ~0ULL;
+    ctx->mem.committed = (size_t)X86_PAGE_COUNT * X86_PAGE_SIZE;
+    return 0;
 }
 
 int x86_mem_commit(x86_context* ctx, uint32_t base, size_t size) {
@@ -2849,7 +3587,12 @@ int x86_mem_map_host(x86_context* ctx, uint32_t guest_addr, void* host_ptr, size
 
 // ---- CPU lifecycle ----
 void x86_cpu_init(x86_context* ctx) {
+    void* old_base = ctx->mem.base; // preserve an existing reservation to free
     memset(ctx, 0, sizeof(*ctx));
+    // A new guest starts with an empty arena: the previous guest's blocks
+    // pointed into a reservation that is about to be released.
+    x86_guest_heap_reset();
+    if (old_base) xg_release4g(old_base, (size_t)X86_PAGE_COUNT * X86_PAGE_SIZE);
     ctx->regs.esp = 0x00100000; // 1MB stack
     ctx->regs.fpu_top = 0;
     ctx->regs.fpu_cw = 0x037F; // default control word
@@ -2883,6 +3626,20 @@ void x86_cpu_init(x86_context* ctx) {
         x86_mem_write32(ctx, 0x7FFDE000 + 0x2C, ctx->tls_array);
     }
     ctx->regs.tsc_base = 0x100000;
+
+    // ---- Basic-block recompiler ----
+    // On by default; TRT_X86_JIT=0 selects the pure interpreter (used by the
+    // differential test that compares both engines instruction-for-instruction).
+    const char* jit = getenv("TRT_X86_JIT");
+    ctx->jit_enabled = !(jit && jit[0] == '0');
+    ctx->code_epoch = 1;
+
+    // Sentinel page: the SEH dispatcher calls guest handlers with this address
+    // as the return address, and HLT stops the nested run loop there.
+    if (x86_mem_commit(ctx, 0x7FFD0000, 0x1000) == 0) {
+        x86_mem_write8(ctx, 0x7FFD0000, 0xF4);
+        ctx->seh_sentinel = 0x7FFD0000;
+    }
 }
 
 void x86_cpu_reset(x86_context* ctx) {
@@ -2894,25 +3651,45 @@ int x86_run(x86_context* ctx) {
     ctx->running = 1;
     ctx->last_error = 0;
     while (ctx->running) {
-        if (x86_step(ctx) != 0) break;
+        // Run a recompiled basic block when one covers this address; otherwise
+        // interpret exactly one instruction (which may itself end a block).
+        int r = x86_jit_step(ctx);
+        if (r < 0) break;
+        if (r == 0 && x86_step(ctx) != 0) break;
     }
     return ctx->last_error;
 }
 
 // ---- Run a 32-bit PE through the interpreter ----
 int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
-                 uint32_t entry_rva, uint32_t stack_base, size_t stack_size) {
-    x86_cpu_init(ctx);
-    
-    // Map the PE image into guest memory at its preferred base
-    // For simplicity, map at 0x00400000 (typical PE base)
-    uint32_t guest_base = 0x00400000;
+                 uint32_t guest_base, uint32_t entry_rva, uint32_t stack_base,
+                 size_t stack_size) {
+    // The caller normally initializes first (to install the log hook); only
+    // initialize when it did not, so a second call never leaks the 4GB
+    // reservation.
+    if (!ctx->mem.base) x86_cpu_init(ctx);
+
+    // Map the PE image at the guest VA base the loader relocated it for.
     if (x86_mem_map_host(ctx, guest_base, image_base, image_size) != 0) {
         if (ctx->log) ctx->log("x86: failed to map PE image");
         return -1;
     }
+    // Commit a tail past SizeOfImage. Host libc routines that bridges call on
+    // guest pointers (glibc's AVX memset/memcpy) may store a few bytes beyond
+    // the requested length, assuming the surrounding memory is mapped. A guest
+    // object ending exactly at SizeOfImage - page aligned - would otherwise
+    // fault inside the bridge on the uncommitted page after the image.
+    if (x86_mem_commit(ctx, guest_base + (uint32_t)image_size, 0x400000) != 0) {
+        if (ctx->log) ctx->log("x86: failed to commit image tail");
+        return -1;
+    }
+
     ctx->image_base = image_base;
     ctx->image_size = (uint32_t)image_size;
+    ctx->image_va = guest_base;  // what GetModuleHandle(NULL) must answer
+    // A PE32 guest uses the 24-byte i386 CRITICAL_SECTION layout: bridges that
+    // initialize one must not write the Win64 40-byte struct over it.
+    trt_set_guest_ptr_bits(32);
     
     // Set up stack
     if (x86_mem_commit(ctx, stack_base, stack_size) != 0) {

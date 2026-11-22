@@ -134,6 +134,14 @@ int trt_pe32_trap_info(int index, char* mod_out, size_t mod_cap,
                        u32* trap_va_out);
 // 1 iff `guest_va` is inside the reserved trap range.
 int trt_pe32_is_trap(u32 guest_va);
+
+// Bind a symbol the guest resolved AT RUNTIME (GetProcAddress) and return the
+// guest VA to hand back: a trap address, which the x86 trap dispatcher turns
+// into a bridge call with the guest's own stacked arguments. Deduped with the
+// static import binder, so an imported-and-looked-up symbol shares one trap.
+// Returns 0 when the trap table is full.
+u32 trt_pe32_bind_dynamic(const char* module, const char* symbol, u32 ordinal,
+                          void* host_fn);
 // Release all guest-VA reservations (called by trt_images_reset between
 // corpus PEs; images already mapped keep their recorded guest_base).
 void trt_pe32_guest_reset(void);
@@ -141,6 +149,10 @@ void trt_pe32_guest_reset(void);
 // Flip sections to final protections (code -> RX). Call once after
 // relocation/import/TLS writes are complete. Returns TRT_OK or TRT_ERR_SEAL.
 int trt_seal_image(const trt_backend* be, trt_image* img);
+// Undo the seal (all sections RW). Only the legacy 32-bit runner needs it,
+// for the data copy-back into an image that trt_seal_image already made RX.
+// The caller re-seals immediately: the image is never RWX.
+int trt_unseal_image(const trt_backend* be, trt_image* img);
 
 // ---- boot audit (offline gate for REAL games) ----------------------------
 // Parses a PE's import + delay-import tables IN FILE SPACE (no mapping,
@@ -317,6 +329,22 @@ int TRT_STDCALL trt_dispatch_win32_exception(void* ep);
 
 // runtime Steam AppID override (read from steam_appid.txt when launching)
 void trt_steam_set_appid(u32 app_id);
+
+// ---- Steam account + library (real, from the user's own installation) ----
+// Set by the host after a Steam OpenID sign-in (see steam_auth.h). Passing
+// null/empty means "nobody signed in". A SteamID is validated before use.
+void trt_steam_set_identity(const char* steamid64, const char* persona);
+void trt_steam_clear_identity(void);
+u64 trt_steam_current_id(void);
+
+// The AppIDs the user's own steamapps/appmanifest_*.acf files name.
+void trt_steam_set_owned_appids(const u32* appids, int count);
+int trt_steam_is_owned(u32 app_id);
+int trt_steam_owned_app_count(void);
+
+// One call for boot: load the persisted identity AND scan the local Steam
+// library, then install both into the bridge. Returns the app count found.
+int trt_steam_load_account(const char* state_dir);
 
 #ifdef __cplusplus
 }

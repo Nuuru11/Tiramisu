@@ -91,6 +91,16 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_pe32"
 "$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll"
 
+# --- 3c. x86 interpreter EXECUTION gate: the instruction bytes must compute.
+#         CPUID/RDTSC, SSE2 packed double + integer SIMD, MMX, 8-bit ALU,
+#         0x80 group, REP MOVSB, PUSHA/POPA, FXSAVE/FXRSTOR, ModRM disp/SIB
+#         addressing, contiguous guest VA, and the import dispatcher
+#         (TLS, GetLastError, Interlocked*, stdcall/cdecl metadata). ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_x86_exec.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_x86_exec"
+"$out/test_x86_exec"
+
 # --- 4. input bridge test (user32 surface the guests consume) ---
 clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_input.cpp "$out/libtrt.a" \
@@ -407,6 +417,13 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_steam.cpp "$out/libtrt.a" \
   -o "$out/test_steam"
 "$out/test_steam" "$out/guest_steam.exe"
+
+# --- 11b. Steam account/library modules: VDF parsing + OpenID validation ---
+# No network: the transport is replaced by trt_steam_set_http_hook().
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_steam_auth.cpp "$out/libtrt.a" \
+  -o "$out/test_steam_auth"
+"$out/test_steam_auth"
 
 # --- 12. winmm timing: the clock games schedule their frames on -------------
 rm -f "$out/winmm.lib"

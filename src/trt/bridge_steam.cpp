@@ -19,13 +19,17 @@
 // Everything is fail-visible: an unimplemented callback names itself.
 #include "bridge_steam.h"
 #include "input.h"
+#include "steam_auth.h"
+#include "steam_library.h"
 #include "thunk.h"
 
+#include <algorithm>
 #include <mutex>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <vector>
 
 namespace {
 
@@ -35,6 +39,19 @@ constexpr int E_FAIL_ = 0x80004005;
 // ---- the app context ----
 u32 g_app_id = 0;
 int g_initialized = 0;
+
+// The signed-in Steam account (0 = nobody signed in). Filled by
+// trt_steam_load_account() from steam_auth's OpenID identity file, so
+// GetSteamID answers with the account the user actually proved.
+u64 g_steamid64 = 0;
+std::string g_persona;
+int g_signed_in = 0;
+
+// AppIDs the user's own Steam library contains (imported manifests).
+// BIsSubscribedApp answers from this set and nothing else: Tiramisu never
+// manufactures an entitlement Steam did not install.
+std::vector<u32> g_owned_apps;
+std::mutex g_owned_mu;
 
 // ---- callback / callresult registration (the overlay + achievements use it) ----
 struct callback_entry {
@@ -68,6 +85,121 @@ int TRT_GUEST_ABI trt_SteamAPI_InitFlat(char* out_err_msg) {
 void TRT_GUEST_ABI trt_SteamAPI_Shutdown(void) { g_initialized = 0; }
 void trt_steam_set_appid(u32 app_id) { g_app_id = app_id; }
 
+// ---- account + library --------------------------------------------------
+// The host calls these after a real OpenID sign-in and after importing the
+// user's Steam library. Nothing here invents an entitlement: the owned set is
+// exactly the AppIDs the user's own appmanifest_*.acf files name.
+void trt_steam_set_identity(const char* steamid64, const char* persona) {
+  g_steamid64 = 0;
+  g_persona.clear();
+  g_signed_in = 0;
+  if (steamid64 && steamid64[0]) {
+#ifndef TIRAMISU_UWP_HOST
+    const std::string claim =
+        std::string("https://steamcommunity.com/openid/id/") + steamid64;
+    std::string canon;
+    if (trt_steam_claimed_id_to_steam64(claim, &canon)) {
+      g_steamid64 = strtoull(canon.c_str(), nullptr, 10);
+      g_signed_in = 1;
+      if (persona) g_persona = persona;
+    }
+#else
+    // UWP: steam_auth.cpp is not in the UWP build (not UWP-ready:
+    // <unistd.h> + WinHTTP); the input is already a numeric steamid64,
+    // so parse it directly (no OpenID round-trip needed).
+    g_steamid64 = strtoull(steamid64, nullptr, 10);
+    if (g_steamid64 != 0) {
+      g_signed_in = 1;
+      if (persona) g_persona = persona;
+    }
+#endif
+  }
+  char line[256];
+  if (g_signed_in) {
+    snprintf(line, sizeof(line), "steam: account signed in as %s (%llu)",
+             g_persona.empty() ? "(no persona)" : g_persona.c_str(),
+             (unsigned long long)g_steamid64);
+  } else {
+    snprintf(line, sizeof(line),
+             "steam: no account signed in -> anonymous local user "
+             "(sign in from the dashboard to import a library)");
+  }
+  trt_core_log(line);
+}
+
+void trt_steam_clear_identity(void) { trt_steam_set_identity(nullptr, nullptr); }
+
+void trt_steam_set_owned_appids(const u32* appids, int count) {
+  std::lock_guard<std::mutex> lk(g_owned_mu);
+  g_owned_apps.clear();
+  for (int i = 0; i < count; ++i) {
+    if (!appids || !appids[i]) continue;
+    if (std::find(g_owned_apps.begin(), g_owned_apps.end(), appids[i]) !=
+        g_owned_apps.end())
+      continue;
+    g_owned_apps.push_back(appids[i]);
+  }
+  std::sort(g_owned_apps.begin(), g_owned_apps.end());
+}
+
+int trt_steam_owned_app_count(void) {
+  std::lock_guard<std::mutex> lk(g_owned_mu);
+  return (int)g_owned_apps.size();
+}
+
+int trt_steam_is_owned(u32 app_id) {
+  std::lock_guard<std::mutex> lk(g_owned_mu);
+  return std::binary_search(g_owned_apps.begin(), g_owned_apps.end(), app_id);
+}
+
+u64 trt_steam_current_id(void) { return g_signed_in ? g_steamid64 : 0; }
+
+// Load the persisted identity and the local Steam library in one call. Returns
+// the number of AppIDs the account's installation reports (0 = no library
+// found, which is a named, visible state rather than a fake success).
+int trt_steam_load_account(const char* state_dir) {
+#ifndef TIRAMISU_UWP_HOST
+  trt_steam_identity id;
+  if (state_dir && trt_steam_auth_load(state_dir, &id)) {
+    trt_steam_set_identity(id.steamid64.c_str(), id.persona.c_str());
+  } else {
+    trt_steam_clear_identity();
+  }
+#else
+  // UWP (Xbox): no Steam client or persisted identity on the console.
+  // The Steam bridge is auth-only here; clear any identity.
+  (void)state_dir;
+  trt_steam_clear_identity();
+#endif
+
+  trt_steam_library lib;
+#ifndef TIRAMISU_UWP_HOST
+  trt_steam_library_scan(&lib);
+#endif  // UWP: no Steam library on the console; lib stays empty
+        // (0 apps = a named, visible state, not a fake success).
+  std::vector<u32> owned;
+  int installed = 0;
+  for (const auto& app : lib.apps) {
+    if (!app.appid) continue;
+    owned.push_back(app.appid);
+    if (app.fully_installed) ++installed;
+  }
+  trt_steam_set_owned_appids(owned.data(), (int)owned.size());
+
+  char line[320];
+  snprintf(line, sizeof(line),
+           "steam: library scan -> %d apps (%d fully installed) across %d "
+           "libraries, %d note(s)",
+           (int)lib.apps.size(), installed, (int)lib.roots.size(),
+           (int)lib.notes.size());
+  trt_core_log(line);
+  for (const auto& n : lib.notes) {
+    const std::string l = "steam: library note: " + n;
+    trt_core_log(l.c_str());
+  }
+  return (int)lib.apps.size();
+}
+
 // SteamAPI_RestartAppIfNecessary(appid): DRM'd builds call this FIRST. We
 // return false ("no restart needed") so a non-DRM'd build keeps booting; a
 // DRM'd build then fails its OWN file verification, visibly.
@@ -86,9 +218,11 @@ int TRT_GUEST_ABI trt_SteamAPI_IsSteamRunning(void) { return 1; }
 
 // ---- user ----
 
-// SteamUser()->GetSteamID(): an anonymous local user
+// SteamUser()->GetSteamID(): the account that actually signed in through
+// Steam OpenID, or the anonymous local user when nobody did.
 u64 TRT_GUEST_ABI trt_SteamAPI_GetSteamID(void) {
-  return 0x0110000100000001ull;  // a valid-format 64-bit Steam ID
+  if (g_signed_in) return g_steamid64;
+  return 0x0110000100000001ull;  // anonymous local user, valid ID format
 }
 
 // ---- friends / overlay / utils: harmless successes ----
@@ -139,11 +273,24 @@ void TRT_GUEST_ABI trt_SteamAPI_UnregisterCallback(void* callback) {
 // SteamApps()->BIsSubscribedApp(appid): we answer honestly: in the Tiramisu
 // auth model there is no Steam license server, so ownership is UNKNOWN and
 // a DRM check keyed on it will fail - visibly, with this log line.
+// SteamApps()->BIsSubscribedApp(appid): the AppID is answered from the
+// user's OWN imported Steam library. A title that is installed on this
+// machine under that account answers 1; anything else answers 0 with a named
+// line. That distinction is the whole point -- it is not a bypass, it is the
+// user's real manifest state.
 int TRT_GUEST_ABI trt_SteamAPI_BIsSubscribedApp(u32 app_id) {
-  char line[128];
+  char line[192];
+  if (trt_steam_is_owned(app_id)) {
+    snprintf(line, sizeof(line),
+             "trt: steam_api64 BIsSubscribedApp(appid=%u) -> 1 (present in "
+             "the signed-in account's imported library)", app_id);
+    trt_core_log(line);
+    return 1;
+  }
   snprintf(line, sizeof(line),
-           "trt: steam_api64 BIsSubscribedApp(appid=%u) -> 0 (no license"
-           " server: a DRM build will refuse here, by design)", app_id);
+           "trt: steam_api64 BIsSubscribedApp(appid=%u) -> 0 (not in the %d "
+           "imported library app(s); no license server, by design)",
+           app_id, trt_steam_owned_app_count());
   trt_core_log(line);
   return 0;
 }

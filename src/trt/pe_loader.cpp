@@ -494,6 +494,12 @@ static int pe32_bind_value(void* host_fn, const char* module,
   return 0;
 }
 
+// Blanket-0 stub for an import the bridge surface does not implement yet.
+// Binding it keeps the image mappable so the boot ladder can name the next
+// real gap, instead of refusing to load the whole executable. Every use is
+// logged by name at load time (never a silent fake success).
+extern "C" u32 trt_pe32_missing_import(void) { return 0; }
+
 extern "C" int trt_pe32_trap_count(void) {
   std::lock_guard<std::mutex> lk(g_pe32_mu);
   return (int)g_pe32_traps.size();
@@ -514,6 +520,18 @@ extern "C" int trt_pe32_trap_info(int index, char* mod_out, size_t mod_cap,
 
 extern "C" int trt_pe32_is_trap(u32 guest_va) {
   return guest_va >= TRT_PE32_TRAP_BASE && guest_va < TRT_PE32_TRAP_END;
+}
+
+// Bind a symbol resolved at runtime (GetProcAddress). The guest gets back a
+// trap VA, never a host function address: a 64-bit pointer does not survive a
+// 32-bit register, and the caller would jump into unmapped space.
+extern "C" u32 trt_pe32_bind_dynamic(const char* module, const char* symbol,
+                                     u32 ordinal, void* host_fn) {
+  u32 trap = 0;
+  if (pe32_trap_alloc(module && module[0] ? module : "?", symbol, (u16)ordinal,
+                      host_fn, 0, &trap) != 0)
+    return 0;
+  return trap;
 }
 
 // The 64-bit bridge address bound to trap N (nullptr for a delay import that
@@ -1307,10 +1325,14 @@ extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
         }
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
-          char det[224];
-          snprintf(det, sizeof(det), "%s!%s", mod_name,
-                   sym_name ? sym_name : "#ordinal");
-          return fail_out(TRT_ERR_IMPORT, det);
+          // Named gap, not a load failure: bind the blanket-0 stub so the
+          // guest reaches its own code and the ladder names the next blocker.
+          char line[256];
+          snprintf(line, sizeof(line),
+                   "trt: PE32 import %s!%s is a NAMED GAP (bound to a 0-returning stub)",
+                   mod_name, sym_name ? sym_name : "#ordinal");
+          logf_be(be, line);
+          fn = (void*)&trt_pe32_missing_import;
         }
         u32 slot = 0;
         int is_trap = 0;
@@ -1498,6 +1520,34 @@ extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
   if (asan_unpoison) asan_unpoison(img.base, size_of_image);
 #  endif
 #endif
+  return TRT_OK;
+}
+
+// Undo the W^X seal: every section back to RW. Needed by the ONLY code path
+// that writes into a sealed image -- the 32-bit legacy runner
+// (trt_x86_run_cdecl), which executes on a private copy and copies the
+// guest's data writes back afterwards. Writing into RX pages there is a host
+// SIGSEGV, so the copy-back requires the pre-seal protection. The seal is
+// re-applied immediately after, so the image is never RWX.
+extern "C" int trt_unseal_image(const trt_backend* be, trt_image* img) {
+  if (!be || !img || !img->base) return TRT_ERR_BAD_ARGS;
+  const trt_dos_header* dos = (const trt_dos_header*)img->base;
+  const trt_nt_headers64* nt =
+      (const trt_nt_headers64*)(img->base + dos->e_lfanew);
+  const u8* sec_base = (const u8*)&nt->optional_header +
+                       rd16((const u8*)&nt->file_header.size_of_optional_header);
+  for (u32 i = 0; i < img->section_count; ++i) {
+    const trt_section_header* sh =
+        (const trt_section_header*)(sec_base + (size_t)i * sizeof(trt_section_header));
+    const u32 va = rd32((const u8*)&sh->virtual_address);
+    const u32 vsize = rd32((const u8*)&sh->virtual_size);
+    if (be->protect(img->base + va, (size_t)vsize ? (size_t)vsize : 4096,
+                    TRT_PROT_R | TRT_PROT_W)) {
+      char d[96];
+      snprintf(d, sizeof(d), "unseal protect failed on section %u", i);
+      return fail(img, be, TRT_ERR_SEAL, d);
+    }
+  }
   return TRT_OK;
 }
 

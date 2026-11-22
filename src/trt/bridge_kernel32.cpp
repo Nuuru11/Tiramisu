@@ -17,6 +17,9 @@
 #include "bridge_mem.h"
 #include "bridge_thread.h"
 #include "bridge_sys.h"
+// Guest object width (24-byte PE32 vs 40-byte Win64 CRITICAL_SECTION); defined
+// in bridge_thread.cpp.
+extern "C" int trt_cs_size_for_guest(void);
 #include "bridge_winmm.h"
 #include "bridge_d3d9.h"
 #include "bridge_dsound.h"
@@ -891,6 +894,19 @@ void* TRT_STDCALL trt_VirtualAlloc(void* addr, u64 bytes, u32 type, u32 prot) {
   if (!(type & 0x3000u)) {
     set_err_for_current_thread(87);  // INVALID_PARAMETER
     return nullptr;
+  }
+  // .199 diagnostic: log large VirtualAlloc requests (the Sekiro arena
+  // allocs are 1537/240/1536/64/16/100/116/800 MB; if the worker never
+  // runs, these never appear). First 32.
+  if (bytes >= (16ull << 20)) {
+    static unsigned s_valloc_logged = 0;
+    if (s_valloc_logged < 32) {
+      ++s_valloc_logged;
+      char vl[192];
+      snprintf(vl, sizeof(vl), "thread: VirtualAlloc %lluMB type=0x%x prot=0x%x addr=%p",
+               (unsigned long long)(bytes >> 20), type, prot, addr);
+      trt_core_log(vl);
+    }
   }
   const u32 pclean = (prot & 0xFFu) ? (prot & 0xFFu) : 0x04u;
   const unsigned tprot = va_prot_bits(pclean);
@@ -5773,11 +5789,57 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
   // Windows ignores this exception when no debugger is attached; swallow
   // it here the way the SysV path does, instead of dispatching it through
   // the real ::RaiseException (which faults the guest in ntdll EH dispatch).
+#if 0  // .199 REVERT EXPERIMENT: dispatch 0x406d1388 normally (.192 behavior).
+  // The VEH fix (.195) + Sleep(1) (.196) + Sleep(50) (.198) all failed to
+  // fix the +0x115c66b fault, so timing/VEH side effects are ruled out.
+  // If Sekiro passes +0x115c66b with the swallow disabled, the swallow
+  // itself is the cause (the missing piece is then the guest __except
+  // handler, which the VEH fix does not invoke). If it still faults,
+  // the swallow is exonerated. Re-enable in .200 with the real fix.
   if (code == 0x406d1388u) {
     boot_log("kernel32: RaiseException(0x406d1388) thread-name exception "
              "swallowed (no debugger attached)");
+#ifdef _WIN32
+    // Run registered guest VEHs before swallowing: a guest VEH may do
+    // per-thread init on the thread-name exception (the .193 regression:
+    // skipping dispatch entirely also skipped guest VEH side effects the
+    // game depends on before sekiro.exe+0x115c66b). Mirrors the
+    // non-swallow path below; the OS dispatch itself is still skipped
+    // (it faults in ntdll EH dispatch on this console).
+    std::vector<void*> vehs;
+    veh_snapshot_ordered(&vehs);
+    if (!vehs.empty() && !(flags & 1u)) {
+      EXCEPTION_RECORD rec = {};
+      rec.ExceptionCode = code;
+      rec.ExceptionFlags = flags;
+      rec.NumberParameters = (count > EXCEPTION_MAXIMUM_PARAMETERS)
+                                 ? EXCEPTION_MAXIMUM_PARAMETERS
+                                 : count;
+      if (args) {
+        for (DWORD i = 0; i < rec.NumberParameters; ++i)
+          rec.ExceptionInformation[i] = (ULONG_PTR)args[i];
+      }
+      CONTEXT ctx = {};
+      ctx.ContextFlags = CONTEXT_FULL;
+      ::RtlCaptureContext(&ctx);
+      EXCEPTION_POINTERS ep = {&rec, &ctx};
+      trt_run_guest_veh(&ep);  // verdict ignored: swallow either way
+    }
+#endif
+#ifdef _WIN32
+    // H2 diagnostic (timing race): the .172-.192 full OS dispatch took
+    // hundreds of us-ms, giving the arena worker time to init before
+    // sekiro.exe+0x115c66b. The instant swallow removes that delay; a
+    // 50ms yield restores real-Windows timing (1ms was insufficient
+    // on .196 -- the fault persisted). If Sekiro passes
+    // +0x115c66b with this yield, H2 is confirmed (the .195 GPR dump
+    // shows mov r8,[rax] with rax=-24 = CONTAINING_RECORD(NULL) on a
+    // list the worker hasn't populated yet).
+    ::Sleep(50);
+#endif
     return;
   }
+#endif  // .199 REVERT EXPERIMENT: end disabled swallow
   static unsigned s_cpp_eh_logged = 0;
   if (code != 0xe06d7363u || ++s_cpp_eh_logged <= 4) {
     char line[192];
@@ -5989,8 +6051,14 @@ u16 TRT_STDCALL trt_QueryDepthSList(void* head) {
 
 int TRT_STDCALL trt_InitializeCriticalSectionAndSpinCount(void* cs, u32 spin) {
   if (!cs) return 0;
-  memset(cs, 0, 40);  // RTL_CRITICAL_SECTION x64
-  ((u32*)cs)[3] = spin;
+  // 40 bytes for a Win64 RTL_CRITICAL_SECTION, 24 for a PE32 guest's - never
+  // both, or the write runs past the caller's object. Exact-size volunteered
+  // stores, not memset: libc may write past the requested length, and a guest
+  // object ending on a page boundary would fault in the bridge.
+  volatile u32* w = (volatile u32*)cs;
+  const int words = trt_cs_size_for_guest() / 4;  // 6 for PE32, 10 for Win64
+  for (int i = 0; i < words; i++) w[i] = 0;
+  w[3] = spin;
   return 1;
 }
 
@@ -6244,6 +6312,16 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
     if (shared) trt_ReleaseSRWLockShared(srw);
     else trt_ReleaseSRWLockExclusive(srw);
   }
+  if (ms == 0xFFFFFFFFu) {
+    // Fail-visible infinite-wait trace: an infinite Sleep on a CV while
+    // holding another lock is the exact lost-wakeup wedge shape; pairing
+    // these lines with the CS-stall probe names both ends of the contract.
+    char iw[128];
+    snprintf(iw, sizeof(iw),
+             "sync: CV-infinite-wait cv=%p srw=%p flags=%u self_tid=%u", cv,
+             srw, flags, trt_GetCurrentThreadId());
+    trt_core_log(iw);
+  }
   const int r = cv_wait_locked(s, ms);
   if (srw) {
     if (shared) trt_AcquireSRWLockShared(srw);
@@ -6266,6 +6344,13 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
   pthread_mutex_lock(&s->mu);
 #endif
   if (cs) trt_LeaveCriticalSection(cs);
+  if (ms == 0xFFFFFFFFu) {
+    char iw[128];
+    snprintf(iw, sizeof(iw),
+             "sync: CV-infinite-wait-CS cv=%p cs=%p self_tid=%u", cv,
+             cs, trt_GetCurrentThreadId());
+    trt_core_log(iw);
+  }
   const int r = cv_wait_locked(s, ms);
   if (cs) trt_EnterCriticalSection(cs);
   return r;

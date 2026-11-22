@@ -1950,6 +1950,22 @@ int TRT_STDCALL trt_ReleaseSemaphore(u64 handle, u32 count, u32* previous) {
   return 1;
 }
 
+// Guest pointer width of the image currently executing. A PE32 guest's
+// RTL_CRITICAL_SECTION is 24 bytes (DebugInfo, LockCount, RecursionCount,
+// OwningThread, LockSemaphore, SpinCount) while a Win64 one is 40. Initializing
+// 40 bytes into a 24-byte guest object overruns into the next guest object;
+// seen live as the last static CS in OpenTTD's .data ending exactly at
+// SizeOfImage, where the 16-byte overrun landed on uncommitted memory.
+static std::atomic<int> g_guest_ptr_bits{64};
+
+extern "C" void trt_set_guest_ptr_bits(int bits) {
+  g_guest_ptr_bits.store(bits, std::memory_order_relaxed);
+}
+
+extern "C" int trt_cs_size_for_guest(void) {
+  return g_guest_ptr_bits.load(std::memory_order_relaxed) == 32 ? 24 : 40;
+}
+
 // --- critical sections (fits inside 40-byte Win64 RTL_CRITICAL_SECTION) ---
 struct crit_section {
   u32 locked;
@@ -1958,15 +1974,25 @@ struct crit_section {
   u32 spin;
 };
 
+// Zero a guest object with exactly-sized stores. Never memset: libc's vector
+// routines are allowed to write past the requested length, and a guest object
+// that ends on a committed-page boundary (a static CRITICAL_SECTION at the end
+// of .data is the common case) then faults inside the bridge.
+static void cs_zero_guest(void* cs) {
+  volatile u32* w = (volatile u32*)cs;
+  const int words = trt_cs_size_for_guest() / 4;  // 6 for PE32, 10 for Win64
+  for (int i = 0; i < words; i++) w[i] = 0;
+}
+
 int TRT_STDCALL trt_InitializeCriticalSection(void* cs) {
   if (!cs) return 0;
-  memset(cs, 0, sizeof(crit_section));
+  cs_zero_guest(cs);
   return 1;
 }
 
 int TRT_STDCALL trt_InitializeCriticalSectionAndSpinCount2(void* cs, u32 spin) {
   if (!cs) return 0;
-  memset(cs, 0, sizeof(crit_section));
+  cs_zero_guest(cs);
   ((crit_section*)cs)->spin = spin;
   return 1;
 }

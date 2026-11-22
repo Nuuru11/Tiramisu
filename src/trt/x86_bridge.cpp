@@ -6,11 +6,23 @@
 // invokes the corresponding 64-bit Tiramisu bridge function, and
 // writes the 32-bit result back to EAX.
 #include "x86_cpu.h"
+#include "apiset.h"
 #include "trt.h"
+#include "images.h"
+#include "pe_exports.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// MSVC has no POSIX strcasecmp/strncasecmp; map to the _stricmp family.
+#if defined(_WIN32) && !defined(strcasecmp)
+#define strcasecmp _stricmp
+#define strncasecmp _strnicmp
+#endif
+
+// Forward declaration (defined in bridge_kernel32.cpp): used by the
+// TRT_X86_TRACE debug line in x86_call_fn below.
 
 // Registry of bridge functions: maps (module, symbol) -> function pointer
 struct bridge_entry {
@@ -19,14 +31,33 @@ struct bridge_entry {
     void* fn;  // 64-bit function pointer
 };
 
-// Forward declaration of Tiramisu's module resolver
-extern "C" void* trt_resolve_symbol(const char* module, const char* symbol);
+// Module-table resolver (defined in module_table.cpp). The 32-bit bridge
+// resolves imports through the same table the 64-bit loader uses, so a symbol
+// implemented for 64-bit guests is reachable from 32-bit ones too.
+extern "C" void* trt_resolve_symbol(const char* module, const char* symbol) {
+    return trt_resolve_module(nullptr, module, symbol, 0);
+}
 
 static int lookup_arg_count(const char* module, const char* symbol);
 static int lookup_cdecl(const char* module, const char* symbol);
+static int mod_eq(const char* a, const char* b);
+static int sym_eq(const char* a, const char* b);
 static uint32_t lookup_ptr_mask(x86_context* ctx, const char* module,
                                 const char* symbol, const uint32_t* args,
                                 int nargs);
+
+// Every bridge in the trap tables is declared TRT_STDCALL, which on clang/x64
+// is __attribute__((ms_abi)): arguments live in RCX/RDX/R8/R9 and the caller
+// must reserve the 32-byte shadow space. Calling one through a plain SysV
+// `(...)` pointer delivers args in RDI/RSI/RDX, so the callee reads whatever
+// the previous guest code left in RCX. (Seen live: OpenTTD's
+// QueryPerformanceCounter received a leftover code address as its out pointer
+// and stored through it.) The call site therefore has to use the same ABI.
+#if defined(__x86_64__) && defined(__clang__)
+#  define TRT_BRIDGE_ABI __attribute__((ms_abi))
+#else
+#  define TRT_BRIDGE_ABI
+#endif
 
 // Call an already-resolved 64-bit bridge function with 32-bit arguments.
 static uint32_t x86_call_fn(x86_context* ctx, void* fn, const char* module,
@@ -37,6 +68,14 @@ static uint32_t x86_call_fn(x86_context* ctx, void* fn, const char* module,
     // slot, so a bridge expecting a 32-bit int reads the correct value, while
     // a bridge expecting a pointer gets the full host address.
     uint32_t mask = lookup_ptr_mask(ctx, module, symbol, args, nargs);
+    static int trace = -1;
+    if (trace < 0) { const char* e = getenv("TRT_X86_TRACE"); trace = (e && e[0] == '1') ? 1 : 0; }
+    if (trace && ctx->log) {
+        char t[256];
+        snprintf(t, sizeof(t), "x86: call %s!%s nargs=%d a0=%08x a1=%08x mask=%x",
+                 module, symbol, nargs, args[0], nargs > 1 ? args[1] : 0u, mask);
+        ctx->log(t);
+    }
     uint64_t a[16];
     for (int i = 0; i < 16; i++) {
         uint32_t v = (i < nargs) ? args[i] : 0;
@@ -48,7 +87,7 @@ static uint32_t x86_call_fn(x86_context* ctx, void* fn, const char* module,
         }
     }
 
-    typedef uint64_t (*generic_fn)(...);
+    typedef uint64_t (TRT_BRIDGE_ABI *generic_fn)(...);
     generic_fn gfn = (generic_fn)fn;
     uint64_t r = 0;
     switch (nargs) {
@@ -97,6 +136,267 @@ uint32_t x86_call_bridge(x86_context* ctx, const char* module, const char* symbo
 // ---- Argument count database for common Windows APIs ----
 // Maps "module!symbol" -> number of arguments (for __stdcall)
 static int lookup_arg_count(const char* module, const char* symbol) {
+
+    // ---- General table (module, symbol, stdcall arg count) ----
+    struct arg_ent { const char* mod; const char* sym; int n; };
+    static const arg_ent k_args[] = {
+        // kernel32
+        {"kernel32","GetModuleHandleA",1},{"kernel32","GetModuleHandleW",1},
+        {"kernel32","GetProcAddress",2},{"kernel32","LoadLibraryA",1},
+        {"kernel32","LoadLibraryW",1},{"kernel32","LoadLibraryExA",3},
+        {"kernel32","LoadLibraryExW",3},{"kernel32","FreeLibrary",1},
+        {"kernel32","CreateFileA",7},{"kernel32","CreateFileW",7},
+        {"kernel32","ReadFile",5},{"kernel32","WriteFile",5},
+        {"kernel32","CloseHandle",1},{"kernel32","GetFileSize",2},
+        {"kernel32","GetFileSizeEx",2},{"kernel32","SetFilePointer",4},
+        {"kernel32","SetFilePointerEx",4},{"kernel32","VirtualAlloc",4},
+        {"kernel32","VirtualFree",3},{"kernel32","VirtualProtect",4},
+        {"kernel32","VirtualQuery",3},{"kernel32","HeapAlloc",3},
+        {"kernel32","HeapFree",3},{"kernel32","HeapCreate",3},
+        {"kernel32","HeapDestroy",1},{"kernel32","HeapReAlloc",4},
+        {"kernel32","HeapSize",3},{"kernel32","GetProcessHeap",0},
+        {"kernel32","GetLastError",0},{"kernel32","SetLastError",1},
+        {"kernel32","GetCommandLineA",0},{"kernel32","GetCommandLineW",0},
+        {"kernel32","ExitProcess",1},{"kernel32","GetCurrentProcess",0},
+        {"kernel32","GetCurrentThread",0},{"kernel32","GetCurrentThreadId",0},
+        {"kernel32","GetCurrentProcessId",0},{"kernel32","Sleep",1},
+        {"kernel32","SleepEx",2},{"kernel32","GetTickCount",0},
+        {"kernel32","GetTickCount64",0},{"kernel32","QueryPerformanceCounter",1},
+        // Time / locale / startup. These were missing and fell through to the
+        // 4-arg default, so a 1-arg stdcall (GetSystemTimeAsFileTime) popped
+        // 12 extra bytes off the guest stack. OpenTTD lost its return address
+        // there and jumped to 0x0000B5E3 right after QueryPerformanceCounter.
+        {"kernel32","GetSystemTimeAsFileTime",1},{"kernel32","GetSystemTime",1},
+        {"kernel32","GetLocalTime",1},{"kernel32","FileTimeToSystemTime",2},
+        {"kernel32","SystemTimeToFileTime",2},{"kernel32","CompareFileTime",2},
+        {"kernel32","GetTimeZoneInformation",1},{"kernel32","FileTimeToLocalFileTime",2},
+        {"kernel32","GetSystemTimeAsFileTime",1},{"kernel32","QueryPerformanceFrequency",1},
+        {"kernel32","GetVersion",0},{"kernel32","GetVersionExA",1},
+        {"kernel32","GetVersionExW",1},{"kernel32","IsDebuggerPresent",0},
+        {"kernel32","SetUnhandledExceptionFilter",1},{"kernel32","UnhandledExceptionFilter",1},
+        {"kernel32","GetStartupInfoA",1},{"kernel32","GetStartupInfoW",1},
+        {"kernel32","GetStdHandle",1},{"kernel32","SetStdHandle",2},
+        {"kernel32","GetACP",0},{"kernel32","GetOEMCP",0},
+        {"kernel32","IsValidCodePage",1},{"kernel32","GetCPInfo",2},
+        {"kernel32","GetLocaleInfoA",4},{"kernel32","GetLocaleInfoW",4},
+        {"kernel32","TlsAlloc",0},{"kernel32","TlsFree",1},
+        {"kernel32","TlsGetValue",1},{"kernel32","TlsSetValue",2},
+        // Fiber-local storage has the same shape as TLS. Without these the
+        // 4-arg default shifted the guest stack 8 bytes on every FlsSetValue.
+        {"kernel32","FlsAlloc",1},{"kernel32","FlsFree",1},
+        {"kernel32","FlsGetValue",1},{"kernel32","FlsSetValue",2},
+        {"kernel32","lstrlenA",1},{"kernel32","lstrlenW",1},
+        {"kernel32","lstrcpyA",2},{"kernel32","lstrcpyW",2},
+        {"kernel32","MultiByteToWideChar",6},{"kernel32","WideCharToMultiByte",8},
+        {"kernel32","LocalAlloc",2},{"kernel32","LocalFree",1},
+        {"kernel32","GlobalAlloc",2},{"kernel32","GlobalFree",1},
+        {"kernel32","GlobalLock",1},{"kernel32","GlobalUnlock",1},
+        {"kernel32","GetSystemInfo",1},{"kernel32","GetSystemDirectoryA",2},
+        {"kernel32","GetWindowsDirectoryA",2},{"kernel32","GetTempPathA",2},
+        {"kernel32","SetCurrentDirectoryA",1},{"kernel32","GetCurrentDirectoryA",2},
+        {"kernel32","GetEnvironmentVariableA",2},{"kernel32","SetEnvironmentVariableA",2},
+        {"kernel32","GetEnvironmentStrings",0},{"kernel32","FreeEnvironmentStringsA",1},
+        {"kernel32","FindFirstFileA",2},{"kernel32","FindNextFileA",2},
+        {"kernel32","FindClose",1},{"kernel32","CreateDirectoryA",2},
+        {"kernel32","RemoveDirectoryA",1},{"kernel32","DeleteFileA",1},
+        {"kernel32","MoveFileA",2},{"kernel32","GetFileAttributesA",1},
+        {"kernel32","SetFileAttributesA",2},{"kernel32","GetFileType",1},
+        {"kernel32","FlushFileBuffers",1},{"kernel32","SetEndOfFile",1},
+        {"kernel32","QueryPerformanceFrequency",1},
+        {"kernel32","InitializeCriticalSection",1},
+        {"kernel32","InitializeCriticalSectionAndSpinCount",2},
+        // Reached through LoadLibraryExW("api-ms-win-core-synch-l1-2-0") +
+        // GetProcAddress by the MSVC CRT (and OpenTTD's initterm loop). Each
+        // one bound as an api-set name would be a NAMED GAP and drift the
+        // stack; they are bound under the resolved kernel32 name instead.
+        {"kernel32","InitializeCriticalSectionEx",3},
+        {"kernel32","InitializeSListHead",1},
+        {"kernel32","GetSystemTimePreciseAsFileTime",1},
+        {"kernel32","EncodePointer",1},{"kernel32","DecodePointer",1},
+        {"kernel32","RtlCaptureContext",1},
+        {"kernel32","GetCurrentProcessorNumber",0},
+        {"kernel32","GetActiveProcessorCount",1},
+        {"kernel32","SetThreadStackGuarantee",1},
+        {"kernel32","GetThreadTimes",5},{"kernel32","GetProcessTimes",5},
+        {"kernel32","QueryThreadCycleTime",2},
+        {"kernel32","GetProcessAffinityMask",3},
+        {"kernel32","SetProcessAffinityMask",2},
+        {"kernel32","GetFileInformationByHandleEx",4},
+        {"kernel32","InitializeProcThreadAttributeList",4},
+        {"kernel32","UpdateProcThreadAttribute",7},
+        {"kernel32","EnterCriticalSection",1},{"kernel32","LeaveCriticalSection",1},
+        {"kernel32","DeleteCriticalSection",1},{"kernel32","TryEnterCriticalSection",1},
+        {"kernel32","CreateEventA",4},{"kernel32","CreateEventW",4},
+        {"kernel32","OpenEventA",3},{"kernel32","OpenEventW",3},
+        {"kernel32","SetEvent",1},{"kernel32","ResetEvent",1},
+        {"kernel32","WaitForSingleObject",2},{"kernel32","WaitForMultipleObjects",4},
+        {"kernel32","CreateThread",6},{"kernel32","ExitThread",1},
+        {"kernel32","GetExitCodeThread",2},{"kernel32","TerminateThread",2},
+        {"kernel32","SetThreadPriority",2},{"kernel32","GetThreadPriority",1},
+        {"kernel32","SuspendThread",1},{"kernel32","ResumeThread",1},
+        {"kernel32","GetModuleFileNameA",3},{"kernel32","GetModuleFileNameW",3},
+        {"kernel32","GetEnvironmentVariableA",3},{"kernel32","GetEnvironmentVariableW",3},
+        {"kernel32","SetEnvironmentVariableA",2},{"kernel32","SetEnvironmentVariableW",2},
+        {"kernel32","MultiByteToWideChar",6},{"kernel32","WideCharToMultiByte",8},
+        {"kernel32","GetStdHandle",1},{"kernel32","SetStdHandle",2},
+        {"kernel32","WriteConsoleA",5},{"kernel32","WriteConsoleW",5},
+        {"kernel32","ReadConsoleA",5},{"kernel32","ReadConsoleW",5},
+        {"kernel32","GetConsoleMode",2},{"kernel32","SetConsoleMode",2},
+        {"kernel32","GetSystemInfo",1},{"kernel32","GlobalMemoryStatus",1},
+        {"kernel32","GlobalMemoryStatusEx",1},{"kernel32","GetVersionExA",1},
+        {"kernel32","GetVersionExW",1},{"kernel32","IsDebuggerPresent",0},
+        {"kernel32","OutputDebugStringA",1},{"kernel32","OutputDebugStringW",1},
+        {"kernel32","RaiseException",4},{"kernel32","UnhandledExceptionFilter",1},
+        {"kernel32","SetUnhandledExceptionFilter",1},{"kernel32","TerminateProcess",2},
+        {"kernel32","RtlMoveMemory",3},{"kernel32","RtlZeroMemory",2},
+        {"kernel32","RtlFillMemory",3},{"kernel32","CreateFileMappingA",6},
+        {"kernel32","CreateFileMappingW",6},{"kernel32","MapViewOfFile",5},
+        {"kernel32","UnmapViewOfFile",1},{"kernel32","FlushViewOfFile",2},
+        {"kernel32","OpenFileMappingA",3},{"kernel32","FindFirstFileA",2},
+        {"kernel32","FindFirstFileW",2},{"kernel32","FindNextFileA",2},
+        {"kernel32","FindNextFileW",2},{"kernel32","FindClose",1},
+        {"kernel32","CreateDirectoryA",2},{"kernel32","CreateDirectoryW",2},
+        {"kernel32","RemoveDirectoryA",1},{"kernel32","DeleteFileA",1},
+        {"kernel32","DeleteFileW",1},{"kernel32","CopyFileA",3},
+        {"kernel32","MoveFileA",2},{"kernel32","SetFileAttributesA",2},
+        {"kernel32","GetFileAttributesA",1},{"kernel32","GetFileAttributesW",1},
+        {"kernel32","GetTempPathA",2},{"kernel32","GetTempPathW",2},
+        {"kernel32","GetFullPathNameA",4},{"kernel32","GetFullPathNameW",4},
+        {"kernel32","SetCurrentDirectoryA",1},{"kernel32","GetCurrentDirectoryA",2},
+        {"kernel32","SetThreadAffinityMask",2},{"kernel32","GetSystemTimes",3},
+        {"kernel32","CreateMutexA",3},{"kernel32","CreateMutexW",3},
+        {"kernel32","ReleaseMutex",1},{"kernel32","DuplicateHandle",7},
+        {"kernel32","GetHandleInformation",2},{"kernel32","SetHandleInformation",3},
+        {"kernel32","FileTimeToSystemTime",2},{"kernel32","GetSystemTime",1},
+        {"kernel32","GetLocalTime",1},{"kernel32","SystemTimeToFileTime",2},
+        {"kernel32","TlsAlloc",0},{"kernel32","TlsFree",1},
+        {"kernel32","TlsGetValue",1},{"kernel32","TlsSetValue",2},
+        {"kernel32","InterlockedIncrement",1},{"kernel32","InterlockedDecrement",1},
+        {"kernel32","InterlockedExchange",2},{"kernel32","InterlockedCompareExchange",3},
+        {"kernel32","InterlockedExchangeAdd",2},{"kernel32","InterlockedAdd",2},
+        {"kernel32","lstrlenA",1},{"kernel32","lstrlenW",1},
+        {"kernel32","lstrcpyA",2},{"kernel32","lstrcpyW",2},
+        {"kernel32","GetACP",0},{"kernel32","GetOEMCP",0},
+        {"kernel32","IsProcessorFeaturePresent",1},
+        // user32
+        {"user32","MessageBoxA",4},{"user32","MessageBoxW",4},
+        {"user32","RegisterClassA",1},{"user32","RegisterClassW",1},
+        {"user32","RegisterClassExA",1},{"user32","RegisterClassExW",1},
+        {"user32","UnregisterClassA",2},{"user32","UnregisterClassW",2},
+        {"user32","CreateWindowExA",12},{"user32","CreateWindowExW",12},
+        {"user32","DestroyWindow",1},{"user32","ShowWindow",2},
+        {"user32","UpdateWindow",1},{"user32","GetMessageA",4},
+        {"user32","GetMessageW",4},{"user32","PeekMessageA",5},
+        {"user32","PeekMessageW",5},{"user32","TranslateMessage",1},
+        {"user32","DispatchMessageA",1},{"user32","DispatchMessageW",1},
+        {"user32","DefWindowProcA",4},{"user32","DefWindowProcW",4},
+        {"user32","PostQuitMessage",1},{"user32","PostMessageA",4},
+        {"user32","PostMessageW",4},{"user32","SendMessageA",4},
+        {"user32","SendMessageW",4},{"user32","LoadIconA",2},
+        {"user32","LoadIconW",2},{"user32","LoadCursorA",2},
+        {"user32","LoadCursorW",2},{"user32","GetDC",1},
+        {"user32","ReleaseDC",2},{"user32","BeginPaint",2},
+        {"user32","EndPaint",2},{"user32","GetClientRect",2},
+        {"user32","GetWindowRect",2},{"user32","SetWindowTextA",2},
+        {"user32","SetWindowTextW",2},{"user32","GetWindowTextA",3},
+        {"user32","GetWindowTextW",3},{"user32","GetWindowLongA",2},
+        {"user32","GetWindowLongW",2},{"user32","SetWindowLongA",3},
+        {"user32","SetWindowLongW",3},{"user32","InvalidateRect",3},
+        {"user32","GetSystemMetrics",1},{"user32","SetTimer",4},
+        {"user32","KillTimer",2},{"user32","GetKeyState",1},
+        {"user32","GetAsyncKeyState",1},{"user32","GetKeyboardState",1},
+        {"user32","SetKeyboardState",1},{"user32","MapVirtualKeyA",2},
+        {"user32","MapVirtualKeyW",2},{"user32","GetCursorPos",1},
+        {"user32","SetCursorPos",2},{"user32","ShowCursor",1},
+        {"user32","ClipCursor",1},{"user32","SetCapture",1},
+        {"user32","ReleaseCapture",0},{"user32","GetForegroundWindow",0},
+        {"user32","SetForegroundWindow",1},{"user32","IsWindow",1},
+        {"user32","IsWindowVisible",1},{"user32","FindWindowA",2},
+        {"user32","FindWindowW",2},{"user32","AdjustWindowRect",3},
+        {"user32","AdjustWindowRectEx",4},{"user32","wsprintfA",0},
+        {"user32","wsprintfW",0},{"user32","GetDesktopWindow",0},
+        // gdi32
+        {"gdi32","CreateCompatibleDC",1},{"gdi32","DeleteDC",1},
+        {"gdi32","SelectObject",2},{"gdi32","DeleteObject",1},
+        {"gdi32","CreateSolidBrush",1},{"gdi32","CreatePen",3},
+        {"gdi32","TextOutA",5},{"gdi32","TextOutW",5},
+        {"gdi32","BitBlt",9},{"gdi32","StretchBlt",11},
+        {"gdi32","GetStockObject",1},{"gdi32","SetBkMode",2},
+        {"gdi32","SetTextColor",2},{"gdi32","CreateFontA",14},
+        {"gdi32","CreateFontW",14},{"gdi32","CreateFontIndirectA",1},
+        {"gdi32","GetDeviceCaps",2},{"gdi32","SetPixel",4},
+        {"gdi32","GetPixel",3},{"gdi32","Rectangle",5},
+        {"gdi32","FillRect",3},{"gdi32","GetObjectA",3},
+        // advapi32
+        {"advapi32","RegOpenKeyExA",5},{"advapi32","RegOpenKeyExW",5},
+        {"advapi32","RegQueryValueExA",6},{"advapi32","RegQueryValueExW",6},
+        {"advapi32","RegSetValueExA",6},{"advapi32","RegSetValueExW",6},
+        {"advapi32","RegCloseKey",1},{"advapi32","RegCreateKeyExA",9},
+        {"advapi32","RegCreateKeyExW",9},{"advapi32","RegEnumKeyExA",8},
+        {"advapi32","RegEnumValueA",8},{"advapi32","RegDeleteKeyA",2},
+        {"advapi32","OpenProcessToken",3},{"advapi32","GetTokenInformation",5},
+        // ole32 / oleaut32
+        {"ole32","CoInitialize",1},{"ole32","CoInitializeEx",2},
+        {"ole32","CoUninitialize",0},{"ole32","CoCreateInstance",5},
+        {"ole32","CoTaskMemAlloc",1},{"ole32","CoTaskMemFree",1},
+        {"oleaut32","SysAllocString",1},{"oleaut32","SysFreeString",1},
+        {"oleaut32","SysStringLen",1},{"oleaut32","VariantInit",1},
+        {"oleaut32","VariantClear",1},
+        // shell32 / shlwapi / comctl32
+        {"shell32","SHGetFolderPathA",5},{"shell32","SHGetFolderPathW",5},
+        {"shell32","SHGetKnownFolderPath",4},{"shell32","ShellExecuteA",6},
+        {"shell32","ShellExecuteW",6},{"shell32","SHGetFileInfoA",5},
+        {"shlwapi","PathFileExistsA",1},{"shlwapi","PathFileExistsW",1},
+        {"shlwapi","PathCombineA",3},{"shlwapi","PathRemoveFileSpecA",1},
+        {"comctl32","InitCommonControls",0},{"comctl32","InitCommonControlsEx",1},
+        // winmm / ws2_32
+        {"winmm","timeBeginPeriod",1},{"winmm","timeEndPeriod",1},
+        {"winmm","timeGetTime",0},{"winmm","PlaySoundA",3},
+        {"winmm","PlaySoundW",3},{"winmm","mciSendStringA",4},
+        {"ws2_32","WSAStartup",2},{"ws2_32","WSACleanup",0},
+        {"ws2_32","socket",3},{"ws2_32","closesocket",1},
+        {"ws2_32","connect",3},{"ws2_32","send",4},{"ws2_32","recv",4},
+        {"ws2_32","bind",3},{"ws2_32","listen",2},{"ws2_32","accept",3},
+        {"ws2_32","inet_addr",1},{"ws2_32","htons",1},{"ws2_32","ntohs",1},
+        {"ws2_32","select",5},{"ws2_32","ioctlsocket",3},
+        // crypt32 / psapi / version
+        {"crypt32","CryptAcquireContextA",5},{"crypt32","CryptReleaseContext",2},
+        {"crypt32","CryptGenRandom",3},
+        {"psapi","EnumProcesses",3},{"psapi","GetProcessMemoryInfo",3},
+        {"version","GetFileVersionInfoSizeA",2},{"version","GetFileVersionInfoA",4},
+        // msvcrt / ucrtbase
+        {"msvcrt","printf",0},{"msvcrt","sprintf",0},{"msvcrt","snprintf",0},
+        {"msvcrt","malloc",1},{"msvcrt","calloc",2},{"msvcrt","realloc",2},
+        {"msvcrt","free",1},{"msvcrt","memcpy",3},{"msvcrt","memset",3},
+        {"msvcrt","memmove",3},{"msvcrt","memcmp",3},{"msvcrt","strlen",1},
+        {"msvcrt","strcmp",2},{"msvcrt","strcpy",2},{"msvcrt","strcat",2},
+        {"msvcrt","fopen",2},{"msvcrt","fclose",1},{"msvcrt","fread",4},
+        {"msvcrt","fwrite",4},{"msvcrt","fseek",3},{"msvcrt","ftell",1},
+        {"msvcrt","exit",1},{"msvcrt","_exit",1},{"msvcrt","abort",0},
+        {"msvcrt","__CxxFrameHandler3",4},
+        // d3d / dxgi
+        {"d3d9","Direct3DCreate9",1},{"d3d9","Direct3DCreate9Ex",2},
+        {"d3d11","D3D11CreateDevice",7},{"d3d11","D3D11CreateDeviceAndSwapChain",12},
+        {"d3d12","D3D12CreateDevice",3},{"dxgi","CreateDXGIFactory",1},
+        {"dxgi","CreateDXGIFactory1",1},{"dxgi","CreateDXGIFactory2",3},
+        {"d3dcompiler_47","D3DCompile",10},{"d3dcompiler_47","D3DCompileFromFile",7},
+        // input / audio
+        {"dinput8","DirectInput8Create",4},{"xinput1_3","XInputGetState",2},
+        {"xinput1_4","XInputGetState",2},{"dsound","DirectSoundCreate",3},
+        {"dsound","DirectSoundCreate8",3},{"xaudio2_9","XAudio2Create",3},
+        {"opengl32","wglGetProcAddress",1},{"opengl32","wglCreateContext",1},
+        {"opengl32","wglDeleteContext",1},{"opengl32","wglMakeCurrent",2},
+        // steam
+        {"steam_api","SteamAPI_Init",0},{"steam_api","SteamAPI_Shutdown",0},
+        {"steam_api","SteamAPI_RunCallbacks",0},
+        {"steam_api64","SteamAPI_Init",0},{"steam_api64","SteamAPI_Shutdown",0},
+        {"steam_api64","SteamAPI_RunCallbacks",0},
+    };
+    for (size_t i = 0; i < sizeof(k_args) / sizeof(k_args[0]); i++) {
+        if (mod_eq(module, k_args[i].mod) && sym_eq(symbol, k_args[i].sym))
+            return k_args[i].n;
+    }
+
     // Helper macro for entries
     #define ARGENTRY(mod, sym, n) if (strcasecmp(module, mod) == 0 && strcmp(symbol, sym) == 0) return n;
 
@@ -319,6 +619,18 @@ static uint32_t lookup_ptr_mask(x86_context* ctx, const char* module,
         if (sym_eq(symbol, "GetSystemInfo") || sym_eq(symbol, "GetVersionExA") ||
             sym_eq(symbol, "GetVersionExW")) P(0x1);
         if (sym_eq(symbol, "RtlMoveMemory")) P(0x3);
+        // Symbols the CRT resolves at runtime (api-set -> kernel32) take guest
+        // pointers too; without these the bridge would see a raw guest VA.
+        if (sym_eq(symbol, "InitializeCriticalSection") ||
+            sym_eq(symbol, "InitializeCriticalSectionEx") ||
+            sym_eq(symbol, "InitializeSListHead") ||
+            sym_eq(symbol, "RtlCaptureContext") ||
+            sym_eq(symbol, "SetThreadStackGuarantee") ||
+            sym_eq(symbol, "EncodePointer") || sym_eq(symbol, "DecodePointer")) P(0x1);
+        if (sym_eq(symbol, "GetThreadTimes") || sym_eq(symbol, "GetProcessTimes")) P(0x1C);
+        if (sym_eq(symbol, "QueryThreadCycleTime")) P(0x2);
+        if (sym_eq(symbol, "GetProcessAffinityMask")) P(0x6);
+        if (sym_eq(symbol, "GetFileInformationByHandleEx")) P(0x8);
         if (sym_eq(symbol, "RtlZeroMemory")) P(0x1);
         if (sym_eq(symbol, "RtlFillMemory")) P(0x1);
         if (sym_eq(symbol, "lstrlenA") || sym_eq(symbol, "lstrlenW")) P(0x1);
@@ -373,9 +685,355 @@ static uint32_t lookup_ptr_mask(x86_context* ctx, const char* module,
     return m;
 }
 
+// ---- 32-bit runtime loading: LoadLibrary / GetProcAddress / GetModuleHandle --
+// A 32-bit Windows guest resolves most of its imports at RUNTIME:
+// LoadLibraryExW("api-ms-win-core-synch-l1-2-0") then GetProcAddress. Both
+// halves must answer in GUEST terms, or the CRT's _initterm loop ends up
+// calling truncated host pointers (that was the OpenTTD __fastfail):
+//   * the module handle is a small integer the guest can store and pass back
+//     (a host module pointer does not survive 32 bits),
+//   * the returned address is a guest VA. For a 64-bit bridge function that is
+//     a TRAP (0xF0000000 + 4*N), which x86_trap_dispatch turns back into a
+//     bridge call using the guest's own stacked arguments. Guest code inside an
+//     already-mapped PE32 image keeps its real VA -- pe_loader binds those.
+extern "C" uint32_t trt_pe32_bind_dynamic(const char* module, const char* symbol,
+                                          uint32_t ordinal, void* host_fn);
+
+#define X86_MOD_HANDLE_BASE 0x00010001u
+#define X86_MOD_MAX 256
+static struct x86_mod_entry { uint32_t h; char name[80]; } g_x86_mods[X86_MOD_MAX];
+static int g_x86_mod_count = 0;
+
+static const char* x86_mod_name(uint32_t h) {
+    for (int i = 0; i < g_x86_mod_count; i++)
+        if (g_x86_mods[i].h == h) return g_x86_mods[i].name;
+    return nullptr;
+}
+
+// Find (or mint) the 32-bit handle for a module name. Handles are dense small
+// integers so they round-trip through a 32-bit register untouched.
+static uint32_t x86_mod_handle(const char* name) {
+    if (!name || !name[0]) return 0;
+    for (int i = 0; i < g_x86_mod_count; i++)
+        if (strcasecmp(g_x86_mods[i].name, name) == 0) return g_x86_mods[i].h;
+    if (g_x86_mod_count >= X86_MOD_MAX) return 0;
+    x86_mod_entry& e = g_x86_mods[g_x86_mod_count];
+    e.h = X86_MOD_HANDLE_BASE + (uint32_t)g_x86_mod_count;
+    snprintf(e.name, sizeof(e.name), "%s", name);
+    g_x86_mod_count++;
+    return e.h;
+}
+
+static bool x86_read_cstr(x86_context* ctx, uint32_t va, char* out, size_t cap) {
+    if (!ctx->mem.base || !va || cap == 0) return false;
+    for (size_t i = 0; i + 1 < cap; i++) {
+        const char c = (char)x86_mem_read8(ctx, va + (uint32_t)i);
+        out[i] = c;
+        if (!c) return true;
+    }
+    out[cap - 1] = 0;
+    return true;
+}
+
+static bool x86_read_wstr(x86_context* ctx, uint32_t va, char* out, size_t cap) {
+    if (!ctx->mem.base || !va || cap == 0) return false;
+    for (size_t i = 0; i + 1 < cap; i++) {
+        const uint16_t c = x86_mem_read16(ctx, va + (uint32_t)(i * 2));
+        out[i] = (c < 0x80) ? (char)c : '?';
+        if (!c) return true;
+    }
+    out[cap - 1] = 0;
+    return true;
+}
+
+// Resolve a symbol for a 32-bit guest. api-set / ext-ms forwarder names carry
+// no implementations of their own; the real entry point lives in
+// kernelbase/kernel32, which is where the bridges are registered.
+// `resolved_module` receives the module that actually supplied the function.
+// That matters beyond diagnostics: the trap is registered under the resolved
+// name, so the stdcall arg-count database (keyed on kernel32/user32/...) finds
+// the symbol. Registered under an api-set name it would be a NAMED GAP and the
+// 4-arg default would shift the guest stack.
+static void* x86_resolve_dynamic(const char* module, const char* symbol,
+                                 uint32_t ordinal, const char** resolved_module) {
+    // An api-set contract ("api-ms-win-core-synch-l1-2-0") is a forwarding
+    // name. Resolve through its real target AND bind the trap under that
+    // target name, so the arg-count database finds it.
+    if (const char* target = trt_apiset_target(module)) module = target;
+    if (resolved_module) *resolved_module = module;
+    void* fn = trt_resolve_module(nullptr, module, symbol, (unsigned short)ordinal);
+    if (fn) return fn;
+    if (strncasecmp(module, "api-ms-win", 10) == 0 ||
+        strncasecmp(module, "ext-ms-win", 10) == 0) {
+        static const char* kForwards[] = {"kernel32", "kernelbase", "ntdll", nullptr};
+        for (int i = 0; kForwards[i]; i++) {
+            fn = trt_resolve_module(nullptr, kForwards[i], symbol, (unsigned short)ordinal);
+            if (fn) {
+                if (resolved_module) *resolved_module = kForwards[i];
+                return fn;
+            }
+        }
+    }
+    return nullptr;
+}
+
+static int x86_pe32_runtime(x86_context* ctx, const char* module,
+                            const char* symbol, const uint32_t* args,
+                            uint32_t* out) {
+    if (!ctx->mem.base) return 0;  // 64-bit guest: the classic bridges apply
+
+    // ---- module handles ----
+    if (sym_eq(symbol, "GetModuleHandleA") || sym_eq(symbol, "GetModuleHandleW") ||
+        sym_eq(symbol, "GetModuleHandleExA") || sym_eq(symbol, "GetModuleHandleExW")) {
+        // GetModuleHandleExA(flags, name, out) reports through a pointer and
+        // returns a BOOL; the 1-arg form returns the handle.
+        char name[128] = {0};
+        uint32_t h = 0;
+        const int is_ex = symbol[16] != 0;
+        if (!is_ex) {
+            if (!args[0]) {
+                h = ctx->image_va;
+            } else if (x86_read_cstr(ctx, args[0], name, sizeof(name))) {
+                h = x86_mod_handle(name);
+            }
+            *out = h;
+            return 1;
+        }
+        if (sym_eq(symbol, "GetModuleHandleExA")) {
+            if (args[1]) x86_read_cstr(ctx, args[1], name, sizeof(name));
+        } else {
+            if (args[1]) x86_read_wstr(ctx, args[1], name, sizeof(name));
+        }
+        h = name[0] ? x86_mod_handle(name) : ctx->image_va;
+        if (args[2]) x86_mem_write32(ctx, args[2], h);
+        *out = h ? 1 : 0;
+        return 1;
+    }
+    if (sym_eq(symbol, "LoadLibraryA") || sym_eq(symbol, "LoadLibraryW") ||
+        sym_eq(symbol, "LoadLibraryExA") || sym_eq(symbol, "LoadLibraryExW")) {
+        char name[128] = {0};
+        const bool wide = symbol[strlen(symbol) - 1] == 'W';
+        if (wide) x86_read_wstr(ctx, args[0], name, sizeof(name));
+        else x86_read_cstr(ctx, args[0], name, sizeof(name));
+        const uint32_t h = x86_mod_handle(name);
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "x86: LoadLibrary(\"%s\") -> handle 0x%08X (32-bit dynamic "
+                 "symbol resolution; a real PE32 DLL image is not mapped yet)",
+                 name[0] ? name : "?", h);
+        if (ctx->log) ctx->log(line);
+        *out = h;
+        return 1;
+    }
+    if (sym_eq(symbol, "FreeLibrary") || sym_eq(symbol, "FreeLibraryAndExitThread")) {
+        *out = 1;
+        return 1;
+    }
+    if (sym_eq(symbol, "GetProcAddress")) {
+        const uint32_t hmod = args[0];
+        char sym[128] = {0};
+        uint32_t ordinal = 0;
+        bool by_ordinal = false;
+        // A name pointer below 64 KB is really an ordinal (the standard
+        // MAKEINTRESOURCE idiom).
+        if (args[1] < 0x10000u) {
+            by_ordinal = true;
+            ordinal = args[1] & 0xFFFFu;
+        } else {
+            x86_read_cstr(ctx, args[1], sym, sizeof(sym));
+        }
+        // Guest DLL (PE32 or PE64) loaded by the loader: resolve its export
+        // table directly and hand back the export's GUEST VA (emulated code
+        // calling emulated code). This bypasses the trap mechanism, which is
+        // only for host (64-bit) bridges.
+        trt_image* gimg = trt_images_by_handle((void*)(uintptr_t)hmod);
+        if (gimg && gimg->is_pe32) {
+            void* fn = trt_pe_find_export(trt_runtime_backend(), nullptr, gimg,
+                                          by_ordinal ? nullptr : sym,
+                                          by_ordinal ? (u16)ordinal : 0);
+            // trt_pe_find_export returns a host pointer (base+func_rva); convert
+            // to guest VA.
+            if (fn) {
+                const u32 guest_va = gimg->guest_base +
+                    (u32)((uintptr_t)fn - (uintptr_t)gimg->base);
+                char line[288];
+                snprintf(line, sizeof(line),
+                         "x86: GetProcAddress(guest %s!%s) -> guest VA 0x%08X",
+                         by_ordinal ? "#ordinal" : sym, by_ordinal ? "#ordinal" : sym,
+                         guest_va);
+                if (ctx->log) ctx->log(line);
+                *out = guest_va;
+                return 1;
+            }
+        }
+
+        const char* modname = (hmod == 0 || hmod == ctx->image_va) ? "" : x86_mod_name(hmod);
+        char line[288];
+        if (!modname || !modname[0]) {
+            snprintf(line, sizeof(line),
+                     "x86: GetProcAddress(handle 0x%08X, \"%s\") -> 0 (handle is "
+                     "not a known 32-bit module)",
+                     hmod, by_ordinal ? "#ordinal" : sym);
+            if (ctx->log) ctx->log(line);
+            *out = 0;
+            return 1;
+        }
+        const char* resolved_mod = modname;
+        void* fn = x86_resolve_dynamic(modname, by_ordinal ? nullptr : sym,
+                                       ordinal, &resolved_mod);
+        if (!fn) {
+            snprintf(line, sizeof(line),
+                     "x86: GetProcAddress(%s!%s) -> 0 (NAMED GAP: no bridge for "
+                     "this symbol)",
+                     modname, by_ordinal ? "#ordinal" : sym);
+            if (ctx->log) ctx->log(line);
+            *out = 0;
+            return 1;
+        }
+        const uint32_t trap =
+            trt_pe32_bind_dynamic(resolved_mod, by_ordinal ? nullptr : sym, ordinal, fn);
+        if (!trap) {
+            snprintf(line, sizeof(line),
+                     "x86: GetProcAddress(%s!%s) -> 0 (trap table full)",
+                     modname, by_ordinal ? "#ordinal" : sym);
+            if (ctx->log) ctx->log(line);
+            *out = 0;
+            return 1;
+        }
+        snprintf(line, sizeof(line),
+                 "x86: GetProcAddress(%s!%s) -> trap 0x%08X (bound as %s!%s, "
+                 "32-bit direct call to a 64-bit bridge)",
+                 modname, by_ordinal ? "#ordinal" : sym, trap, resolved_mod,
+                 by_ordinal ? "#ordinal" : sym);
+        if (ctx->log) ctx->log(line);
+        *out = trap;
+        return 1;
+    }
+    if (sym_eq(symbol, "GetModuleFileNameA") || sym_eq(symbol, "GetModuleFileNameW")) {
+        const uint32_t hmod = args[0];
+        const char* nm = hmod ? x86_mod_name(hmod) : nullptr;
+        char text[128];
+        snprintf(text, sizeof(text), "%s", nm && nm[0] ? nm : "program.exe");
+        const uint32_t cap = args[2];
+        const bool wide = symbol[strlen(symbol) - 1] == 'W';
+        uint32_t n = 0;
+        for (; text[n] && n + 1 < cap; n++) {
+            if (wide) x86_mem_write16(ctx, args[1] + n * 2, (uint16_t)(uint8_t)text[n]);
+            else x86_mem_write8(ctx, args[1] + n, (uint8_t)text[n]);
+        }
+        if (wide) x86_mem_write16(ctx, args[1] + n * 2, 0);
+        else x86_mem_write8(ctx, args[1] + n, 0);
+        *out = n;
+        return 1;
+    }
+
+    // ---- allocators: everything the guest keeps must live in the arena ----
+    if (sym_eq(symbol, "GetProcessHeap")) { *out = 1; return 1; }
+    if (sym_eq(symbol, "HeapCreate") || sym_eq(symbol, "HeapDestroy")) { *out = 1; return 1; }
+    if (sym_eq(symbol, "HeapAlloc")) {
+        *out = x86_guest_alloc(ctx, args[2], (args[1] & 0x8u) != 0 /*HEAP_ZERO_MEMORY*/);
+        return 1;
+    }
+    if (sym_eq(symbol, "HeapReAlloc")) {
+        *out = x86_guest_realloc(ctx, args[2], args[3], (args[1] & 0x8u) != 0);
+        return 1;
+    }
+    if (sym_eq(symbol, "HeapFree")) { *out = (uint32_t)x86_guest_free(ctx, args[2]); return 1; }
+    if (sym_eq(symbol, "HeapSize")) { *out = x86_guest_blocksize(ctx, args[2]); return 1; }
+    if (sym_eq(symbol, "LocalAlloc") || sym_eq(symbol, "GlobalAlloc")) {
+        *out = x86_guest_alloc(ctx, args[1], (args[0] & 0x40u) != 0 /*LMEM_ZEROINIT*/);
+        return 1;
+    }
+    if (sym_eq(symbol, "LocalFree") || sym_eq(symbol, "GlobalFree")) {
+        x86_guest_free(ctx, args[0]);
+        *out = 0;
+        return 1;
+    }
+    if (sym_eq(symbol, "VirtualAlloc")) {
+        const uint32_t addr = args[0];
+        const uint32_t size = args[1];
+        if (!size) { *out = 0; return 1; }
+        if (addr) {
+            // Honour a caller-chosen address INSIDE the reservation; anything
+            // outside it cannot be handed back to a 32-bit guest safely.
+            if (addr >= 0x10000u && addr + size > addr &&
+                x86_mem_commit(ctx, addr, size) == 0) {
+                *out = addr;
+            } else {
+                char line[160];
+                snprintf(line, sizeof(line),
+                         "x86: VirtualAlloc(0x%08X, %u) refused (outside the "
+                         "guest arena)", addr, size);
+                if (ctx->log) ctx->log(line);
+                *out = 0;
+            }
+            return 1;
+        }
+        *out = x86_guest_alloc(ctx, size, 1);
+        return 1;
+    }
+    if (sym_eq(symbol, "VirtualFree")) {
+        if (args[2] & 0x8000u /*MEM_RELEASE*/) x86_guest_free(ctx, args[0]);
+        *out = 1;
+        return 1;
+    }
+    if (sym_eq(symbol, "VirtualQuery")) {
+        // 32-bit MEMORY_BASIC_INFORMATION is 28 bytes.
+        const uint32_t addr = args[0];
+        const uint32_t mbi = args[1];
+        const uint32_t len = args[2];
+        if (!mbi || len < 28u) { *out = 0; return 1; }
+        // Zero the struct first.
+        for (int i = 0; i < 28; i++) x86_mem_write8(ctx, mbi + i, 0);
+        const uint32_t page = addr & ~0xFFFu;
+        // Report the page as committed (MEM_COMMIT) with PAGE_READWRITE.
+        x86_mem_write32(ctx, mbi + 0, page);     // BaseAddress
+        x86_mem_write32(ctx, mbi + 4, page);     // AllocationBase
+        x86_mem_write32(ctx, mbi + 8, 0x04u);    // AllocationProtect (PAGE_READWRITE)
+        x86_mem_write32(ctx, mbi + 12, 0x1000u); // RegionSize
+        x86_mem_write32(ctx, mbi + 16, 0x1000u); // State (MEM_COMMIT)
+        x86_mem_write32(ctx, mbi + 20, 0x04u);   // Protect
+        x86_mem_write32(ctx, mbi + 24, 0x20000u);// Type (MEM_PRIVATE)
+        *out = 28u;
+        return 1;
+    }
+    if (sym_eq(symbol, "VirtualProtect")) {
+        const uint32_t addr = args[0];
+        const uint32_t size = args[1];
+        // Honour the request inside the reservation; report success.
+        if (size && x86_mem_commit(ctx, addr, size) == 0) {
+            if (args[3]) x86_mem_write32(ctx, args[3], 0x04u); // old protect
+            *out = 1;
+        } else {
+            *out = 0;
+        }
+        return 1;
+    }
+    if (mod_eq(module, "msvcrt") || mod_eq(module, "ucrtbase")) {
+        if (sym_eq(symbol, "malloc")) { *out = x86_guest_alloc(ctx, args[0], 0); return 1; }
+        if (sym_eq(symbol, "calloc")) {
+            const uint32_t total = args[0] * args[1];
+            if (args[0] && args[1] && total / args[1] != args[0]) { *out = 0; return 1; }
+            *out = x86_guest_alloc(ctx, total, 1);
+            return 1;
+        }
+        if (sym_eq(symbol, "realloc")) { *out = x86_guest_realloc(ctx, args[0], args[1], 0); return 1; }
+        if (sym_eq(symbol, "free") || sym_eq(symbol, "_free")) {
+            x86_guest_free(ctx, args[0]);
+            *out = 0;
+            return 1;
+        }
+        if (sym_eq(symbol, "_msize")) { *out = x86_guest_blocksize(ctx, args[0]); return 1; }
+    }
+    return 0;
+}
+
 // Per-thread state the guest expects to be local, not host-global.
 static int special_import(x86_context* ctx, const char* module, const char* symbol,
                           const uint32_t* args, uint32_t* out) {
+    // The 32-bit guest needs its OWN runtime loader and allocator semantics;
+    // both are answered before any 64-bit bridge sees the call.
+    if (x86_pe32_runtime(ctx, module, symbol, args, out)) return 1;
     if (mod_eq(module, "kernel32") || mod_eq(module, "msvcrt")) {
         if (sym_eq(symbol, "GetLastError")) { *out = (uint32_t)ctx->last_error; return 1; }
         if (sym_eq(symbol, "SetLastError")) { ctx->last_error = (int)args[0]; *out = 0; return 1; }
@@ -429,6 +1087,14 @@ static int special_import(x86_context* ctx, const char* module, const char* symb
 
 extern "C" void* trt_pe32_trap_host_fn(int index);
 
+// Test/introspection hook: is this import __cdecl (caller cleans)?
+extern "C" int x86_is_cdecl(const char* module, const char* symbol) {
+    return lookup_cdecl(module, symbol);
+}
+extern "C" int x86_arg_count(const char* module, const char* symbol) {
+    return lookup_arg_count(module, symbol);
+}
+
 // Dispatch one imported call. trap_index is -1 when the caller already knows
 // the module/symbol (direct call path).
 extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
@@ -440,7 +1106,18 @@ extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
 
     int cdecl_call = lookup_cdecl(module, symbol);
     int nargs = lookup_arg_count(module, symbol);
-    if (nargs < 0) nargs = 4; // default for unknown
+    if (nargs < 0) {
+        // No ABI entry: fall back to the historical 4-arg guess, but say so
+        // once per symbol. A wrong count silently shifts the guest stack by
+        // 4 bytes per missing argument, which surfaces much later as a jump to
+        // a garbage EIP. Naming it here keeps that failure attributable.
+        nargs = 4;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "x86_bridge: NAMED GAP %s!%s has no stdcall arg-count entry; "
+                 "assuming 4 (stack may drift)", module, symbol ? symbol : "?");
+        if (ctx->log) ctx->log(buf);
+    }
 
     uint32_t result = 0;
     if (special_import(ctx, module, symbol, args, &result)) {

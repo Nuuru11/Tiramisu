@@ -797,6 +797,45 @@ int main() {
               ((fn_bsub)apps_vt[6])(s_apps, 480u) == 0,
           "Steam BIsSubscribedApp remains honest 0 via both flat and vtable paths");
 
+    // Imported-library ownership: an AppID the user's own Steam installation
+    // reports answers 1, anything else still answers 0. This is manifest
+    // state, not a manufactured license, and it restores to empty.
+    {
+      const u32 owned_ids[2] = {730u, 228980u};
+      trt_steam_set_owned_appids(owned_ids, 2);
+      CHECK(trt_steam_owned_app_count() == 2, "owned AppID set holds 2 apps");
+      CHECK(pBSub && pBSub(s_apps, 730u) == 1,
+            "BIsSubscribedApp -> 1 for an AppID in the imported library");
+      CHECK(pBSub && pBSub(s_apps, 999999u) == 0,
+            "BIsSubscribedApp -> 0 for an AppID not in the library");
+      const u32 dup[3] = {730u, 730u, 0u};
+      trt_steam_set_owned_appids(dup, 3);
+      CHECK(trt_steam_owned_app_count() == 1,
+            "duplicate/zero AppIDs are ignored");
+      trt_steam_set_owned_appids(nullptr, 0);
+      CHECK(trt_steam_owned_app_count() == 0, "owned set clears");
+      CHECK(pBSub && pBSub(s_apps, 730u) == 0,
+            "after clearing, BIsSubscribedApp is honest 0 again");
+    }
+
+    // Signed-in identity: the bridge answers with the validated SteamID and
+    // refuses anything that is not shaped like one.
+    {
+      using fn_id = u64(TRT_GUEST_ABI*)(void);
+      auto pGetId = (fn_id)sq("SteamAPI_GetSteamID");
+      CHECK(trt_steam_current_id() == 0, "no identity before sign-in");
+      trt_steam_set_identity("76561197960287930", "Tester");
+      CHECK(trt_steam_current_id() == 76561197960287930ull,
+            "signed-in SteamID reaches the bridge");
+      CHECK(pGetId && pGetId() == 76561197960287930ull,
+            "GetSteamID returns the signed-in account");
+      trt_steam_set_identity("11111111111111111", "Bogus");
+      CHECK(trt_steam_current_id() == 0,
+            "a malformed SteamID is refused, not adopted");
+      CHECK(pGetId && pGetId() == 0x0110000100000001ull,
+            "GetSteamID falls back to the anonymous user");
+    }
+
     // ISteamRemoteStorage VFS cloud-save persistence + traversal guard
     using fn_fw = int(TRT_GUEST_ABI*)(void*, const char*, const void*, i32);
     using fn_fr = i32(TRT_GUEST_ABI*)(void*, const char*, void*, i32);

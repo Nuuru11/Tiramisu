@@ -568,7 +568,11 @@ trt_image* trt_load_pe(const char* host_path, const char* guest_name,
              base);
     trt_core_log(line);
   }
-  // TLS callbacks, then the entry point (DllMain for a DLL).
+  // TLS callbacks, then the entry point (DllMain for a DLL). The legacy 32-bit
+  // runner executes a private copy and copies the guest's data writes back
+  // into the image, which is sealed RX at this point: unseal for that window
+  // and re-seal afterwards, so no page is ever writable and executable.
+  if (img->is_pe32 && g_run_image_code) trt_unseal_image(g_be, img);
   if (img->is_pe32 && g_run_image_code) {
     const u32 hinst = img->guest_base;
     for (int i = 0; i < img->tls_callback_count; ++i) {

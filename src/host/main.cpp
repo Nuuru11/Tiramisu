@@ -1197,6 +1197,41 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
              (unsigned long)record.ExceptionCode, where);
   }
   longan::log_line(line);
+  // GPR + faulting-instruction dump (mirrors the old FATAL VEH format).
+  // Must run BEFORE capture_fault_stack: the unwind mutates the context.
+  if (ep->ContextRecord) {
+    const CONTEXT& c = *ep->ContextRecord;
+    char g[512];
+    snprintf(g, sizeof(g),
+             "  GPRs: rip=%llx rsp=%llx rbp=%llx rax=%llx rbx=%llx rcx=%llx rdx=%llx rsi=%llx rdi=%llx",
+             (unsigned long long)c.Rip, (unsigned long long)c.Rsp, (unsigned long long)c.Rbp,
+             (unsigned long long)c.Rax, (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+             (unsigned long long)c.Rdx, (unsigned long long)c.Rsi, (unsigned long long)c.Rdi);
+    longan::log_line(g);
+    snprintf(g, sizeof(g),
+             "  GPRs2: r8=%llx r9=%llx r10=%llx r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+             (unsigned long long)c.R8, (unsigned long long)c.R9, (unsigned long long)c.R10,
+             (unsigned long long)c.R11, (unsigned long long)c.R12, (unsigned long long)c.R13,
+             (unsigned long long)c.R14, (unsigned long long)c.R15);
+    longan::log_line(g);
+    unsigned char code[32];
+    memset(code, 0, sizeof(code));
+    bool got_code = false;
+    __try {
+      memcpy(code, record.ExceptionAddress, sizeof(code));
+      got_code = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+      got_code = false;
+    }
+    if (got_code) {
+      char cb[256];
+      char* p = cb;
+      p += snprintf(p, sizeof(cb) - (size_t)(p - cb), "  code [pc..pc+32]:");
+      for (int i = 0; i < 32; ++i)
+        p += snprintf(p, sizeof(cb) - (size_t)(p - cb), " %02x", code[i]);
+      longan::log_line(cb);
+    }
+  }
   DWORD64 frames[32];
   const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
   for (int i = 1; i < count; ++i) {
@@ -1405,6 +1440,9 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_runtime_init(&be, exe_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
+  {  // scope the first exe read: buf dies after the managed check
+     // (saves 409MB persistent + the 409MB transient double-buffer
+     // during mapping; the second read below is a separate buf).
   std::ifstream f(exe_path, std::ios::binary);
   if (!f) {
     snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
@@ -1465,6 +1503,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     }
     return r;
   }
+  }  // end scoped first-read block; the 409MB buf is freed before the native map
 
   trt_image* img = nullptr;
   {
@@ -1514,11 +1553,11 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     // 32-bit PE: run through x86 interpreter instead of native call
     snprintf(line, sizeof(line), "trt: 32-bit PE detected, running via x86 interpreter");
     longan::log_line(line);
-    x86_context xctx;
+    x86_context xctx = {};
     x86_cpu_init(&xctx);
     xctx.log = [](const char* s) { longan::log_line(s); };
     int rc = x86_run_pe32(&xctx, img->base, img->size_of_image,
-                          img->entry_rva, 0x00100000, 0x00100000);
+                          img->guest_base, img->entry_rva, 0x00100000, 0x00100000);
     snprintf(r.detail, sizeof(r.detail), "x86 interpreter returned %d", rc);
     x86_mem_free(&xctx);
     return r;

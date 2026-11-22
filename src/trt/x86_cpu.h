@@ -80,6 +80,9 @@ struct x86_context {
     // Guest image base (host pointer to mapped PE)
     void* image_base;
     uint32_t image_size;
+    // The same image's GUEST base. A 32-bit guest must get this back from
+    // GetModuleHandle(NULL) / a NULL hInstance, never the host pointer.
+    uint32_t image_va;
     // Entry point (RVA)
     uint32_t entry_rva;
     // Is the CPU running?
@@ -94,27 +97,93 @@ struct x86_context {
     void (*log)(const char*);
     // TLS array base address (guest)
     uint32_t tls_array;
+    // ---- JIT state ----
+    // Pages that currently hold recompiled basic blocks. A store into one of
+    // these bumps `code_epoch`, which invalidates every cached block
+    // (self-modifying-code safety).
+    uint64_t code_pages[X86_MAP_WORDS];
+    uint32_t code_epoch;
+    int jit_enabled;
+    void* jit_cache;          // jit_cache* (owned by x86_jit.cpp)
+    // Sentinel address for guest->guest calls made by the SEH dispatcher.
+    uint32_t seh_sentinel;
 };
+
+// Called by guest stores that land in a page holding recompiled code.
+void x86_jit_note_write(x86_context* ctx, uint32_t addr);
+// Drop every cached basic block.
+void x86_jit_flush(x86_context* ctx);
+// Execute one cached (or freshly recompiled) basic block on this guest VA.
+// Returns 1 when a block ran, 0 when the address is not recompilable (the
+// caller should fall back to x86_step), -1 on a fatal guest error.
+int x86_jit_step(x86_context* ctx);
+// Recompiler statistics (for tests/telemetry).
+struct x86_jit_stats { unsigned long long blocks, insns, decoded, evictions; };
+void x86_jit_get_stats(x86_context* ctx, x86_jit_stats* out);
+
+// ---- Structured Exception Handling ----
+// Deliver an exception to the guest's FS:[0] handler chain. Returns 0 when a
+// handler resumed execution (EIP/ESP/registers restored from the CONTEXT),
+// -1 when the chain ended unhandled (caller decides how to fail).
+int x86_raise_seh(x86_context* ctx, uint32_t code, uint32_t flags,
+                  uint32_t addr, uint32_t nparams, const uint32_t* params);
+// Call a guest function with __cdecl args and return its EAX.
+uint32_t x86_call_guest(x86_context* ctx, uint32_t fn, const uint32_t* args, int nargs);
 
 // ---- Memory access helpers ----
 static inline int x86_page_mapped(x86_context* ctx, uint32_t page) {
     return (ctx->mem.map[page >> 6] >> (page & 63)) & 1;
 }
+// Is every page touched by [addr, addr+n) committed?
+static inline int x86_span_mapped(x86_context* ctx, uint32_t addr, uint32_t n) {
+    uint32_t p0 = addr >> X86_PAGE_SHIFT;
+    uint32_t p1 = (addr + n - 1) >> X86_PAGE_SHIFT;
+    if (p0 == p1) return x86_page_mapped(ctx, p0);
+    if (p1 >= X86_PAGE_COUNT) return 0;
+    for (uint32_t p = p0; p <= p1; p++)
+        if (!x86_page_mapped(ctx, p)) return 0;
+    return 1;
+}
+
+// Forward declaration (defined in x86_exec.cpp): commits a range of guest
+// memory inside the 4 GB reservation.
+int x86_mem_commit(x86_context* ctx, uint32_t base, size_t size);
+
 static inline uint8_t x86_mem_read8(x86_context* ctx, uint32_t addr) {
-    if (!ctx->mem.base || !x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
-        ctx->last_error = 1; // page fault
-        return 0;
+    if (!ctx->mem.base) { ctx->last_error = 1; return 0; }
+    uint32_t page = addr >> X86_PAGE_SHIFT;
+    if (!x86_page_mapped(ctx, page)) {
+        // Demand-page: commit the page on first touch, like Windows does inside
+        // a reserved region. This keeps guest writes to memory the guest
+        // believes exists (large static arrays, .bss overflow) from faulting
+        // inside the emulator while still failing for truly out-of-range VAs.
+        if (x86_mem_commit(ctx, page << X86_PAGE_SHIFT, X86_PAGE_SIZE) != 0) {
+            ctx->last_error = 1; // page fault
+            return 0;
+        }
     }
     return ctx->mem.base[addr];
 }
 
+// Multi-byte accesses take a fast path that tests the page bitmap once and
+// then does a single host load/store. The old byte-at-a-time form cost four
+// bitmap tests plus four branches for every 32-bit operand, which dominated
+// interpreter time.
 static inline uint16_t x86_mem_read16(x86_context* ctx, uint32_t addr) {
+    if (ctx->mem.base && (addr & 0xFFFu) <= 0xFFEu &&
+        x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
+        uint16_t v; memcpy(&v, ctx->mem.base + addr, 2); return v;
+    }
     uint16_t v = x86_mem_read8(ctx, addr);
     v |= (uint16_t)x86_mem_read8(ctx, addr + 1) << 8;
     return v;
 }
 
 static inline uint32_t x86_mem_read32(x86_context* ctx, uint32_t addr) {
+    if (ctx->mem.base && (addr & 0xFFFu) <= 0xFFCu &&
+        x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
+        uint32_t v; memcpy(&v, ctx->mem.base + addr, 4); return v;
+    }
     uint32_t v = x86_mem_read8(ctx, addr);
     v |= (uint32_t)x86_mem_read8(ctx, addr + 1) << 8;
     v |= (uint32_t)x86_mem_read8(ctx, addr + 2) << 16;
@@ -122,20 +191,47 @@ static inline uint32_t x86_mem_read32(x86_context* ctx, uint32_t addr) {
     return v;
 }
 
-static inline void x86_mem_write8(x86_context* ctx, uint32_t addr, uint8_t val) {
-    if (!ctx->mem.base || !x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
-        ctx->last_error = 1;
-        return;
+static inline void x86_note_code_write(x86_context* ctx, uint32_t addr) {
+    uint32_t page = addr >> X86_PAGE_SHIFT;
+    // Only pay for the epoch bump when this page actually holds recompiled
+    // code; ordinary data writes never touch it.
+    if (ctx->code_pages[page >> 6] & (1ull << (page & 63))) {
+        ctx->code_epoch++;
+        ctx->code_pages[page >> 6] &= ~(1ull << (page & 63));
     }
+}
+
+static inline void x86_mem_write8(x86_context* ctx, uint32_t addr, uint8_t val) {
+    if (!ctx->mem.base) { ctx->last_error = 1; return; }
+    uint32_t page = addr >> X86_PAGE_SHIFT;
+    if (!x86_page_mapped(ctx, page)) {
+        if (x86_mem_commit(ctx, page << X86_PAGE_SHIFT, X86_PAGE_SIZE) != 0) {
+            ctx->last_error = 1;
+            return;
+        }
+    }
+    x86_note_code_write(ctx, addr);
     ctx->mem.base[addr] = val;
 }
 
 static inline void x86_mem_write16(x86_context* ctx, uint32_t addr, uint16_t val) {
+    if (ctx->mem.base && (addr & 0xFFFu) <= 0xFFEu &&
+        x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
+        x86_note_code_write(ctx, addr);
+        memcpy(ctx->mem.base + addr, &val, 2);
+        return;
+    }
     x86_mem_write8(ctx, addr, (uint8_t)(val & 0xFF));
     x86_mem_write8(ctx, addr + 1, (uint8_t)((val >> 8) & 0xFF));
 }
 
 static inline void x86_mem_write32(x86_context* ctx, uint32_t addr, uint32_t val) {
+    if (ctx->mem.base && (addr & 0xFFFu) <= 0xFFCu &&
+        x86_page_mapped(ctx, addr >> X86_PAGE_SHIFT)) {
+        x86_note_code_write(ctx, addr);
+        memcpy(ctx->mem.base + addr, &val, 4);
+        return;
+    }
     x86_mem_write8(ctx, addr, (uint8_t)(val & 0xFF));
     x86_mem_write8(ctx, addr + 1, (uint8_t)((val >> 8) & 0xFF));
     x86_mem_write8(ctx, addr + 2, (uint8_t)((val >> 16) & 0xFF));
@@ -159,8 +255,23 @@ static inline void xg_write64(x86_context* ctx, uint32_t addr, uint64_t v) {
 }
 
 // ---- Memory management ----
-// Commit a range of guest memory (maps host pages)
-int x86_mem_commit(x86_context* ctx, uint32_t base, size_t size);
+// Commit a range of guest memory (maps host pages) — declared above.
+
+// ---- Guest heap arena (x86_heap.cpp) ----
+// 32-bit guests must allocate INSIDE the 4 GB reservation, otherwise the
+// pointer they keep is a truncated host address. These are the allocators
+// HeapAlloc / VirtualAlloc / msvcrt malloc are routed to for such guests.
+struct x86_heap_stats {
+    uint32_t arena_base, arena_end, bump;
+    uint64_t allocs, frees, live_bytes, peak_bytes;
+};
+uint32_t x86_guest_alloc(x86_context* ctx, uint32_t bytes, int zero);
+uint32_t x86_guest_realloc(x86_context* ctx, uint32_t ptr, uint32_t bytes, int zero);
+int x86_guest_free(x86_context* ctx, uint32_t ptr);
+uint32_t x86_guest_blocksize(x86_context* ctx, uint32_t ptr);
+int x86_guest_ptr_in_arena(uint32_t ptr);
+void x86_guest_heap_reset(void);
+void x86_guest_heap_stats(x86_heap_stats* out);
 // Free all committed memory
 void x86_mem_free(x86_context* ctx);
 // Map a host buffer into guest address space (zero-copy for PE image)
@@ -171,7 +282,8 @@ int x86_mem_map_host(x86_context* ctx, uint32_t guest_addr, void* host_ptr, size
 // and runs it through the x86 interpreter.
 // Returns 0 on success, -1 on error.
 int x86_run_pe32(x86_context* ctx, void* image_base, size_t image_size,
-                 uint32_t entry_rva, uint32_t stack_base, size_t stack_size);
+                 uint32_t guest_base, uint32_t entry_rva, uint32_t stack_base,
+                 size_t stack_size);
 
 // ---- CPU lifecycle ----
 // Initialize CPU state
