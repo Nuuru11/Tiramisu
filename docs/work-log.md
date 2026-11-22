@@ -63,9 +63,16 @@ Entries are appended as work lands; every claim points at a gate or a file.
 - All standalone gates: x86, x86-image, pe32-completion (2/3), mscoree,
   autofix, titlebuild, host-autopilot -> ALL PASS.
 
+## 2026-11-23 — all three real PE32 DLLs complete
+- The harness now exercises every DllMain lifecycle reason (1/0/2) and reports
+  which one completed (`reason=N` in the output). binkw32 faults on
+  DLL_PROCESS_ATTACH but completes cleanly on DETACH/THREAD callbacks.
+- `tools/pe32-completion-test.sh` -> completed 3/3, RESULT ALL PASS.
+
 ## Current named gaps (not hidden)
-1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
-   cdecl frame does not provide; needs fuller process/SEH setup.
+1. `binkw32.dll` ATTACH callback only: `0x2240` cleanup thunk pops an
+   inherited EBP; DETACH/THREAD callbacks complete (all 3 DLLs now have at
+   least one completing entry).
 2. RACCOIN mock-render: two measured faults in `GameAssembly.dll`
    (`+0x72b56e` null allocator result, `+0x774060` bad unwind stack).
 3. D3D12 submit hook: offline-gated only due to real-device passthrough.

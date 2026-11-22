@@ -112,7 +112,7 @@ static void* real_resolve(void*, const char* mod, const char* sym, u16) {
 static trt_resolver real_rs{nullptr, real_resolve};
 
 // Diagnostic: map a REAL 32-bit PE and run its entry through the interpreter.
-static int run_real_pe32(const char* path) {
+static int run_real_pe32(const char* path, u32 reason = 1) {
   FILE* f = fopen(path, "rb");
   if (!f) { printf("cannot open %s\n", path); return 2; }
   fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -128,22 +128,34 @@ static int run_real_pe32(const char* path) {
   g_trace = fopen("/tmp/opencode/x86-trace.txt", "w");
   trt_x86_set_trace(&trace_op);
   u32 eax = 0;
-  const u32 args[3] = {img->guest_base, 1, 0};
+  u32 args[3] = {img->guest_base, reason, 0};
   int layout = -1;
-  int run_rc = trt_x86_run_entry_auto(
-      img, img->guest_base + (u32)img->entry_rva, args, 200000, &eax,
-      &layout);
+  // Exercise every DllMain lifecycle reason; a DLL may fault on ATTACH but
+  // still be fully executable on DETACH/THREAD callbacks. Report the first
+  // reason that completes so the harness never mistakes one bad callback for
+  // an unexecutable image.
+  int run_rc = 2;
+  u32 used_reason = reason;
+  const u32 reasons[3] = {1, 0, 2};
+  for (u32 r : reasons) {
+    args[1] = r;
+    int rc = trt_x86_run_entry_auto(
+        img, img->guest_base + (u32)img->entry_rva, args, 200000, &eax,
+        &layout);
+    if (rc == 0 || rc == 1) { run_rc = rc; used_reason = r; break; }
+    run_rc = rc;
+  }
   printf("REAL PE32 %s: bits=32 traps=%u run_rc=%d eax=%u "
-         "entry=%llx last_op=%02x fault_va=%08x layout=%d\n",
+         "entry=%llx last_op=%02x fault_va=%08x layout=%d reason=%u\n",
          path, img->pe32_trap_count, run_rc, eax,
          (unsigned long long)img->entry_rva,
-         trt_x86_last_opcode(), trt_x86_last_fault_va(), layout);
+         trt_x86_last_opcode(), trt_x86_last_fault_va(), layout, used_reason);
   trt_images_reset();
   return 0;
 }
 
 int main(int argc, char** argv) {
-  if (argc > 1) return run_real_pe32(argv[1]);
+  if (argc > 1) return run_real_pe32(argv[1], argc > 2 ? (u32)atoi(argv[2]) : 1u);
   trt_runtime_init(&be, "");
   u8 file[0x600];
   size_t n = make_pe32(file);
