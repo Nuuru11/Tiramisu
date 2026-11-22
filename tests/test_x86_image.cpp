@@ -99,6 +99,11 @@ static size_t make_pe32(u8* out) {
   return 0x600;
 }
 
+static FILE* g_trace = nullptr;
+static void trace_op(u32 va, unsigned op) {
+  if (g_trace) fprintf(g_trace, "%08x %02x\n", va, op);
+}
+
 static u64 dummy_bridge(u64, u64, u64, u64) { return 0; }
 static void* real_resolve(void*, const char* mod, const char* sym, u16) {
   (void)mod; (void)sym;
@@ -120,6 +125,8 @@ static int run_real_pe32(const char* path) {
   int rc = trt_map_pe32(&be, &real_rs, data.data(), data.size(), &img);
   if (rc != TRT_OK || !img) { printf("map rc=%d\n", rc); return 2; }
   trt_x86_set_resolver(&real_rs);
+  g_trace = fopen("/tmp/opencode/x86-trace.txt", "w");
+  trt_x86_set_trace(&trace_op);
   u32 eax = 0;
   const u32 args[3] = {img->guest_base, 1, 0};
   int run_rc = trt_x86_run_cdecl(

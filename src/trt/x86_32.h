@@ -35,6 +35,10 @@ typedef struct trt_x86_ctx {
 // Returns 0 on HLT, 1 on trap stop, 2 on invalid/fault (stop_code set).
 int trt_x86_run(trt_x86_ctx* c, u64 max_instructions);
 
+// Optional instruction trace: called once per decoded instruction (VA, opcode)
+// so a real guest that stops mid-instruction names the last decode.
+void trt_x86_set_trace(void (*fn)(u32 va, unsigned op));
+
 // Diagnostics: the opcode and VA of the last named fault, so a real guest
 // that hits an unsupported instruction names itself instead of stopping silent.
 unsigned trt_x86_last_opcode(void);

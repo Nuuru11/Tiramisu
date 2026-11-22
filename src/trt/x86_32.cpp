@@ -171,6 +171,9 @@ bool jcc(int cond, u32 flags) {
 
 }  // namespace
 
+static void (*g_x86_trace)(u32, unsigned) = nullptr;
+void trt_x86_set_trace(void (*fn)(u32, unsigned)) { g_x86_trace = fn; }
+
 static unsigned g_last_opcode = 0;
 static u32 g_last_fault_va = 0;
 unsigned trt_x86_last_opcode(void) { return g_last_opcode; }
@@ -218,7 +221,14 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
       if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
     }
     if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
+    if (g_x86_trace) g_x86_trace(op_va, op);
     switch (op) {
+      case 0x0d: {                                        // or eax, imm32 (no ModRM)
+        u32 imm = d.i32();
+        c->r[X86_EAX] |= imm;
+        set_logic_flags(c, c->r[X86_EAX]);
+        break;
+      }
       case 0x90: break;                                   // nop
       case 0xf4: return 0;                                // hlt
       case 0xcc: c->stop_code = 0x80000003u; return 1;    // int3
@@ -381,7 +391,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
         } else if (op == 0x89 || op == 0x8b || op == 0x01 ||
                    op == 0x03 || op == 0x29 || op == 0x2b ||
                    op == 0x31 || op == 0x33 || op == 0x39 ||
-                   op == 0x3b || op == 0x09 || op == 0x0b || op == 0x0d ||
+                   op == 0x3b || op == 0x09 || op == 0x0b ||
                    op == 0x85 || op == 0xc7 ||
                    op == 0x8d || op == 0x83 || op == 0xff) {
           modrm_t m; decode_modrm(d, m);
@@ -395,7 +405,7 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
             case 0x8b: set_reg_op(d, m.reg, a); break;            // mov r, r/m
             case 0x09: res = a | b; write_rm(d, m, res); set_logic_flags(c, res); break;
             case 0x0b: res = b | a; set_reg_op(d, m.reg, res); set_logic_flags(c, res); break;
-            case 0x0d: res = a | d.i32(); write_rm(d, m, res); set_logic_flags(c, res); break;
+
             case 0x01: res = a + b; write_rm(d, m, res); set_add_flags(c, a, b, res); break;
             case 0x03: res = b + a; set_reg_op(d, m.reg, res); set_add_flags(c, b, a, res); break;
             case 0x29: res = a - b; write_rm(d, m, res); set_sub_flags(c, a, b, res); break;
