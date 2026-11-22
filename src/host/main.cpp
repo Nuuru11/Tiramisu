@@ -10,6 +10,7 @@
 #include "swapchain.h"
 #include "ui.h"
 #include "webxfer.h"
+#include "host_autopilot.h"
 #include "settings.h"
 #include "../trt/trt.h"
 #include "../trt/mono_host.h"
@@ -103,6 +104,11 @@ std::string g_running_game_name;  // guest currently running ("" when idle) — 
 ULONGLONG g_boot_ms = 0;          // GetTickCount64 at Run() start — heartbeat uptime
 ULONGLONG g_last_rescan_ms = 0;   // GetTickCount64 of the last shelf rescan — debounce clock
 std::string g_pending_launch;
+
+// In-console autopilot state owned by the host loop (see host_autopilot.h).
+// webxfer arms it on transfer; the launch handoff and its result drive the
+// transitions; the repair/retry itself is applied by webxfer's state machine.
+static longan::host_autopilot_state& g_host_ap = longan::host_ap_state();
 bool g_mouse_mode = false;
 bool g_kbd_mouse_mode = false;
 bool g_quick_menu_open = false;
@@ -2827,6 +2833,9 @@ struct tiramisu_host
             } else if (!m_rescan_pending_game.empty()) {
               const std::string game = m_rescan_pending_game;
               m_rescan_pending_game.clear();
+              // A transfer just landed: arm the in-console autopilot for it.
+              longan::host_ap_arm(game);
+              longan::log_line(("host: autopilot armed for " + game).c_str());
               rescan_one_game(game);
             }
             // any rescan resets the periodic clock
@@ -2840,6 +2849,7 @@ struct tiramisu_host
         std::string webname;
         if (longan::webxfer_poll_launch(&webname)) {
           g_pending_launch = webname;
+          longan::host_ap_on_launch(webname);
           if (g_setup_active && g_setup_done) {
             g_setup_active = false;
             longan::ui_dismiss_first_run();
@@ -2881,6 +2891,7 @@ struct tiramisu_host
                        "launch %s: game not found on shelf or web list", want.c_str());
               longan::log_line(drop);
               longan::webxfer_set_launch_result(want, "not found");
+              longan::host_ap_on_result(want, "not found");
             }
           }
           for (const auto& ge : g_games) {
@@ -2909,6 +2920,29 @@ struct tiramisu_host
               trt_input_reset_cursor_mode(true);
               longan::webxfer_set_running_game(want);
               longan::webxfer_set_launch_result(want, "started");
+              longan::host_ap_on_result(want, "started");
+              // The webxfer machine matched the log and may have applied a
+              // repair; mirror its verdict into the host-side state.
+              {
+                std::string ap_game, ap_result;
+                int ap_attempt = 0;
+                longan::webxfer_autopilot_state(&ap_game, &ap_attempt,
+                                                &ap_result);
+                if (ap_game == want && ap_result == "fix")
+                  longan::host_ap_on_fix(ap_attempt);
+                else if (ap_game == want &&
+                         (ap_result == "no-fix" ||
+                          ap_result == "attempt-limit"))
+                  longan::host_ap_on_no_fix();
+              }
+              {
+                char ap_msg[192];
+                snprintf(ap_msg, sizeof(ap_msg),
+                         "host: autopilot status=%s attempt=%d game=%s",
+                         g_host_ap.status.c_str(), g_host_ap.attempt,
+                         g_host_ap.game.c_str());
+                longan::log_line(ap_msg);
+              }
               g_running_game_name = want;
               g_guest_running.store(true);
               const std::string exe = ge.exe;
