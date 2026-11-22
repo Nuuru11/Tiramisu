@@ -37,6 +37,12 @@ Entries are appended as work lands; every claim points at a gate or a file.
   StackBase/StackLimit, Self pointer, stack guard. Gates stay green; binkw32
   still returns through its inherited EBP (exact wrapper at 0x2240 analyzed).
 
+## 2026-11-23 — adaptive PE32 entry frames
+- Added `trt_x86_run_entry_auto`: tries standard cdecl then inherited-EBP
+  caller-frame layouts and keeps the completing one (engine adapts to guest).
+  Added 8-bit shift group (D0/D2). SDL2/discord complete on layout 0; binkw32
+  still faults on both layouts (last named stop recorded).
+
 ## Current named gaps (not hidden)
 1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
    cdecl frame does not provide; needs fuller process/SEH setup.

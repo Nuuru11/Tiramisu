@@ -70,6 +70,11 @@ int trt_x86_run_cdecl(struct trt_image* img, u32 entry_va,
                       const u32 args[3], u64 max_instructions,
                       u32* out_eax);
 
+// Tries both caller-frame layouts and returns the one that completes.
+int trt_x86_run_entry_auto(struct trt_image* img, u32 entry_va,
+                           const u32 args[3], u64 max_instructions,
+                           u32* out_eax, int* layout_out);
+
 #ifdef __cplusplus
 }
 #endif

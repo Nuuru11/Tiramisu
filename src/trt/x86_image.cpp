@@ -88,8 +88,11 @@ void trt_x86_set_resolver(const trt_resolver* rs) {
   if (rs) g_trap_rs = *rs;
 }
 
-int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
-                      u64 max_instructions, u32* out_eax) {
+// layout 0 = standard cdecl (return address, then args)
+// layout 1 = caller-EBP chain (saved EBP, args, then return address) — used by
+//            CRT thunks that inherit the caller's EBP across a tail jump.
+int trt_x86_run_cdecl_ex(trt_image* img, u32 entry_va, const u32 args[3],
+                         u64 max_instructions, u32* out_eax, int layout) {
   if (!img || !img->is_pe32 || !img->base) return 2;
   const u32 isz = (u32)img->size_of_image;
   if (!isz || isz > 64u * 1024u * 1024u) return 2;
@@ -127,10 +130,20 @@ int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
   const u32 sp = img->guest_base + isz + stack_size - 64;
   c.r[X86_ESP] = sp;
   c.r[X86_EBP] = sp;
-  trt_x86_mem_write(&c, sp, 4, &kReturnSentinel);           // return address
-  for (int i = 0; i < 3; ++i) {
-    u32 a = args ? args[i] : 0;
-    trt_x86_mem_write(&c, sp + 4u + 4u * (u32)i, 4, &a);  // cdecl args
+  if (layout == 0) {
+    trt_x86_mem_write(&c, sp, 4, &kReturnSentinel);        // return address
+    for (int i = 0; i < 3; ++i) {
+      u32 a = args ? args[i] : 0;
+      trt_x86_mem_write(&c, sp + 4u + 4u * (u32)i, 4, &a);
+    }
+  } else {
+    u32 caller_ebp = sp + 16;                              // inherited frame
+    trt_x86_mem_write(&c, sp, 4, &caller_ebp);
+    for (int i = 0; i < 3; ++i) {
+      u32 a = args ? args[i] : 0;
+      trt_x86_mem_write(&c, sp + 4u + 4u * (u32)i, 4, &a);
+    }
+    trt_x86_mem_write(&c, sp + 16, 4, &kReturnSentinel);
   }
   trap_ctx t{}; t.c = &c;
   c.trap = &image_trap; c.trap_user = &t;
@@ -140,6 +153,31 @@ int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
   if (out_eax) *out_eax = c.r[X86_EAX];
   free(mem);
   return rc;
+}
+
+int trt_x86_run_cdecl(trt_image* img, u32 entry_va, const u32 args[3],
+                      u64 max_instructions, u32* out_eax) {
+  return trt_x86_run_cdecl_ex(img, entry_va, args, max_instructions,
+                              out_eax, 0);
+}
+
+// Auto-adapt: try the standard frame, then the inherited-EBP frame. A guest
+// whose CRT thunk pops a caller EBP completes on the second layout instead of
+// returning through garbage — the engine fits the ABI to the title.
+int trt_x86_run_entry_auto(trt_image* img, u32 entry_va, const u32 args[3],
+                           u64 max_instructions, u32* out_eax, int* layout_out) {
+  for (int layout = 0; layout < 2; ++layout) {
+    u32 eax = 0;
+    int rc = trt_x86_run_cdecl_ex(img, entry_va, args, max_instructions,
+                                  &eax, layout);
+    if (rc == 0 || rc == 1) {
+      if (out_eax) *out_eax = eax;
+      if (layout_out) *layout_out = layout;
+      return rc;
+    }
+  }
+  if (layout_out) *layout_out = -1;
+  return 2;
 }
 
 int trt_x86_run_image(trt_image* img, u32 entry_va, u32 stack_size,

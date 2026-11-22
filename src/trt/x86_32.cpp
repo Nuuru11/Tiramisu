@@ -355,6 +355,17 @@ int trt_x86_run(trt_x86_ctx* c, u64 max_instructions) {
         else { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }
         break;
       }
+      case 0xd0: case 0xd2: {                             // 8-bit shift group
+        modrm_t m; decode_modrm(d, m);
+        if (d.fault) { c->stop_code = op_va; return 2; }
+        u8 a = read_rm8(d, m);
+        unsigned n = (op == 0xd0) ? 1 : (c->r[X86_ECX] & 31);
+        u8 res = (u8)apply_shift(m.reg, a, n);
+        write_rm8(d, m, res);
+        if (res) c->eflags &= ~ZF; else c->eflags |= ZF;
+        if (d.fault) { c->stop_code = op_va; return 2; }
+        break;
+      }
       case 0xc1: case 0xd1: case 0xd3: {                   // shift/rotate group
         modrm_t m; decode_modrm(d, m);
         if (d.fault) { g_last_opcode = op; g_last_fault_va = op_va; c->stop_code = op_va; return 2; }

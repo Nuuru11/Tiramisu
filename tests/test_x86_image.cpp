@@ -129,13 +129,15 @@ static int run_real_pe32(const char* path) {
   trt_x86_set_trace(&trace_op);
   u32 eax = 0;
   const u32 args[3] = {img->guest_base, 1, 0};
-  int run_rc = trt_x86_run_cdecl(
-      img, img->guest_base + (u32)img->entry_rva, args, 200000, &eax);
+  int layout = -1;
+  int run_rc = trt_x86_run_entry_auto(
+      img, img->guest_base + (u32)img->entry_rva, args, 200000, &eax,
+      &layout);
   printf("REAL PE32 %s: bits=32 traps=%u run_rc=%d eax=%u "
-         "entry=%llx last_op=%02x fault_va=%08x\n",
+         "entry=%llx last_op=%02x fault_va=%08x layout=%d\n",
          path, img->pe32_trap_count, run_rc, eax,
          (unsigned long long)img->entry_rva,
-         trt_x86_last_opcode(), trt_x86_last_fault_va());
+         trt_x86_last_opcode(), trt_x86_last_fault_va(), layout);
   trt_images_reset();
   return 0;
 }
