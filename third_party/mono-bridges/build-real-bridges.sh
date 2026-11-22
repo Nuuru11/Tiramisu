@@ -71,8 +71,11 @@ $CXX $CXXFLAGS -c src/trt/bridge_fmod.cpp -o "$objs/bridge_fmod.o"
 $CXX $CXXFLAGS -c src/trt/bridge_fmod_studio.cpp -o "$objs/bridge_fmod_studio.o"
 $CXX $CXXFLAGS -c src/trt/trt_trace.cpp -o "$objs/trt_trace.o"
 $CXX $CXXFLAGS -c src/trt/bridge_steam.cpp -o "$objs/bridge_steam.o"
+$CXX $CXXFLAGS -c src/trt/steam_auth.cpp -o "$objs/steam_auth.o"
+$CXX $CXXFLAGS -c src/trt/steam_library.cpp -o "$objs/steam_library.o"
 $CC $CFLAGS -DSTB_VORBIS_NO_STDIO -c src/trt/vendor_stb_vorbis.c \
   -o "$objs/vendor_stb_vorbis.o"
+$CC $CFLAGS -c src/trt/vendor_dr_mp3.c -o "$objs/vendor_dr_mp3.o"
 $CXX $CXXFLAGS -c third_party/mono-bridges/mono_dllmap_shim.cpp \
   -o "$objs/mono_dllmap_shim.o"
 $CXX $CXXFLAGS -c third_party/mono-bridges/mono_fmod_door.cpp \
@@ -84,11 +87,12 @@ $CXX $CXXFLAGS -c third_party/mono-bridges/mono_steam_door.cpp \
 $CXX -shared -fPIC -Bsymbolic -Wl,--no-undefined \
   "$objs/bridge_fmod.o" "$objs/bridge_fmod_studio.o" \
   "$objs/trt_trace.o" \
-  "$objs/vendor_stb_vorbis.o" "$objs/mono_dllmap_shim.o" \
+  "$objs/vendor_stb_vorbis.o" "$objs/vendor_dr_mp3.o" "$objs/mono_dllmap_shim.o" \
   "$objs/mono_fmod_door.o" -lpthread -lm \
   -o "$out/libfmod-real.so"
 $CXX -shared -fPIC -Bsymbolic -Wl,--no-undefined \
-  "$objs/bridge_steam.o" "$objs/mono_dllmap_shim.o" \
+  "$objs/bridge_steam.o" "$objs/steam_auth.o" "$objs/steam_library.o" \
+  "$objs/mono_dllmap_shim.o" \
   "$objs/mono_steam_door.o" -lpthread -lm \
   -o "$out/libcsteamworks-real.so"
 

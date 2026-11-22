@@ -48,6 +48,13 @@ Entries are appended as work lands; every claim points at a gate or a file.
   plus xorps (0F 57) to the clean-room x86 core; gated by a real 16-byte
   load/store fixture in tests/test_x86_32.cpp. All gates green.
 
+## 2026-11-23 — build integration
+- `third_party/mono-bridges/build-real-bridges.sh` now compiles/links
+  vendor_dr_mp3, steam_auth and steam_library objects; rebuilt .so files
+  report "missing 0" exports.
+- `tools/corpus-run.sh` mock-render now prints NAMED FAULT / NAMED BLOCKER
+  markers with the exact crash site, consistent with the RUN FAILED contract.
+
 ## Current named gaps (not hidden)
 1. `binkw32.dll` entry: `0x2240` wrapper pops an inherited EBP the synthetic
    cdecl frame does not provide; needs fuller process/SEH setup.

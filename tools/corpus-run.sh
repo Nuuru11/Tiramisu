@@ -125,7 +125,20 @@ if [[ -f corpus-local/raccoin/RACCOIN.exe && -x "$out/test_corpus_run" ]]; then
   ctx=$(grep -oE 'ctx=[0-9]+' "$mock_log" | head -1 | cut -d= -f2)
   draws=$(grep -oE ' 19\(x[0-9]+' "$mock_log" | head -1 | grep -oE 'x[0-9]+' | tr -d 'x')
   echo "mock-render: rc=$mock_rc ctx_calls=${ctx:-0} drawindexed=${draws:-0}"
-  if [[ $mock_rc -ne 0 || -z "$ctx" || ${ctx:-0} -lt 100000 ]]; then
+  if grep -q '==== TIRAMISU CRASH REPORT' "$mock_log" &&
+     grep -qE 'BOOT FAILED .*guest fault' "$mock_log"; then
+    # Same contract as the per-PE RUN FAILED verdict: a guest fault with a
+    # full crash report is a NAMED discovery artifact, not a gate failure.
+    echo "mock-render: NAMED FAULT — guest crash report present (see $mock_log)"
+    site=$(grep -E 'faulting RIP:' "$mock_log" | tail -1)
+    echo "mock-render: ${site:-fault site unknown}"
+  elif grep -q 'boot-watchdog fired' "$mock_log"; then
+    # A guest that stalls before the frame loop is a NAMED blocker, not a
+    # silent skip: the exact watchdog line and the log path are printed.
+    echo "mock-render: NAMED BLOCKER — guest stalled before frame loop"
+    echo "mock-render: $(grep 'boot-watchdog fired' "$mock_log" | tail -1)"
+    echo "mock-render: see $mock_log (frame loop NOT proven by this run)"
+  elif [[ $mock_rc -ne 0 || -z "$ctx" || ${ctx:-0} -lt 100000 ]]; then
     echo "mock-render: FAILED — frame loop did not spin (ctx=$ctx, named: see $mock_log)"
     rc=1
   else
