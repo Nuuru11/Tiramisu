@@ -58,6 +58,9 @@ echo "$out" | grep -q 'guest-fault-named' && \
 out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-title-boot-failure.log)
 echo "$out" | grep -q 'mscoree-stub-named' && \
   echo "OK real non-booting title (Go Next) failure matched + named" || { echo "FAIL real title rule"; rc=1; }
+out=$($py tools/autofix.py "$real_game" tests/fixtures/logs/real-title-boot-after-mscoree-fix.log)
+echo "$out" | grep -q 'unitymain2-probe-named' && \
+  echo "OK post-mscoree real failure (UnityMain2 probe) matched + named" || { echo "FAIL post-mscoree rule"; rc=1; }
 
 echo "== retry loop =="
 $py tools/autopilot.py "$game" --dry-run tests/fixtures/logs --max-attempts 5 >"$tmp/loop.txt" 2>&1

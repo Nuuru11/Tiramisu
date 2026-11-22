@@ -1,0 +1,30 @@
+  [trt] advapi32: OpenProcessToken -> token record (pseudo handle)
+  [trt] advapi32: GetTokenInformation class=25 -> 40 bytes of record
+  [trt] modtrace: GetModuleHandleW -> "(null)" handle=0x180000000
+  [trt] strtrace: GetModuleFileNameW -> buf=0x762bb0000010 len=260 value="Z:\Go Next demo.exe"
+  [trt] user32: DialogBoxParamW -> -1 (no dialog host)
+  [trt] modtrace: GetModuleHandleW -> "(null)" handle=0x180000000
+  [trt] kernel32: LoadLibrary/GetModuleHandle(kernel32.dll) -> synthetic handle (system module, offline bridge surface)
+  [trt] modtrace: LoadLibraryExW -> "api-ms-win-appmodel-runtime-l1-1-2" flags=0x800 handle=0x1deb6d0
+  [trt] kernel32: LoadLibrary/GetModuleHandle(mscoree.dll) -> synthetic handle (system module, offline bridge surface)
+  [trt] modtrace: GetModuleHandleW -> "mscoree.dll" handle=0x1deb910
+  [trt] mscoree: CorExitProcess -> clean guest quit (no CLR on console)
+  [trt] kernel32: ExitProcess(1) called
+
+==== TIRAMISU BOOT DEPTH LADDER: Go Next demo.exe ====
+  CRT-STARTUP OK        : REACHED (CRT init called; trap-eligible)
+  WINMAIN ENTERED       : REACHED
+  UNITYMAIN2 CALLED     : REACHED (IAT-probed)
+  WINDOW CREATED        : -
+  D3D11 DEVICE ACQUIRED : -
+  PUMP ENTERED          : -
+  PUMP QUIT             : -
+  messages dispatched   : 0
+  mock gpu calls        : dev=0 ctx=0 sc=0
+  mock ctx top slots    :
+  mock sc hit slots     :
+
+BOOT EXITED Go Next demo.exe: ExitProcess(rc=1) at last bridge: trt: UnityMain2 probe armed (IAT slot 14000e240 -> probe shim)
+last trt log lines:
+  [trt] guest-dbg: 
+

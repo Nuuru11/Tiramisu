@@ -178,6 +178,16 @@
       "note": "Real RACCOIN crash path: dbghelp exports absent from the bridge, named gap",
       "severity": "info",
       "actions": {}
+    },
+    {
+      "id": "unitymain2-probe-named",
+      "match": [
+        "UnityMain2 probe armed",
+        "BOOT EXITED .*UnityMain2"
+      ],
+      "note": "Real Go Next failure AFTER the mscoree fix: the IAT probe records UnityMain2 but the guest exits rc=1; named work item, not hidden",
+      "severity": "info",
+      "actions": {}
     }
   ]
 }
