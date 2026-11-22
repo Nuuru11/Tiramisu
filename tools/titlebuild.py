@@ -70,7 +70,7 @@ BUILTIN = {
 STUB = {'d3d9.dll', 'd3d9core.dll', 'uiautomationcore.dll'}
 RECORDED = {'d3d12.dll'}          # accepted + logged, not executed
 NAMED_SILENT = {                  # truthful empty answers / named failures
-    'mfplat.dll', 'mfreadwrite.dll', 'mscoree.dll', 'steam_api64.dll',
+    'mfplat.dll', 'mfreadwrite.dll', 'steam_api64.dll',
     'steam_api.dll', 'msacm32.dll', 'msvfw32.dll', 'winspool.drv',
 }
 SILENT_SYMBOLS = {                # honest-empty per-symbol answers

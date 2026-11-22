@@ -320,7 +320,11 @@ const impl_override k_impl_classes[] = {
     {"mfplat.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"mfreadwrite.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     // .NET Framework and the Steam auth layer are honest surfaces only.
-    {"mscoree.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    // mscoree: CorExitProcess is REAL (clean guest quit); entry points stay
+    // named-silent because there is no CLR on the console.
+    {"mscoree.dll", "_CorExeMain", TRT_IMPL_NAMED_SILENT},
+    {"mscoree.dll", "_CorDllMain", TRT_IMPL_NAMED_SILENT},
+    {"mscoree.dll", "CorBindToRuntimeEx", TRT_IMPL_NAMED_SILENT},
     {"steam_api64.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"steam_api.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     // Honest empty answers, not real functionality.
@@ -746,11 +750,38 @@ const mod_default k_defaults[] = {
 
 } // namespace
 
+// Defined in bridge_user32.cpp; posts the guest's clean exit (WM_QUIT path).
+extern "C" void trt_bridge_post_quit(int code);
+
+static void TRT_STDCALL mscoree_CorExitProcess(int code) {
+  trt_core_log("mscoree: CorExitProcess -> clean guest quit (no CLR on console)");
+  trt_bridge_post_quit(code);
+}
+
+static void TRT_STDCALL mscoree_named_fail() {
+  trt_core_log("mscoree: managed CLR entry is unavailable on console "
+               "(named; no CLR in the AppContainer)");
+}
+
 void trt_modules_register_defaults(void) {
   for (size_t i = 0; i < sizeof(k_defaults) / sizeof(k_defaults[0]); ++i) {
     if (find_module(k_defaults[i].name) >= 0) continue;  // bridge wins
     trt_module_register(k_defaults[i].name, k_defaults[i].route, nullptr, 0);
   }
+
+  // Real mscoree shim (replaces the default STUB). There is no CLR on the
+  // console, so managed ENTRY is named-fail — but managed EXIT must be clean:
+  // the captured Go Next failed boot ended at STUB mscoree!CorExitProcess.
+  // Unity IL2CPP and other managed hosts call CorExitProcess on shutdown;
+  // posting the guest quit there turns that failure into a clean EXIT.
+  static const trt_named_fn k_mscoree_fns[] = {
+      {"CorExitProcess", (void*)&mscoree_CorExitProcess},
+      {"_CorExeMain", (void*)&mscoree_named_fail},
+      {"_CorDllMain", (void*)&mscoree_named_fail},
+      {"CorBindToRuntimeEx", (void*)&mscoree_named_fail},
+  };
+  trt_module_register("mscoree.dll", TRT_ROUTE_BUILTIN, k_mscoree_fns,
+                      (int)(sizeof(k_mscoree_fns) / sizeof(k_mscoree_fns[0])));
 }
 
 } // extern "C"

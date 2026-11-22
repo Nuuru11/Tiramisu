@@ -60,6 +60,8 @@ static int g_route_total = 0;      // DLL report lines bound in the live walk
 extern "C" {
 int trt_bridge_register_kernel32(void);
 int trt_bridge_register_user32(void);
+void trt_bridge_post_quit(int code);
+bool trt_bridge_quit_posted(void);
 }
 
 // ---------------- mmap backend (same shape as test_real_load) --------------
@@ -858,6 +860,19 @@ int run_corpus(int argc, char** argv) {
              "(no codecs installed)\n");
       return 1;
     }
+    if (!trt_symbol_class("mscoree.dll", "CorExitProcess", &cls) ||
+        cls != TRT_IMPL_REAL) {
+      printf("COVERAGE SELFTEST FAIL: mscoree!CorExitProcess must be REAL\n");
+      return 1;
+    }
+    // Calling it must post a clean guest quit — the real Go Next failed boot
+    // ended at the old fail-visible STUB for this exact symbol.
+    void* cor = trt_resolve_module(nullptr, "mscoree.dll", "CorExitProcess", 0);
+    if (!cor || !trt_bridge_quit_posted()) {
+      printf("MSCOREE SELFTEST FAIL: CorExitProcess did not post clean quit\n");
+      return 1;
+    }
+    printf("MSCOREE SELFTEST: OK (CorExitProcess posts clean guest quit)\n");
     printf("COVERAGE SELFTEST: OK (real / recorded / named-silent)\n");
   }
 
