@@ -21,7 +21,8 @@ pad_vibration=1
 resolution_scale=100        # 50..200
 frame_rate_cap=60           # 0=unlimited, 30, 60, 120
 vsync=1
-texture_quality=2           # 0=low, 1=med, 2=high, 3=ultra
+texture_quality=2           # DOCUMENTED BUT SETTINGS-ONLY — no bridge reads it yet;
+                            # write it and nothing changes (tools/profile-audit.py)
 
 # ---- OS personality (some engines gate on this) ----
 os_major=10
