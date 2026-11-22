@@ -117,8 +117,14 @@ void trt_core_log(const char* line) {
     std::lock_guard<std::mutex> lk(g_backend_mu);
     if (g_backend_set && g_backend.log) log_fn = g_backend.log;
   }
-  if (log_fn) log_fn(line);
-  else fprintf(stderr, "  [trt] %s\n", line);
+  // .203 diagnostic: tag every log line with the calling thread id, so
+  // Sekiro/Ultrapool stalls can be attributed (main vs worker). The
+  // function does not log, so there is no recursion risk.
+  char tagged[2048];
+  snprintf(tagged, sizeof(tagged), "[tid=%u] %s",
+           trt_GetCurrentThreadId(), line);
+  if (log_fn) log_fn(tagged);
+  else fprintf(stderr, "  [trt] %s\n", tagged);
 }
 
 // the target of every stub: names the symbol, returns 0

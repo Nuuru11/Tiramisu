@@ -709,6 +709,20 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
   }
   trt_guest_tls_sync_thread();
   trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
+  {
+    // .203 diagnostic: did the worker reach its guest routine? (First 32.)
+    // Separates "blocked in DllMain/TLS notify" from "blocked inside the
+    // guest routine on a bridge primitive". The [tid=] prefix (trt_core_log)
+    // identifies the thread; the routine address identifies the worker.
+    static unsigned s_enter_logged = 0;
+    if (s_enter_logged < 32) {
+      ++s_enter_logged;
+      char el[192];
+      snprintf(el, sizeof(el), "thread: win_thread_trampoline entering guest routine=0x%llx",
+               (unsigned long long)routine);
+      trt_core_log(el);
+    }
+  }
   const u64 ret = win_call_guest_seh(routine, arg);
   notify_thread_exit_once();
 

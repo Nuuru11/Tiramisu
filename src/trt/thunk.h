@@ -27,6 +27,10 @@ const trt_backend* trt_core_backend(void);
 // Log through the backend if we have one, else stderr.
 void trt_core_log(const char* line);
 
+// .203 diagnostic: current thread id for the [tid=] log prefix.
+// Defined in bridge_kernel32.cpp (Win32: ::GetCurrentThreadId()).
+u32 TRT_STDCALL trt_GetCurrentThreadId(void);
+
 // Build (or reuse) a callable that logs "kind mod!sym called" and returns
 // 0. `be` may be NULL to use the remembered backend.
 void* trt_thunk_make(const trt_backend* be, const char* kind,
