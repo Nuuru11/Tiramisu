@@ -347,6 +347,23 @@ int trt_fmod_studio_global_event_count();
 // (patch 07) logs it after each bank load.
 u64 trt_fmod_studio_pcm_cache_bytes();
 
+// FSB5 header envelope. A bank is parsed (and later decoded) only if its
+// declared sample count, header table, name table and data size can describe
+// something this engine can decode inside its memory budget. Exported with a
+// reason string so tests can drive it with corrupt headers instead of needing
+// a real bank file. Returns 1 when sane, 0 with *why set to a static string.
+int trt_fsb5_header_sane(u32 num_samples, u32 shdr_size, u32 name_size,
+                         u32 data_size, u64 file_bytes, const char** why);
+// Same contract for one sample's decode budget: 0 frames, an absurd frame
+// count, or more PCM bytes than the console can hold is a named refusal.
+int trt_fsb5_sample_sane(u32 frames, u32 channels, const char** why);
+// Console decode gate. Off by default: the unhardened FSB5 decode corrupted the
+// heap on a Series S, and that fault was never reproduced under a debugger.
+// The host calls this with the `fsb_decode` setting (settings.ini, or a
+// per-game `tiramisu.profile.ini`) so a title can be dogfooded on the console
+// without a rebuild. Off = named-silent audio; on = the hardened path.
+void trt_fsb5_set_console_decode(int on);
+
 #ifdef __cplusplus
 }
 #endif

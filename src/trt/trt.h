@@ -239,6 +239,7 @@ int trt_vfs_normalize_guest_utf16(const u16* guest_path, char* out,
 int trt_vfs_resolve_utf16(const u16* guest_path, char* out, size_t out_cap);
 int trt_vfs_resolve_utf16_rw(const u16* guest_path, int for_write, char* out,
                              size_t out_cap);
+void trt_vfs_resolve_case_insensitive(char* path, size_t cap);
 int trt_vfs_resolve_z_pair_utf16(const u16* guest_path, char* ov_out,
                                  size_t ov_cap, char* ro_out, size_t ro_cap,
                                  char* rel_out, size_t rel_cap);

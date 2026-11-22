@@ -759,9 +759,9 @@ int TRT_STDCALL trt_FlashWindow(void* hwnd, int bInvert) {
   (void)hwnd; (void)bInvert;
   return 1;
 }
+extern "C" int TRT_STDCALL trt_ShowWindow(void* hwnd, int cmd);
 int TRT_STDCALL trt_ShowWindowAsync(void* hwnd, int nCmdShow) {
-  (void)hwnd; (void)nCmdShow;
-  return 1;
+  return trt_ShowWindow(hwnd, nCmdShow);
 }
 int TRT_STDCALL trt_SetLayeredWindowAttributes(void* hwnd, u32 crKey,
                                                u8 bAlpha, u32 dwFlags) {

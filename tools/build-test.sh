@@ -30,6 +30,7 @@ printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-$(nproc)}" -I{} bash -c '
 clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
 clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
 clang -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$objdir/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO
+clang -O2 -Wall -fno-pie -c src/trt/vendor_dr_mp3.c -o "$objdir/vendor_dr_mp3.o"
 ar rcs "$out/libtrt.a" "$objdir"/*.o
 
 # --- 1. import library for the guest (tiramisu_host.dll) ---
@@ -805,6 +806,15 @@ if [[ -f "$MONO_CELESTE_BANKS/sfx.bank" ]]; then
 else
   echo "SKIP fmod/studio: no game banks at $MONO_CELESTE_BANKS"
 fi
+
+# --- 43c. FSB5 envelope: a corrupt bank header is refused BY NAME before any
+#          allocation or read. This is the door the console heap corruption
+#          came through (a bogus frame count went straight into reserve()), so
+#          it is tested without a game or a console. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_fsb5_sanity.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_fsb5_sanity"
+"$out/test_fsb5_sanity"
 
 # --- 44. loader fuzzer: malformed PEs must fail NAMED, never crash the host
 #         (the launch path reads untrusted game files) ---

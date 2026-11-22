@@ -48,6 +48,8 @@ std::string host_settings::to_ini() const {
   s += win11_personality ? "win11_personality=1\n" : "win11_personality=0\n";
   s += write_watch ? "write_watch=1\n" : "write_watch=0\n";
   s += steam_auth ? "steam_auth=1\n" : "steam_auth=0\n";
+  s += fsb_decode ? "fsb_decode=1\n" : "fsb_decode=0\n";
+  s += crash_report ? "crash_report=1\n" : "crash_report=0\n";
   s += show_qr ? "show_qr=1\n" : "show_qr=0\n";
   s += show_fps ? "show_fps=1\n" : "show_fps=0\n";
   s += show_sysinfo ? "show_sysinfo=1\n" : "show_sysinfo=0\n";
@@ -104,6 +106,10 @@ int host_settings::apply_ini(const std::string& text) {
       write_watch = (val == "1" || val == "true");
     } else if (key == "steam_auth") {
       steam_auth = (val == "1" || val == "true");
+    } else if (key == "fsb_decode") {
+      fsb_decode = (val == "1" || val == "true");
+    } else if (key == "crash_report") {
+      crash_report = (val == "1" || val == "true");
     } else if (key == "show_qr") {
       show_qr = (val == "1" || val == "true");
     } else if (key == "show_fps") {
@@ -136,6 +142,9 @@ int host_settings::apply_ini(const std::string& text) {
   return applied;
 }
 
+// NOTE: settings.cpp is linked on its own by tests/test_settings.cpp, so it
+// must not reference the engine. The trt layer owns the FSB5 console decode
+// gate; main.cpp applies `fsb_decode` to it after each ini load.
 int settings_load(const std::string& local_state) {
   FILE* f = fopen((local_state + k_sep + "settings.ini").c_str(), "rb");
   if (!f) return 0;
@@ -145,8 +154,7 @@ int settings_load(const std::string& local_state) {
   while ((n = fread(buf, 1, sizeof(buf), f)) > 0) text.append(buf, n);
   fclose(f);
   std::lock_guard<std::mutex> lk(g_mu);
-  const int applied = g_live.apply_ini(text);
-  return applied;
+  return g_live.apply_ini(text);
 }
 
 int settings_save(const std::string& local_state) {
@@ -175,8 +183,7 @@ int settings_load_profile(const std::string& game_dir) {
   fclose(f);
 
   std::lock_guard<std::mutex> lk(g_mu);
-  const int applied = g_live.apply_ini(text);
-  return applied;
+  return g_live.apply_ini(text);
 }
 
 void settings_store(const host_settings& s, const std::string& local_state) {
@@ -258,6 +265,16 @@ int trt_settings_frame_rate_cap() {
 int trt_settings_memory_budget_mb() {
   std::lock_guard<std::mutex> lk(g_mu);
   return g_live.memory_budget_mb;
+}
+
+bool trt_settings_fsb_decode() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.fsb_decode;
+}
+
+bool trt_settings_crash_report() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_live.crash_report;
 }
 
 bool trt_settings_vsync() {

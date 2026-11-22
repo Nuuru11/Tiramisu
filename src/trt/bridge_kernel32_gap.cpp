@@ -3372,6 +3372,18 @@ int trt_gap_handle_close(void* h) {
   return 0;
 }
 
+// Geography (honest stubs: return 0 / empty)
+extern "C" int TRT_GUEST_ABI trt_GetGeoInfoW(unsigned geo, unsigned type,
+                                             unsigned char* data, int data_size,
+                                             unsigned lang) {
+    (void)geo; (void)type; (void)data; (void)data_size; (void)lang;
+    return 0;
+}
+extern "C" unsigned TRT_GUEST_ABI trt_GetUserGeoID(int level) {
+    (void)level;
+    return 0;  // GEOID_NOT_AVAILABLE
+}
+
 static const trt_named_fn k_gap_fns[] = {
   {"IsWow64Process", (void*)&trt_IsWow64Process},
   {"IsWow64Process2", (void*)&trt_IsWow64Process2},
@@ -3616,6 +3628,8 @@ static const trt_named_fn k_gap_fns[] = {
   {"SetProcessMitigationPolicy", (void*)&trt_SetProcessMitigationPolicy},
   {"SetThreadStackGuarantee", (void*)&trt_SetThreadStackGuarantee},
   {"GetThreadStackGuarantee", (void*)&trt_GetThreadStackGuarantee},
+  {"GetGeoInfoW", (void*)&trt_GetGeoInfoW},
+  {"GetUserGeoID", (void*)&trt_GetUserGeoID},
 };
 
 // registered by trt_bridge_register_kernel32 after the core table

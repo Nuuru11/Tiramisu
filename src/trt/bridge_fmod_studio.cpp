@@ -92,6 +92,15 @@ void stb_vorbis_close(stb_vorbis* f);
 stb_vorbis_info stb_vorbis_get_info(stb_vorbis* f);
 int stb_vorbis_get_frame_short_interleaved(stb_vorbis* f, int num_c,
                                            short* buffer, int num_shorts);
+
+// Console decode gate, set by the host from the `fsb_decode` setting. Only the
+// Windows build consults it (the Linux gate always decodes, because
+// test_fmod_studio asserts real PCM).
+std::atomic<bool> g_fsb5_console_decode{false};
+
+void trt_fsb5_set_console_decode(int on) {
+  g_fsb5_console_decode.store(on != 0);
+}
 }
 
 namespace {
@@ -364,7 +373,7 @@ struct fsb_bank {
 
 // Parse one FSB5 blob at absolute file offset `fsb_off` in `f`.
 // Reads only the header + sample headers + name table (not sample data).
-bool fsb_parse(FILE* f, u64 fsb_off, fsb_bank* out) {
+bool fsb_parse(FILE* f, u64 fsb_off, u64 file_bytes, fsb_bank* out) {
   if (file_seek(f, fsb_off) != 0) return false;
   u8 hdr[60];
   if (fread(hdr, 1, 60, f) != 60) return false;
@@ -378,6 +387,19 @@ bool fsb_parse(FILE* f, u64 fsb_off, fsb_bank* out) {
   u32 name_size = r.u32v();
   u32 data_size = r.u32v();
   u32 mode = r.u32v();
+  // A corrupt header used to reach reserve()/vector<> with whatever the file
+  // said, which is the shape of the console crash that disabled decode. Every
+  // refusal below is named and happens before a byte is allocated or read.
+  const char* why = nullptr;
+  if (!trt_fsb5_header_sane(num_samples, shdr_size, name_size, data_size,
+                            file_bytes > fsb_off ? file_bytes - fsb_off : 0,
+                            &why)) {
+    logf("fmod-studio: FSB5 at 0x%llx rejected: %s (samples=%u shdr=%u "
+         "names=%u data=%u filesize=%llu)",
+         (unsigned long long)fsb_off, why ? why : "unspecified", num_samples,
+         shdr_size, name_size, data_size, (unsigned long long)file_bytes);
+    return false;
+  }
   out->mode = mode;
   out->samples.clear();
   out->samples.reserve(num_samples);
@@ -430,7 +452,7 @@ bool fsb_parse(FILE* f, u64 fsb_off, fsb_bank* out) {
   std::vector<u8> names(name_size);
   if (name_size && fread(names.data(), 1, name_size, f) != name_size)
     return false;
-  if (name_size >= num_samples * 4u) {
+  if ((u64)name_size >= (u64)num_samples * 4ull) {
     for (u32 i = 0; i < num_samples; ++i) {
       u32 off = 0;
       memcpy(&off, names.data() + i * 4, 4);
@@ -457,6 +479,82 @@ bool fsb_parse(FILE* f, u64 fsb_off, fsb_bank* out) {
 }
 
 }  // namespace
+
+// ---- FSB5 envelope checks ----
+extern "C" {
+// Limits, and where they come from:
+//   * a Studio bank holds at most a few thousand samples (Celeste's largest is
+//     587 events / ~700 samples), so 65536 is already absurd;
+//   * every sample header is at least 8 bytes, every name index 4;
+//   * 1 MiB of sample headers and 4 MiB of names is larger than any shipping
+//     bank, and small enough that a corrupt size cannot exhaust the console;
+//   * the declared blocks must fit in the file that was actually opened.
+// The point is not the exact number: it is that a bad bank fails with a name
+// instead of an allocation or a read past the end.
+int trt_fsb5_header_sane(u32 num_samples, u32 shdr_size, u32 name_size,
+                         u32 data_size, u64 file_bytes, const char** why) {
+  const char* ignored = "";
+  if (!why) why = &ignored;
+  *why = "";
+  if (file_bytes < 60) {
+    *why = "file shorter than the 60-byte FSB5 header";
+    return 0;
+  }
+  if (num_samples == 0) {
+    *why = "header declares no samples";
+    return 0;
+  }
+  if (num_samples > 65536u) {
+    *why = "sample count above the 65536 sanity limit";
+    return 0;
+  }
+  if (shdr_size > (1u << 20)) {
+    *why = "sample-header table above the 1 MiB sanity limit";
+    return 0;
+  }
+  if ((u64)shdr_size < (u64)num_samples * 8ull) {
+    *why = "sample-header table shorter than the sample count";
+    return 0;
+  }
+  if (name_size > (4u << 20)) {
+    *why = "name table above the 4 MiB sanity limit";
+    return 0;
+  }
+  if (name_size != 0 && (u64)name_size < (u64)num_samples * 4ull) {
+    *why = "name table shorter than its own index";
+    return 0;
+  }
+  const u64 declared = 60ull + (u64)shdr_size + (u64)name_size +
+                       (u64)data_size;
+  if (declared > file_bytes) {
+    *why = "declared header+names+data exceeds the file size";
+    return 0;
+  }
+  return 1;
+}
+
+// A decoded sample becomes a heap allocation of frames*channels*2 bytes, so a
+// corrupt frame count is a memory bomb. 20M frames is ~7 minutes at 48 kHz
+// (80 MB stereo); longer than any single FMOD sample in Celeste's banks.
+int trt_fsb5_sample_sane(u32 frames, u32 channels, const char** why) {
+  const char* ignored = "";
+  if (!why) why = &ignored;
+  *why = "";
+  if (frames == 0) {
+    *why = "sample declares zero frames";
+    return 0;
+  }
+  if (channels == 0 || channels > 8) {
+    *why = "channel count out of range";
+    return 0;
+  }
+  if (frames > 20000000u) {
+    *why = "frame count above the 20M decode limit";
+    return 0;
+  }
+  return 1;
+}
+}  // extern "C"
 
 // ---- bank data (parsed metadata; sample data stays on disk) ----
 struct trigger_box {
@@ -1034,7 +1132,8 @@ struct bank_walker {
         if (file_read_at(f, candidates[c], magic, 4) &&
             memcmp(magic, "FSB5", 4) == 0) {
           fsb_bank fb;
-          if (fsb_parse(f, candidates[c], &fb)) b->fsbs.push_back(std::move(fb));
+          if (fsb_parse(f, candidates[c], b->file_size, &fb))
+            b->fsbs.push_back(std::move(fb));
           break;
         }
       }
@@ -1051,7 +1150,8 @@ struct bank_walker {
       for (u64 i = 0; i + 4 <= want; ++i) {
         if (memcmp(block.data() + i, "FSB5", 4) == 0) {
           fsb_bank fb;
-          if (fsb_parse(f, pos + i, &fb)) b->fsbs.push_back(std::move(fb));
+          if (fsb_parse(f, pos + i, b->file_size, &fb))
+            b->fsbs.push_back(std::move(fb));
         }
       }
       pos += want;
@@ -1226,14 +1326,24 @@ bool decode_fsb_sample(bank_data* bank, const fsb_sample& s,
                        decoded_sample* out) {
   if (s.data_len == 0) return false;
 #ifdef _WIN32
-  // Console: Vorbis decode corrupts the heap here (AV in get_decoded).
-  // Skip it so the game can render; audio is named-silent on console.
-  // The Linux gate keeps real decode (test_fmod_studio asserts PCM).
-  { static std::atomic<int> once{0};
+  // Console: the unhardened decode corrupted the heap here (AV in
+  // get_decoded), which is why Celeste is silent on an Xbox. The envelope
+  // checks below now run on every platform and reject the shapes that caused
+  // it, but decode still stays off by default until a console run proves it:
+  // `fsb_decode=1` (settings.ini or a per-game tiramisu.profile.ini, pushed
+  // through the file API) or TIRAMISU_FSB_DECODE=1 enables it for one run.
+  static const bool env_wants_decode = [] {
+    const char* env = getenv("TIRAMISU_FSB_DECODE");
+    return env && *env && *env != '0';
+  }();
+  if (!env_wants_decode && !g_fsb5_console_decode.load()) {
+    static std::atomic<int> once{0};
     log_once(&once,
-      "fmod-studio: FSB sample decoding disabled on console (audio silent)"); }
-  (void)bank; (void)s; (void)out;
-  return false;
+             "fmod-studio: FSB decode off on console (audio silent); set "
+             "fsb_decode=1 in settings.ini or tiramisu.profile.ini to try "
+             "the hardened path");
+    return false;
+  }
 #endif
   // Guard against corrupt parsed offsets/sizes: a bogus data_len made
   // stb_vorbis (and the vector heap) corrupt on console. Fail visible.
@@ -1246,55 +1356,76 @@ bool decode_fsb_sample(bank_data* bank, const fsb_sample& s,
          (unsigned long long)bank->file_size);
     return false;
   }
-  std::vector<u8> compressed(s.data_len);
-  if (!file_read_at(bank->f, s.file_offset, compressed.data(), s.data_len))
-    return false;
-  if (s.vorbis_crc == 0) {
-    // Not Vorbis (PCM/ADPCM/etc.): named-silent until a decoder lands.
-    logf("fmod-studio: sample '%s' is not Vorbis (no VORBISDATA chunk) — "
-         "decoder pending",
-         s.name.c_str());
-    return false;
+  // The frame count comes straight from a bitfield in the bank; it is what
+  // reserve() used to trust. Refuse the absurd ones by name.
+  {
+    const char* why = nullptr;
+    if (!trt_fsb5_sample_sane(s.samples, s.channels ? s.channels : 1, &why)) {
+      logf("fmod-studio: sample '%s' rejected: %s (frames=%u channels=%u)",
+           s.name.c_str(), why ? why : "unspecified", s.samples, s.channels);
+      return false;
+    }
   }
-  std::vector<u8> ogg;
-  if (!fsb_vorbis_to_ogg(s, compressed.data(), s.data_len, &ogg)) return false;
-  int err = 0;
-  stb_vorbis* v = stb_vorbis_open_memory(ogg.data(), (int)ogg.size(), &err,
-                                         nullptr);
-  if (!v) {
-    logf("fmod-studio: stb_vorbis failed to open rebuilt Ogg for '%s' "
-         "(err=%d)",
-         s.name.c_str(), err);
-    return false;
-  }
-  stb_vorbis_info info = stb_vorbis_get_info(v);
-  if (!info.channels || !info.sample_rate) {
+  try {
+    std::vector<u8> compressed(s.data_len);
+    if (!file_read_at(bank->f, s.file_offset, compressed.data(), s.data_len))
+      return false;
+    if (s.vorbis_crc == 0) {
+      // Not Vorbis (PCM/ADPCM/etc.): named-silent until a decoder lands.
+      logf("fmod-studio: sample '%s' is not Vorbis (no VORBISDATA chunk) — "
+           "decoder pending",
+           s.name.c_str());
+      return false;
+    }
+    std::vector<u8> ogg;
+    if (!fsb_vorbis_to_ogg(s, compressed.data(), s.data_len, &ogg))
+      return false;
+    int err = 0;
+    stb_vorbis* v = stb_vorbis_open_memory(ogg.data(), (int)ogg.size(), &err,
+                                           nullptr);
+    if (!v) {
+      logf("fmod-studio: stb_vorbis failed to open rebuilt Ogg for '%s' "
+           "(err=%d)",
+           s.name.c_str(), err);
+      return false;
+    }
+    stb_vorbis_info info = stb_vorbis_get_info(v);
+    if (!info.channels || !info.sample_rate) {
+      stb_vorbis_close(v);
+      return false;
+    }
+    std::vector<short> pcm;
+    pcm.reserve((size_t)s.samples * info.channels);
+    short frame_buf[8192 * 2];
+    int n;
+    while ((n = stb_vorbis_get_frame_short_interleaved(
+                v, info.channels, frame_buf, 8192 * 2)) > 0) {
+      pcm.insert(pcm.end(), frame_buf, frame_buf + (size_t)n * info.channels);
+    }
     stb_vorbis_close(v);
+    if (pcm.empty()) {
+      logf("fmod-studio: stb_vorbis decoded 0 frames for '%s'",
+           s.name.c_str());
+      return false;
+    }
+    out->pcm = std::move(pcm);
+    out->rate = info.sample_rate;
+    out->channels = (u32)info.channels;
+    out->frames = (u32)(out->pcm.size() / out->channels);
+    out->loop = s.has_loop;
+    out->loop_start_frame = s.loop_start;
+    out->loop_end_frame = s.loop_end && s.loop_end <= out->frames
+                              ? s.loop_end
+                              : out->frames;
+    return true;
+  } catch (const std::bad_alloc&) {
+    // A decode that cannot fit the budget is a named skip, not a termination
+    // (an uncaught bad_alloc took the whole app down on console).
+    logf("fmod-studio: sample '%s' exceeds the decode memory budget "
+         "(%u frames x %u ch) — silent",
+         s.name.c_str(), s.samples, s.channels);
     return false;
   }
-  std::vector<short> pcm;
-  pcm.reserve((size_t)s.samples * info.channels);
-  short frame_buf[8192 * 2];
-  int n;
-  while ((n = stb_vorbis_get_frame_short_interleaved(
-              v, info.channels, frame_buf, 8192 * 2)) > 0) {
-    pcm.insert(pcm.end(), frame_buf, frame_buf + (size_t)n * info.channels);
-  }
-  stb_vorbis_close(v);
-  if (pcm.empty()) {
-    logf("fmod-studio: stb_vorbis decoded 0 frames for '%s'", s.name.c_str());
-    return false;
-  }
-  out->pcm = std::move(pcm);
-  out->rate = info.sample_rate;
-  out->channels = (u32)info.channels;
-  out->frames = (u32)(out->pcm.size() / out->channels);
-  out->loop = s.has_loop;
-  out->loop_start_frame = s.loop_start;
-  out->loop_end_frame = s.loop_end && s.loop_end <= out->frames
-                            ? s.loop_end
-                            : out->frames;
-  return true;
 }
 
 // ---- PCM cache (decoded samples shared across instances) ----
@@ -1330,7 +1461,14 @@ std::shared_ptr<decoded_sample> get_decoded(bank_data* bank, int fsb_idx,
   if (fsb_idx < 0 || fsb_idx >= (int)bank->fsbs.size()) return nullptr;
   const fsb_bank& fb = bank->fsbs[(size_t)fsb_idx];
   if (subsound < 0 || subsound >= (int)fb.samples.size()) return nullptr;
-  auto dec = std::make_shared<decoded_sample>();
+  std::shared_ptr<decoded_sample> dec;
+  try {
+    dec = std::make_shared<decoded_sample>();
+  } catch (const std::bad_alloc&) {
+    logf("fmod-studio: no memory for a decode slot (bank '%s' sample %d/%d)",
+         bank->path.c_str(), fsb_idx, subsound);
+    return nullptr;
+  }
   if (!decode_fsb_sample(bank, fb.samples[(size_t)subsound], dec.get()))
     return nullptr;
   {

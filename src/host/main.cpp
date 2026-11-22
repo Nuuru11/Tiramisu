@@ -13,6 +13,7 @@
 #include "host_autopilot.h"
 #include "settings.h"
 #include "../trt/trt.h"
+#include "../trt/x86_cpu.h"
 #include "../trt/mono_host.h"
 #include "../trt/fna_platform.h"
 #include "../trt/fna3d_host.h"
@@ -1509,6 +1510,19 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     return r;
   }
   trt_images_register_main(img, exe.c_str());
+  if (img->is_pe32) {
+    // 32-bit PE: run through x86 interpreter instead of native call
+    snprintf(line, sizeof(line), "trt: 32-bit PE detected, running via x86 interpreter");
+    longan::log_line(line);
+    x86_context xctx;
+    x86_cpu_init(&xctx);
+    xctx.log = [](const char* s) { longan::log_line(s); };
+    int rc = x86_run_pe32(&xctx, img->base, img->size_of_image,
+                          img->entry_rva, 0x00100000, 0x00100000);
+    snprintf(r.detail, sizeof(r.detail), "x86 interpreter returned %d", rc);
+    x86_mem_free(&xctx);
+    return r;
+  }
   for (int i = 0; i < img->tls_callback_count; ++i) {
     trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
                        (u64)(uintptr_t)img->base, 1, 0, 0);

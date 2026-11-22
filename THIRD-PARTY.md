@@ -14,6 +14,7 @@ Vendored, with licenses preserved in their directories:
 | FAudio | `third_party/faudio-src`, built in `third_party/faudio/out` (Linux, SDL2) and compiled into the UWP host (`third_party/faudio/uwp/`, XAudio2) | zlib | FNA's XAudio2 reimplementation (audio-device dependency; FNA audio backend on the console) |
 | Mono 6.8.0.105 | `third_party/mono` (Ubuntu noble `.deb`s, extracted, never installed); `third_party/mono-uwp` (stock 6.8.0.105 source built as a static UWP lib, incl. a TEB fallback typedef from the Unity mono fork) | MIT | Embedding headers + SGen runtime for `src/trt/mono_host.cpp` (shared lib on Linux, static lib on UWP) |
 | stb_vorbis | `src/trt/vendor_stb_vorbis.c` | public domain | Ogg Vorbis decoder (v1.24) for FSB5 sample playback in the FMOD Studio bridge |
+| dr_mp3 | `src/trt/vendor_dr_mp3.h`, `vendor_dr_mp3.c` | public domain / MIT-0 | MP3 decoder (v0.7.5) for FMOD payloads; closes the last common legacy-FMOD container class |
 | TriMO-FSB5 Vorbis setup packets | `src/trt/fsb_vorbis_setups.h` | Apache-2.0 | FSB Vorbis setup-header packets for the 2 CRC32s Celeste banks need (fork of python-fsb5, MIT) |
 
 Everything else in this repository is original code, MIT licensed — see

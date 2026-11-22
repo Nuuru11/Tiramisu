@@ -73,14 +73,33 @@ decode for the containers games actually ship.
 |---|---|---|
 | WAV PCM | **real** | real |
 | OGG Vorbis | **real** (stb_vorbis) | real (FSB5 → Ogg rebuild) |
+| MP3 | **real** (dr_mp3, 2026-11-21) | silent, named |
 | FSB5 Vorbis | silent, named | **real** (Celeste) |
 | FSB5 FADPCM | silent, named | silent, named |
-| MP3 | silent, named | silent, named |
+| FSB5 Vorbis, corrupt header | n/a | **refused by name** (2026-11-21 envelope checks) |
+| Memory-backed (`FMOD_OPENMEMORY`) | **decodes** (owned copy taken, 2026-11-21) | n/a |
 
 - **Measured**: `bridge_fmod.cpp` classifies and names each container; the
   FMOD Studio path parses FSB5 sample tables and rebuilds Vorbis streams.
-- **Next increment (cheap, high share)**: FADPCM decode + legacy-Ex FSB5
-  reuse, so FMOD-Ex titles (thousands of indies) are audible.
+- **Landed 2026-11-21 (console audio wall)**: the FSB5 path no longer trusts
+  the file. `trt_fsb5_header_sane` / `trt_fsb5_sample_sane` refuse a bank whose
+  sample count, header table, name table, declared data size or frame count
+  cannot describe something decodable inside the console budget, by name and
+  before any allocation; the decode body catches `bad_alloc` instead of taking
+  the app down. That is the shape of the AV that disabled console decode. It
+  stays off by default on console until a run proves it —
+  `fsb_decode=1` in `settings.ini` or a per-game `tiramisu.profile.ini`
+  (`game-stage.py --set fsb_decode=1`) turns it on with no rebuild, which is
+  the only channel that reaches a packaged app. Gate:
+  `test_fsb5_sanity` (offline, no game needed), which also covers the
+  `num_samples * 4` u32 wrap that made the name table an out-of-bounds read.
+- **Landed 2026-11-21**: MP3 decode for the legacy FMOD Ex family (dr_mp3,
+  public domain), and `FMOD_OPENMEMORY` payloads now decode at all — they
+  previously fell into the no-owned-buffer branch and were silent for every
+  game that loads audio from RAM. Gate: `test_fmod` plays a real 22.05 kHz
+  mono MP3 fixture and asserts non-zero PCM at the right rate/channels.
+- **Next increment**: FADPCM decode + legacy-Ex FSB5 reuse, so FMOD-Ex bank
+  titles are audible.
 - **Acceptance**: `test_fmod` and `test_fmod_studio` assert non-zero PCM for
   an FSB5-FADPCM fixture and an MP3 fixture, not a named-silent log.
 
@@ -158,12 +177,12 @@ three of which exist:
   D3D12 is seeded as RECORDED; mfplat/mfreadwrite/mscoree/Steam as
   NAMED_SILENT; the honest-empty shell32/winmm answers are per-symbol.
 - `test_corpus --coverage` prints one `COVERAGE <pe>: imports=N real=X
-  recorded=Y named-silent=Z delay=N` line per PE, with a self-test that fails
-  the gate if the seed table drifts. Delay-load descriptors are walked too
-  (VA-style and RVA-style), so UnityPlayer's d3d12 and binkw32's Miles are
-  counted just like static imports.
+  recorded=Y named-silent=Z` line per PE, with a self-test that fails the
+  gate if the seed table drifts.
 - `tools/support-matrix.sh` runs the corpus and writes
   `docs/support-matrix.md` from those lines — measured, never hand-written.
+- Known scope limit: the report walks the **static** import directory only.
+  Delay imports (UnityPlayer → d3d12) are bound at runtime but not counted.
 
 ---
 

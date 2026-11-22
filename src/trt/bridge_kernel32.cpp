@@ -45,6 +45,10 @@
 #include "bridge_gdi.h"
 #include "bridge_gdiplus.h"
 #include "bridge_fmod.h"
+#include "bridge_wwise.h"
+#include "bridge_bink.h"
+#include "bridge_criware.h"
+#include "bridge_miles.h"
 #include "bridge_wininet.h"
 #include "bridge_psapi.h"
 #include "bridge_iphlpapi.h"
@@ -1302,8 +1306,12 @@ void trt_bind_guest_thread_id(u32 tid) {
 }
 
 u32 TRT_STDCALL trt_GetCurrentThreadId(void) {
+#if defined(_WIN32)
+  return (u32)::GetCurrentThreadId();
+#else
   if (t_guest_tid == 0) t_guest_tid = trt_alloc_guest_thread_id();
   return t_guest_tid;
+#endif
 }
 
 // the monotonic clock games use for timing (GetTickCount64 since Win7)
@@ -1609,6 +1617,14 @@ void trt_bridge_boot(const trt_backend* be) {
   trt_bridge_register_gdiplus();
   // fmod: FMOD Ex/Studio audio (wav/pcm real through the host mixer)
   trt_bridge_register_fmod();
+  // wwise: Audiokinetic Wwise audio middleware (stubs, AK_Success)
+  trt_bridge_register_wwise();
+  // bink: RAD Game Tools Bink video (stubs, skip)
+  trt_bridge_register_bink();
+  // criware: CRI Middleware (ADX2/CriAtom/CriMana) (stubs)
+  trt_bridge_register_criware();
+  // miles: Miles Sound System (stubs)
+  trt_bridge_register_miles();
   // STAGE 5 boot determinism: the 7 UNCERTAIN console DLLs converted to
   // BUILTIN honest-runtime — the boot no longer depends on unproven
   // console presence (wininet/psapi/iphlpapi/imm32/crypt32/dbghelp/dbgcore)
@@ -2307,7 +2323,12 @@ int TRT_STDCALL trt_SetCurrentDirectoryA(const char* name) {
 int TRT_STDCALL trt_GetCurrentDirectoryW(u32 len, u16* buf) {
   trt_vfs_get_cwd(g_cwd, sizeof(g_cwd));
   const u32 clen = (u32)strlen(g_cwd);
-  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_cwd); trt_core_log(st_line); }
+  static u32 s_gcd_log = 0;
+  if (++s_gcd_log <= 32) {
+    char st_line[256];
+    snprintf(st_line, sizeof(st_line), "strtrace: GetCurrentDirectoryW -> buf=%p len=%u value=\"%.128s\"", (void*)buf, len, g_cwd);
+    trt_core_log(st_line);
+  }
   if (!buf || len <= clen) return (int)(clen + 1);
   for (u32 i = 0; i <= clen; ++i) buf[i] = (u16)(u8)g_cwd[i];
   return (int)clen;
@@ -2538,11 +2559,14 @@ void* system_module_handle(const char* utf8_name) {
   if (trt_module_route(base) == TRT_ROUTE_MISSING) return nullptr;
   void* h = trt_images_synthetic_handle(base);
   if (h) {
-    char line[224];
-    snprintf(line, sizeof(line),
-             "kernel32: LoadLibrary/GetModuleHandle(%s) -> synthetic handle "
-             "(system module, offline bridge surface)", base);
-    trt_core_log(line);
+    static u32 s_syn_log = 0;
+    if (++s_syn_log <= 64) {
+      char line[224];
+      snprintf(line, sizeof(line),
+               "kernel32: LoadLibrary/GetModuleHandle(%s) -> synthetic handle "
+               "(system module, offline bridge surface)", base);
+      trt_core_log(line);
+    }
   }
   if (!h) {
     char st_line[224];
@@ -2609,7 +2633,8 @@ static void* load_library_impl(const u16* path, u32 flags) {
 
 void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
   void* h = load_library_impl(path, 0);
-  { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
+  static u32 s_llw_log = 0;
+  if (++s_llw_log <= 64) { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
   return h;
 }
 
@@ -5254,6 +5279,18 @@ extern "C" int trt_dispatch_hw_fault(int sig, void* siginfo_v, void* uctx_v) {
   if (!is_guest_exec_pc(rip)) return 0;
 
   if (sig == SIGSEGV &&
+      ((const u8*)(uintptr_t)rip)[0] == 0xCDu &&
+      ((const u8*)(uintptr_t)rip)[1] == 0x29u) {
+    char ff[128];
+    snprintf(ff, sizeof(ff),
+             "kernel32: __fastfail(code=%llu) at rip=0x%llx -> non-continuable",
+             (unsigned long long)uc->uc_mcontext.gregs[REG_RCX],
+             (unsigned long long)rip);
+    boot_log(ff);
+    return 0;
+  }
+
+  if (sig == SIGSEGV &&
       ((u64)uc->uc_mcontext.gregs[REG_ERR] & 16ULL) &&
       trt_va_try_promote_rx(rip)) {
     return 1;
@@ -6145,29 +6182,9 @@ void TRT_STDCALL trt_InitializeConditionVariable(void* cv) {
   if (cv) memset(cv, 0, sizeof(void*));
 }
 
-static int cv_wait_internal(void* cv, u32 ms) {
-  cv_slot* s = cv_get(cv);
-  if (!s) {
-    g_cv_wake_mu.unlock();
-    err_ref_for_current_thread() = 8;
-    return 0;
-  }
-  // Caller (trt_SleepConditionVariableSRW/CS) holds g_cv_wake_mu across the
-  // USER-LOCK RELEASE so that "released the SRW/CS" and "registered as a
-  // waiter" are atomic against WakeConditionVariable/WakeAllConditionVariable
-  // (which take g_cv_wake_mu before signaling). This is the Win32
-  // release-and-wait atomicity contract; without it a producer that acquires
-  // the just-released lock, updates the predicate and wakes BEFORE the
-  // consumer registers produces a LOST WAKEUP — measured live as Godot's
-  // tid=11 parked forever in SleepConditionVariableSRW(recursion=1 CS hold)
-  // wedging the entire boot past the 10s watchdog.
+static int cv_wait_locked(cv_slot* s, u32 ms) {
   g_cv_waits.fetch_add(1, std::memory_order_relaxed);
 #if defined(_WIN32)
-  ::EnterCriticalSection(&s->cs);
-  // SleepConditionVariableCS releases s->cs atomically with wait
-  // registration, so dropping g_cv_wake_mu here leaves no window: a waker
-  // still cannot signal before we are asleep (it blocks on s->cs).
-  g_cv_wake_mu.unlock();
   const BOOL ok = ::SleepConditionVariableCS(&s->cv, &s->cs, ms);
   ::LeaveCriticalSection(&s->cs);
   if (!ok) {
@@ -6177,10 +6194,6 @@ static int cv_wait_internal(void* cv, u32 ms) {
   }
   return 1;
 #else
-  pthread_mutex_lock(&s->mu);
-  // From here the waiter is "registered": pthread_cond_wait releases s->mu
-  // atomically with blocking, and any waker must pass s->mu first.
-  g_cv_wake_mu.unlock();
   int rc = 0;
   if (ms == 0xFFFFFFFFu) {
     rc = pthread_cond_wait(&s->cv, &s->mu);
@@ -6205,24 +6218,24 @@ static int cv_wait_internal(void* cv, u32 ms) {
 int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
                                               u32 flags) {
   const bool shared = (flags & 0x1u) != 0;
-  // Serialize "release user lock -> register as waiter" against Wake* (see
-  // cv_wait_internal). g_cv_wake_mu is consumed by cv_wait_internal.
-  g_cv_wake_mu.lock();
+  cv_slot* s = cv_get(cv);
+  if (!s) {
+    err_ref_for_current_thread() = 8;
+    return 0;
+  }
+  // Hold the per-slot lock across releasing the user's SRW lock and entering
+  // the OS condition wait so Wake* (which also acquires the per-slot lock)
+  // can never fire in the window between user-lock release and sleep.
+#if defined(_WIN32)
+  ::EnterCriticalSection(&s->cs);
+#else
+  pthread_mutex_lock(&s->mu);
+#endif
   if (srw) {
     if (shared) trt_ReleaseSRWLockShared(srw);
     else trt_ReleaseSRWLockExclusive(srw);
   }
-  if (ms == 0xFFFFFFFFu) {
-    // Fail-visible infinite-wait trace: an infinite Sleep on a CV while
-    // holding another lock is the exact lost-wakeup wedge shape; pairing
-    // these lines with the CS-stall probe names both ends of the contract.
-    char iw[128];
-    snprintf(iw, sizeof(iw),
-             "sync: CV-infinite-wait cv=%p srw=%p flags=%u self_tid=%u", cv,
-             srw, flags, trt_GetCurrentThreadId());
-    trt_core_log(iw);
-  }
-  const int r = cv_wait_internal(cv, ms);
+  const int r = cv_wait_locked(s, ms);
   if (srw) {
     if (shared) trt_AcquireSRWLockShared(srw);
     else trt_AcquireSRWLockExclusive(srw);
@@ -6233,9 +6246,18 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
 int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
   extern int TRT_STDCALL trt_LeaveCriticalSection(void* cs);
   extern int TRT_STDCALL trt_EnterCriticalSection(void* cs);
-  g_cv_wake_mu.lock();
+  cv_slot* s = cv_get(cv);
+  if (!s) {
+    err_ref_for_current_thread() = 8;
+    return 0;
+  }
+#if defined(_WIN32)
+  ::EnterCriticalSection(&s->cs);
+#else
+  pthread_mutex_lock(&s->mu);
+#endif
   if (cs) trt_LeaveCriticalSection(cs);
-  const int r = cv_wait_internal(cv, ms);
+  const int r = cv_wait_locked(s, ms);
   if (cs) trt_EnterCriticalSection(cs);
   return r;
 }
@@ -6244,9 +6266,6 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_all.fetch_add(1, std::memory_order_relaxed);
-  // Take g_cv_wake_mu so a wake can never land in the window between the
-  // waiter's user-lock release and its wait registration (lost wakeup).
-  std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
   ::WakeAllConditionVariable(&s->cv);
@@ -6255,18 +6274,6 @@ void TRT_STDCALL trt_WakeAllConditionVariable(void* cv) {
   pthread_mutex_lock(&s->mu);
   pthread_cond_broadcast(&s->cv);
   pthread_mutex_unlock(&s->mu);
-  // Fail-visible: a wake for a CV nobody waits on right now is legal Win32,
-  // but a wake DURING an active infinite wait is the wake that must land.
-  if (g_cv_waits.load(std::memory_order_relaxed) >
-      g_cv_timeouts.load(std::memory_order_relaxed)) {
-    char wl[128];
-    snprintf(wl, sizeof(wl),
-             "sync: CV-wakeall cv=%p (waiters active: %llu waits vs %llu "
-             "timeouts)",
-             cv, (unsigned long long)g_cv_waits.load(std::memory_order_relaxed),
-             (unsigned long long)g_cv_timeouts.load(std::memory_order_relaxed));
-    trt_core_log(wl);
-  }
 #endif
 }
 
@@ -6274,7 +6281,6 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   cv_slot* s = cv_get(cv);
   if (!s) return;
   g_cv_wake_single.fetch_add(1, std::memory_order_relaxed);
-  std::lock_guard<std::mutex> lk(g_cv_wake_mu);
 #if defined(_WIN32)
   ::EnterCriticalSection(&s->cs);
   ::WakeConditionVariable(&s->cv);
@@ -6283,16 +6289,6 @@ void TRT_STDCALL trt_WakeConditionVariable(void* cv) {
   pthread_mutex_lock(&s->mu);
   pthread_cond_signal(&s->cv);
   pthread_mutex_unlock(&s->mu);
-  if (g_cv_waits.load(std::memory_order_relaxed) >
-      g_cv_timeouts.load(std::memory_order_relaxed)) {
-    char wl[128];
-    snprintf(wl, sizeof(wl),
-             "sync: CV-wake cv=%p (waiters active: %llu waits vs %llu "
-             "timeouts)",
-             cv, (unsigned long long)g_cv_waits.load(std::memory_order_relaxed),
-             (unsigned long long)g_cv_timeouts.load(std::memory_order_relaxed));
-    trt_core_log(wl);
-  }
 #endif
 }
 

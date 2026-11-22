@@ -355,6 +355,8 @@ const console_dll k_console_dlls[] = {
     {"vcruntime140.dll"}, {"msvcp140.dll"},
     {"vcruntime140_app.dll"}, {"msvcp140_app.dll"},
     {"dstorage.dll"}, {"dstoragecore.dll"},
+    {"bink2w64.dll"}, {"binkw64.dll"}, {"bink2w32.dll"},
+    {"oo2core_6_win64.dll"}, {"oo2core_8_win64.dll"}, {"oo2core_5_win64.dll"},
 };
 
 char wl_lower(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }

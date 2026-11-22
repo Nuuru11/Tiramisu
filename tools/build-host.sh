@@ -91,6 +91,8 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/bridge_hid.cpp \
   src/trt/bridge_xinput.cpp src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
+  src/trt/bridge_dstorage.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp \
+  src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
   src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
@@ -121,6 +123,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/host/vendor/miniz.c src/host/vendor/miniz_tdef.c \
   src/host/vendor/miniz_tinfl.c src/host/vendor/miniz_zip.c \
   src/host/vendor/qrcodegen.c src/trt/mojo_hlsl.c src/trt/vendor_stb_vorbis.c \
+  src/trt/vendor_dr_mp3.c \
   --link-arg d3d11.lib --link-arg d3d12.lib --link-arg dxgi.lib --link-arg xinput.lib \
   --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib --link-arg ws2_32.lib \
   --link-arg mfplat.lib --link-arg mfreadwrite.lib --link-arg mfuuid.lib \
@@ -198,9 +201,10 @@ echo "FNA3D exports present in tiramisu.exe"
 MONO_FW="${MONO_FRAMEWORK_DIR:-/usr/lib/mono}"
 [[ -d "$MONO_FW/4.5" && -f "$MONO_FW/4.5/mscorlib.dll" ]] \
   || { echo "ERROR: Mono framework assemblies not found: $MONO_FW/4.5" >&2; exit 6; }
+rm -rf "$out/layout/mono"
 mkdir -p "$out/layout/mono" "$out/layout/etc/mono"
-cp -r "$MONO_FW/4.5" "$out/layout/mono/4.5"
-[[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/gac"
+cp -r "$MONO_FW/4.5" "$out/layout/mono/"
+[[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/"
 [[ -f /etc/mono/config ]] && cp /etc/mono/config "$out/layout/etc/mono/config"
 # Tiramisu UWP: map every managed P/Invoke library to the host exe's
 # exports. Programmatic dllmaps (assembly_load_hook) do not apply to all

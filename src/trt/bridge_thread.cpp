@@ -954,8 +954,14 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
     sync_object* o = object_for_locked(obj);
     if (o) {
       o->win_handle = t;
-      o->tid = win_tid;
+      o->tid = (u32)win_tid;
     }
+  }
+  {
+    char tline[96];
+    snprintf(tline, sizeof(tline), "thread: CreateThread win_tid=%u guest_tid=%u routine=%p",
+             (u32)win_tid, child_tid, routine);
+    trt_core_log(tline);
   }
   if (tid) *tid = (u32)win_tid;
 #else

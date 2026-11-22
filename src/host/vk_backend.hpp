@@ -131,9 +131,9 @@ inline DXGI_FORMAT vk_to_dxgi_fmt(uint32_t vk_fmt, bool typeless_depth = false) 
     case 101u: return DXGI_FORMAT_R32G32_UINT;
     case 102u: return DXGI_FORMAT_R32G32_SINT;
     case 103u: return DXGI_FORMAT_R32G32_FLOAT;
-    case 104u: return DXGI_FORMAT_R32G32B32_UINT;
-    case 105u: return DXGI_FORMAT_R32G32B32_SINT;
-    case 106u: return DXGI_FORMAT_R32G32B32_FLOAT;
+    case 104u: return DXGI_FORMAT_R32G32B32A32_UINT;
+    case 105u: return DXGI_FORMAT_R32G32B32A32_SINT;
+    case 106u: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case 107u: return DXGI_FORMAT_R32G32B32A32_UINT;
     case 108u: return DXGI_FORMAT_R32G32B32A32_SINT;
     case 109u: return DXGI_FORMAT_R32G32B32A32_FLOAT;
@@ -315,10 +315,51 @@ inline bool compile_hlsl_blob(const char* src, uint32_t len, const char* profile
                           D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &errs);
   if (FAILED(hr) || !code) {
     if (errs) {
-      char buf[384];
-      snprintf(buf, sizeof(buf), "[vk_backend] %s compile failed: %.300s",
-               profile, (const char*)errs->GetBufferPointer());
-      trt_core_log(buf);
+      const char* emsg = (const char*)errs->GetBufferPointer();
+      // Print all lines of the error message to catch both warnings and errors
+      const char* ep = emsg;
+      while (*ep) {
+        const char* next = strchr(ep, '\n');
+        int len = next ? (int)(next - ep) : (int)strlen(ep);
+        if (len > 0) {
+          char lbuf[512];
+          snprintf(lbuf, sizeof(lbuf), "[vk_backend] %s: %.*s", profile, std::min(len, 480), ep);
+          trt_core_log(lbuf);
+        }
+        if (!next) break;
+        ep = next + 1;
+      }
+
+      // Extract line number from error
+      int err_line = 0;
+      const char* err_ptr = strstr(emsg, "error ");
+      const char* lp = err_ptr ? strchr(err_ptr, '(') : strchr(emsg, '(');
+      if (!lp && err_ptr) {
+        // Look backwards for '('
+        const char* b = err_ptr;
+        while (b > emsg && *b != '(' && *b != '\n') b--;
+        if (*b == '(') lp = b;
+      }
+      if (lp) err_line = atoi(lp + 1);
+      if (err_line > 0) {
+        int cur_line = 1;
+        const char* p = src;
+        const char* end = src + len;
+        while (p < end) {
+          const char* le = (const char*)memchr(p, '\n', end - p);
+          if (!le) le = end;
+          if (cur_line >= err_line - 3 && cur_line <= err_line + 3) {
+            char lbuf[512];
+            int llen = std::min<int>((int)(le - p), 480);
+            snprintf(lbuf, sizeof(lbuf), "  L%d%s: %.*s",
+                     cur_line, (cur_line == err_line) ? " >>>" : "    ", llen, p);
+            trt_core_log(lbuf);
+          }
+          if (cur_line > err_line + 3) break;
+          p = (le < end) ? le + 1 : end;
+          cur_line++;
+        }
+      }
       errs->Release();
     }
     if (code) code->Release();
@@ -608,20 +649,21 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
   if (!same) {
     free_img_rec(im);
     im.desc = *desc;
-    const bool depth = is_depth_vk_fmt(desc->vk_format) || ((desc->usage & 0x20u) != 0u);
+    const bool depth = is_depth_vk_fmt(desc->vk_format);
     const bool is_cube = ((desc->flags & 0x10u) != 0u) && desc->layers >= 6u;
-    const bool want_srv = !is_bc_vk_fmt(desc->vk_format) || !depth;
-    const bool want_rtv = !depth && !is_bc_vk_fmt(desc->vk_format) && ((desc->usage & 0x10u) != 0u);
-    const bool want_uav = !depth && !is_bc_vk_fmt(desc->vk_format) && ((desc->usage & 0x08u) != 0u);
 
-    UINT bind_flags = 0;
-    if (want_srv) bind_flags |= D3D11_BIND_SHADER_RESOURCE;
-    if (depth) bind_flags |= D3D11_BIND_DEPTH_STENCIL;
-    if (want_rtv) bind_flags |= D3D11_BIND_RENDER_TARGET;
-    if (want_uav) bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
-    if (!bind_flags) bind_flags = D3D11_BIND_SHADER_RESOURCE;
+    UINT bind_flags = D3D11_BIND_SHADER_RESOURCE;
+    if (depth) {
+      bind_flags |= D3D11_BIND_DEPTH_STENCIL;
+    } else if (!is_bc_vk_fmt(desc->vk_format)) {
+      if (desc->usage & 0x10u) bind_flags |= D3D11_BIND_RENDER_TARGET;
+      if (desc->usage & 0x08u) bind_flags |= D3D11_BIND_UNORDERED_ACCESS;
+    }
 
-    const UINT mips = std::max<UINT>(1u, desc->mips);
+    UINT max_mips = 1;
+    UINT max_dim = std::max<UINT>(desc->w, desc->h);
+    while (max_dim > 1) { max_mips++; max_dim >>= 1; }
+    const UINT mips = std::min<UINT>(std::max<UINT>(1u, desc->mips), max_mips);
     const UINT layers = std::max<UINT>(1u, desc->layers);
     const DXGI_FORMAT tex_fmt = vk_to_dxgi_fmt(desc->vk_format, depth);
 
@@ -653,7 +695,21 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags;
       if (is_cube) td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-      if (SUCCEEDED(g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d)) && im.tex2d) {
+      HRESULT hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
+      if (FAILED(hr) && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
+        td.BindFlags &= ~D3D11_BIND_UNORDERED_ACCESS;
+        bind_flags = td.BindFlags;
+        hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
+      }
+      if (FAILED(hr)) {
+        HRESULT rem = g_vkrt.dev ? g_vkrt.dev->GetDeviceRemovedReason() : S_OK;
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "[vk_backend] CreateTexture2D failed vk_fmt=%u dxgi=%u %ux%u mips=%u layers=%u bind=0x%x hr=0x%08x rem=0x%08x",
+                 desc->vk_format, (unsigned)tex_fmt, td.Width, td.Height, mips, layers, bind_flags, (unsigned)hr, (unsigned)rem);
+        trt_core_log(buf);
+      }
+      if (SUCCEEDED(hr) && im.tex2d) {
         if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {
           D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
           sd.Format = depth ? depth_srv_fmt(desc->vk_format) : tex_fmt;
@@ -692,11 +748,32 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
     const UINT mips = std::max<UINT>(1u, desc->mips);
     const UINT mw = std::max<UINT>(1u, desc->w >> mip);
     const UINT mh = std::max<UINT>(1u, desc->h >> mip);
-    UINT rp = 0, sp = 0;
-    calc_img_pitch(desc->vk_format, mw, mh, &rp, &sp);
     const UINT sub = D3D11CalcSubresource(mip, layer, mips);
     ID3D11Resource* res = im.tex3d ? (ID3D11Resource*)im.tex3d : (ID3D11Resource*)im.tex2d;
-    g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, data, rp, sp);
+    if ((desc->vk_format == 104u || desc->vk_format == 105u || desc->vk_format == 106u) && data) {
+      std::vector<uint32_t> converted((size_t)mw * (size_t)mh * 4u);
+      const uint32_t* src3 = (const uint32_t*)data;
+      const size_t total_px = (size_t)mw * (size_t)mh;
+      for (size_t px = 0; px < total_px && (px + 1) * 3 * sizeof(uint32_t) <= bytes; ++px) {
+        converted[px * 4 + 0] = src3[px * 3 + 0];
+        converted[px * 4 + 1] = src3[px * 3 + 1];
+        converted[px * 4 + 2] = src3[px * 3 + 2];
+        converted[px * 4 + 3] = (desc->vk_format == 106u) ? 0x3F800000u /* 1.0f */ : 1u;
+      }
+      UINT rp = mw * 16u;
+      UINT sp = rp * mh;
+      g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, converted.data(), rp, sp);
+    } else {
+      UINT rp = 0, sp = 0;
+      calc_img_pitch(desc->vk_format, mw, mh, &rp, &sp);
+      if (bytes < (u64)sp) {
+        std::vector<uint8_t> pad((size_t)sp, 0);
+        memcpy(pad.data(), data, (size_t)bytes);
+        g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, pad.data(), rp, sp);
+      } else {
+        g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, data, rp, sp);
+      }
+    }
   }
   return 1;
 }
@@ -746,6 +823,9 @@ inline void hk_begin_render_pass(const trt_vk_rp_begin* rp, void*) {
     if (it != g_vkrt.imgs.end()) dsv = it->second.dsv;
   } else if (uses_swapchain) {
     dsv = g_vkrt.main_dsv;
+    if (dsv) {
+      g_vkrt.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+    }
   }
   if (dsv && (rp->clear_depth || rp->clear_stencil)) {
     UINT cf = 0;
@@ -793,7 +873,7 @@ inline void bind_descriptor_table(const trt_vk_desc_binding* bindings, u32 count
       if (to_ps) g_vkrt.ctx->PSSetConstantBuffers(reg, 1, &cb);
     };
     auto bind_srv = [&](ID3D11ShaderResourceView* srv) {
-      if (reg >= 32u) return;
+      if (reg >= 128u) return;
       if (to_cs) g_vkrt.ctx->CSSetShaderResources(reg, 1, &srv);
       if (to_vs) g_vkrt.ctx->VSSetShaderResources(reg, 1, &srv);
       if (to_ps) g_vkrt.ctx->PSSetShaderResources(reg, 1, &srv);
@@ -1000,17 +1080,50 @@ inline void hk_copy_buf_to_img(u64 src_buf, u64 dst_img, u64 buf_off, u32 w,
   if (!src_ptr || !src_len) return;
 
   const UINT mips = std::max<UINT>(1u, im.desc.mips);
-  UINT rp = 0, sp = 0;
-  calc_img_pitch(im.desc.vk_format, w ? w : im.desc.w, h ? h : im.desc.h, &rp, &sp);
+  const UINT mw = std::max<UINT>(1u, im.desc.w >> mip);
+  const UINT mh = std::max<UINT>(1u, im.desc.h >> mip);
+  const UINT pw = w ? std::min<UINT>(w, mw) : mw;
+  const UINT ph = h ? std::min<UINT>(h, mh) : mh;
   const UINT sub = D3D11CalcSubresource(mip, layer, mips);
   ID3D11Resource* res = im.tex3d ? (ID3D11Resource*)im.tex3d : (ID3D11Resource*)im.tex2d;
-  g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, src_ptr, rp, sp);
+
+  D3D11_BOX box{0, 0, 0, pw, ph, 1};
+  const D3D11_BOX* pbox = (pw != mw || ph != mh) ? &box : nullptr;
+
+  if ((im.desc.vk_format == 104u || im.desc.vk_format == 105u || im.desc.vk_format == 106u) && src_ptr) {
+    std::vector<uint32_t> converted((size_t)pw * (size_t)ph * 4u);
+    const uint32_t* src3 = (const uint32_t*)src_ptr;
+    const size_t total_px = (size_t)pw * (size_t)ph;
+    for (size_t px = 0; px < total_px && (px + 1) * 3 * sizeof(uint32_t) <= src_len; ++px) {
+      converted[px * 4 + 0] = src3[px * 3 + 0];
+      converted[px * 4 + 1] = src3[px * 3 + 1];
+      converted[px * 4 + 2] = src3[px * 3 + 2];
+      converted[px * 4 + 3] = (im.desc.vk_format == 106u) ? 0x3F800000u /* 1.0f */ : 1u;
+    }
+    UINT rp = pw * 16u;
+    UINT sp = rp * ph;
+    g_vkrt.ctx->UpdateSubresource(res, sub, pbox, converted.data(), rp, sp);
+    return;
+  }
+
+  UINT rp = 0, sp = 0;
+  calc_img_pitch(im.desc.vk_format, pw, ph, &rp, &sp);
+  if (src_len < (u64)sp) {
+    std::vector<uint8_t> pad((size_t)sp, 0);
+    memcpy(pad.data(), src_ptr, (size_t)src_len);
+    g_vkrt.ctx->UpdateSubresource(res, sub, pbox, pad.data(), rp, sp);
+  } else {
+    g_vkrt.ctx->UpdateSubresource(res, sub, pbox, src_ptr, rp, sp);
+  }
 }
 
 inline void hk_present(u64, u32, void*) {
   if (g_vkrt.swap) {
     longan::draw_pointer(false);
     g_vkrt.swap->Present(1, 0);
+    if (g_vkrt.ctx && g_vkrt.main_rtv) {
+      g_vkrt.ctx->OMSetRenderTargets(1, &g_vkrt.main_rtv, g_vkrt.main_dsv);
+    }
   }
 }
 

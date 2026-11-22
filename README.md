@@ -289,6 +289,28 @@ DP_HOST=<console-ip> DP_PASS=<portal-pass> \
 tools/deploy.sh screenshot tv.png
 ```
 
+To push a game straight from the PC instead of the phone page — and to record
+proof for the title matrix:
+
+```sh
+python3 tools/game-stage.py "~/Games/<Title>" --out staging/<Title> --exe <rel.exe>
+python3 tools/console.py upload --game staging/<Title> --console <console-ip>
+python3 tools/console.py proof  --game staging/<Title> --console <console-ip>
+```
+
+`game-stage.py` refuses a 32-bit exe (Tiramisu runs PE32+ only) instead of
+uploading gigabytes that cannot start. `--set key=value` stages a per-game
+`tiramisu.profile.ini` (e.g. `--set fsb_decode=1` to try FSB5 audio decode on
+one title); it is the only settings channel a packaged app can read. Proven titles live in
+[docs/title-matrix.md](docs/title-matrix.md), which is generated from
+`docs/proof/titles.json` + `proof.json` — `python3 tools/title-matrix.py
+--check` fails if a row cites an artifact that is not on disk.
+
+No console on the network? The whole deploy path can be rehearsed offline:
+`python3 -m unittest discover -s tests/py_tools` runs `console.py` against a
+fake Device Portal over real TLS (CSRF cookie/header, basic auth, multipart
+install, batched file upload, launch, screenshot, log fetch, `proof.json`).
+
 Prereqs on the console: Device Portal enabled and **"Treat UWP apps as games
 by default" ON** (5 GB limit, not 1 GB). Games you **own**; DRM-free builds
 or your own Steam account auth. **No DRM bypass, ever.**
@@ -307,6 +329,17 @@ uwp-crossbuild wrapper (defaults to `~/gow-uwp/ref/uwp-crossbuild`; override
 with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 (`package/branding/` is the source of every packaged logo; regenerate with
 `python3 tools/gen-assets.py`).
+
+## 📚 Docs
+
+- `docs/known-issues.md` — measured/honest limitations.
+- `docs/troubleshooting.md` — common failures and fixes.
+- `docs/crash-reporting-plan.md` — planned opt-in crash reporting (not built).
+- `docs/title-matrix.md` — evidence-backed title matrix (`tools/title-matrix.py --check`).
+- `tools/auto-compat.py` — scan any PE64 game and report API coverage vs. Tiramisu bridges. Supports `--scaffold DIR` to generate stub bridge skeletons.
+- `docs/known-issues.md` — honest list of open engine walls and what's been stubbed vs. implemented.
+- `CHANGELOG.md` — version + change history.
+- `GAP-MAP.md` — walls and what's open.
 
 ## 📊 Status
 

@@ -846,5 +846,27 @@ No console claim without a TV screenshot + the log pull.
   720p+ output, and **audio** (Celeste's FSB/Vorbis decode is disabled on the
   Series S after a heap-corruption fault). Those are the remaining walls,
   not "G1 never ran".
+
+### 2026-11-21 — the two walls worth naming, and what changed
+
+- **FSB5 decode (console audio).** The corrupt-header shapes that could reach
+  `reserve()`/vector growth are now refused by name in `fsb_parse`
+  (`trt_fsb5_header_sane`) and per sample before decoding
+  (`trt_fsb5_sample_sane`),  the `num_samples * 4` u32 wrap in the name-table
+  check is fixed to a 64-bit compare, and a `bad_alloc` during decode is a
+  named skip instead of a termination. Decode remains **off by default** on
+  console — the fault was never reproduced under a debugger — and
+  `fsb_decode=1` (settings.ini, or a per-game `tiramisu.profile.ini` that
+  `game-stage.py --set fsb_decode=1` writes) enables the hardened path for one
+  run; a packaged app inherits no environment, so an env var alone would not
+  have reached it. Offline
+  proof: `tests/test_fsb5_sanity.cpp` (`build-test.sh` §43c), no game banks or
+  console required. Console proof is still pending; do not write "Celeste has
+  audio" until a `proof.json` run says so.
+- **x86-32 (W1/G8).** Unchanged and still the largest gate: PE32 execution
+  needs an interpreter or JIT, and the license decision for Boxedwine's core
+  comes first. `tools/game-stage.py` refuses to stage a PE32 title rather than
+  upload gigabytes that cannot run. Nothing in this session made the catalogue
+  wider here, and nothing should claim it did.
   The probe sequence in W3 converts all of them from speculation to measurement
   in one deploy session.

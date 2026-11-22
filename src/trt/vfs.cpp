@@ -20,8 +20,23 @@
 #  include <direct.h>
 #  include <io.h>
 #  include <sys/stat.h>
-static int vfs_mkdir_one(const char* p) { return _mkdir(p); }
-static int vfs_rmdir_one(const char* p) { return _rmdir(p); }
+static int vfs_mkdir_one(const char* p) {
+  if (!p || !*p) return -1;
+  wchar_t wbuf[1024];
+  MultiByteToWideChar(CP_UTF8, 0, p, -1, wbuf, 1024);
+  for (wchar_t* w = wbuf; *w; ++w) if (*w == L'/') *w = L'\\';
+  if (CreateDirectoryW(wbuf, NULL)) return 0;
+  DWORD err = GetLastError();
+  if (err == ERROR_ALREADY_EXISTS) return 0;
+  return -1;
+}
+static int vfs_rmdir_one(const char* p) {
+  if (!p || !*p) return -1;
+  wchar_t wbuf[1024];
+  MultiByteToWideChar(CP_UTF8, 0, p, -1, wbuf, 1024);
+  for (wchar_t* w = wbuf; *w; ++w) if (*w == L'/') *w = L'\\';
+  return RemoveDirectoryW(wbuf) ? 0 : -1;
+}
 #else
 #  include <dirent.h>
 #  include <sys/stat.h>
@@ -688,12 +703,107 @@ int trt_vfs_resolve_utf16_rw(const u16* guest_path, int for_write, char* out,
         }
       }
       snprintf(out, out_cap, "%s", zpath);
+      trt_vfs_resolve_case_insensitive(out, out_cap);
       return 0;
     }
   }
   vfs_unlock();
   join_norm(out, out_cap, m->target, "", rest);
+  // Windows paths are case-insensitive; host Linux FS is not. If the exact
+  // path doesn't exist, walk components case-insensitively to find the real
+  // casing (fast path: exact match succeeds, no extra stat calls).
+  trt_vfs_resolve_case_insensitive(out, out_cap);
   return 0;
+}
+
+// Resolve a host path's casing case-insensitively. If the path exists as-is,
+// do nothing. Otherwise walk each component and substitute the actual on-disk
+// casing. Last component is only resolved if it exists (so creates/writes
+// keep their requested name).
+void trt_vfs_resolve_case_insensitive(char* path, size_t cap) {
+#if defined(_WIN32)
+  (void)path; (void)cap;
+  return;
+#else
+  if (!path || !*path) return;
+  // Fast path: exact exists.
+  struct stat st{};
+  if (stat(path, &st) == 0) return;
+  // Walk components.
+  char buf[1024];
+  snprintf(buf, sizeof(buf), "%s", path);
+  // Find mount root (everything up to and including the drive letter + colon,
+  // or leading slash).
+  char resolved[1024];
+  resolved[0] = '\0';
+  // Handle drive letter prefix like "C:/"
+  size_t i = 0;
+  if (strlen(buf) >= 2 && buf[1] == ':') {
+    // drive prefix
+    snprintf(resolved, sizeof(resolved), "%c:", buf[0]);
+    i = 2;
+    if (buf[i] == '/') { resolved[2] = '/'; resolved[3] = '\0'; i = 3; }
+  } else if (buf[0] == '/') {
+    resolved[0] = '/'; resolved[1] = '\0';
+    i = 1;
+  }
+  // Now walk each path component.
+  char component[256];
+  while (i < strlen(buf)) {
+    // Extract next component.
+    size_t j = i;
+    while (j < strlen(buf) && buf[j] != '/') ++j;
+    size_t comp_len = j - i;
+    if (comp_len == 0) { i = j + 1; continue; }
+    if (comp_len >= sizeof(component)) { i = j; continue; }
+    memcpy(component, buf + i, comp_len);
+    component[comp_len] = '\0';
+    // Try exact first.
+    char candidate[1024];
+    snprintf(candidate, sizeof(candidate), "%s/%s", resolved, component);
+    // Trim trailing slash from resolved if present for the stat.
+    struct stat cst{};
+    if (stat(candidate, &cst) == 0) {
+      // Exact exists; append as-is.
+      if (resolved[strlen(resolved)-1] != '/')
+        strncat(resolved, "/", sizeof(resolved) - strlen(resolved) - 1);
+      strncat(resolved, component, sizeof(resolved) - strlen(resolved) - 1);
+      i = j;
+      if (buf[j] == '/') ++i;
+      continue;
+    }
+    // Case-insensitive search in resolved directory.
+    DIR* dir = opendir(resolved[0] ? resolved : ".");
+    int found = 0;
+    if (dir) {
+      struct dirent* ent;
+      while ((ent = readdir(dir)) != nullptr) {
+        if (strcasecmp(ent->d_name, component) == 0) {
+          // Found case-insensitive match.
+          if (resolved[strlen(resolved)-1] != '/' && resolved[0] && resolved[strlen(resolved)-1] != ':')
+            strncat(resolved, "/", sizeof(resolved) - strlen(resolved) - 1);
+          else if (resolved[0] && resolved[strlen(resolved)-1] == ':')
+            strncat(resolved, "/", sizeof(resolved) - strlen(resolved) - 1);
+          strncat(resolved, ent->d_name, sizeof(resolved) - strlen(resolved) - 1);
+          found = 1;
+          break;
+        }
+      }
+      closedir(dir);
+    }
+    if (!found) {
+      // Component doesn't exist with any casing; keep original and stop.
+      // Append remaining path as-is.
+      if (resolved[strlen(resolved)-1] != '/' && resolved[0] && resolved[strlen(resolved)-1] != ':')
+        strncat(resolved, "/", sizeof(resolved) - strlen(resolved) - 1);
+      strncat(resolved, buf + i, sizeof(resolved) - strlen(resolved) - 1);
+      break;
+    }
+    i = j;
+    if (buf[j] == '/') ++i;
+  }
+  snprintf(path, cap, "%s", resolved);
+#endif
 }
 
 void trt_vfs_set_cwd(const char* guest_dir) {

@@ -29,6 +29,9 @@ struct host_settings {
   // ---- compatibility surfaces ----
   bool write_watch = true;             // GetWriteWatch honest impl (GC)
   bool steam_auth = true;              // allow Steam QR link (own account)
+  bool fsb_decode = false;             // let FMOD Studio decode FSB5 on console
+                                       // (off: heap corruption history, Series S)
+  bool crash_report = false;            // opt-in crash reporting (default off)
   bool show_qr = true;                 // QR overlay on the TV dashboard
   int log_lines = 14;                  // dashboard log tail lines, 4..40
 
@@ -83,6 +86,8 @@ int trt_settings_resolution_scale();   // render resolution %, 50..200
 int trt_settings_frame_rate_cap();     // 0=unlimited, 30, 60, 120
 int trt_settings_memory_budget_mb();   // guest heap cap MB
 bool trt_settings_vsync();
+bool trt_settings_fsb_decode();
+bool trt_settings_crash_report();
 bool trt_settings_shader_cache();
 int trt_settings_audio_buffer_ms();
 int trt_settings_input_deadzone();

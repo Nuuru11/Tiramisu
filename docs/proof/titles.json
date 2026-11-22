@@ -1,0 +1,54 @@
+{
+  "_comment": "Evidence-backed rows for docs/title-matrix.md. A row needs at least one artifact that exists; tools/title-matrix.py refuses to render otherwise. Machine columns are overwritten by docs/proof/<dir>/proof.json when a run produced one.",
+  "titles": [
+    {
+      "title": "RACCOIN",
+      "dir": "raccoin",
+      "build": "Unity 6 IL2CPP, D3D11, Steam",
+      "machine": "PE32+ x64",
+      "boots": "yes",
+      "renders": "yes",
+      "audio": "not measured",
+      "input": "on-console pad",
+      "playable": "**yes** — menu + a full run (Round 8/15)",
+      "evidence": [
+        "docs/proof/raccoin-main-menu.png",
+        "docs/proof/raccoin-gameplay.png",
+        "docs/proof/raccoin-gameplay.mp4"
+      ]
+    },
+    {
+      "title": "Celeste v1.4.0.0",
+      "dir": "celeste",
+      "build": "XNA/Mono (FNA3D), managed .NET",
+      "machine": "PE32+ x64 + embedded Mono",
+      "boots": "yes",
+      "renders": "yes",
+      "audio": "**silent** — FSB5 Vorbis decode is disabled on console after it heap-corrupted",
+      "input": "on-console pad",
+      "playable": "**yes** — title, menu, Chapter 1 gameplay",
+      "evidence": [
+        "docs/proof/celeste-title.jpg",
+        "docs/proof/celeste-menu.jpg",
+        "docs/proof/celeste-gameplay.mp4"
+      ]
+    },
+    {
+      "title": "God of War (PC)",
+      "dir": "god-of-war",
+      "build": "AAA in-house engine, D3D11",
+      "machine": "PE32+ x64",
+      "boots": "yes",
+      "renders": "**yes** — opening forest across four boots",
+      "audio": "not measured",
+      "input": "not reached",
+      "playable": "**no** — renders, does not yet reach gameplay",
+      "evidence": [
+        "docs/proof/gow-forest-01.webp",
+        "docs/proof/gow-forest-02.webp",
+        "docs/proof/gow-forest-03.webp",
+        "docs/proof/gow-forest-04.webp"
+      ]
+    }
+  ]
+}

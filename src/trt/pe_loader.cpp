@@ -516,6 +516,14 @@ extern "C" int trt_pe32_is_trap(u32 guest_va) {
   return guest_va >= TRT_PE32_TRAP_BASE && guest_va < TRT_PE32_TRAP_END;
 }
 
+// The 64-bit bridge address bound to trap N (nullptr for a delay import that
+// has not been upgraded yet). Phase 2 dispatches through this.
+extern "C" void* trt_pe32_trap_host_fn(int index) {
+  std::lock_guard<std::mutex> lk(g_pe32_mu);
+  if (index < 0 || (size_t)index >= g_pe32_traps.size()) return nullptr;
+  return g_pe32_traps[(size_t)index].host_fn;
+}
+
 // fail: record stage detail, release mapping, return error code
 int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
   if (detail && img) {

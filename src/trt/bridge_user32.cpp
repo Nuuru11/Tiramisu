@@ -285,7 +285,17 @@ int TRT_STDCALL trt_DestroyWindow(void* hwnd) {
   return 1;
 }
 
-int TRT_STDCALL trt_ShowWindow(void*, int) { return 1; }
+int TRT_STDCALL trt_ShowWindow(void* hwnd, int cmd) {
+  if (!hwnd) return 0;
+  const u64 hv = (u64)(uintptr_t)hwnd;
+  const i64 old_style = trt_GetWindowLongPtrW(hv, -16 /*GWL_STYLE*/);
+  const int was_visible = ((u32)old_style & 0x10000000u /*WS_VISIBLE*/) ? 1 : 0;
+  const u32 new_style = (cmd == 0 /*SW_HIDE*/)
+                            ? ((u32)old_style & ~0x10000000u)
+                            : ((u32)old_style | 0x10000000u);
+  trt_SetWindowLongPtrW(hv, -16 /*GWL_STYLE*/, (i64)(i32)new_style);
+  return was_visible;
+}
 int TRT_STDCALL trt_UpdateWindow(void*) { return 1; }
 
 i64 TRT_STDCALL trt_DefWindowProcW(void* hwnd, u32 msg, u64 wp, i64 lp) {
@@ -796,14 +806,25 @@ void* TRT_STDCALL trt_GetFocus(void) { return g_focus_window; }
 // SetWindowPos(hwnd, after, x, y, cx, cy, flags)
 int TRT_STDCALL trt_SetWindowPos(void* hwnd, void* after, i32 x, i32 y,
                                   i32 cx, i32 cy, u32 flags) {
-  (void)hwnd; (void)after; (void)x; (void)y; (void)cx; (void)cy; (void)flags;
+  (void)after; (void)x; (void)y; (void)cx; (void)cy;
+  if (hwnd && (flags & (0x0040u /*SWP_SHOWWINDOW*/ | 0x0080u /*SWP_HIDEWINDOW*/))) {
+    const u64 hv = (u64)(uintptr_t)hwnd;
+    u32 st = (u32)trt_GetWindowLongPtrW(hv, -16 /*GWL_STYLE*/);
+    if (flags & 0x0040u) st |= 0x10000000u /*WS_VISIBLE*/;
+    if (flags & 0x0080u) st &= ~0x10000000u /*WS_VISIBLE*/;
+    trt_SetWindowLongPtrW(hv, -16 /*GWL_STYLE*/, (i64)(i32)st);
+  }
   return 1;
 }
 
 // IsWindow / IsWindowVisible: the guest asks whether its window is alive
 int TRT_STDCALL trt_IsWindow(void* hwnd) { return hwnd ? 1 : 0; }
 
-int TRT_STDCALL trt_IsWindowVisible(void* hwnd) { return hwnd ? 1 : 0; }
+int TRT_STDCALL trt_IsWindowVisible(void* hwnd) {
+  if (!hwnd) return 0;
+  const i64 style = trt_GetWindowLongPtrW((u64)(uintptr_t)hwnd, -16 /*GWL_STYLE*/);
+  return ((u32)style & 0x10000000u /*WS_VISIBLE*/) ? 1 : 0;
+}
 
 // GetClientRect / GetWindowRect: the guest asks how big it is
 int TRT_STDCALL trt_GetClientRect(void* hwnd, void* rect) {

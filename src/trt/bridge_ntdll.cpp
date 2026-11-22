@@ -204,6 +204,15 @@ u32 TRT_GUEST_ABI nt_NtWriteFile(void* h, void* ev, void* apc, void* apc_ctx,
                                  const i64* byte_offset, void* key) {
   (void)ev; (void)apc; (void)apc_ctx; (void)key;
   io_status_block* iosb = (io_status_block*)iosb_ptr;
+  const intptr_t hv = (intptr_t)h;
+  if (hv == -10 || hv == -11 || hv == -12) {
+    if (buf && len) {
+      extern void console_log_bytes(const char* buf, u32 bytes);
+      console_log_bytes((const char*)buf, len);
+    }
+    if (iosb) { iosb->status = k_status_ok; iosb->info = len; }
+    return k_status_ok;
+  }
   FILE* os = trt_file_os(h);
   if (!os) {
     if (iosb) { iosb->status = k_status_invalid_handle; iosb->info = 0; }
@@ -488,6 +497,11 @@ u32 TRT_GUEST_ABI nt_NtReadFile(void* h, void* ev, void* apc, void* apc_ctx,
                                 const i64* byte_offset, void* key) {
   (void)ev; (void)apc; (void)apc_ctx; (void)key;
   io_status_block* iosb = (io_status_block*)iosb_ptr;
+  const intptr_t hv = (intptr_t)h;
+  if (hv == -10 || hv == -11 || hv == -12) {
+    if (iosb) { iosb->status = k_status_end_of_file; iosb->info = 0; }
+    return k_status_end_of_file;
+  }
   FILE* os = trt_file_os(h);
   if (!os) {
     if (iosb) { iosb->status = k_status_invalid_handle; iosb->info = 0; }

@@ -189,9 +189,14 @@ u32 TRT_STDCALL trt_GetEnvironmentVariableW(const u16* name, u16* buf,
     v = trt_gap_env_get(n);
   }
   if (!v) v = getenv(n);
-  if (!v) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" value=NULL", n); trt_core_log(st_line); return 0; }
+  static u32 s_gev_log = 0;
+  const bool do_log = (++s_gev_log <= 64);
+  if (!v) {
+    if (do_log) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" value=NULL", n); trt_core_log(st_line); }
+    return 0;
+  }
   const u32 need = (u32)strlen(v) + 1;
-  { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" buf=%p value=\"%.128s\"", n, (void*)buf, v); trt_core_log(st_line); }
+  if (do_log) { char st_line[256]; snprintf(st_line, sizeof(st_line), "strtrace: GetEnvironmentVariableW -> name=\"%.64s\" buf=%p value=\"%.128s\"", n, (void*)buf, v); trt_core_log(st_line); }
   if (buf && size >= need) {
     for (u32 i = 0; i < need; ++i) buf[i] = (u16)(u8)v[i];
     return need;
@@ -432,10 +437,16 @@ int TRT_STDCALL trt_CreateDirectoryW(const u16* path, void* sa) {
   if (trt_vfs_resolve_utf16_rw(path, 1, p, sizeof(p)) != 0) {
     utf16_to_utf8(path, p, sizeof(p));  // fail-visible: try the raw name
   }
+  int is_dir = 0;
+  if (trt_vfs_stat(p, &is_dir, nullptr) == 0 && is_dir) {
+    trt_SetLastError(183);  // ERROR_ALREADY_EXISTS
+    return 0;
+  }
   if (trt_vfs_mkdir_p(p) == 0) {
     trt_vfs_mark_z_deleted_utf16(path, 0, 1);
     return 1;
   }
+  trt_SetLastError(3);  // ERROR_PATH_NOT_FOUND
   return 0;
 }
 

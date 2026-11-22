@@ -1,6 +1,7 @@
 // tiramisu/src/trt/bridge_vulkan.cpp
 // Vulkan 1.0-1.3 + WSI ICD -> SPIR-V->HLSL -> D3D11 bridge.
 #include "bridge_vulkan.h"
+#include "input.h"
 #include "spirv_hlsl.h"
 #include "thunk.h"
 
@@ -50,7 +51,7 @@ struct cache_key_h {
   }
 };
 static std::mutex g_mu;
-static std::unordered_map<cache_key, std::string, cache_key_h> g_cache;
+static std::unordered_map<cache_key, spirv_compile_result, cache_key_h> g_cache;
 static bool g_enabled = true;   // default matches settings default
 static bool g_checked = false;
 
@@ -82,10 +83,10 @@ static u64 spec_fnv(const spirv_spec_entry* s, u32 n) {
 
 // Memoized compile: returns nullptr when the knob is off or on cache miss
 // (caller compiles + stores through spirv_cache_store).
-static const std::string* spirv_cache_lookup(const u32* words, u32 wc,
-                                             spirv_stage st, const char* name,
-                                             const spirv_spec_entry* specs,
-                                             u32 spec_n) {
+static const spirv_compile_result* spirv_cache_lookup(const u32* words, u32 wc,
+                                                      spirv_stage st, const char* name,
+                                                      const spirv_spec_entry* specs,
+                                                      u32 spec_n) {
   using namespace vkshader_cache;
   check_enabled();
   if (!g_enabled) return nullptr;
@@ -97,13 +98,13 @@ static const std::string* spirv_cache_lookup(const u32* words, u32 wc,
 }
 static void spirv_cache_store(const u32* words, u32 wc, spirv_stage st,
                               const char* name, const spirv_spec_entry* specs,
-                              u32 spec_n, const std::string& hlsl) {
+                              u32 spec_n, const spirv_compile_result& cr) {
   using namespace vkshader_cache;
   if (!g_enabled) return;
   cache_key k{fnv1a(words, wc), (u32)st,
               spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
   std::lock_guard<std::mutex> lk(g_mu);
-  g_cache.emplace(k, hlsl);
+  g_cache.emplace(k, cr);
 }
 #include <cstdlib>
 #include <cstring>
@@ -451,6 +452,8 @@ struct vk_dispatch_indirect_cmd { u32 x, y, z; };
 // ---- Internal ICD Objects --------------------------------------------------
 struct vk_mem_obj {
   u64 id = 0;
+  u64 size = 0;
+  u32 mem_type = 0;
   std::vector<u8> data;
   bool mapped = false;
 };
@@ -645,12 +648,19 @@ static bool write_buf_mem(vk_device_obj* d, u64 bid, u64 off, const void* src, s
   if (bit == d->bufs.end()) return false;
   const auto& b = bit->second;
   if (!b.mem_id || !d->mems.count(b.mem_id)) return false;
-  auto& m = d->mems[b.mem_id].data;
+  auto& m = d->mems[b.mem_id];
+  if (m.data.size() < m.size && m.size > 0) {
+    try {
+      m.data.resize((size_t)std::max<u64>(m.size, 16u));
+    } catch (...) {
+      return false;
+    }
+  }
   u64 pos = b.mem_off + off;
-  if (pos >= m.size() || off >= b.size) return false;
-  size_t avail = (size_t)std::min<u64>({(u64)bytes, b.size - off, m.size() - pos});
+  if (pos >= m.data.size() || off >= b.size) return false;
+  size_t avail = (size_t)std::min<u64>({(u64)bytes, b.size - off, (u64)(m.data.size() - pos)});
   if (!avail) return false;
-  memcpy(m.data() + pos, src, avail);
+  memcpy(m.data.data() + pos, src, avail);
   return true;
 }
 
@@ -747,6 +757,13 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
     cmd.bindings = tmp_binds.empty() ? nullptr : tmp_binds.data();
     cmd.binding_count = (u32)tmp_binds.size();
     if (g_vk_hooks_set && g_vk_hooks.draw) g_vk_hooks.draw(&cmd, g_vk_hooks.user);
+    static u64 s_draw_count = 0;
+    ++s_draw_count;
+    if (s_draw_count <= 5) {
+      vk_logf("vulkan: Draw #%llu pipe=%llu idx=%u vtx=%u inst=%u binds=%u",
+              (unsigned long long)s_draw_count, (unsigned long long)cmd.pipeline_id,
+              (u32)cmd.indexed, cmd.vtx_count, cmd.inst_count, cmd.binding_count);
+    }
   };
   auto emit_dispatch = [&](u32 gx, u32 gy, u32 gz) {
     auto pit = d->pipes.find(st.bound_cs_pipe);
@@ -766,11 +783,19 @@ static void exec_cmdbuf_state(vk_device_obj* d, const vk_cmdbuf_obj* cb,
   for (const auto& op : cb->ops) {
     switch (op.kind) {
       case vk_cmd_op::OP_BEGIN_RP:
-      case vk_cmd_op::OP_BEGIN_RENDERING:
+      case vk_cmd_op::OP_BEGIN_RENDERING: {
+        static u64 s_rp_count = 0;
+        ++s_rp_count;
+        if (s_rp_count <= 5) {
+          vk_logf("vulkan: BeginRP #%llu kind=%d color_cnt=%u color0=%llu depth=%llu clear_mask=0x%x area=%ux%u",
+                  (unsigned long long)s_rp_count, (int)op.kind, op.rp.color_count,
+                  (unsigned long long)op.rp.color_imgs[0], (unsigned long long)op.rp.depth_img,
+                  op.rp.clear_color_mask, op.rp.area_w, op.rp.area_h);
+        }
         if (g_vk_hooks_set && g_vk_hooks.begin_render_pass) {
           g_vk_hooks.begin_render_pass(&op.rp, g_vk_hooks.user);
         }
-        break;
+      } break;
       case vk_cmd_op::OP_END_RP:
       case vk_cmd_op::OP_END_RENDERING:
         if (g_vk_hooks_set && g_vk_hooks.end_render_pass) {
@@ -1541,7 +1566,9 @@ i32 TRT_GUEST_ABI trt_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(void*, u64, vk_s
   if (!p) return VK_ERROR_INITIALIZATION_FAILED_V;
   memset(p, 0, sizeof(*p));
   p->minImageCount = 2; p->maxImageCount = 4;
-  p->currentExtent = {1280, 720};
+  int dw = 0, dh = 0;
+  trt_display_size(&dw, &dh);
+  p->currentExtent = {(u32)(dw > 0 ? dw : 1280), (u32)(dh > 0 ? dh : 720)};
   p->minImageExtent = {64, 64}; p->maxImageExtent = {4096, 4096};
   p->maxImageArrayLayers = 1;
   p->supportedTransforms = 1; p->currentTransform = 1;
@@ -1649,6 +1676,9 @@ i32 TRT_GUEST_ABI trt_vkCreateSwapchainKHR(void* dev_v, const vk_swapchain_ci* c
   }
   d->swapchains[scid] = std::move(sc);
   *pSc = scid;
+  vk_logf("vulkan: vkCreateSwapchainKHR -> id=%llu %ux%u fmt=%u imgs=%u",
+          (unsigned long long)scid, ci->imageExtent.width, ci->imageExtent.height,
+          ci->imageFormat, cnt);
   return VK_SUCCESS_V;
 }
 void TRT_GUEST_ABI trt_vkDestroySwapchainKHR(void* dev_v, u64 sc, const void*) {
@@ -1677,6 +1707,14 @@ i32 TRT_GUEST_ABI trt_vkAcquireNextImageKHR(void* dev_v, u64 sc, u64, u64, u64, 
 }
 i32 TRT_GUEST_ABI trt_vkQueuePresentKHR(void*, const vk_present_info* pi) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
+  static u64 s_presents = 0;
+  ++s_presents;
+  if (s_presents <= 10 || s_presents % 60 == 0) {
+    vk_logf("vulkan: vkQueuePresentKHR frame=%llu sc=%llu idx=%u",
+            (unsigned long long)s_presents,
+            (unsigned long long)((pi && pi->swapchainCount && pi->pSwapchains) ? pi->pSwapchains[0] : 0),
+            (pi && pi->swapchainCount && pi->pImageIndices) ? pi->pImageIndices[0] : 0u);
+  }
   if (pi && pi->swapchainCount > 0 && pi->pSwapchains && g_vk_hooks_set && g_vk_hooks.present) {
     u32 idx = pi->pImageIndices ? pi->pImageIndices[0] : 0;
     g_vk_hooks.present(pi->pSwapchains[0], idx, g_vk_hooks.user);
@@ -1692,20 +1730,47 @@ i32 TRT_GUEST_ABI trt_vkAllocateMemory(void* dev_v, const vk_mem_alloc_info* ai,
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
   u64 id = d->next_h++;
-  d->mems[id].id = id;
-  d->mems[id].data.resize((size_t)std::max<u64>(ai->allocationSize, 16u));
+  auto& m = d->mems[id];
+  m.id = id;
+  m.size = ai->allocationSize;
+  m.mem_type = ai->memoryTypeIndex;
+  // If memory is host-visible (type 1) and <= 16MB, allocate vector.
+  // If device-local (type 0), do NOT preallocate a giant CPU buffer!
+  if (ai->memoryTypeIndex != 0 && ai->allocationSize <= (16ull * 1024ull * 1024ull)) {
+    try {
+      m.data.resize((size_t)std::max<u64>(ai->allocationSize, 16u));
+    } catch (...) {
+      m.data.clear();
+    }
+  }
+  char buf[128];
+  snprintf(buf, sizeof(buf), "[vulkan] vkAllocateMemory id=%llu size=%llu type=%u host_vec=%zu",
+           (unsigned long long)id, (unsigned long long)ai->allocationSize, ai->memoryTypeIndex, m.data.size());
+  trt_core_log(buf);
   *pMem = id;
   return VK_SUCCESS_V;
 }
 void TRT_GUEST_ABI trt_vkFreeMemory(void* dev_v, u64 mem, const void*) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
-  if (vk_device_obj* d = dev_from(dev_v)) d->mems.erase(mem);
+  if (vk_device_obj* d = dev_from(dev_v)) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "[vulkan] vkFreeMemory id=%llu", (unsigned long long)mem);
+    trt_core_log(buf);
+    d->mems.erase(mem);
+  }
 }
 i32 TRT_GUEST_ABI trt_vkMapMemory(void* dev_v, u64 mem, u64 offset, u64, u32, void** ppData) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
   vk_device_obj* d = dev_from(dev_v);
   if (!d || !d->mems.count(mem) || !ppData) return VK_ERROR_OUT_OF_DEVICE_MEMORY_V;
   auto& m = d->mems[mem];
+  if (m.data.size() < m.size && m.size > 0) {
+    try {
+      m.data.resize((size_t)std::max<u64>(m.size, 16u));
+    } catch (...) {
+      return VK_ERROR_OUT_OF_HOST_MEMORY_V;
+    }
+  }
   if (offset >= m.data.size()) return VK_ERROR_OUT_OF_DEVICE_MEMORY_V;
   m.mapped = true;
   *ppData = m.data.data() + offset;
@@ -2082,13 +2147,12 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
       collect_spec(st.pSpecializationInfo, specs);
       const auto& spv = d->shaders[st.module].spv;
       spirv_stage sst = (st.stage == 0x10u) ? SPV_STAGE_FRAGMENT : SPV_STAGE_VERTEX;
-      const std::string* cached = spirv_cache_lookup(
+      const spirv_compile_result* cached = spirv_cache_lookup(
           spv.data(), (u32)spv.size(), sst, st.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
       spirv_compile_result cr;
       if (cached) {
-        cr.ok = true;
-        cr.hlsl = *cached;
+        cr = *cached;
       } else {
         cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), sst, st.pName,
@@ -2096,7 +2160,7 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
         if (cr.ok)
           spirv_cache_store(spv.data(), (u32)spv.size(), sst, st.pName,
                             specs.empty() ? nullptr : specs.data(),
-                            (u32)specs.size(), cr.hlsl);
+                            (u32)specs.size(), cr);
       }
       if (!cr.ok) {
         // Fail-visible: never create a pipeline with a silently missing
@@ -2206,14 +2270,13 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
       std::vector<spirv_spec_entry> specs;
       collect_spec(cis[i].stage.pSpecializationInfo, specs);
       const auto& spv = d->shaders[cis[i].stage.module].spv;
-      const std::string* cached = spirv_cache_lookup(
+      const spirv_compile_result* cached = spirv_cache_lookup(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
           cis[i].stage.pName, specs.empty() ? nullptr : specs.data(),
           (u32)specs.size());
       spirv_compile_result cr;
       if (cached) {
-        cr.ok = true;
-        cr.hlsl = *cached;
+        cr = *cached;
       } else {
         cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE, cis[i].stage.pName,
@@ -2222,7 +2285,7 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
           spirv_cache_store(spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
                             cis[i].stage.pName,
                             specs.empty() ? nullptr : specs.data(),
-                            (u32)specs.size(), cr.hlsl);
+                            (u32)specs.size(), cr);
       }
       if (!cr.ok) {
         // Fail-visible: never create a compute pipeline with a silently
@@ -2684,9 +2747,18 @@ void TRT_GUEST_ABI trt_vkCmdCopyBufferToImage(void* cb_v, u64 src, u64 dst, u32,
 }
 void TRT_GUEST_ABI trt_vkCmdPipelineBarrier(void*, u32, u32, u32, u32, const void*, u32, const void*, u32, const void*) {}
 void TRT_GUEST_ABI trt_vkCmdPipelineBarrier2(void*, const void*) {}
-void TRT_GUEST_ABI trt_vkCmdClearColorImage(void*, u64, u32, const void*, u32, const void*) {}
-void TRT_GUEST_ABI trt_vkCmdBlitImage(void*, u64, u32, u64, u32, u32, const void*, u32) {}
-void TRT_GUEST_ABI trt_vkCmdCopyImage(void*, u64, u32, u64, u32, u32, const void*) {}
+void TRT_GUEST_ABI trt_vkCmdClearColorImage(void*, u64 img, u32, const void*, u32, const void*) {
+  static bool s_logged = false;
+  if (!s_logged) { s_logged = true; vk_logf("vulkan: vkCmdClearColorImage(img=%llu)", (unsigned long long)img); }
+}
+void TRT_GUEST_ABI trt_vkCmdBlitImage(void*, u64 src, u32, u64 dst, u32, u32, const void*, u32) {
+  static bool s_logged = false;
+  if (!s_logged) { s_logged = true; vk_logf("vulkan: vkCmdBlitImage(src=%llu -> dst=%llu)", (unsigned long long)src, (unsigned long long)dst); }
+}
+void TRT_GUEST_ABI trt_vkCmdCopyImage(void*, u64 src, u32, u64 dst, u32, u32, const void*) {
+  static bool s_logged = false;
+  if (!s_logged) { s_logged = true; vk_logf("vulkan: vkCmdCopyImage(src=%llu -> dst=%llu)", (unsigned long long)src, (unsigned long long)dst); }
+}
 void TRT_GUEST_ABI trt_vkCmdCopyImageToBuffer(void*, u64, u32, u64, u32, const void*) {}
 void TRT_GUEST_ABI trt_vkCmdSetBlendConstants(void*, const float*) {}
 void TRT_GUEST_ABI trt_vkCmdSetDepthBias(void*, float, float, float) {}

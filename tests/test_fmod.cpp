@@ -170,6 +170,38 @@ int main(void) {
   CHECK(g_cap.count >= 2, "feeder re-pushed the loop");
   fmod_Channel_Stop(ch2);
 
+  // --- real MP3: fixture decoded through the bridge, PCM on the mixer ---
+  {
+    const char* paths[] = {"tests/fixtures/audio/sine22050.mp3",
+                           "../tests/fixtures/audio/sine22050.mp3"};
+    FILE* mf = nullptr;
+    for (int i = 0; i < 2 && !mf; ++i) mf = fopen(paths[i], "rb");
+    if (!mf) {
+      printf("  FAIL mp3 fixture missing (tests/fixtures/audio/sine22050.mp3)\n");
+      ++failures;
+    } else {
+      static u8 mp3buf[64 * 1024];
+      const size_t got = fread(mp3buf, 1, sizeof(mp3buf), mf);
+      fclose(mf);
+      void* msnd = nullptr;
+      u32 mex[2] = {64, (u32)got};
+      CHECK(got > 0 &&
+                fmod_System_CreateSound(sys, mp3buf, 0x800u /*OPENMEMORY*/, mex,
+                                        &msnd) == 0 &&
+                msnd != nullptr,
+            "CreateSound(mp3 memory) -> handle");
+      const u32 pre_mp3 = g_cap.count;
+      void* mch = nullptr;
+      CHECK(fmod_System_PlaySound(sys, msnd, nullptr, 0, &mch) == 0 && mch,
+            "mp3 sound plays a real channel");
+      CHECK(g_cap.count > pre_mp3 && g_cap.bytes > 0 && g_cap.rate == 22050 &&
+                g_cap.channels == 1 && g_cap.bps == 2,
+            "mp3 decoded to PCM (22050 Hz mono s16, real audio)");
+      fmod_Channel_Stop(mch);
+      fmod_Sound_Release(msnd);
+    }
+  }
+
   // --- compressed: named-silent, handle still real ---
   static u8 ogg[8] = {'O', 'g', 'g', 'S', 0, 0, 0, 0};
   void* osnd = nullptr;

@@ -46,6 +46,13 @@ stb_vorbis_info stb_vorbis_get_info(stb_vorbis* f);
 int stb_vorbis_get_frame_short_interleaved(stb_vorbis* f, int num_c,
                                            short* buffer, int num_shorts);
 }
+
+// vendored dr_mp3 (public domain / MIT-0, src/trt/vendor_dr_mp3.c): MP3 is
+// the last common FMOD payload class that was a named-silent path.
+extern "C" {
+// dr_mp3.h sets DR_MP3_NO_STDIO itself; the implementation TU does the same.
+#include "vendor_dr_mp3.h"
+}
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -347,6 +354,49 @@ int ogg_decode(const u8* data, u32 size, fmod_sound* out) {
   return 0;
 }
 
+// MP3 full decode -> s16 interleaved PCM (owned; the caller frees).
+// Same ownership contract as ogg_decode: alloc_base == the decoded buffer.
+int mp3_decode(const u8* data, u32 size, fmod_sound* out) {
+  drmp3 mp3{};
+  if (!drmp3_init_memory(&mp3, data, (size_t)size, nullptr)) return -1;
+  const drmp3_uint64 frames = drmp3_get_pcm_frame_count(&mp3);
+  const u32 rate = mp3.sampleRate;
+  const u32 channels = mp3.channels;
+  if (!frames || frames > (drmp3_uint64)(1u << 26) || !rate || !channels ||
+      channels > 8) {
+    drmp3_uninit(&mp3);
+    return -1;
+  }
+  short* pcm = (short*)malloc((size_t)frames * channels * sizeof(short));
+  if (!pcm) {
+    drmp3_uninit(&mp3);
+    return -1;
+  }
+  const drmp3_uint64 got = drmp3_read_pcm_frames_s16(&mp3, frames, pcm);
+  drmp3_uninit(&mp3);
+  if (!got) {
+    free(pcm);
+    return -1;
+  }
+  out->alloc_base = (u8*)pcm;
+  out->pcm = (u8*)pcm;
+  out->pcm_bytes = (u32)(got * channels * 2u);
+  out->rate = rate;
+  out->channels = channels;
+  out->bps = 2;
+  out->is_float = 0;
+  out->length_ms = (u32)(got * 1000ull / rate);
+  return 0;
+}
+
+// MP3 containers: ID3 tag, or a bare MPEG frame sync.
+int is_mp3(const u8* d, u32 n) {
+  if (n < 4) return 0;
+  if (!memcmp(d, "ID3", 3)) return 1;
+  if (d[0] == 0xFF && (d[1] & 0xE0) == 0xE0) return 1;
+  return 0;
+}
+
 int is_compressed(const u8* d, u32 n) {
   if (n < 4) return 1;
   if (!memcmp(d, "OggS", 4)) return 1;               // ogg/vorbis
@@ -423,10 +473,23 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
     const u32* ex = (const u32*)exinfo;
     size = (ex && ex[0] >= 8) ? ex[1] : 0;
     data = (const u8*)name_or_data;
-    if (!data || !size) {
+    if (!data || !size || size > (64u << 20)) {
       obj_take(o);
       return FMOD_ERR_INVALID_PARAM_;
     }
+    // OPENMEMORY payloads are guest-owned (and may be freed the moment
+    // CreateSound returns), so the decode paths must never read them later.
+    // Take an owned copy: this is also what makes memory-backed sounds
+    // decodable at all — previously any OPENMEMORY sound fell into the
+    // "no alloc_base" branch and was silent.
+    u8* copy = (u8*)malloc(size);
+    if (!copy) {
+      obj_take(o);
+      return FMOD_ERR_INVALID_PARAM_;
+    }
+    memcpy(copy, data, size);
+    data = copy;
+    s->alloc_base = copy;
   } else {
     // guest file path (char*): resolve through the VFS like CreateFileW
     const char* path8 = (const char*)name_or_data;
@@ -499,15 +562,20 @@ int TRT_GUEST_ABI fmod_System_CreateSound(void* sys, const void* name_or_data,
       // OGG: decode for real (stb_vorbis). The file buffer (alloc_base, when
       // we own it) feeds the decoder, then the decoded PCM replaces it.
       u8* old_base = s->alloc_base;
-      const int decoded = ogg_decode(data, size, s);
+      const char* kind = "ogg";
+      int decoded = ogg_decode(data, size, s);
+      if (decoded != 0 && is_mp3(data, size)) {
+        decoded = mp3_decode(data, size, s);
+        kind = "mp3";
+      }
       if (old_base) free(old_base);  // data pointed inside it: free AFTER
       s->alloc_base = (decoded == 0) ? s->alloc_base : nullptr;
       if (decoded == 0) {
         s->loop = (mode & (FMOD_LOOP_NORMAL_ | FMOD_LOOP_BIDI_)) ? 1 : 0;
         char line[224];
         snprintf(line, sizeof(line),
-                 "fmod: CreateSound(%s) -> ogg decoded (%ums, %uhz %uch, real "
-                 "audio)", label, s->length_ms, s->rate, s->channels);
+                 "fmod: CreateSound(%s) -> %s decoded (%ums, %uhz %uch, real "
+                 "audio)", label, kind, s->length_ms, s->rate, s->channels);
         log_line(line);
       } else {
         s->pcm = nullptr;

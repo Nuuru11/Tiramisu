@@ -121,7 +121,10 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
   g_setup_finished = finished;
 }
 
-void ui_dismiss_first_run() { g_first_run = false; }
+void ui_dismiss_first_run() {
+  g_first_run = false;
+  if (g_screen == UI_SETUP) g_screen = UI_SHELF;
+}
 
 void ui_set_control_hint(std::wstring hint) { g_control_hint.swap(hint); }
 

@@ -3,6 +3,7 @@
 #include "spirv_hlsl.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -48,7 +49,10 @@ enum spv_op : u16 {
   OP_SPEC_CONSTANT_TRUE = 48,
   OP_SPEC_CONSTANT_FALSE = 49,
   OP_SPEC_CONSTANT = 50,
+  OP_SPEC_CONSTANT_COMPOSITE = 51,
+  OP_SPEC_CONSTANT_OP = 52,
   OP_FUNCTION = 54,
+  OP_FUNCTION_PARAMETER = 55,
   OP_FUNCTION_END = 56,
   OP_FUNCTION_CALL = 57,
   OP_VARIABLE = 59,
@@ -72,10 +76,16 @@ enum spv_op : u16 {
   OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD = 89,
   OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD = 90,
   OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD = 91,
+  OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD = 92,
   OP_IMAGE_FETCH = 95,
+  OP_IMAGE_GATHER = 96,
+  OP_IMAGE_DREF_GATHER = 97,
   OP_IMAGE_READ = 98,
   OP_IMAGE_WRITE = 99,
   OP_IMAGE = 100,
+  OP_IMAGE_QUERY_SIZE_LOD = 103,
+  OP_IMAGE_QUERY_SIZE = 104,
+  OP_IMAGE_QUERY_LEVELS = 106,
   OP_CONVERT_F_TO_U = 109,
   OP_CONVERT_F_TO_S = 110,
   OP_CONVERT_S_TO_F = 111,
@@ -83,6 +93,7 @@ enum spv_op : u16 {
   OP_U_CONVERT = 113,
   OP_S_CONVERT = 114,
   OP_F_CONVERT = 115,
+  OP_QUANTIZE_TO_F16 = 116,
   OP_BITCAST = 124,
   OP_S_NEGATE = 126,
   OP_F_NEGATE = 127,
@@ -97,13 +108,20 @@ enum spv_op : u16 {
   OP_F_DIV = 136,
   OP_U_MOD = 137,
   OP_S_REM = 138,
+  OP_S_MOD = 139,
+  OP_F_REM = 140,
   OP_F_MOD = 141,
   OP_VECTOR_TIMES_SCALAR = 142,
   OP_MATRIX_TIMES_SCALAR = 143,
   OP_VECTOR_TIMES_MATRIX = 144,
   OP_MATRIX_TIMES_VECTOR = 145,
   OP_MATRIX_TIMES_MATRIX = 146,
+  OP_OUTER_PRODUCT = 147,
   OP_DOT = 148,
+  OP_ANY = 154,
+  OP_ALL = 155,
+  OP_IS_NAN = 156,
+  OP_IS_INF = 157,
   OP_LOGICAL_EQUAL = 164,
   OP_LOGICAL_NOT_EQUAL = 165,
   OP_LOGICAL_OR = 166,
@@ -121,11 +139,17 @@ enum spv_op : u16 {
   OP_U_LESS_THAN_EQUAL = 178,
   OP_S_LESS_THAN_EQUAL = 179,
   OP_F_ORD_EQUAL = 180,
+  OP_F_UNORD_EQUAL = 181,
   OP_F_ORD_NOT_EQUAL = 182,
+  OP_F_UNORD_NOT_EQUAL = 183,
   OP_F_ORD_LESS_THAN = 184,
+  OP_F_UNORD_LESS_THAN = 185,
   OP_F_ORD_GREATER_THAN = 186,
+  OP_F_UNORD_GREATER_THAN = 187,
   OP_F_ORD_LESS_THAN_EQUAL = 188,
+  OP_F_UNORD_LESS_THAN_EQUAL = 189,
   OP_F_ORD_GREATER_THAN_EQUAL = 190,
+  OP_F_UNORD_GREATER_THAN_EQUAL = 191,
   OP_SHIFT_RIGHT_LOGICAL = 194,
   OP_SHIFT_RIGHT_ARITHMETIC = 195,
   OP_SHIFT_LEFT_LOGICAL = 196,
@@ -133,8 +157,20 @@ enum spv_op : u16 {
   OP_BITWISE_XOR = 198,
   OP_BITWISE_AND = 199,
   OP_NOT = 200,
+  OP_BIT_FIELD_INSERT = 201,
+  OP_BIT_FIELD_S_EXTRACT = 202,
+  OP_BIT_FIELD_U_EXTRACT = 203,
+  OP_BIT_REVERSE = 204,
+  OP_BIT_COUNT = 205,
   OP_DPDX = 207,
   OP_DPDY = 208,
+  OP_DPDX_FINE = 209,
+  OP_DPDY_FINE = 210,
+  OP_FWIDTH = 211,
+  OP_DPDX_COARSE = 212,
+  OP_DPDY_COARSE = 213,
+  OP_FWIDTH_FINE = 214,
+  OP_FWIDTH_COARSE = 215,
   OP_CONTROL_BARRIER = 224,
   OP_PHI = 245,
   OP_LOOP_MERGE = 246,
@@ -301,6 +337,7 @@ struct spv_ctx {
   std::map<u32, u32> expr_types;
   std::map<u32, spv_ptr_val> ptrs;
   std::map<u32, std::string> phi_vars;
+  std::set<u32> declared_temps;
 
   u32 temp_counter = 0;
   std::map<u32, spirv_spec_entry> spec_overrides;
@@ -396,20 +433,25 @@ struct spv_ctx {
         return b + std::to_string(t.count);
       }
       case spv_type::T_MAT: {
-        // Column-major SPIR-V matC x vecR -> column_major floatRxC
+        // Column-major SPIR-V matC x vecR -> row_major floatCxR
         const auto& col = types[t.comp_type];
         u32 rows = col.count ? col.count : 4;
-        return "column_major float" + std::to_string(t.count) + "x" + std::to_string(rows);
+        return "row_major float" + std::to_string(t.count) + "x" + std::to_string(rows);
       }
       case spv_type::T_IMAGE:
-        if (t.sampled == 2) return (t.dim == 2) ? "RWTexture3D<float4>" : "RWTexture2D<float4>";
+        if (t.sampled == 2) {
+          if (t.dim == 2) return "RWTexture3D<float4>";
+          if (t.arrayed || t.dim == 3) return "RWTexture2DArray<float4>";
+          return "RWTexture2D<float4>";
+        }
         if (t.dim == 3) return "TextureCube";
         if (t.dim == 2) return "Texture3D";
         if (t.arrayed) return "Texture2DArray";
         return "Texture2D";
       case spv_type::T_SAMPLER: return "SamplerState";
       case spv_type::T_STRUCT: return get_name(tid, "_Struct");
-      case spv_type::T_ARRAY: return hlsl_type(t.comp_type);
+      case spv_type::T_ARRAY:
+      case spv_type::T_RUNTIME_ARRAY: return hlsl_type(t.comp_type);
       default: return "float4";
     }
   }
@@ -418,7 +460,36 @@ struct spv_ctx {
     std::string s = hlsl_type(tid);
     const size_t p = s.find("column_major ");
     if (p == 0) s.erase(0, 13);
+    const size_t p2 = s.find("row_major ");
+    if (p2 == 0) s.erase(0, 10);
     return s;
+  }
+
+  std::string hlsl_array_suffix(u32 tid, u32* out_elem_tid = nullptr) {
+    std::string sfx;
+    u32 cur = tid;
+    while (types.count(cur) &&
+           (types[cur].kind == spv_type::T_ARRAY ||
+            types[cur].kind == spv_type::T_RUNTIME_ARRAY)) {
+      u32 acnt = std::max(1u, const_u32(types[cur].len_const_id, 1u));
+      sfx += "[" + std::to_string(acnt) + "]";
+      cur = types[cur].comp_type;
+    }
+    if (out_elem_tid) *out_elem_tid = cur;
+    return sfx;
+  }
+
+  std::string hlsl_var_decl(u32 tid, const std::string& name, bool zero_init = false) {
+    u32 elem_tid = tid;
+    std::string sfx = hlsl_array_suffix(tid, &elem_tid);
+    std::string base = hlsl_local_type(elem_tid);
+    std::string decl = base + " " + name + sfx;
+    if (zero_init && sfx.empty()) {
+      if (!types.count(elem_tid) || types[elem_tid].kind != spv_type::T_STRUCT) {
+        decl += " = (" + base + ")0";
+      }
+    }
+    return decl;
   }
 
   u32 scalar_comp_count(u32 tid) {
@@ -458,6 +529,8 @@ struct spv_ctx {
     if (ty.kind == spv_type::T_FLOAT && !cv.raw_words.empty()) {
       float f = 0.0f;
       memcpy(&f, &cv.raw_words[0], 4);
+      if (std::isinf(f)) return (f > 0.0f) ? "asfloat(0x7F800000u)" : "asfloat(0xFF800000u)";
+      if (std::isnan(f)) return "asfloat(0x7FC00000u)";
       char buf[64];
       snprintf(buf, sizeof(buf), "%.9g", f);
       std::string s(buf);
@@ -467,7 +540,7 @@ struct spv_ctx {
       }
       return s;
     }
-    if (ty.kind == spv_type::T_VEC && !cv.comp_ids.empty()) {
+    if ((ty.kind == spv_type::T_VEC || ty.kind == spv_type::T_MAT) && !cv.comp_ids.empty()) {
       std::string s = hlsl_local_type(cv.type_id) + "(";
       for (size_t i = 0; i < cv.comp_ids.size(); ++i) {
         if (i) s += ", ";
@@ -476,10 +549,50 @@ struct spv_ctx {
       s += ")";
       return s;
     }
-    if (ty.kind == spv_type::T_VEC || ty.kind == spv_type::T_MAT) {
-      return "(" + hlsl_local_type(cv.type_id) + ")0";
+    if (ty.kind == spv_type::T_STRUCT) {
+      std::string zname = "_zero_" + get_name(cv.type_id, "_Struct");
+      if (!declared_temps.count(cv.type_id ^ 0xA5A5A5A5u)) {
+        declared_temps.insert(cv.type_id ^ 0xA5A5A5A5u);
+        decls_hlsl += "static const " + hlsl_local_type(cv.type_id) + " " + zname + ";\n";
+      }
+      return zname;
     }
+    if (ty.kind == spv_type::T_ARRAY) {
+      std::string zname = "_zero_arr_" + std::to_string(cv.type_id);
+      if (!declared_temps.count(cv.type_id ^ 0x5A5A5A5Au)) {
+        declared_temps.insert(cv.type_id ^ 0x5A5A5A5Au);
+        decls_hlsl += "static const " + hlsl_var_decl(cv.type_id, zname, false) + ";\n";
+      }
+      return zname;
+    }
+    if (ty.kind == spv_type::T_VEC || ty.kind == spv_type::T_MAT) {
+      return "((" + hlsl_local_type(cv.type_id) + ")0)";
+    }
+    if (ty.kind == spv_type::T_FLOAT) return "0.0";
+    if (ty.kind == spv_type::T_INT && !ty.is_signed) return "0u";
+    if (ty.kind == spv_type::T_BOOL) return "false";
     return "0";
+  }
+
+  std::string format_array_init(u32 id) {
+    auto it = consts.find(id);
+    if (it == consts.end() || it->second.comp_ids.empty()) return "";
+    const auto& cv = it->second;
+    const auto& ty = types[cv.type_id];
+    if (ty.kind != spv_type::T_ARRAY) return format_const(id);
+    std::string s = "{ ";
+    for (size_t i = 0; i < cv.comp_ids.size(); ++i) {
+      if (i) s += ", ";
+      u32 cid = cv.comp_ids[i];
+      if (consts.count(cid) && types[consts[cid].type_id].kind == spv_type::T_ARRAY) {
+        std::string sub = format_array_init(cid);
+        s += sub.empty() ? "0" : sub;
+      } else {
+        s += format_const(cid);
+      }
+    }
+    s += " }";
+    return s;
   }
 
   std::string get_expr(u32 id) {
@@ -487,7 +600,26 @@ struct spv_ctx {
     if (it != exprs.end()) return it->second;
     if (consts.count(id)) return format_const(id);
     if (phi_vars.count(id)) return phi_vars[id];
-    return get_name(id);
+    if (vars.count(id)) return vars[id].hlsl_name;
+    if (ptrs.count(id)) return ptrs[id].hlsl_lvalue;
+    if (expr_types.count(id) && types.count(expr_types[id])) {
+      u32 et = expr_types[id];
+      const auto& ty = types[et];
+      if (ty.kind != spv_type::T_VOID && ty.kind != spv_type::T_ARRAY &&
+          ty.kind != spv_type::T_RUNTIME_ARRAY && ty.kind != spv_type::T_IMAGE &&
+          ty.kind != spv_type::T_SAMPLER && ty.kind != spv_type::T_SAMPLED_IMAGE) {
+        if (ty.kind == spv_type::T_STRUCT) {
+          std::string zname = "_zero_" + get_name(et, "_Struct");
+          if (!declared_temps.count(et ^ 0xA5A5A5A5u)) {
+            declared_temps.insert(et ^ 0xA5A5A5A5u);
+            decls_hlsl += "static const " + hlsl_local_type(et) + " " + zname + ";\n";
+          }
+          return zname;
+        }
+        return "((" + hlsl_local_type(et) + ")0)";
+      }
+    }
+    return "0";
   }
 };
 
@@ -537,14 +669,24 @@ static void emit_cbuffer_fields(spv_ctx& ctx, u32 struct_tid, std::string& body)
     const u32 c_sub = (off % 16u) / 4u;
     static const char* k_comp[4] = {"", ".y", ".z", ".w"};
     const auto& mt = ctx.types[mtid];
-    std::string arr_sfx;
-    std::string mty = ctx.hlsl_type(mtid);
-    if (mt.kind == spv_type::T_ARRAY) {
+    u32 elem_tid = mtid;
+    std::string arr_sfx = ctx.hlsl_array_suffix(mtid, &elem_tid);
+    std::string mty = ctx.hlsl_type(elem_tid);
+    if (mt.kind == spv_type::T_ARRAY && c_sub != 0) {
       u32 acnt = std::max(1u, ctx.const_u32(mt.len_const_id, 1u));
-      arr_sfx = "[" + std::to_string(acnt) + "]";
+      for (u32 ai = 0; ai < acnt; ++ai) {
+        u32 elem_sub = (c_sub + ai) % 4u;
+        u32 elem_reg = c_reg + (c_sub + ai) / 4u;
+        char epo[64];
+        snprintf(epo, sizeof(epo), " : packoffset(c%u%s);", elem_reg, k_comp[elem_sub]);
+        body += "  " + mty + " " + mname + "_" + std::to_string(struct_tid) + "_" +
+                std::to_string(i) + "_" + std::to_string(ai) + epo + "\n";
+      }
+      continue;
     }
+    const char* comp_sfx = k_comp[c_sub & 3u];
     char po[64];
-    snprintf(po, sizeof(po), " : packoffset(c%u%s);", c_reg, k_comp[c_sub & 3u]);
+    snprintf(po, sizeof(po), " : packoffset(c%u%s);", c_reg, comp_sfx);
     body += "  " + mty + " " + mname + "_" + std::to_string(struct_tid) + "_" +
             std::to_string(i) + arr_sfx + po + "\n";
   }
@@ -571,6 +713,47 @@ static std::string ssbo_store_stmt(spv_ctx& ctx, const spv_ptr_val& pv, u32 val_
   std::string vexpr = ctx.get_expr(val_id);
   u32 vtid = ctx.expr_types.count(val_id) ? ctx.expr_types[val_id]
              : (ctx.consts.count(val_id) ? ctx.consts[val_id].type_id : pv.pointee_type);
+  if (!ctx.types.count(vtid)) {
+    return pv.ssbo_buf_name + ".Store(" + pv.ssbo_byte_offset_expr + ", asuint(" + vexpr + "));\n";
+  }
+  const auto& ty = ctx.types[vtid];
+  if (ty.kind == spv_type::T_STRUCT) {
+    std::string out;
+    const auto& dec = ctx.decs[vtid];
+    for (u32 i = 0; i < (u32)ty.members.size(); ++i) {
+      u32 mtid = ty.members[i];
+      u32 moff = dec.members.count(i) && dec.members.at(i).has_offset ? dec.members.at(i).offset : (i * 16u);
+      std::string off = "(" + pv.ssbo_byte_offset_expr + " + " + std::to_string(moff) + "u)";
+      std::string mfield = vexpr + "." + cbuffer_member_expr(ctx, vtid, i);
+      u32 mn = ctx.scalar_comp_count(mtid);
+      std::string mst = (mn == 4) ? "Store4" : (mn == 3 ? "Store3" : (mn == 2 ? "Store2" : "Store"));
+      out += pv.ssbo_buf_name + "." + mst + "(" + off + ", asuint(" + mfield + "));\n";
+    }
+    return out;
+  }
+  if (ty.kind == spv_type::T_MAT) {
+    std::string out;
+    u32 cols = ty.count;
+    u32 rows = ctx.types.count(ty.comp_type) ? ctx.types[ty.comp_type].count : 4u;
+    std::string mst = (rows == 4) ? "Store4" : (rows == 3 ? "Store3" : (rows == 2 ? "Store2" : "Store"));
+    for (u32 c = 0; c < cols; ++c) {
+      std::string off = "(" + pv.ssbo_byte_offset_expr + " + " + std::to_string(c * 16u) + "u)";
+      out += pv.ssbo_buf_name + "." + mst + "(" + off + ", asuint(" + vexpr + "[" + std::to_string(c) + "]));\n";
+    }
+    return out;
+  }
+  if (ty.kind == spv_type::T_ARRAY) {
+    std::string out;
+    u32 len = std::max(1u, ctx.const_u32(ty.len_const_id, 1u));
+    u32 stride = ctx.decs[vtid].array_stride ? ctx.decs[vtid].array_stride : ctx.byte_size_of(ty.comp_type);
+    u32 en = ctx.scalar_comp_count(ty.comp_type);
+    std::string est = (en == 4) ? "Store4" : (en == 3 ? "Store3" : (en == 2 ? "Store2" : "Store"));
+    for (u32 i = 0; i < len; ++i) {
+      std::string off = "(" + pv.ssbo_byte_offset_expr + " + " + std::to_string(i * stride) + "u)";
+      out += pv.ssbo_buf_name + "." + est + "(" + off + ", asuint(" + vexpr + "[" + std::to_string(i) + "]));\n";
+    }
+    return out;
+  }
   const u32 n = ctx.scalar_comp_count(vtid);
   std::string st_fn = (n == 4) ? "Store4" : (n == 3 ? "Store3" : (n == 2 ? "Store2" : "Store"));
   return pv.ssbo_buf_name + "." + st_fn + "(" + pv.ssbo_byte_offset_expr +
@@ -582,18 +765,27 @@ static std::string emit_glsl_ext(spv_ctx& ctx, u32 ext_op, const std::vector<u32
     return (i < args.size()) ? ctx.get_expr(args[i]) : "0.0";
   };
   switch (ext_op) {
+    case 1:  return "round(" + a(0) + ")";     // Round
+    case 2:  return "round(" + a(0) + ")";     // RoundEven
+    case 3:  return "trunc(" + a(0) + ")";     // Trunc
     case 4:  return "abs(" + a(0) + ")";       // FAbs
     case 5:  return "abs(" + a(0) + ")";       // SAbs
     case 6:  return "sign(" + a(0) + ")";      // FSign
+    case 7:  return "sign(" + a(0) + ")";      // SSign
     case 8:  return "floor(" + a(0) + ")";     // Floor
     case 9:  return "ceil(" + a(0) + ")";      // Ceil
     case 10: return "frac(" + a(0) + ")";      // Fract
+    case 11: return "radians(" + a(0) + ")";   // Radians
+    case 12: return "degrees(" + a(0) + ")";   // Degrees
     case 13: return "sin(" + a(0) + ")";       // Sin
     case 14: return "cos(" + a(0) + ")";       // Cos
     case 15: return "tan(" + a(0) + ")";       // Tan
     case 16: return "asin(" + a(0) + ")";      // Asin
     case 17: return "acos(" + a(0) + ")";      // Acos
     case 18: return "atan(" + a(0) + ")";      // Atan
+    case 19: return "sinh(" + a(0) + ")";      // Sinh
+    case 20: return "cosh(" + a(0) + ")";      // Cosh
+    case 21: return "tanh(" + a(0) + ")";      // Tanh
     case 25: return "atan2(" + a(0) + ", " + a(1) + ")"; // Atan2
     case 26: return "pow(" + a(0) + ", " + a(1) + ")";   // Pow
     case 27: return "exp(" + a(0) + ")";       // Exp
@@ -616,12 +808,21 @@ static std::string emit_glsl_ext(spv_ctx& ctx, u32 ext_op, const std::vector<u32
     case 48: return "step(" + a(0) + ", " + a(1) + ")";                // Step
     case 49: return "smoothstep(" + a(0) + ", " + a(1) + ", " + a(2) + ")"; // SmoothStep
     case 50: return "mad(" + a(0) + ", " + a(1) + ", " + a(2) + ")";   // Fma
+    case 58: return "((f32tof16((" + a(0) + ").x) & 0xFFFFu) | ((f32tof16((" + a(0) + ").y) & 0xFFFFu) << 16u))"; // PackHalf2x16
+    case 62: return "float2(f16tof32((uint)(" + a(0) + ") & 0xFFFFu), f16tof32(((uint)(" + a(0) + ") >> 16u) & 0xFFFFu))"; // UnpackHalf2x16
     case 66: return "length(" + a(0) + ")";    // Length
     case 67: return "distance(" + a(0) + ", " + a(1) + ")"; // Distance
     case 68: return "cross(" + a(0) + ", " + a(1) + ")";    // Cross
     case 69: return "normalize(" + a(0) + ")"; // Normalize
+    case 70: return "faceforward(" + a(0) + ", " + a(1) + ", " + a(2) + ")"; // FaceForward
     case 71: return "reflect(" + a(0) + ", " + a(1) + ")";  // Reflect
     case 72: return "refract(" + a(0) + ", " + a(1) + ", " + a(2) + ")"; // Refract
+    case 73: return "firstbitlow(" + a(0) + ")";  // FindILsb
+    case 74: return "firstbithigh(" + a(0) + ")"; // FindSMsb
+    case 75: return "firstbithigh(" + a(0) + ")"; // FindUMsb
+    case 79: return "min(" + a(0) + ", " + a(1) + ")";   // NMin
+    case 80: return "max(" + a(0) + ", " + a(1) + ")";   // NMax
+    case 81: return "clamp(" + a(0) + ", " + a(1) + ", " + a(2) + ")"; // NClamp
     default: return a(0);
   }
 }
@@ -636,7 +837,8 @@ struct spv_block {
 static std::string emit_block_chain(spv_ctx& ctx, const std::map<u32, spv_block>& blocks,
                                     u32 start_lbl, u32 stop_lbl,
                                     const std::map<std::pair<u32, u32>, std::vector<std::pair<u32, u32>>>& phi_edges,
-                                    std::set<u32>& visited, std::string indent);
+                                    std::set<u32>& visited, std::string indent,
+                                    u32 loop_hdr = 0, u32 loop_merge = 0);
 
 static void emit_phi_copies(spv_ctx& ctx, u32 from_lbl, u32 to_lbl,
                             const std::map<std::pair<u32, u32>, std::vector<std::pair<u32, u32>>>& phi_edges,
@@ -653,8 +855,19 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
   std::string out;
   auto emit_assign = [&](u32 res_id, u32 res_tid, const std::string& rhs) {
     ctx.expr_types[res_id] = res_tid;
+    const bool is_arr = ctx.types.count(res_tid) &&
+                        (ctx.types[res_tid].kind == spv_type::T_ARRAY ||
+                         ctx.types[res_tid].kind == spv_type::T_RUNTIME_ARRAY);
+    if (is_arr) {
+      ctx.exprs[res_id] = rhs;
+      return;
+    }
     std::string nm = "_t" + std::to_string(res_id);
-    out += indent + ctx.hlsl_local_type(res_tid) + " " + nm + " = " + rhs + ";\n";
+    if (!ctx.declared_temps.count(res_id)) {
+      ctx.declared_temps.insert(res_id);
+      ctx.main_body_hlsl += "  " + ctx.hlsl_var_decl(res_tid, nm, true) + ";\n";
+    }
+    out += indent + nm + " = " + rhs + ";\n";
     ctx.exprs[res_id] = nm;
   };
   for (const spv_insn* ins : blk.body) {
@@ -664,12 +877,25 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         u32 pt = w[0], id = w[1];
         u32 pte = ctx.unwrap_struct_or_pointee(pt);
         std::string nm = ctx.get_name(id, "_loc");
-        out += indent + ctx.hlsl_local_type(pte) + " " + nm;
-        if (w.size() >= 4) out += " = " + ctx.get_expr(w[3]);
-        else out += " = (" + ctx.hlsl_local_type(pte) + ")0";
-        out += ";\n";
+        const bool is_arr = ctx.types.count(pte) &&
+                            (ctx.types[pte].kind == spv_type::T_ARRAY ||
+                             ctx.types[pte].kind == spv_type::T_RUNTIME_ARRAY);
+        if (!ctx.declared_temps.count(id)) {
+          ctx.declared_temps.insert(id);
+          if (is_arr) {
+            std::string ainit = (w.size() >= 4) ? ctx.format_array_init(w[3]) : "";
+            ctx.decls_hlsl += "static " + ctx.hlsl_var_decl(pte, nm, false) +
+                              (ainit.empty() ? "" : (" = " + ainit)) + ";\n";
+          } else {
+            ctx.main_body_hlsl += "  " + ctx.hlsl_var_decl(pte, nm, true) + ";\n";
+          }
+        }
+        if (!is_arr && w.size() >= 4) {
+          out += indent + nm + " = " + ctx.get_expr(w[3]) + ";\n";
+        }
         ctx.ptrs[id] = {true, id, false, "", "", nm, pte};
         ctx.exprs[id] = nm;
+        ctx.expr_types[id] = pte;
       } break;
       case OP_ACCESS_CHAIN:
       case OP_IN_BOUNDS_ACCESS_CHAIN: {
@@ -686,6 +912,9 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
           pv.pointee_type = gv.pointee_id;
         }
         u32 cur_tid = pv.pointee_type;
+        const bool is_unif_const =
+            ctx.vars.count(pv.base_var) &&
+            ctx.vars[pv.base_var].storage_class == SC_UNIFORM_CONSTANT;
         for (size_t i = 3; i < w.size(); ++i) {
           u32 idx_id = w[i];
           const auto& ct = ctx.types[cur_tid];
@@ -709,17 +938,28 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
               cur_tid = ct.comp_type;
             }
             pv.ssbo_byte_offset_expr = "(" + pv.ssbo_byte_offset_expr + " + " + add + ")";
+          } else if (is_unif_const) {
+            // Descriptor arrays of textures/samplers/storage-images collapse
+            // to the bound HLSL resource name in SM5.0 (do not emit tex[i],
+            // which HLSL parses as Texture2D::operator[](uint2) texel load).
+            if (ct.kind == spv_type::T_ARRAY || ct.kind == spv_type::T_RUNTIME_ARRAY) {
+              cur_tid = ct.comp_type;
+            }
           } else {
             if (ct.kind == spv_type::T_STRUCT) {
               u32 mi = ctx.const_u32(idx_id, 0);
-              const auto& base_var = ctx.vars[pv.base_var];
-              if ((base_var.is_ubo || base_var.is_push) && i == 3) {
+              const bool is_root_cb =
+                  ctx.vars.count(pv.base_var) &&
+                  (ctx.vars[pv.base_var].is_ubo || ctx.vars[pv.base_var].is_push) &&
+                  base == pv.base_var && i == 3;
+              if (is_root_cb) {
                 pv.hlsl_lvalue = cbuffer_member_expr(ctx, cur_tid, mi);
               } else {
                 pv.hlsl_lvalue += "." + cbuffer_member_expr(ctx, cur_tid, mi);
               }
               cur_tid = (mi < ct.members.size()) ? ct.members[mi] : cur_tid;
-            } else if (ct.kind == spv_type::T_ARRAY || ct.kind == spv_type::T_VEC || ct.kind == spv_type::T_MAT) {
+            } else if (ct.kind == spv_type::T_ARRAY || ct.kind == spv_type::T_RUNTIME_ARRAY ||
+                       ct.kind == spv_type::T_VEC || ct.kind == spv_type::T_MAT) {
               pv.hlsl_lvalue += "[" + ctx.get_expr(idx_id) + "]";
               cur_tid = ct.comp_type;
             }
@@ -728,16 +968,38 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         pv.pointee_type = pte;
         ctx.ptrs[id] = pv;
         ctx.exprs[id] = pv.hlsl_lvalue;
+        ctx.expr_types[id] = pte;
       } break;
       case OP_LOAD: {
         u32 rt = w[0], id = w[1], ptr = w[2];
         if (ctx.ptrs.count(ptr) && ctx.ptrs[ptr].is_ssbo) {
           emit_assign(id, rt, ssbo_load_expr(ctx, ctx.ptrs[ptr], rt));
         } else if (ctx.ptrs.count(ptr)) {
-          ctx.exprs[id] = ctx.ptrs[ptr].hlsl_lvalue;
-          ctx.expr_types[id] = rt;
+          const auto& pv = ctx.ptrs[ptr];
+          const bool is_res = ctx.types.count(rt) &&
+                              (ctx.types[rt].kind == spv_type::T_IMAGE ||
+                               ctx.types[rt].kind == spv_type::T_SAMPLER ||
+                               ctx.types[rt].kind == spv_type::T_SAMPLED_IMAGE ||
+                               ctx.types[rt].kind == spv_type::T_ARRAY);
+          if (is_res) {
+            ctx.exprs[id] = pv.hlsl_lvalue;
+            ctx.expr_types[id] = rt;
+          } else {
+            emit_assign(id, rt, pv.hlsl_lvalue);
+          }
         } else if (ctx.vars.count(ptr)) {
-          ctx.exprs[id] = ctx.vars[ptr].hlsl_name;
+          const bool is_res = ctx.types.count(rt) &&
+                              (ctx.types[rt].kind == spv_type::T_IMAGE ||
+                               ctx.types[rt].kind == spv_type::T_SAMPLER ||
+                               ctx.types[rt].kind == spv_type::T_SAMPLED_IMAGE ||
+                               ctx.types[rt].kind == spv_type::T_ARRAY);
+          if (is_res) {
+            ctx.exprs[id] = ctx.vars[ptr].hlsl_name;
+            ctx.expr_types[id] = rt;
+          } else {
+            emit_assign(id, rt, ctx.vars[ptr].hlsl_name);
+          }
+        } else {
           ctx.expr_types[id] = rt;
         }
       } break;
@@ -755,45 +1017,158 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         ctx.exprs[w[1]] = ctx.get_expr(w[2]);
         ctx.expr_types[w[1]] = w[0];
         break;
+      case OP_VECTOR_EXTRACT_DYNAMIC: {
+        u32 rt = w[0], id = w[1], vec = w[2], idx = w[3];
+        emit_assign(id, rt, ctx.get_expr(vec) + "[" + ctx.get_expr(idx) + "]");
+      } break;
+      case OP_VECTOR_INSERT_DYNAMIC: {
+        u32 rt = w[0], id = w[1], vec = w[2], comp = w[3], idx = w[4];
+        emit_assign(id, rt, ctx.get_expr(vec));
+        out += indent + ctx.exprs[id] + "[" + ctx.get_expr(idx) + "] = " + ctx.get_expr(comp) + ";\n";
+      } break;
       case OP_COMPOSITE_CONSTRUCT: {
         u32 rt = w[0], id = w[1];
-        std::string rhs = ctx.hlsl_local_type(rt) + "(";
-        for (size_t i = 2; i < w.size(); ++i) {
-          if (i > 2) rhs += ", ";
-          rhs += ctx.get_expr(w[i]);
+        if (ctx.types.count(rt) && ctx.types[rt].kind == spv_type::T_STRUCT) {
+          std::string nm = "_t" + std::to_string(id);
+          if (!ctx.declared_temps.count(id)) {
+            ctx.declared_temps.insert(id);
+            ctx.main_body_hlsl += "  " + ctx.hlsl_var_decl(rt, nm, false) + ";\n";
+          }
+          ctx.exprs[id] = nm;
+          ctx.expr_types[id] = rt;
+          for (size_t i = 2; i < w.size() && (i - 2) < ctx.types[rt].members.size(); ++i) {
+            u32 mi = (u32)(i - 2);
+            out += indent + nm + "." + cbuffer_member_expr(ctx, rt, mi) +
+                   " = " + ctx.get_expr(w[i]) + ";\n";
+          }
+        } else if (ctx.types.count(rt) && ctx.types[rt].kind == spv_type::T_ARRAY) {
+          std::string nm = "_t" + std::to_string(id);
+          if (!ctx.declared_temps.count(id)) {
+            ctx.declared_temps.insert(id);
+            ctx.decls_hlsl += "static " + ctx.hlsl_var_decl(rt, nm, false) + ";\n";
+          }
+          for (size_t i = 2; i < w.size(); ++i) {
+            out += indent + nm + "[" + std::to_string(i - 2) + "] = " + ctx.get_expr(w[i]) + ";\n";
+          }
+          ctx.exprs[id] = nm;
+          ctx.expr_types[id] = rt;
+        } else {
+          std::string rhs = ctx.hlsl_local_type(rt) + "(";
+          for (size_t i = 2; i < w.size(); ++i) {
+            if (i > 2) rhs += ", ";
+            rhs += ctx.get_expr(w[i]);
+          }
+          rhs += ")";
+          emit_assign(id, rt, rhs);
         }
-        rhs += ")";
-        emit_assign(id, rt, rhs);
       } break;
       case OP_COMPOSITE_EXTRACT: {
         u32 rt = w[0], id = w[1], comp = w[2];
         std::string e = ctx.get_expr(comp);
+        u32 cur_tid = ctx.expr_types.count(comp)
+                          ? ctx.expr_types[comp]
+                          : (ctx.consts.count(comp) ? ctx.consts[comp].type_id : 0);
         static const char* k_sw = "xyzw";
         for (size_t i = 3; i < w.size(); ++i) {
           u32 idx = w[i];
-          if (idx < 4 && (i == w.size() - 1)) e += std::string(".") + k_sw[idx];
-          else e += "[" + std::to_string(idx) + "]";
+          if (ctx.types.count(cur_tid)) {
+            const auto& ct = ctx.types[cur_tid];
+            if (ct.kind == spv_type::T_STRUCT) {
+              e += "." + cbuffer_member_expr(ctx, cur_tid, idx);
+              cur_tid = (idx < ct.members.size()) ? ct.members[idx] : 0;
+              continue;
+            } else if (ct.kind == spv_type::T_VEC) {
+              if (e == "0") {
+                cur_tid = ct.comp_type;
+                continue;
+              }
+              e += std::string(".") + k_sw[idx & 3u];
+              cur_tid = ct.comp_type;
+              continue;
+            } else if (ct.kind == spv_type::T_ARRAY || ct.kind == spv_type::T_MAT) {
+              e += "[" + std::to_string(idx) + "]";
+              cur_tid = ct.comp_type;
+              continue;
+            } else if (ct.kind == spv_type::T_FLOAT || ct.kind == spv_type::T_INT ||
+                       ct.kind == spv_type::T_BOOL) {
+              continue;
+            }
+          }
+          if (e != "0" && ctx.scalar_comp_count(cur_tid) > 1 && idx < 4 && (i == w.size() - 1)) {
+            e += std::string(".") + k_sw[idx & 3u];
+          } else if (e != "0" && ctx.scalar_comp_count(cur_tid) > 1) {
+            e += "[" + std::to_string(idx) + "]";
+          }
         }
-        ctx.exprs[id] = e;
-        ctx.expr_types[id] = rt;
+        emit_assign(id, rt, e);
+      } break;
+      case OP_COMPOSITE_INSERT: {
+        u32 rt = w[0], id = w[1], val = w[2], comp = w[3];
+        emit_assign(id, rt, ctx.get_expr(comp));
+        std::string lhs = ctx.exprs[id];
+        u32 cur_tid = rt;
+        static const char* k_sw = "xyzw";
+        for (size_t i = 4; i < w.size(); ++i) {
+          u32 idx = w[i];
+          if (ctx.types.count(cur_tid)) {
+            const auto& ct = ctx.types[cur_tid];
+            if (ct.kind == spv_type::T_STRUCT) {
+              lhs += "." + cbuffer_member_expr(ctx, cur_tid, idx);
+              cur_tid = (idx < ct.members.size()) ? ct.members[idx] : 0;
+              continue;
+            } else if (ct.kind == spv_type::T_VEC) {
+              lhs += std::string(".") + k_sw[idx & 3u];
+              cur_tid = ct.comp_type;
+              continue;
+            } else if (ct.kind == spv_type::T_ARRAY || ct.kind == spv_type::T_MAT) {
+              lhs += "[" + std::to_string(idx) + "]";
+              cur_tid = ct.comp_type;
+              continue;
+            } else if (ct.kind == spv_type::T_FLOAT || ct.kind == spv_type::T_INT ||
+                       ct.kind == spv_type::T_BOOL) {
+              continue;
+            }
+          }
+          if (lhs != "0" && ctx.scalar_comp_count(cur_tid) > 1 && idx < 4 && (i == w.size() - 1)) {
+            lhs += std::string(".") + k_sw[idx & 3u];
+          } else if (lhs != "0" && ctx.scalar_comp_count(cur_tid) > 1) {
+            lhs += "[" + std::to_string(idx) + "]";
+          }
+        }
+        out += indent + lhs + " = " + ctx.get_expr(val) + ";\n";
       } break;
       case OP_VECTOR_SHUFFLE: {
         u32 rt = w[0], id = w[1], v1 = w[2], v2 = w[3];
         u32 c1 = ctx.scalar_comp_count(ctx.expr_types.count(v1) ? ctx.expr_types[v1] : rt);
+        u32 c2 = ctx.scalar_comp_count(ctx.expr_types.count(v2) ? ctx.expr_types[v2] : rt);
         std::string rhs = ctx.hlsl_local_type(rt) + "(";
         static const char* k_sw = "xyzw";
         for (size_t i = 4; i < w.size(); ++i) {
           if (i > 4) rhs += ", ";
           u32 c = w[i];
-          if (c < c1) rhs += ctx.get_expr(v1) + "." + k_sw[c & 3u];
-          else rhs += ctx.get_expr(v2) + "." + k_sw[(c - c1) & 3u];
+          if (c == 0xFFFFFFFFu) {
+            rhs += "0";
+          } else if (c < c1) {
+            std::string e1 = ctx.get_expr(v1);
+            if (c1 <= 1 || e1 == "0") rhs += e1;
+            else rhs += e1 + "." + k_sw[c & 3u];
+          } else {
+            std::string e2 = ctx.get_expr(v2);
+            if (c2 <= 1 || e2 == "0") rhs += e2;
+            else rhs += e2 + "." + k_sw[(c - c1) & 3u];
+          }
         }
         rhs += ")";
         emit_assign(id, rt, rhs);
       } break;
       case OP_SAMPLED_IMAGE:
         ctx.exprs[w[1]] = ctx.get_expr(w[2]); // carries tex name; smp stored by convention _smp
+        ctx.expr_types[w[1]] = w[0];
         ctx.ptrs[w[1]].ssbo_buf_name = ctx.get_expr(w[3]); // sampler name
+        break;
+      case OP_IMAGE:
+        ctx.exprs[w[1]] = ctx.get_expr(w[2]);
+        ctx.expr_types[w[1]] = w[0];
         break;
       case OP_IMAGE_SAMPLE_IMPLICIT_LOD:
       case OP_IMAGE_SAMPLE_EXPLICIT_LOD: {
@@ -801,23 +1176,89 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         std::string tex = ctx.get_expr(si);
         std::string smp = (ctx.ptrs.count(si) && !ctx.ptrs[si].ssbo_buf_name.empty())
                               ? ctx.ptrs[si].ssbo_buf_name : (tex + "_smp");
-        std::string rhs = (ins->op == OP_IMAGE_SAMPLE_EXPLICIT_LOD && w.size() >= 6)
-                              ? (tex + ".SampleLevel(" + smp + ", " + ctx.get_expr(coord) + ", " + ctx.get_expr(w[5]) + ")")
-                              : (tex + ".Sample(" + smp + ", " + ctx.get_expr(coord) + ")");
+        std::string rhs;
+        if (ins->op == OP_IMAGE_SAMPLE_EXPLICIT_LOD && w.size() >= 6) {
+          if (w[4] & 0x2u /*Lod*/) {
+            rhs = tex + ".SampleLevel(" + smp + ", " + ctx.get_expr(coord) + ", " + ctx.get_expr(w[5]) + ")";
+          } else if ((w[4] & 0x4u /*Grad*/) && w.size() >= 7) {
+            rhs = tex + ".SampleGrad(" + smp + ", " + ctx.get_expr(coord) + ", " + ctx.get_expr(w[5]) + ", " + ctx.get_expr(w[6]) + ")";
+          } else {
+            rhs = tex + ".SampleLevel(" + smp + ", " + ctx.get_expr(coord) + ", 0.0)";
+          }
+        } else if (ctx.active_ep.stage != SPV_STAGE_FRAGMENT) {
+          rhs = tex + ".SampleLevel(" + smp + ", " + ctx.get_expr(coord) + ", 0.0)";
+        } else {
+          rhs = tex + ".Sample(" + smp + ", " + ctx.get_expr(coord) + ")";
+        }
         emit_assign(id, rt, rhs);
+      } break;
+      case OP_IMAGE_SAMPLE_DREF_IMPLICIT_LOD:
+      case OP_IMAGE_SAMPLE_DREF_EXPLICIT_LOD: {
+        u32 rt = w[0], id = w[1], si = w[2], coord = w[3], dref = w[4];
+        std::string tex = ctx.get_expr(si);
+        std::string smp = (ctx.ptrs.count(si) && !ctx.ptrs[si].ssbo_buf_name.empty())
+                              ? ctx.ptrs[si].ssbo_buf_name : (tex + "_smp");
+        std::string s = tex + ".SampleLevel(" + smp + ", " + ctx.get_expr(coord) + ", 0.0).x";
+        emit_assign(id, rt, "((" + s + " <= " + ctx.get_expr(dref) + ") ? 1.0 : 0.0)");
+      } break;
+      case OP_IMAGE_SAMPLE_PROJ_IMPLICIT_LOD:
+      case OP_IMAGE_SAMPLE_PROJ_EXPLICIT_LOD: {
+        u32 rt = w[0], id = w[1], si = w[2], coord = w[3];
+        std::string tex = ctx.get_expr(si);
+        std::string smp = (ctx.ptrs.count(si) && !ctx.ptrs[si].ssbo_buf_name.empty())
+                              ? ctx.ptrs[si].ssbo_buf_name : (tex + "_smp");
+        std::string c = ctx.get_expr(coord);
+        emit_assign(id, rt, tex + ".SampleLevel(" + smp + ", (" + c + ").xy / (" + c + ").w, 0.0)");
+      } break;
+      case OP_IMAGE_GATHER:
+      case OP_IMAGE_DREF_GATHER: {
+        u32 rt = w[0], id = w[1], si = w[2], coord = w[3];
+        std::string tex = ctx.get_expr(si);
+        std::string smp = (ctx.ptrs.count(si) && !ctx.ptrs[si].ssbo_buf_name.empty())
+                              ? ctx.ptrs[si].ssbo_buf_name : (tex + "_smp");
+        emit_assign(id, rt, tex + ".Gather(" + smp + ", " + ctx.get_expr(coord) + ")");
       } break;
       case OP_IMAGE_FETCH: {
         u32 rt = w[0], id = w[1], img = w[2], coord = w[3];
-        emit_assign(id, rt, ctx.get_expr(img) + ".Load(int3(" + ctx.get_expr(coord) + ", 0))");
+        u32 c_tid = ctx.expr_types.count(coord) ? ctx.expr_types[coord]
+                  : (ctx.consts.count(coord) ? ctx.consts[coord].type_id : 0);
+        u32 c_cnt = ctx.scalar_comp_count(c_tid);
+        std::string lod = (w.size() >= 6 && (w[4] & 0x2u)) ? ("(int)(" + ctx.get_expr(w[5]) + ")") : "0";
+        std::string larg = (c_cnt >= 3)
+                               ? ("int4((int3)(" + ctx.get_expr(coord) + "), " + lod + ")")
+                               : ("int3((int2)(" + ctx.get_expr(coord) + "), " + lod + ")");
+        emit_assign(id, rt, "((" + ctx.hlsl_local_type(rt) + ")" + ctx.get_expr(img) + ".Load(" + larg + "))");
       } break;
       case OP_IMAGE_READ: {
         u32 rt = w[0], id = w[1], img = w[2], coord = w[3];
-        emit_assign(id, rt, ctx.get_expr(img) + "[" + ctx.get_expr(coord) + "]");
+        emit_assign(id, rt, "((" + ctx.hlsl_local_type(rt) + ")" + ctx.get_expr(img) + "[" + ctx.get_expr(coord) + "])");
       } break;
       case OP_IMAGE_WRITE:
-        out += indent + ctx.get_expr(w[0]) + "[" + ctx.get_expr(w[1]) + "] = " +
-               ctx.get_expr(w[2]) + ";\n";
+        out += indent + ctx.get_expr(w[0]) + "[" + ctx.get_expr(w[1]) + "] = (float4)(" +
+               ctx.get_expr(w[2]) + ");\n";
         break;
+      case OP_IMAGE_QUERY_SIZE_LOD:
+      case OP_IMAGE_QUERY_SIZE: {
+        u32 rt = w[0], id = w[1], img = w[2];
+        u32 cnt = ctx.scalar_comp_count(rt);
+        std::string qw = "_qw" + std::to_string(id), qh = "_qh" + std::to_string(id);
+        if (cnt >= 3) {
+          std::string qd = "_qd" + std::to_string(id);
+          out += indent + "uint " + qw + " = 1u, " + qh + " = 1u, " + qd + " = 1u;\n";
+          out += indent + ctx.get_expr(img) + ".GetDimensions(" + qw + ", " + qh + ", " + qd + ");\n";
+          emit_assign(id, rt, ctx.hlsl_local_type(rt) + "(" + qw + ", " + qh + ", " + qd + ")");
+        } else if (cnt == 2) {
+          out += indent + "uint " + qw + " = 1u, " + qh + " = 1u;\n";
+          out += indent + ctx.get_expr(img) + ".GetDimensions(" + qw + ", " + qh + ");\n";
+          emit_assign(id, rt, ctx.hlsl_local_type(rt) + "(" + qw + ", " + qh + ")");
+        } else {
+          emit_assign(id, rt, "(" + ctx.hlsl_local_type(rt) + ")1");
+        }
+      } break;
+      case OP_IMAGE_QUERY_LEVELS: {
+        u32 rt = w[0], id = w[1];
+        emit_assign(id, rt, "(" + ctx.hlsl_local_type(rt) + ")1");
+      } break;
       case OP_EXT_INST: {
         u32 rt = w[0], id = w[1], eop = w[3];
         std::vector<u32> args(w.begin() + 4, w.end());
@@ -831,36 +1272,70 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " * " + ctx.get_expr(w[3]) + ")"); break;
       case OP_F_DIV: case OP_S_DIV: case OP_U_DIV:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " / " + ctx.get_expr(w[3]) + ")"); break;
+      case OP_U_MOD: case OP_S_REM: case OP_S_MOD:
+        emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " % " + ctx.get_expr(w[3]) + ")"); break;
+      case OP_F_REM: case OP_F_MOD:
+        emit_assign(w[1], w[0], "fmod(" + ctx.get_expr(w[2]) + ", " + ctx.get_expr(w[3]) + ")"); break;
       case OP_S_NEGATE: case OP_F_NEGATE:
         emit_assign(w[1], w[0], "(-" + ctx.get_expr(w[2]) + ")"); break;
-      case OP_MATRIX_TIMES_VECTOR:
-      case OP_VECTOR_TIMES_MATRIX:
+      case OP_MATRIX_TIMES_VECTOR: {
+        std::string m = ctx.get_expr(w[2]);
+        std::string v = ctx.get_expr(w[3]);
+        u32 v_tid = ctx.expr_types.count(w[3]) ? ctx.expr_types[w[3]]
+                    : (ctx.consts.count(w[3]) ? ctx.consts[w[3]].type_id : w[0]);
+        if (v == "0" && ctx.types.count(v_tid)) {
+          v = "((" + ctx.hlsl_local_type(v_tid) + ")0)";
+        }
+        emit_assign(w[1], w[0], "mul(" + m + ", " + v + ")");
+      } break;
+      case OP_VECTOR_TIMES_MATRIX: {
+        std::string v = ctx.get_expr(w[2]);
+        std::string m = ctx.get_expr(w[3]);
+        u32 v_tid = ctx.expr_types.count(w[2]) ? ctx.expr_types[w[2]]
+                    : (ctx.consts.count(w[2]) ? ctx.consts[w[2]].type_id : w[0]);
+        if (v == "0" && ctx.types.count(v_tid)) {
+          v = "((" + ctx.hlsl_local_type(v_tid) + ")0)";
+        }
+        emit_assign(w[1], w[0], "mul(" + v + ", " + m + ")");
+      } break;
       case OP_MATRIX_TIMES_MATRIX:
         emit_assign(w[1], w[0], "mul(" + ctx.get_expr(w[2]) + ", " + ctx.get_expr(w[3]) + ")"); break;
       case OP_DOT:
         emit_assign(w[1], w[0], "dot(" + ctx.get_expr(w[2]) + ", " + ctx.get_expr(w[3]) + ")"); break;
       case OP_TRANSPOSE:
         emit_assign(w[1], w[0], "transpose(" + ctx.get_expr(w[2]) + ")"); break;
-      case OP_SELECT:
-        emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " ? " + ctx.get_expr(w[3]) + " : " + ctx.get_expr(w[4]) + ")"); break;
+      case OP_ANY:
+        emit_assign(w[1], w[0], "any(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_ALL:
+        emit_assign(w[1], w[0], "all(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_IS_NAN:
+        emit_assign(w[1], w[0], "isnan(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_IS_INF:
+        emit_assign(w[1], w[0], "isinf(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_SELECT: {
+        u32 rt = w[0], id = w[1], cond = w[2], tv = w[3], fv = w[4];
+        emit_assign(id, rt, "(" + ctx.get_expr(cond) + " ? " + ctx.get_expr(tv) + " : " + ctx.get_expr(fv) + ")");
+      } break;
       case OP_CONVERT_F_TO_U: case OP_CONVERT_F_TO_S: case OP_CONVERT_S_TO_F:
       case OP_CONVERT_U_TO_F: case OP_U_CONVERT: case OP_S_CONVERT: case OP_F_CONVERT:
         emit_assign(w[1], w[0], "((" + ctx.hlsl_local_type(w[0]) + ")" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_QUANTIZE_TO_F16:
+        emit_assign(w[1], w[0], "f16tof32(f32tof16(" + ctx.get_expr(w[2]) + "))"); break;
       case OP_BITCAST: {
         std::string fn = ctx.is_float_type(w[0]) ? "asfloat" : (ctx.is_signed_int_type(w[0]) ? "asint" : "asuint");
         emit_assign(w[1], w[0], fn + "(" + ctx.get_expr(w[2]) + ")");
       } break;
-      case OP_I_EQUAL: case OP_F_ORD_EQUAL: case OP_LOGICAL_EQUAL:
+      case OP_I_EQUAL: case OP_F_ORD_EQUAL: case OP_F_UNORD_EQUAL: case OP_LOGICAL_EQUAL:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " == " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_I_NOT_EQUAL: case OP_F_ORD_NOT_EQUAL: case OP_LOGICAL_NOT_EQUAL:
+      case OP_I_NOT_EQUAL: case OP_F_ORD_NOT_EQUAL: case OP_F_UNORD_NOT_EQUAL: case OP_LOGICAL_NOT_EQUAL:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " != " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_U_LESS_THAN: case OP_S_LESS_THAN: case OP_F_ORD_LESS_THAN:
+      case OP_U_LESS_THAN: case OP_S_LESS_THAN: case OP_F_ORD_LESS_THAN: case OP_F_UNORD_LESS_THAN:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " < " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_U_GREATER_THAN: case OP_S_GREATER_THAN: case OP_F_ORD_GREATER_THAN:
+      case OP_U_GREATER_THAN: case OP_S_GREATER_THAN: case OP_F_ORD_GREATER_THAN: case OP_F_UNORD_GREATER_THAN:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " > " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_U_LESS_THAN_EQUAL: case OP_S_LESS_THAN_EQUAL: case OP_F_ORD_LESS_THAN_EQUAL:
+      case OP_U_LESS_THAN_EQUAL: case OP_S_LESS_THAN_EQUAL: case OP_F_ORD_LESS_THAN_EQUAL: case OP_F_UNORD_LESS_THAN_EQUAL:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " <= " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_U_GREATER_THAN_EQUAL: case OP_S_GREATER_THAN_EQUAL: case OP_F_ORD_GREATER_THAN_EQUAL:
+      case OP_U_GREATER_THAN_EQUAL: case OP_S_GREATER_THAN_EQUAL: case OP_F_ORD_GREATER_THAN_EQUAL: case OP_F_UNORD_GREATER_THAN_EQUAL:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " >= " + ctx.get_expr(w[3]) + ")"); break;
       case OP_LOGICAL_AND:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " && " + ctx.get_expr(w[3]) + ")"); break;
@@ -874,12 +1349,35 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " | " + ctx.get_expr(w[3]) + ")"); break;
       case OP_BITWISE_XOR:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " ^ " + ctx.get_expr(w[3]) + ")"); break;
+      case OP_NOT:
+        emit_assign(w[1], w[0], "(~" + ctx.get_expr(w[2]) + ")"); break;
       case OP_SHIFT_LEFT_LOGICAL:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " << " + ctx.get_expr(w[3]) + ")"); break;
       case OP_SHIFT_RIGHT_LOGICAL: case OP_SHIFT_RIGHT_ARITHMETIC:
         emit_assign(w[1], w[0], "(" + ctx.get_expr(w[2]) + " >> " + ctx.get_expr(w[3]) + ")"); break;
-      case OP_DPDX: emit_assign(w[1], w[0], "ddx(" + ctx.get_expr(w[2]) + ")"); break;
-      case OP_DPDY: emit_assign(w[1], w[0], "ddy(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_BIT_FIELD_U_EXTRACT: {
+        std::string b = ctx.get_expr(w[2]), o = ctx.get_expr(w[3]), c = ctx.get_expr(w[4]);
+        emit_assign(w[1], w[0], "((" + ctx.hlsl_local_type(w[0]) + ")(((" + b + ") >> (" + o + ")) & (((1u << (" + c + ")) - 1u))))");
+      } break;
+      case OP_BIT_FIELD_S_EXTRACT: {
+        std::string b = ctx.get_expr(w[2]), o = ctx.get_expr(w[3]), c = ctx.get_expr(w[4]);
+        emit_assign(w[1], w[0], "((" + ctx.hlsl_local_type(w[0]) + ")(((int)(" + b + ") << (32 - ((int)(" + o + ") + (int)(" + c + ")))) >> (32 - (int)(" + c + "))))");
+      } break;
+      case OP_BIT_FIELD_INSERT: {
+        std::string b = ctx.get_expr(w[2]), ins_v = ctx.get_expr(w[3]), o = ctx.get_expr(w[4]), c = ctx.get_expr(w[5]);
+        std::string mask = "(((1u << (" + c + ")) - 1u) << (" + o + "))";
+        emit_assign(w[1], w[0], "((" + ctx.hlsl_local_type(w[0]) + ")(((" + b + ") & ~" + mask + ") | (((" + ins_v + ") << (" + o + ")) & " + mask + ")))");
+      } break;
+      case OP_BIT_REVERSE:
+        emit_assign(w[1], w[0], "reversebits(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_BIT_COUNT:
+        emit_assign(w[1], w[0], "((" + ctx.hlsl_local_type(w[0]) + ")countbits(" + ctx.get_expr(w[2]) + "))"); break;
+      case OP_DPDX: case OP_DPDX_FINE: case OP_DPDX_COARSE:
+        emit_assign(w[1], w[0], "ddx(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_DPDY: case OP_DPDY_FINE: case OP_DPDY_COARSE:
+        emit_assign(w[1], w[0], "ddy(" + ctx.get_expr(w[2]) + ")"); break;
+      case OP_FWIDTH: case OP_FWIDTH_FINE: case OP_FWIDTH_COARSE:
+        emit_assign(w[1], w[0], "fwidth(" + ctx.get_expr(w[2]) + ")"); break;
       case OP_CONTROL_BARRIER:
         out += indent + "GroupMemoryBarrierWithGroupSync();\n"; break;
       default: break;
@@ -891,7 +1389,7 @@ static std::string emit_block_stmts(spv_ctx& ctx, const spv_block& blk,
 static std::string emit_block_chain(
     spv_ctx& ctx, const std::map<u32, spv_block>& blocks, u32 start_lbl, u32 stop_lbl,
     const std::map<std::pair<u32, u32>, std::vector<std::pair<u32, u32>>>& phi_edges,
-    std::set<u32>& visited, std::string indent) {
+    std::set<u32>& visited, std::string indent, u32 loop_hdr, u32 loop_merge) {
   std::string out;
   u32 cur = start_lbl;
   for (int guard = 0; guard < 1024; ++guard) {
@@ -900,6 +1398,58 @@ static std::string emit_block_chain(
     if (it == blocks.end()) break;
     visited.insert(cur);
     const spv_block& blk = it->second;
+
+    if (blk.merge && blk.merge->op == OP_LOOP_MERGE) {
+      u32 l_merge = blk.merge->w[0];
+      u32 l_cont = (blk.merge->w.size() >= 2) ? blk.merge->w[1] : 0;
+      out += indent + "for (uint _iter = 0; _iter < 65536u; ++_iter) {\n";
+      std::string b_indent = indent + "  ";
+      out += emit_block_stmts(ctx, blk, b_indent);
+      std::set<u32> loop_vis;
+      loop_vis.insert(cur);
+      if (blk.term && blk.term->op == OP_BRANCH) {
+        u32 tgt = blk.term->w[0];
+        emit_phi_copies(ctx, cur, tgt, phi_edges, out, b_indent);
+        if (tgt == l_merge) {
+          out += b_indent + "break;\n";
+        } else if (tgt != cur) {
+          out += emit_block_chain(ctx, blocks, tgt, cur, phi_edges, loop_vis, b_indent, cur, l_merge);
+        }
+      } else if (blk.term && blk.term->op == OP_BRANCH_CONDITIONAL) {
+        u32 cond_id = blk.term->w[0], t_lbl = blk.term->w[1], f_lbl = blk.term->w[2];
+        if (f_lbl == l_merge) {
+          out += b_indent + "if (!(" + ctx.get_expr(cond_id) + ")) {\n";
+          emit_phi_copies(ctx, cur, l_merge, phi_edges, out, b_indent + "  ");
+          out += b_indent + "  break;\n";
+          out += b_indent + "}\n";
+          emit_phi_copies(ctx, cur, t_lbl, phi_edges, out, b_indent);
+          out += emit_block_chain(ctx, blocks, t_lbl, cur, phi_edges, loop_vis, b_indent, cur, l_merge);
+        } else if (t_lbl == l_merge) {
+          out += b_indent + "if (" + ctx.get_expr(cond_id) + ") {\n";
+          emit_phi_copies(ctx, cur, l_merge, phi_edges, out, b_indent + "  ");
+          out += b_indent + "  break;\n";
+          out += b_indent + "}\n";
+          emit_phi_copies(ctx, cur, f_lbl, phi_edges, out, b_indent);
+          out += emit_block_chain(ctx, blocks, f_lbl, cur, phi_edges, loop_vis, b_indent, cur, l_merge);
+        } else {
+          u32 sub_stop = (l_cont && l_cont != cur) ? l_cont : cur;
+          out += b_indent + "if (" + ctx.get_expr(cond_id) + ") {\n";
+          emit_phi_copies(ctx, cur, t_lbl, phi_edges, out, b_indent + "  ");
+          out += emit_block_chain(ctx, blocks, t_lbl, sub_stop, phi_edges, loop_vis, b_indent + "  ", cur, l_merge);
+          out += b_indent + "} else {\n";
+          emit_phi_copies(ctx, cur, f_lbl, phi_edges, out, b_indent + "  ");
+          out += emit_block_chain(ctx, blocks, f_lbl, sub_stop, phi_edges, loop_vis, b_indent + "  ", cur, l_merge);
+          out += b_indent + "}\n";
+          if (sub_stop != cur) {
+            out += emit_block_chain(ctx, blocks, sub_stop, cur, phi_edges, loop_vis, b_indent, cur, l_merge);
+          }
+        }
+      }
+      out += indent + "}\n";
+      cur = l_merge;
+      continue;
+    }
+
     out += emit_block_stmts(ctx, blk, indent);
     if (!blk.term) break;
     if (blk.term->op == OP_RETURN || blk.term->op == OP_RETURN_VALUE) {
@@ -912,41 +1462,42 @@ static std::string emit_block_chain(
     if (blk.term->op == OP_BRANCH) {
       u32 tgt = blk.term->w[0];
       emit_phi_copies(ctx, cur, tgt, phi_edges, out, indent);
+      if (loop_merge && tgt == loop_merge) {
+        out += indent + "break;\n";
+        break;
+      }
+      if (loop_hdr && tgt == loop_hdr) {
+        break;
+      }
       if (tgt == stop_lbl) break;
       cur = tgt;
       continue;
     }
     if (blk.term->op == OP_BRANCH_CONDITIONAL) {
       u32 cond_id = blk.term->w[0], t_lbl = blk.term->w[1], f_lbl = blk.term->w[2];
-      if (blk.merge && blk.merge->op == OP_LOOP_MERGE) {
-        u32 l_merge = blk.merge->w[0];
-        out += indent + "for (uint _iter = 0; _iter < 65536u; ++_iter) {\n";
-        std::string b_indent = indent + "  ";
-        if (f_lbl == l_merge) {
-          out += b_indent + "if (!(" + ctx.get_expr(cond_id) + ")) break;\n";
-          std::set<u32> loop_vis;
-          out += emit_block_chain(ctx, blocks, t_lbl, cur, phi_edges, loop_vis, b_indent);
-        } else {
-          out += b_indent + "if (" + ctx.get_expr(cond_id) + ") break;\n";
-          std::set<u32> loop_vis;
-          out += emit_block_chain(ctx, blocks, f_lbl, cur, phi_edges, loop_vis, b_indent);
-        }
-        out += indent + "}\n";
-        cur = l_merge;
-        continue;
-      }
       u32 merge_lbl = (blk.merge && blk.merge->op == OP_SELECTION_MERGE) ? blk.merge->w[0] : stop_lbl;
       out += indent + "if (" + ctx.get_expr(cond_id) + ") {\n";
       emit_phi_copies(ctx, cur, t_lbl, phi_edges, out, indent + "  ");
-      if (t_lbl != merge_lbl) {
-        out += emit_block_chain(ctx, blocks, t_lbl, merge_lbl, phi_edges, visited, indent + "  ");
+      if (loop_merge && t_lbl == loop_merge) {
+        out += indent + "  break;\n";
+      } else if (loop_hdr && t_lbl == loop_hdr) {
+        out += indent + "  continue;\n";
+      } else if (t_lbl != merge_lbl) {
+        out += emit_block_chain(ctx, blocks, t_lbl, merge_lbl, phi_edges, visited, indent + "  ", loop_hdr, loop_merge);
       }
-      if (f_lbl != merge_lbl) {
+      if (f_lbl != merge_lbl || (loop_merge && f_lbl == loop_merge) || (loop_hdr && f_lbl == loop_hdr)) {
         out += indent + "} else {\n";
         emit_phi_copies(ctx, cur, f_lbl, phi_edges, out, indent + "  ");
-        out += emit_block_chain(ctx, blocks, f_lbl, merge_lbl, phi_edges, visited, indent + "  ");
+        if (loop_merge && f_lbl == loop_merge) {
+          out += indent + "  break;\n";
+        } else if (loop_hdr && f_lbl == loop_hdr) {
+          out += indent + "  continue;\n";
+        } else if (f_lbl != merge_lbl) {
+          out += emit_block_chain(ctx, blocks, f_lbl, merge_lbl, phi_edges, visited, indent + "  ", loop_hdr, loop_merge);
+        }
       }
       out += indent + "}\n";
+      if ((loop_merge && merge_lbl == loop_merge) || (loop_hdr && merge_lbl == loop_hdr)) break;
       cur = merge_lbl;
       continue;
     }
@@ -959,14 +1510,14 @@ static std::string emit_block_chain(
         out += indent + "  case " + std::to_string((int32_t)lit) + ": {\n";
         emit_phi_copies(ctx, cur, clbl, phi_edges, out, indent + "    ");
         if (clbl != merge_lbl) {
-          out += emit_block_chain(ctx, blocks, clbl, merge_lbl, phi_edges, visited, indent + "    ");
+          out += emit_block_chain(ctx, blocks, clbl, merge_lbl, phi_edges, visited, indent + "    ", loop_hdr, loop_merge);
         }
         out += indent + "  } break;\n";
       }
       if (def_lbl != merge_lbl) {
         out += indent + "  default: {\n";
         emit_phi_copies(ctx, cur, def_lbl, phi_edges, out, indent + "    ");
-        out += emit_block_chain(ctx, blocks, def_lbl, merge_lbl, phi_edges, visited, indent + "    ");
+        out += emit_block_chain(ctx, blocks, def_lbl, merge_lbl, phi_edges, visited, indent + "    ", loop_hdr, loop_merge);
         out += indent + "  } break;\n";
       }
       out += indent + "}\n";
@@ -1120,6 +1671,7 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         int sid = ctx.decs[w[1]].spec_id;
         if (sid >= 0 && ctx.spec_overrides.count((u32)sid)) c.b = (ctx.spec_overrides[(u32)sid].value_u32 != 0);
         ctx.consts[w[1]] = c;
+        ctx.expr_types[w[1]] = w[0];
       } break;
       case OP_CONSTANT_FALSE:
       case OP_SPEC_CONSTANT_FALSE: {
@@ -1127,6 +1679,7 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         int sid = ctx.decs[w[1]].spec_id;
         if (sid >= 0 && ctx.spec_overrides.count((u32)sid)) c.b = (ctx.spec_overrides[(u32)sid].value_u32 != 0);
         ctx.consts[w[1]] = c;
+        ctx.expr_types[w[1]] = w[0];
       } break;
       case OP_CONSTANT:
       case OP_SPEC_CONSTANT: {
@@ -1137,16 +1690,70 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
           c.raw_words[0] = ctx.spec_overrides[(u32)sid].value_u32;
         }
         ctx.consts[w[1]] = std::move(c);
+        ctx.expr_types[w[1]] = w[0];
       } break;
-      case OP_CONSTANT_COMPOSITE: {
+      case OP_CONSTANT_COMPOSITE:
+      case OP_SPEC_CONSTANT_COMPOSITE: {
         spv_const_val c; c.is_const = true; c.type_id = w[0];
         for (size_t i = 2; i < w.size(); ++i) c.comp_ids.push_back(w[i]);
         ctx.consts[w[1]] = std::move(c);
+        ctx.expr_types[w[1]] = w[0];
+      } break;
+      case OP_SPEC_CONSTANT_OP: {
+        if (w.size() >= 3) {
+          u32 rt = w[0], id = w[1], sop = w[2];
+          u32 a = (w.size() >= 4) ? ctx.const_u32(w[3], 0) : 0;
+          u32 b = (w.size() >= 5) ? ctx.const_u32(w[4], 0) : 0;
+          u32 c_v = (w.size() >= 6) ? ctx.const_u32(w[5], 0) : 0;
+          u32 res_u = 0;
+          bool is_b = ctx.types.count(rt) && ctx.types[rt].kind == spv_type::T_BOOL;
+          switch (sop) {
+            case OP_I_ADD: res_u = a + b; break;
+            case OP_I_SUB: res_u = a - b; break;
+            case OP_I_MUL: res_u = a * b; break;
+            case OP_U_DIV: res_u = b ? (a / b) : 0; break;
+            case OP_S_DIV: res_u = b ? (u32)((int32_t)a / (int32_t)b) : 0; break;
+            case OP_U_MOD: res_u = b ? (a % b) : 0; break;
+            case OP_S_REM: case OP_S_MOD: res_u = b ? (u32)((int32_t)a % (int32_t)b) : 0; break;
+            case OP_S_NEGATE: res_u = (u32)(-(int32_t)a); break;
+            case OP_NOT: res_u = ~a; break;
+            case OP_BITWISE_OR: res_u = a | b; break;
+            case OP_BITWISE_XOR: res_u = a ^ b; break;
+            case OP_BITWISE_AND: res_u = a & b; break;
+            case OP_SHIFT_LEFT_LOGICAL: res_u = a << (b & 31u); break;
+            case OP_SHIFT_RIGHT_LOGICAL: res_u = a >> (b & 31u); break;
+            case OP_SHIFT_RIGHT_ARITHMETIC: res_u = (u32)((int32_t)a >> (b & 31u)); break;
+            case OP_LOGICAL_OR: res_u = (a || b) ? 1u : 0u; break;
+            case OP_LOGICAL_AND: res_u = (a && b) ? 1u : 0u; break;
+            case OP_LOGICAL_NOT: res_u = (!a) ? 1u : 0u; break;
+            case OP_LOGICAL_EQUAL: case OP_I_EQUAL: res_u = (a == b) ? 1u : 0u; break;
+            case OP_LOGICAL_NOT_EQUAL: case OP_I_NOT_EQUAL: res_u = (a != b) ? 1u : 0u; break;
+            case OP_U_LESS_THAN: res_u = (a < b) ? 1u : 0u; break;
+            case OP_S_LESS_THAN: res_u = ((int32_t)a < (int32_t)b) ? 1u : 0u; break;
+            case OP_U_GREATER_THAN: res_u = (a > b) ? 1u : 0u; break;
+            case OP_S_GREATER_THAN: res_u = ((int32_t)a > (int32_t)b) ? 1u : 0u; break;
+            case OP_U_LESS_THAN_EQUAL: res_u = (a <= b) ? 1u : 0u; break;
+            case OP_S_LESS_THAN_EQUAL: res_u = ((int32_t)a <= (int32_t)b) ? 1u : 0u; break;
+            case OP_U_GREATER_THAN_EQUAL: res_u = (a >= b) ? 1u : 0u; break;
+            case OP_S_GREATER_THAN_EQUAL: res_u = ((int32_t)a >= (int32_t)b) ? 1u : 0u; break;
+            case OP_SELECT: res_u = a ? b : c_v; break;
+            default: res_u = a; break;
+          }
+          spv_const_val cv;
+          cv.is_const = true;
+          cv.is_bool = is_b;
+          cv.b = (res_u != 0);
+          cv.type_id = rt;
+          cv.raw_words.push_back(res_u);
+          ctx.consts[id] = std::move(cv);
+          ctx.expr_types[id] = rt;
+        }
       } break;
       case OP_CONSTANT_NULL:
       case OP_UNDEF: {
         spv_const_val c; c.is_const = true; c.type_id = w[0];
         ctx.consts[w[1]] = c;
+        ctx.expr_types[w[1]] = w[0];
       } break;
       default: break;
     }
@@ -1174,9 +1781,33 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
   ctx.res.entry_name = "main";
   memcpy(ctx.res.local_size, ctx.local_size, sizeof(ctx.local_size));
 
+  auto type_location_slots = [](spv_ctx& c, u32 tid) -> u32 {
+    auto self_fn = [&](auto& self, u32 t) -> u32 {
+      if (!c.types.count(t)) return 1u;
+      const auto& ty = c.types[t];
+      if (ty.kind == spv_type::T_MAT) return std::max(1u, ty.count);
+      if (ty.kind == spv_type::T_ARRAY) {
+        u32 len = std::max(1u, c.const_u32(ty.len_const_id, 1u));
+        return len * self(self, ty.comp_type);
+      }
+      return 1u;
+    };
+    return self_fn(self_fn, tid);
+  };
+
   // Classify global OpVariables (only top-level ones outside functions)
-  std::string vs_in_struct, vs_out_struct;
+  std::string vs_in_user_struct, vs_in_sys_struct, vs_out_struct;
+  std::set<std::string> used_in_sems, used_out_sems;
+  std::map<std::string, std::string> in_sem_to_member;
   std::vector<std::string> vs_in_copies, vs_out_copies, cs_in_copies;
+
+  auto add_vs_in = [&](const std::string& line, const std::string& sem) {
+    if (sem.rfind("SV_", 0) == 0) {
+      vs_in_sys_struct += line;
+    } else {
+      vs_in_user_struct += line;
+    }
+  };
   bool in_func = false;
   for (const auto& ins : ctx.insns) {
     if (ins.op == OP_FUNCTION) { in_func = true; continue; }
@@ -1195,9 +1826,16 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
     if (sc == SC_UNIFORM_CONSTANT) {
       u32 set = (dec.set >= 0) ? (u32)dec.set : 0u;
       u32 bind = (dec.binding >= 0) ? (u32)dec.binding : 0u;
-      if (pty.kind == spv_type::T_SAMPLED_IMAGE) {
+      u32 elem_pte = pte;
+      while (ctx.types.count(elem_pte) &&
+             (ctx.types[elem_pte].kind == spv_type::T_ARRAY ||
+              ctx.types[elem_pte].kind == spv_type::T_RUNTIME_ARRAY)) {
+        elem_pte = ctx.types[elem_pte].comp_type;
+      }
+      const auto& elem_pty = ctx.types[elem_pte];
+      if (elem_pty.kind == spv_type::T_SAMPLED_IMAGE) {
         u32 tr = ctx.next_t++, sr = ctx.next_s++;
-        u32 img_tid = pty.comp_type;
+        u32 img_tid = elem_pty.comp_type;
         std::string itype = ctx.hlsl_type(img_tid);
         char dbuf[256];
         snprintf(dbuf, sizeof(dbuf), "%s %s : register(t%u);\nSamplerState %s_smp : register(s%u);\n",
@@ -1205,23 +1843,23 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         ctx.decls_hlsl += dbuf;
         gv.hlsl_reg = tr; gv.smp_reg = sr;
         ctx.res.bindings.push_back({set, bind, SPV_BIND_COMBINED_IMG_SMP, tr, sr, 0, gv.hlsl_name});
-      } else if (pty.kind == spv_type::T_IMAGE && pty.sampled == 2) {
+      } else if (elem_pty.kind == spv_type::T_IMAGE && elem_pty.sampled == 2) {
         u32 ur = ctx.next_u++;
         char dbuf[256];
         snprintf(dbuf, sizeof(dbuf), "%s %s : register(u%u);\n",
-                 ctx.hlsl_type(pte).c_str(), gv.hlsl_name.c_str(), ur);
+                 ctx.hlsl_type(elem_pte).c_str(), gv.hlsl_name.c_str(), ur);
         ctx.decls_hlsl += dbuf;
         gv.hlsl_reg = ur;
         ctx.res.bindings.push_back({set, bind, SPV_BIND_STORAGE_IMG, ur, 0, 0, gv.hlsl_name});
-      } else if (pty.kind == spv_type::T_IMAGE) {
+      } else if (elem_pty.kind == spv_type::T_IMAGE) {
         u32 tr = ctx.next_t++;
         char dbuf[256];
         snprintf(dbuf, sizeof(dbuf), "%s %s : register(t%u);\n",
-                 ctx.hlsl_type(pte).c_str(), gv.hlsl_name.c_str(), tr);
+                 ctx.hlsl_type(elem_pte).c_str(), gv.hlsl_name.c_str(), tr);
         ctx.decls_hlsl += dbuf;
         gv.hlsl_reg = tr;
         ctx.res.bindings.push_back({set, bind, SPV_BIND_TEXTURE, tr, 0, 0, gv.hlsl_name});
-      } else if (pty.kind == spv_type::T_SAMPLER) {
+      } else if (elem_pty.kind == spv_type::T_SAMPLER) {
         u32 sr = ctx.next_s++;
         char dbuf[256];
         snprintf(dbuf, sizeof(dbuf), "SamplerState %s : register(s%u);\n",
@@ -1281,37 +1919,71 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         ctx.res.bindings.push_back({set, bind, SPV_BIND_CBV, br, 0, bsz, gv.hlsl_name});
       }
     } else if (sc == SC_WORKGROUP) {
-      ctx.decls_hlsl += "groupshared " + ctx.hlsl_local_type(pte) + " " + gv.hlsl_name + ";\n";
+      ctx.decls_hlsl += "groupshared " + ctx.hlsl_var_decl(pte, gv.hlsl_name, false) + ";\n";
     } else if (sc == SC_PRIVATE) {
-      ctx.decls_hlsl += "static " + ctx.hlsl_local_type(pte) + " " + gv.hlsl_name + ";\n";
+      std::string ainit = (w.size() >= 4) ? ctx.format_array_init(w[3]) : "";
+      ctx.decls_hlsl += "static " + ctx.hlsl_var_decl(pte, gv.hlsl_name, false) +
+                        (ainit.empty() ? "" : (" = " + ainit)) + ";\n";
     } else if (sc == SC_INPUT) {
       u32 bi = 0xFFFFFFFFu;
       bool is_bi = (dec.builtin != 0xFFFFFFFFu) || has_builtin_in_type(ctx, pte, bi);
       if (dec.builtin != 0xFFFFFFFFu) bi = dec.builtin;
       if (is_bi) {
         if (ctx.active_ep.stage == SPV_STAGE_COMPUTE) {
-          std::string sem = builtin_semantic(bi, SPV_STAGE_COMPUTE, false);
-          std::string fty = (bi == BI_LOCAL_INVOCATION_INDEX) ? "uint" : "uint3";
-          vs_in_struct += "  " + fty + " " + gv.hlsl_name + " : " + sem + ";\n";
-          ctx.decls_hlsl += "static " + fty + " " + gv.hlsl_name + ";\n";
-          cs_in_copies.push_back("  " + gv.hlsl_name + " = _in." + gv.hlsl_name + ";\n");
+          if (bi == BI_NUM_WORKGROUPS) {
+            ctx.decls_hlsl += "static const uint3 " + gv.hlsl_name + " = uint3(65535, 65535, 65535);\n";
+          } else {
+            std::string sem = builtin_semantic(bi, SPV_STAGE_COMPUTE, false);
+            std::string fty = (bi == BI_LOCAL_INVOCATION_INDEX) ? "uint" : "uint3";
+            ctx.decls_hlsl += "static " + fty + " " + gv.hlsl_name + ";\n";
+            if (in_sem_to_member.count(sem)) {
+              cs_in_copies.push_back("  " + gv.hlsl_name + " = _in." + in_sem_to_member[sem] + ";\n");
+            } else {
+              in_sem_to_member[sem] = gv.hlsl_name;
+              used_in_sems.insert(sem);
+              add_vs_in("  " + fty + " " + gv.hlsl_name + " : " + sem + ";\n", sem);
+              cs_in_copies.push_back("  " + gv.hlsl_name + " = _in." + gv.hlsl_name + ";\n");
+            }
+          }
         } else {
           std::string sem = builtin_semantic(bi, ctx.active_ep.stage, false);
           std::string hty = (bi == BI_VERTEX_INDEX || bi == BI_INSTANCE_INDEX) ? "uint"
                           : (bi == BI_FRONT_FACING ? "bool" : "float4");
-          vs_in_struct += "  " + hty + " " + gv.hlsl_name + " : " + sem + ";\n";
+          if (used_in_sems.count(sem)) {
+            u32 slot = 0;
+            while (used_in_sems.count("TEXCOORD" + std::to_string(slot))) slot++;
+            sem = "TEXCOORD" + std::to_string(slot);
+          }
+          used_in_sems.insert(sem);
+          add_vs_in("  " + hty + " " + gv.hlsl_name + " : " + sem + ";\n", sem);
           ctx.decls_hlsl += "static " + hty + " " + gv.hlsl_name + ";\n";
           vs_in_copies.push_back("  " + gv.hlsl_name + " = _in." + gv.hlsl_name + ";\n");
           ctx.res.inputs.push_back({0, bi, gv.hlsl_name, hty});
         }
       } else {
+        u32 slots = type_location_slots(ctx, pte);
         u32 loc = (dec.location >= 0) ? (u32)dec.location : 0u;
-        std::string hty = ctx.hlsl_local_type(pte);
+        bool conflict = true;
+        while (conflict) {
+          conflict = false;
+          for (u32 s = 0; s < slots; ++s) {
+            std::string s_sem = "TEXCOORD" + std::to_string(loc + s);
+            if (used_in_sems.count(s_sem)) {
+              loc = loc + s + 1;
+              conflict = true;
+              break;
+            }
+          }
+        }
         std::string sem = "TEXCOORD" + std::to_string(loc);
-        vs_in_struct += "  " + hty + " " + gv.hlsl_name + " : " + sem + ";\n";
-        ctx.decls_hlsl += "static " + hty + " " + gv.hlsl_name + ";\n";
+        for (u32 s = 0; s < slots; ++s) {
+          used_in_sems.insert("TEXCOORD" + std::to_string(loc + s));
+        }
+        std::string hdecl = ctx.hlsl_var_decl(pte, gv.hlsl_name, false);
+        add_vs_in("  " + hdecl + " : " + sem + ";\n", sem);
+        ctx.decls_hlsl += "static " + hdecl + ";\n";
         vs_in_copies.push_back("  " + gv.hlsl_name + " = _in." + gv.hlsl_name + ";\n");
-        ctx.res.inputs.push_back({loc, 0xFFFFFFFFu, gv.hlsl_name, hty});
+        ctx.res.inputs.push_back({loc, 0xFFFFFFFFu, gv.hlsl_name, ctx.hlsl_local_type(pte)});
       }
     } else if (sc == SC_OUTPUT) {
       u32 bi = 0xFFFFFFFFu;
@@ -1321,20 +1993,27 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         // Per-vertex gl_PerVertex block -> promote members to globals and copy Position to SV_Position
         std::string sdef = "struct " + ctx.hlsl_local_type(pte) + " {\n";
         for (u32 mi = 0; mi < (u32)pty.members.size(); ++mi) {
-          sdef += "  " + ctx.hlsl_local_type(pty.members[mi]) + " " +
-                  cbuffer_member_expr(ctx, pte, mi) + ";\n";
+          sdef += "  " + ctx.hlsl_var_decl(pty.members[mi], cbuffer_member_expr(ctx, pte, mi), false) + ";\n";
         }
         sdef += "};\n";
         ctx.structs_hlsl += sdef;
         ctx.decls_hlsl += "static " + ctx.hlsl_local_type(pte) + " " + gv.hlsl_name + ";\n";
         std::string pos_field = cbuffer_member_expr(ctx, pte, 0);
         vs_out_struct += "  float4 gl_Position : SV_Position;\n";
+        used_out_sems.insert("SV_Position");
         vs_out_copies.push_back("  _out.gl_Position = " + gv.hlsl_name + "." + pos_field + ";\n");
         vs_out_copies.push_back("  _out.gl_Position.y = -_out.gl_Position.y;\n");
         ctx.res.outputs.push_back({0, BI_POSITION, gv.hlsl_name, "float4"});
       } else if (is_bi) {
         std::string sem = builtin_semantic(bi, ctx.active_ep.stage, true);
         std::string hty = (bi == BI_FRAG_DEPTH) ? "float" : "float4";
+        if (used_out_sems.count(sem)) {
+          std::string prefix = (ctx.active_ep.stage == SPV_STAGE_FRAGMENT) ? "SV_Target" : "TEXCOORD";
+          u32 slot = 0;
+          while (used_out_sems.count(prefix + std::to_string(slot))) slot++;
+          sem = prefix + std::to_string(slot);
+        }
+        used_out_sems.insert(sem);
         vs_out_struct += "  " + hty + " " + gv.hlsl_name + " : " + sem + ";\n";
         ctx.decls_hlsl += "static " + hty + " " + gv.hlsl_name + ";\n";
         vs_out_copies.push_back("  _out." + gv.hlsl_name + " = " + gv.hlsl_name + ";\n");
@@ -1343,15 +2022,30 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
         }
         ctx.res.outputs.push_back({0, bi, gv.hlsl_name, hty});
       } else {
+        u32 slots = type_location_slots(ctx, pte);
         u32 loc = (dec.location >= 0) ? (u32)dec.location : 0u;
-        std::string hty = ctx.hlsl_local_type(pte);
-        std::string sem = (ctx.active_ep.stage == SPV_STAGE_FRAGMENT)
-                              ? ("SV_Target" + std::to_string(loc))
-                              : ("TEXCOORD" + std::to_string(loc));
-        vs_out_struct += "  " + hty + " " + gv.hlsl_name + " : " + sem + ";\n";
-        ctx.decls_hlsl += "static " + hty + " " + gv.hlsl_name + ";\n";
+        std::string prefix = (ctx.active_ep.stage == SPV_STAGE_FRAGMENT) ? "SV_Target" : "TEXCOORD";
+        bool conflict = true;
+        while (conflict) {
+          conflict = false;
+          for (u32 s = 0; s < slots; ++s) {
+            std::string s_sem = prefix + std::to_string(loc + s);
+            if (used_out_sems.count(s_sem)) {
+              loc = loc + s + 1;
+              conflict = true;
+              break;
+            }
+          }
+        }
+        std::string sem = prefix + std::to_string(loc);
+        for (u32 s = 0; s < slots; ++s) {
+          used_out_sems.insert(prefix + std::to_string(loc + s));
+        }
+        std::string hdecl = ctx.hlsl_var_decl(pte, gv.hlsl_name, false);
+        vs_out_struct += "  " + hdecl + " : " + sem + ";\n";
+        ctx.decls_hlsl += "static " + hdecl + ";\n";
         vs_out_copies.push_back("  _out." + gv.hlsl_name + " = " + gv.hlsl_name + ";\n");
-        ctx.res.outputs.push_back({loc, 0xFFFFFFFFu, gv.hlsl_name, hty});
+        ctx.res.outputs.push_back({loc, 0xFFFFFFFFu, gv.hlsl_name, ctx.hlsl_local_type(pte)});
       }
     }
     ctx.vars[id] = std::move(gv);
@@ -1366,8 +2060,7 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
     if (has_builtin_in_type(ctx, kv.first, bi)) continue;
     std::string sdef = "struct " + ctx.get_name(kv.first, "_Struct") + " {\n";
     for (u32 mi = 0; mi < (u32)kv.second.members.size(); ++mi) {
-      sdef += "  " + ctx.hlsl_local_type(kv.second.members[mi]) + " " +
-              cbuffer_member_expr(ctx, kv.first, mi) + ";\n";
+      sdef += "  " + ctx.hlsl_var_decl(kv.second.members[mi], cbuffer_member_expr(ctx, kv.first, mi), false) + ";\n";
     }
     sdef += "};\n";
     ctx.structs_hlsl += sdef;
@@ -1399,8 +2092,7 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
       u32 pt = ins.w[0], pid = ins.w[1];
       std::string pv = "_phi_" + std::to_string(pid);
       ctx.phi_vars[pid] = pv;
-      ctx.main_body_hlsl += "  " + ctx.hlsl_local_type(pt) + " " + pv + " = (" +
-                            ctx.hlsl_local_type(pt) + ")0;\n";
+      ctx.main_body_hlsl += "  " + ctx.hlsl_var_decl(pt, pv, true) + ";\n";
       for (size_t k = 2; k + 1 < ins.w.size(); k += 2) {
         phi_edges[{cur_lbl, ins.w[k + 1]}].push_back({pid, ins.w[k]});
       }
@@ -1425,6 +2117,7 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
   std::string emitted_body = emit_block_chain(ctx, blocks, entry_lbl, 0, phi_edges, visited, "  ");
 
   // Assemble complete HLSL SM5 shader
+  std::string vs_in_struct = vs_in_user_struct + vs_in_sys_struct;
   std::string hlsl = "// Generated by Tiramisu SPIR-V -> HLSL SM5\n";
   hlsl += ctx.structs_hlsl;
   hlsl += ctx.decls_hlsl;
@@ -1447,7 +2140,10 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
     if (!vs_out_struct.empty()) hlsl += "struct VSOut {\n" + vs_out_struct + "};\n";
     hlsl += vs_out_struct.empty() ? "\nvoid main(" : "\nVSOut main(";
     hlsl += vs_in_struct.empty() ? ") {\n" : "VSIn _in) {\n";
-    if (!vs_out_struct.empty()) hlsl += "  VSOut _out = (VSOut)0;\n";
+    if (!vs_out_struct.empty()) {
+      hlsl += "  static const VSOut _zero_out;\n";
+      hlsl += "  VSOut _out = _zero_out;\n";
+    }
     for (const auto& s : vs_in_copies) hlsl += s;
     hlsl += ctx.main_body_hlsl;
     hlsl += emitted_body;

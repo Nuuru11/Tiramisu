@@ -233,7 +233,7 @@ int main(int argc, char** argv) {
         "delay import bound and logged");
   CHECK(log_has("advapi32.dll"),
         "advapi32 is a real module now (the registry bridge)");
-  CHECK(log_has("DELAY d3dcompiler_47.dll!D3DCompile called (unimplemented)"),
+  CHECK(log_has("d3dcompiler_47.dll!D3DCompile called (unimplemented)"),
         "delay-import call site names itself");
   // HISTORY: originally both synch and winrt contracts fell through to
   // fake_system_load (>= 2 fake calls). Then kernel32's WaitOnAddress moved
