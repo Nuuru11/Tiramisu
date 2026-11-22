@@ -2686,6 +2686,23 @@ int TRT_STDCALL trt_DisableThreadLibraryCalls(void* handle) {
 
 void* TRT_STDCALL trt_GetProcAddress(void* handle, const char* name) {
   if (!name) return nullptr;
+  // .213 DIAG: log when the game resolves an exit/terminate entry point
+  // (dynamic exit path -- a static CRT or PEB-walked exit bypasses this,
+  // but a GetProcAddress-resolved one is visible here).
+  if ((uintptr_t)name >= 0x10000) {
+    static const char* const k_exit_names[] = {
+        "ExitProcess", "RtlExitUserProcess", "TerminateProcess", "FatalExit",
+        "_exit", "_Exit", "abort", "quick_exit"};
+    for (size_t i = 0; i < sizeof(k_exit_names) / sizeof(k_exit_names[0]); ++i) {
+      if (strcmp(name, k_exit_names[i]) == 0) {
+        char line[256];
+        snprintf(line, sizeof(line),
+                 "kernel32: GetProcAddress exit-name %s (handle=%p)", name, handle);
+        trt_core_log(line);
+        break;
+      }
+    }
+  }
   // STAGE 7 (OrTMM): a synthetic system-module handle holds no PE image —
   // resolve through the module table, the SAME surface the static import
   // binder used (kernel32!RtlCaptureContext etc. live there, not in a file).
@@ -3670,6 +3687,16 @@ void TRT_STDCALL trt_ExitProcess(u32 code) {
 #else
   _exit((int)(code & 0xFF));
 #endif
+}
+
+// .213 DIAG: FatalExit is a real kernel32 export the game could resolve
+// (statically or via GetProcAddress). It was not bridged anywhere; treat it
+// as ExitProcess so the exit is logged instead of silent.
+void TRT_STDCALL trt_FatalExit(u32 code) {
+  char line[128];
+  snprintf(line, sizeof(line), "kernel32: FatalExit(%u) called -- treated as ExitProcess", code);
+  boot_log(line);
+  trt_ExitProcess(code);
 }
 
 int TRT_STDCALL trt_TerminateProcess(void* proc, u32 code) {
@@ -7648,6 +7675,7 @@ static const trt_named_fn k_kernel32_fns[] = {
   {"CreateProcessW", (void*)&trt_CreateProcessW},
   // ---- STAGE 7: EXE boot / MSVC CRT surface ----
   {"ExitProcess", (void*)&trt_ExitProcess},
+  {"FatalExit", (void*)&trt_FatalExit},
   {"TerminateProcess", (void*)&trt_TerminateProcess},
   {"GetStartupInfoW", (void*)&trt_GetStartupInfoW},
   {"GetStartupInfoA", (void*)&trt_GetStartupInfoA},
