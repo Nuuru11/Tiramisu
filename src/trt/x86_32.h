@@ -33,6 +33,11 @@ typedef struct trt_x86_ctx {
 // Returns 0 on HLT, 1 on trap stop, 2 on invalid/fault (stop_code set).
 int trt_x86_run(trt_x86_ctx* c, u64 max_instructions);
 
+// Diagnostics: the opcode and VA of the last named fault, so a real guest
+// that hits an unsupported instruction names itself instead of stopping silent.
+unsigned trt_x86_last_opcode(void);
+u32 trt_x86_last_fault_va(void);
+
 // Helpers used by the guest-memory bridge thunks.
 int trt_x86_mem_read(const trt_x86_ctx* c, u32 va, u32 len, void* out);
 int trt_x86_mem_write(trt_x86_ctx* c, u32 va, u32 len, const void* in);

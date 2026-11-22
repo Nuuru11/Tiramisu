@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 #include <strings.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -98,7 +99,42 @@ static size_t make_pe32(u8* out) {
   return 0x600;
 }
 
-int main() {
+static u64 dummy_bridge(u64, u64, u64, u64) { return 0; }
+static void* real_resolve(void*, const char* mod, const char* sym, u16) {
+  (void)mod; (void)sym;
+  return (void*)&dummy_bridge;  // every import binds; traps name themselves
+}
+static trt_resolver real_rs{nullptr, real_resolve};
+
+// Diagnostic: map a REAL 32-bit PE and run its entry through the interpreter.
+static int run_real_pe32(const char* path) {
+  FILE* f = fopen(path, "rb");
+  if (!f) { printf("cannot open %s\n", path); return 2; }
+  fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+  if (sz <= 0 || sz > 64 * 1024 * 1024) { fclose(f); return 2; }
+  std::vector<u8> data((size_t)sz);
+  if (fread(data.data(), 1, (size_t)sz, f) != (size_t)sz) { fclose(f); return 2; }
+  fclose(f);
+  trt_runtime_init(&be, "");
+  trt_image* img = nullptr;
+  int rc = trt_map_pe32(&be, &real_rs, data.data(), data.size(), &img);
+  if (rc != TRT_OK || !img) { printf("map rc=%d\n", rc); return 2; }
+  trt_x86_set_resolver(&real_rs);
+  u32 eax = 0;
+  const u32 args[3] = {img->guest_base, 1, 0};
+  int run_rc = trt_x86_run_cdecl(
+      img, img->guest_base + (u32)img->entry_rva, args, 200000, &eax);
+  printf("REAL PE32 %s: bits=32 traps=%u run_rc=%d eax=%u "
+         "entry=%llx last_op=%02x fault_va=%08x\n",
+         path, img->pe32_trap_count, run_rc, eax,
+         (unsigned long long)img->entry_rva,
+         trt_x86_last_opcode(), trt_x86_last_fault_va());
+  trt_images_reset();
+  return 0;
+}
+
+int main(int argc, char** argv) {
+  if (argc > 1) return run_real_pe32(argv[1]);
   trt_runtime_init(&be, "");
   u8 file[0x600];
   size_t n = make_pe32(file);

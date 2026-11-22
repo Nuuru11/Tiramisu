@@ -66,6 +66,45 @@ int main() {
           "out-of-window EIP takes the named trap path");
   }
 
+  // rdtsc (0f 31) then hlt.
+  {
+    u8 code[] = {0x0f,0x31, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0x6000);
+    CHECK(trt_x86_run(&c, 16) == 0, "rdtsc guest halted");
+  }
+  // movzx eax, byte [0x6200] where the byte is 0x80 -> 0x00000080.
+  {
+    u8 code[] = {0x0f,0xb6,0x05,0x80,0x61,0x00,0x00, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0x6100);
+    // place the immediate at relative offset 0x100 in the ctx window
+    // (make_ctx zeroes the window; write through the public helper)
+    u8 val = 0x80;
+    trt_x86_mem_write(&c, 0x6180, 1, &val);
+    CHECK(trt_x86_run(&c, 16) == 0 && c.r[X86_EAX] == 0x80,
+          "movzx zero-extended a real memory byte");
+  }
+  // shl eax,3: mov eax,1 ; c1 e0 03 ; hlt -> eax=8.
+  {
+    u8 code[] = {0xb8,1,0,0,0, 0xc1,0xe0,3, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0x7000);
+    CHECK(trt_x86_run(&c, 16) == 0 && c.r[X86_EAX] == 8,
+          "immediate shift produced 8");
+  }
+  // mov al,0x42 ; hlt -> eax low byte 0x42.
+  {
+    u8 code[] = {0xb0,0x42, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0x8000);
+    CHECK(trt_x86_run(&c, 16) == 0 && (c.r[X86_EAX] & 0xff) == 0x42,
+          "8-bit immediate mov wrote AL");
+  }
+  // loop: mov ecx,3 ; loop -2 ; hlt -> ecx=0.
+  {
+    u8 code[] = {0xb9,3,0,0,0, 0xe2,0xfe, 0xf4};
+    auto c = make_ctx(code, sizeof(code), 0x9000);
+    CHECK(trt_x86_run(&c, 32) == 0 && c.r[X86_ECX] == 0,
+          "loop decremented ECX to zero and exited");
+  }
+
   printf("  result: %s\n", fails ? "FAIL" : "ALL PASS");
   return fails ? 1 : 0;
 }
