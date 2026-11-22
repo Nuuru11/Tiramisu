@@ -1460,7 +1460,7 @@ u32 TRT_STDCALL trt_ResumeThread(u64 thread) {
       trt_core_log(rl);
     }
   }
-  if (prev_count == 1) ::Sleep(100);  // .204: let a newly-resumed thread run before the resumer continues
+  if (prev_count == 1) ::Sleep(500);  // .205: 100ms insufficient (.204) -- worker does zero allocs after entering routine, needs more init time (or is blocked; 500ms distinguishes)
   return prev_count;
 #else
   std::lock_guard<std::mutex> lk(g_obj_mu);
