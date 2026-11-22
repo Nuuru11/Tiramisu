@@ -2039,6 +2039,21 @@ int TRT_STDCALL trt_EnterCriticalSection(void* cs) {
     if (trt_TryEnterCriticalSection(cs)) return 1;
     std::this_thread::yield();
   }
+  {
+    // .206 diagnostic: log the first contended CS waits (first 64) so a
+    // worker parked on a lock is visible immediately, not just after the
+    // 3s stall probe. The [tid=] prefix identifies the waiter; owner_tid
+    // names the thread holding the lock.
+    static unsigned s_cs_contended_logged = 0;
+    if (s_cs_contended_logged < 64) {
+      ++s_cs_contended_logged;
+      char cl[192];
+      snprintf(cl, sizeof(cl),
+               "sync: EnterCriticalSection cs=%p CONTENDED owner_tid=%u recursion=%u",
+               cs, c->owner, c->recursion);
+      trt_core_log(cl);
+    }
+  }
   // Contended: block on the lock word instead of Sleep(1) polling (which
   // cost ~1 ms of handoff latency plus a wakeup per millisecond per
   // waiter). The wait runs in 100 ms slices so the >3s stall probe below

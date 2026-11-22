@@ -6194,6 +6194,21 @@ void* TRT_STDCALL trt_AcquireSRWLockExclusive(void* srw) {
     }
     // block until the state word changes (a release wakes us) — no more
     // full-core Sleep(0) spin under contention
+    {
+      // .206 diagnostic: log the first SRW-exclusive waits (first 64).
+      // SRW acquire parks INFINITE with no stall probe, so a blocked
+      // writer is otherwise invisible. The [tid=] prefix (boot_log ->
+      // trt_core_log) identifies the waiter; state shows the lock state.
+      static unsigned s_srw_ex_logged = 0;
+      if (s_srw_ex_logged < 64) {
+        ++s_srw_ex_logged;
+        char sl[192];
+        snprintf(sl, sizeof(sl),
+                 "sync: AcquireSRWLockExclusive srw=%p CONTENDED state=%u",
+                 srw, cur);
+        boot_log(sl);
+      }
+    }
     trt_WaitOnAddress(srw, &cur, 4, 0xFFFFFFFFu /*INFINITE*/);
   }
 }
