@@ -500,17 +500,27 @@ struct spin_tab_entry {
   u64 handle = 0;
   u32 kind = 0;
   unsigned long long fast = 0;
+  // .228 DIAG: the FINAL fast wait per handle (SPIN-LAST) --
+  // the live WAIT-FAST lines only sample the first 32 + every
+  // 100th, so the last iteration (n=120 in .227) was invisible.
+  unsigned long long last_n = 0;
+  u64 last_ret_off = 0;
+  u64 last_fn_off = 0;
 };
 static spin_tab_entry g_spin_tab[16];
 static unsigned g_spin_tab_n = 0;
 // .227 DIAG: total fast waits (all handles), for the
 // before/after-wake split in the census SPIN-SUMMARY.
 static unsigned long long g_spin_fast_total = 0;
-static void spin_tab_count(u64 handle, u32 kind) {
+static void spin_tab_count(u64 handle, u32 kind, u64 ret_off,
+                         u64 fn_off, unsigned long long n) {
   ++g_spin_fast_total;
   for (unsigned i = 0; i < g_spin_tab_n; ++i) {
     if (g_spin_tab[i].handle == handle) {
       ++g_spin_tab[i].fast;
+      g_spin_tab[i].last_n = n;
+      g_spin_tab[i].last_ret_off = ret_off;
+      g_spin_tab[i].last_fn_off = fn_off;
       return;
     }
   }
@@ -518,7 +528,35 @@ static void spin_tab_count(u64 handle, u32 kind) {
   g_spin_tab[g_spin_tab_n].handle = handle;
   g_spin_tab[g_spin_tab_n].kind = kind;
   g_spin_tab[g_spin_tab_n].fast = 1;
+  g_spin_tab[g_spin_tab_n].last_n = n;
+  g_spin_tab[g_spin_tab_n].last_ret_off = ret_off;
+  g_spin_tab[g_spin_tab_n].last_fn_off = fn_off;
   ++g_spin_tab_n;
+}
+
+// .228 DIAG: main-IP sampler arming state (see
+// spin_main_ip_sampler below). Set from the WAIT-FAST path
+// on every fast wait; read by the sampler thread only.
+static std::atomic<u32> g_spin_main_tid{0};
+static std::atomic<unsigned long long> g_spin_last_fast_ms{0};
+static std::atomic<bool> g_spin_sampler_started{false};
+static std::atomic<bool> g_spin_worker_exit_seen{false};
+static std::atomic<unsigned> g_spin_samples_done{0};
+static void spin_main_ip_sampler();
+static unsigned long long spin_now_ms() {
+  return (unsigned long long)std::chrono::duration_cast<
+      std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void spin_note_fast_wait(u32 tid) {
+  g_spin_main_tid.store(tid, std::memory_order_relaxed);
+  g_spin_last_fast_ms.store(spin_now_ms(),
+                            std::memory_order_relaxed);
+  bool expected = false;
+  if (g_spin_sampler_started.compare_exchange_strong(
+          expected, true, std::memory_order_relaxed)) {
+    std::thread([] { spin_main_ip_sampler(); }).detach();
+  }
 }
 
 struct woke_entry {
@@ -558,6 +596,94 @@ static void woke_record(u32 tid, u64 handle) {
   ++g_woke_n;
 }
 
+// .228 DIAG: main-IP sampler -- Sekiro's main thread makes no
+// bridged calls after the spin loop ends (#506), so the bridge
+// cannot see what it does next. This host watchdog samples the
+// main thread's RIP directly: after the spinning tid goes 500ms
+// without a fast wait AND a worker ExitThread has been seen, it
+// OpenThread/SuspendThread/GetThreadContext/ResumeThread's the
+// main thread 3x (~300ms apart) and logs the RIP + enclosing
+// .pdata function + RSP. The sample reads the context only --
+// no bridge lock is held while the target is suspended, and all
+// logging + fn lookup happen AFTER ResumeThread, so a main
+// thread suspended while holding a lock cannot deadlock the
+// sampler. The suspend window is microseconds (one
+// GetThreadContext); this is standard debugger behavior, not a
+// guest code patch (no VEH, no INT3 -- see the header note on
+// why the spin-return trap was not done). POSIX: no sampler
+// (OpenThread is Win32-only); the thread exits immediately.
+static void spin_main_ip_sampler() {
+#if defined(_WIN32)
+  for (int iter = 0; iter < 6000; ++iter) {  // up to ~10 min
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (g_spin_samples_done.load(std::memory_order_relaxed) >= 3)
+      return;
+    const u32 tid = g_spin_main_tid.load(std::memory_order_relaxed);
+    if (!tid) continue;
+    if (!g_spin_worker_exit_seen.load(std::memory_order_relaxed))
+      continue;
+    const unsigned long long last =
+        g_spin_last_fast_ms.load(std::memory_order_relaxed);
+    if (!last) continue;
+    if (spin_now_ms() < last + 500) continue;
+    const unsigned n =
+        g_spin_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                            THREAD_QUERY_INFORMATION,
+                            FALSE, tid);
+    if (!h) {
+      char sl[160];
+      snprintf(sl, sizeof(sl),
+               "sync: MAIN-IP-SAMPLE n=%u tid=%u open-fail err=%lu",
+               n, tid, (unsigned long)::GetLastError());
+      trt_core_log(sl);
+      return;  // main thread is gone
+    }
+    const DWORD sus = ::SuspendThread(h);
+    if (sus == (DWORD)-1) {
+      const DWORD err = ::GetLastError();
+      ::CloseHandle(h);
+      char sl[160];
+      snprintf(sl, sizeof(sl),
+               "sync: MAIN-IP-SAMPLE n=%u tid=%u sus-fail err=%lu",
+               n, tid, (unsigned long)err);
+      trt_core_log(sl);
+      return;
+    }
+    CONTEXT ctx{};
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    const BOOL ok = ::GetThreadContext(h, &ctx);
+    const u64 rip = ok ? (u64)ctx.Rip : 0;
+    const u64 rsp = ok ? (u64)ctx.Rsp : 0;
+    ::ResumeThread(h);
+    ::CloseHandle(h);
+    // Fn lookup AFTER resume (see header comment).
+    u64 fn_off = 0, fn_len = 0, rip_off = 0;
+    if (rip) {
+      spin_fn_range(rip, &fn_off, &fn_len);
+      const trt_image* img = trt_images_first();
+      if (img && img->base && img->size_of_image) {
+        const u64 b = (u64)(uintptr_t)img->base;
+        if (rip >= b && rip < b + img->size_of_image) rip_off = rip - b;
+      }
+    }
+    char sl[256];
+    snprintf(sl, sizeof(sl),
+             "sync: MAIN-IP-SAMPLE n=%u tid=%u rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d",
+             n, tid, (unsigned long long)rip,
+             (unsigned long long)rip_off,
+             (unsigned long long)fn_off,
+             (unsigned long long)fn_len,
+             (unsigned long long)rsp, (unsigned long)sus,
+             ok ? 1 : 0);
+    trt_core_log(sl);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  }
+#else
+  (void)0;
+#endif
+}
+
 // Requires g_obj_mu held. Refresh + read a guest thread's liveness:
 // alive=true means the thread is still executing somewhere (guest code
 // or an unbridged block); alive=false (or the object reclaimed away)
@@ -585,9 +711,9 @@ static void dump_spin_summary() {
   // Requires g_obj_mu held.
   for (unsigned i = 0; i < g_spin_tab_n; ++i) {
     const sync_object* o = object_for_locked(g_spin_tab[i].handle, nullptr);
-    char line[256];
+    char line[320];
     snprintf(line, sizeof(line),
-             "sync: SPIN-SUMMARY handle=%llx kind=%u fast=%llu wake=%llu after=%llu owner=%u lock=%d sets=%llu lastset=%u",
+             "sync: SPIN-SUMMARY handle=%llx kind=%u fast=%llu wake=%llu after=%llu owner=%u lock=%d sets=%llu lastset=%u lastn=%llu lastret=0x%llx lastfn=0x%llx",
              (unsigned long long)g_spin_tab[i].handle,
              (unsigned)g_spin_tab[i].kind,
              (unsigned long long)g_spin_tab[i].fast,
@@ -595,7 +721,10 @@ static void dump_spin_summary() {
              (unsigned long long)(g_spin_tab[i].fast - (g_wake_split_done ? g_spin_tab_at_wake[i] : 0ull)),
              o ? o->owner_tid : 0u, o ? o->lock_count : 0,
              o ? (unsigned long long)o->set_count : 0ull,
-             o ? o->last_set_tid : 0u);
+             o ? o->last_set_tid : 0u,
+             (unsigned long long)g_spin_tab[i].last_n,
+             (unsigned long long)g_spin_tab[i].last_ret_off,
+             (unsigned long long)g_spin_tab[i].last_fn_off);
     trt_core_log(line);
   }
 }
@@ -1507,6 +1636,10 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
              "sync: THREAD-EXIT tid=%u code=%u via=ExitThread",
              current_tid(), code);
     trt_core_log(xl);
+    // .228 DIAG: a worker ExitThread arms the main-IP
+    // sampler's post-exit gate (the sampler fires only after
+    // this + 500ms of main silence).
+    g_spin_worker_exit_seen.store(true, std::memory_order_relaxed);
   }
   notify_thread_exit_once();
 #if defined(_WIN32)
@@ -1652,35 +1785,43 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
     {
       static unsigned long long s_fast_n = 0;
       ++s_fast_n;
+      // .228 DIAG: hoist the ret/fn computation out of the
+      // sampling if (below) so the census SPIN-LAST + the
+      // main-IP sampler see EVERY fast wait, not just the
+      // sampled ones.
+      u64 ret_off = 0;
+      const u64 retaddr =
+          ret_in_guest_image((u64)(uintptr_t)guest_ret)
+              ? (u64)(uintptr_t)guest_ret
+              : 0;
+      if (retaddr) {
+        const trt_image* first_img = trt_images_first();
+        if (first_img && first_img->base && first_img->size_of_image) {
+          const u64 b = (u64)(uintptr_t)first_img->base;
+          if (retaddr >= b && retaddr < b + first_img->size_of_image)
+            ret_off = retaddr - b;
+        }
+      }
+      u64 fn_off = 0, fn_len = 0;
+      spin_fn_range(retaddr, &fn_off, &fn_len);
       // .226 DIAG: count every fast wait per handle (census
       // SPIN-SUMMARY), not just the sampled ones.
-      spin_tab_count(handle, (unsigned)o->kind);
+      spin_tab_count(handle, (unsigned)o->kind, ret_off, fn_off,
+                     s_fast_n);
+      // .228 DIAG: arm the main-IP sampler (see
+      // spin_main_ip_sampler): record the spinning tid +
+      // the last-fast-wait timestamp on EVERY fast wait;
+      // the sampler fires only after this tid goes silent
+      // post-worker-exit.
+      spin_note_fast_wait(my_tid);
       if (s_fast_n <= 32 || (s_fast_n % 100) == 0) {
-        // .225 DIAG: spin return address -- guest_ret is the guest
-        // call site of this WaitForSingleObject (threaded down from
-        // the export wrapper); validated against the guest images,
-        // with the offset against the main image for the offline
-        // map. An off-image ret (the internal WaitForMultipleObjects
-        // path) logs as 0.
-        u64 ret_off = 0;
-        const u64 retaddr =
-            ret_in_guest_image((u64)(uintptr_t)guest_ret)
-                ? (u64)(uintptr_t)guest_ret
-                : 0;
-        if (retaddr) {
-          const trt_image* first_img = trt_images_first();
-          if (first_img && first_img->base && first_img->size_of_image) {
-            const u64 b = (u64)(uintptr_t)first_img->base;
-            if (retaddr >= b && retaddr < b + first_img->size_of_image)
-              ret_off = retaddr - b;
-          }
-        }
+        // .225 DIAG: spin return address (ret_off/fn_off now
+        // hoisted above spin_tab_count by .228, so the census
+        // sees every fast wait, not just the sampled ones).
         // .226 DIAG: enclosing .pdata function of the spin call
         // site (runtime data only) + the wait timeout, so an
         // INFINITE always-ready wait reads differently from a
         // 0-timeout poll.
-        u64 fn_off = 0, fn_len = 0;
-        spin_fn_range(retaddr, &fn_off, &fn_len);
         char fl[384];
         snprintf(fl, sizeof(fl),
                  "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 ms=%u lastset=%u sets=%llu n=%llu owner=%u lock=%d retaddr=%llx ret_off=%llx fn_off=%llx fn_len=%llx",
