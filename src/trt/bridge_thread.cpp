@@ -139,6 +139,11 @@ struct sync_object {
   int lock_count = 0;
   int max_count = 0x7FFFFFFF;
   u32 owner_tid = 0;
+  // .221 DIAG: last thread to SetEvent this object + total sets --
+  // names the ping-pong partner for a thread parked in
+  // WaitForSingleObject on this event.
+  u32 last_set_tid = 0;
+  u64 set_count = 0;
   std::atomic<int> suspend_count{0};
   int priority = 0;
   u32 tid = 0;
@@ -231,6 +236,66 @@ struct apc_item {
   u64 a2 = 0;
 };
 std::unordered_map<u32, std::deque<apc_item>> g_apc_queues;
+
+// .221 DIAG: parked-wait table -- every thread currently parked
+// inside wait_single_impl / wait_multiple_impl, so the gap final
+// dump can name the thread that never wakes and the event it
+// waits on (Sekiro's terminal wait). Guarded by g_obj_mu;
+// entries are added before the park loop and removed by an RAII
+// guard on every exit path. One slot per tid (a nested wait
+// overwrites the outer one -- the innermost wait is the live one).
+struct parked_wait {
+  u32 tid = 0;
+  u64 handle = 0;
+  u32 kind = 0;
+  u32 handle_count = 1;
+  u64 since_ms = 0;
+};
+static parked_wait g_parked_waits[32];
+static u64 park_now_ms() {
+  return (u64)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static void park_wait_add(u32 tid, u64 handle, u32 kind, u32 count) {
+  for (int i = 0; i < 32; ++i) {
+    if (g_parked_waits[i].tid == tid) {
+      g_parked_waits[i].handle = handle;
+      g_parked_waits[i].kind = kind;
+      g_parked_waits[i].handle_count = count;
+      g_parked_waits[i].since_ms = park_now_ms();
+      return;
+    }
+  }
+  for (int i = 0; i < 32; ++i) {
+    if (g_parked_waits[i].tid == 0) {
+      g_parked_waits[i].tid = tid;
+      g_parked_waits[i].handle = handle;
+      g_parked_waits[i].kind = kind;
+      g_parked_waits[i].handle_count = count;
+      g_parked_waits[i].since_ms = park_now_ms();
+      return;
+    }
+  }
+}
+static void park_wait_remove(u32 tid) {
+  for (int i = 0; i < 32; ++i) {
+    if (g_parked_waits[i].tid == tid) {
+      g_parked_waits[i].tid = 0;
+      g_parked_waits[i].handle = 0;
+      return;
+    }
+  }
+}
+struct parked_wait_guard {
+  u32 tid;
+  bool active;
+  parked_wait_guard(u32 t, u64 h, u32 k, u32 c) : tid(t), active(true) {
+    park_wait_add(t, h, k, c);
+  }
+  ~parked_wait_guard() {
+    if (active) park_wait_remove(tid);
+  }
+};
 
 u32 current_tid() {
   return trt_GetCurrentThreadId();
@@ -1174,6 +1239,24 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
       trt_core_log(wl);
     }
   }
+  // .221 DIAG: ping-pong partner -- record this park (INFINITE
+  // waits only; the terminal Sekiro wait is one) and log the
+  // park with the event's last setter, so the partner is named
+  // even if the thread never wakes. The RAII guard clears the
+  // entry on every exit path.
+  parked_wait_guard park_guard(my_tid, handle, (u32)o->kind, 1);
+  if (ms == 0xFFFFFFFFu) {
+    static unsigned s_park_logged = 0;
+    ++s_park_logged;
+    if (s_park_logged <= 128 || (s_park_logged % 128) == 0) {
+      char pl[256];
+      snprintf(pl, sizeof(pl),
+               "sync: WAIT-PARK handle=%llx kind=%u tid=%u ms=%u lastset=%u sets=%llu",
+               (unsigned long long)handle, (unsigned)o->kind, my_tid, ms,
+               o->last_set_tid, (unsigned long long)o->set_count);
+      trt_core_log(pl);
+    }
+  }
   for (;;) {
     if (ms == 0xFFFFFFFFu) {
       g_sync_cv.wait(lk);
@@ -1195,6 +1278,21 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
 #endif
     if (is_object_ready_locked(o, my_tid)) {
       consume_object_wait_locked(o, my_tid);
+      // .221 DIAG: the wait woke -- log who set the event, so a
+      // park/wake pair names the partner even when the gap ring
+      // only shows the wait side. Same cap shape as WAIT-PARK.
+      if (ms == 0xFFFFFFFFu) {
+        static unsigned s_woke_logged = 0;
+        ++s_woke_logged;
+        if (s_woke_logged <= 128 || (s_woke_logged % 128) == 0) {
+          char wl[256];
+          snprintf(wl, sizeof(wl),
+                   "sync: WAIT-WOKE handle=%llx kind=%u tid=%u lastset=%u sets=%llu",
+                   (unsigned long long)handle, (unsigned)o->kind, my_tid,
+                   o->last_set_tid, (unsigned long long)o->set_count);
+          trt_core_log(wl);
+        }
+      }
       return 0;
     }
     if (ms != 0xFFFFFFFFu && std::chrono::steady_clock::now() >= deadline) {
@@ -1233,6 +1331,13 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
       trt_core_log(wl);
     }
   }
+  // .221 DIAG: same parked-wait record as wait_single_impl
+  // (first handle only; the full set is in the WAIT log above).
+  // Function scope on purpose: the guard must live until the
+  // wait returns, so it is NOT wrapped in a bare block.
+  sync_object* o_first = object_for_locked(hs[0]);
+  parked_wait_guard park_guard_multi(my_tid, hs[0],
+      o_first ? (u32)o_first->kind : 99u, count);
   for (;;) {
     u32 signalled = 0;
     u32 first_idx = 0xFFFFFFFFu;
@@ -1298,6 +1403,38 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
   gap_trace_record("WaitForSingleObject");
   return wait_single_impl(handle, ms, false);
+}
+
+// .221 DIAG: log the parked-wait table (called from the gap final
+// dump in bridge_kernel32.cpp). One line per parked thread: the
+// waiter tid, the handle + kind it waits on, how long it has
+// been parked, and the last thread to SetEvent that handle +
+// how many times it was set. If the terminal Sekiro wait is
+// here with sets=0, nothing ever sets the event; if sets>0 but
+// the last setter is dead, the partner stopped signalling.
+extern "C" void trt_sync_parked_log(void) {
+  std::unique_lock<std::mutex> lk(g_obj_mu, std::try_to_lock);
+  if (!lk.owns_lock()) {
+    trt_core_log("sync: PARKED report-busy");
+    return;
+  }
+  bool any = false;
+  for (int i = 0; i < 32; ++i) {
+    if (!g_parked_waits[i].tid) continue;
+    any = true;
+    const sync_object* o = object_for_locked(g_parked_waits[i].handle);
+    char pl[256];
+    snprintf(pl, sizeof(pl),
+             "sync: PARKED tid=%u handle=%llx kind=%u handles=%u parked_ms=%llu lastset=%u sets=%llu",
+             g_parked_waits[i].tid,
+             (unsigned long long)g_parked_waits[i].handle,
+             g_parked_waits[i].kind, g_parked_waits[i].handle_count,
+             (unsigned long long)(park_now_ms() - g_parked_waits[i].since_ms),
+             o ? o->last_set_tid : 0u,
+             o ? (unsigned long long)o->set_count : 0ull);
+    trt_core_log(pl);
+  }
+  if (!any) trt_core_log("sync: PARKED none");
 }
 
 u32 TRT_STDCALL trt_WaitForSingleObjectEx(u64 handle, u32 ms, int alertable) {
@@ -1834,14 +1971,21 @@ int TRT_STDCALL trt_SetEvent(u64 handle) {
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
   o->signalled = true;
+  // .221 DIAG: record the setter -- the ping-pong partner for a
+  // thread parked in WaitForSingleObject on this event.
+  o->last_set_tid = current_tid();
+  ++o->set_count;
   {
-    // .208 diagnostic: log event signals (first 64).
+    // .208 diagnostic: log event signals (first 64 + every
+    // 256th, so death-phase sets stay visible; .221 adds the
+    // setter tid + set count).
     static unsigned s_set_event_logged = 0;
-    if (s_set_event_logged < 64) {
-      ++s_set_event_logged;
-      char el[128];
-      snprintf(el, sizeof(el), "sync: SetEvent handle=%llx",
-               (unsigned long long)handle);
+    ++s_set_event_logged;
+    if (s_set_event_logged <= 64 || (s_set_event_logged % 256) == 0) {
+      char el[192];
+      snprintf(el, sizeof(el), "sync: SetEvent handle=%llx tid=%u sets=%llu",
+               (unsigned long long)handle, o->last_set_tid,
+               (unsigned long long)o->set_count);
       trt_core_log(el);
     }
   }
@@ -1873,6 +2017,9 @@ int TRT_STDCALL trt_PulseEvent(u64 handle) {
   sync_object* o = object_for_locked(handle);
   if (!o || o->kind != OBJ_EVENT) return 0;
   o->signalled = true;
+  // .221 DIAG: a pulse is a set attempt (see trt_SetEvent).
+  o->last_set_tid = current_tid();
+  ++o->set_count;
   {
     // .208 diagnostic: log event pulses (first 64). A Pulse before any
     // thread waits LOSES the signal (set then immediately cleared).

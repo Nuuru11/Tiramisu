@@ -58,6 +58,9 @@ struct img_rec {
   ID3D11RenderTargetView* rtv = nullptr;
   ID3D11DepthStencilView* dsv = nullptr;
   ID3D11UnorderedAccessView* uav = nullptr;
+  // .221 DIAG: estimated D3D11 bytes of the live tex2d/tex3d
+  // (see d3d_tex_note_created); subtracted in free_img_rec.
+  u64 d3d_bytes = 0;
 };
 
 struct vk_state {
@@ -285,6 +288,80 @@ inline void free_pipe_rec(pipe_rec& p) {
   p.bs = nullptr;
 }
 
+// .221 DIAG: D3D11 creation-size ledger -- the ~3.7GB unlogged
+// video consumer. Every CreateTexture2D/3D and CreateBuffer in
+// this backend feeds these counters; the live texture total is
+// decremented in free_img_rec, the live buffer total is the
+// bufs-map sum (b.bytes, as in TEX-OOM-DIAG). If tex_live stays
+// ~50MB while VIDEO-SAMPLE climbs to 3.8GB, the consumer is
+// OUTSIDE D3D11 creation (a driver reservation, the swapchain,
+// or a Godot-side allocation the bridge never sees). If tex_live
+// tracks VIDEO-SAMPLE, the top-1 texture + periodic summary name
+// it. Plain statics, like the rest of this header: hk_sync_* is
+// called from the single render-thread path that already
+// mutates the imgs/bufs maps without a lock.
+static u64 g_d3d_tex_live_bytes = 0;
+static u64 g_d3d_tex_created_bytes = 0;
+static u64 g_d3d_tex_created_n = 0;
+static u64 g_d3d_buf_created_bytes = 0;
+static u64 g_d3d_buf_created_n = 0;
+static u64 g_d3d_top_bytes = 0;
+static u32 g_d3d_top_w = 0, g_d3d_top_h = 0, g_d3d_top_d = 0;
+static u32 g_d3d_top_fmt = 0;
+static inline u64 d3d_tex_est_bytes(u32 vk_fmt, UINT w, UINT h, UINT d,
+                                    UINT mips, UINT layers) {
+  u64 total = 0;
+  for (UINT m = 0; m < mips; ++m) {
+    const UINT mw = std::max<UINT>(1u, w >> m);
+    const UINT mh = std::max<UINT>(1u, h >> m);
+    const UINT md = std::max<UINT>(1u, d >> m);
+    UINT rp = 0, sp = 0;
+    calc_img_pitch(vk_fmt, mw, mh, &rp, &sp);
+    total += (u64)sp * (u64)layers * (u64)md;
+  }
+  return total;
+}
+static inline void d3d_sizes_log(const char* why) {
+  u64 buf_live = 0;
+  for (const auto& kv : g_vkrt.bufs) buf_live += kv.second.bytes;
+  char sb[384];
+  snprintf(sb, sizeof(sb),
+           "D3D11-SIZES %s tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB buf_created=%lluMB buf_n=%llu top=%ux%ux%u fmt=%u %lluMB",
+           why,
+           (unsigned long long)(g_d3d_tex_live_bytes >> 20),
+           (unsigned long long)(g_d3d_tex_created_bytes >> 20),
+           (unsigned long long)g_d3d_tex_created_n,
+           (unsigned long long)(buf_live >> 20),
+           (unsigned long long)(g_d3d_buf_created_bytes >> 20),
+           (unsigned long long)g_d3d_buf_created_n,
+           g_d3d_top_w, g_d3d_top_h, g_d3d_top_d, g_d3d_top_fmt,
+           (unsigned long long)(g_d3d_top_bytes >> 20));
+  trt_core_log(sb);
+}
+// Records one texture creation; returns its estimated bytes so
+// the caller can store them in img_rec::d3d_bytes.
+static inline u64 d3d_tex_note_created(u32 vk_fmt, UINT w, UINT h, UINT d,
+                                       UINT mips, UINT layers) {
+  const u64 bytes = d3d_tex_est_bytes(vk_fmt, w, h, d, mips, layers);
+  g_d3d_tex_live_bytes += bytes;
+  g_d3d_tex_created_bytes += bytes;
+  ++g_d3d_tex_created_n;
+  if (bytes > g_d3d_top_bytes) {
+    g_d3d_top_bytes = bytes;
+    g_d3d_top_w = w; g_d3d_top_h = h; g_d3d_top_d = d; g_d3d_top_fmt = vk_fmt;
+  }
+  if (bytes >= (256ull << 20)) {
+    char bb[256];
+    snprintf(bb, sizeof(bb),
+             "D3D11-SIZES BIGTEX %ux%ux%u fmt=%u mips=%u layers=%u %lluMB",
+             w, h, d, vk_fmt, mips, layers,
+             (unsigned long long)(bytes >> 20));
+    trt_core_log(bb);
+  }
+  if ((g_d3d_tex_created_n % 256) == 0) d3d_sizes_log("periodic");
+  return bytes;
+}
+
 inline void free_buf_rec(buf_rec& b) {
   if (b.srv) b.srv->Release();
   if (b.uav) b.uav->Release();
@@ -297,6 +374,12 @@ inline void free_buf_rec(buf_rec& b) {
 }
 
 inline void free_img_rec(img_rec& im) {
+  // .221 DIAG: keep the live texture total honest.
+  if (im.d3d_bytes) {
+    g_d3d_tex_live_bytes = (g_d3d_tex_live_bytes >= im.d3d_bytes)
+        ? g_d3d_tex_live_bytes - im.d3d_bytes : 0;
+    im.d3d_bytes = 0;
+  }
   if (im.srv) im.srv->Release();
   if (im.rtv) im.rtv->Release();
   if (im.dsv) im.dsv->Release();
@@ -389,6 +472,9 @@ inline bool ensure_dyn_cb(ID3D11Buffer*& cb, uint32_t& cap, uint32_t want_bytes,
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(g_vkrt.dev->CreateBuffer(&bd, nullptr, &cb))) return false;
+    // .221 DIAG: D3D11 creation-size ledger.
+    g_d3d_buf_created_bytes += aligned;
+    ++g_d3d_buf_created_n;
     cap = aligned;
   }
   if (data && data_bytes) {
@@ -579,6 +665,11 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
       init.pSysMem = init_pad.data();
     }
     g_vkrt.dev->CreateBuffer(&bd, init.pSysMem ? &init : nullptr, &b.buf);
+    // .221 DIAG: D3D11 creation-size ledger.
+    if (b.buf) {
+      g_d3d_buf_created_bytes += bd.ByteWidth;
+      ++g_d3d_buf_created_n;
+    }
     if (b.buf && data && bytes && g_vkrt.ctx && !init.pSysMem) {
       D3D11_BOX box{0, 0, 0, (UINT)std::min<uint64_t>(bytes, bd.ByteWidth), 1, 1};
       g_vkrt.ctx->UpdateSubresource(b.buf, 0, &box, data, 0, 0);
@@ -610,8 +701,18 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
         memcpy(init_pad.data(), data, (size_t)std::min<uint64_t>(bytes, cbd.ByteWidth));
         init.pSysMem = init_pad.data();
         g_vkrt.dev->CreateBuffer(&cbd, &init, &b.cb);
+        // .221 DIAG: D3D11 creation-size ledger.
+        if (b.cb) {
+          g_d3d_buf_created_bytes += cbd.ByteWidth;
+          ++g_d3d_buf_created_n;
+        }
       } else {
         g_vkrt.dev->CreateBuffer(&cbd, nullptr, &b.cb);
+        // .221 DIAG: D3D11 creation-size ledger.
+        if (b.cb) {
+          g_d3d_buf_created_bytes += cbd.ByteWidth;
+          ++g_d3d_buf_created_n;
+        }
         if (b.cb && data && bytes && g_vkrt.ctx) {
           if (bytes >= cbd.ByteWidth) {
             g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, data, 0, 0);
@@ -712,6 +813,9 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
         trt_core_log(buf);
       }
       if (SUCCEEDED(hr3d) && im.tex3d) {
+        // .221 DIAG: D3D11 creation-size ledger.
+        im.d3d_bytes = d3d_tex_note_created(desc->vk_format, td.Width,
+                                            td.Height, td.Depth, mips, 1u);
         if (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
           g_vkrt.dev->CreateShaderResourceView(im.tex3d, nullptr, &im.srv);
         }
@@ -773,6 +877,10 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
                    (unsigned long long)(ms.ullAvailPhys >> 20), (unsigned long long)(ms.ullTotalPhys >> 20),
                    n_img, (unsigned long long)(sum_img >> 20), n_buf, (unsigned long long)(sum_buf >> 20), n_pipe);
           trt_core_log(db);
+          // .221 DIAG: D3D11 creation totals at the OOM point --
+          // if tex_live is ~50MB here, the 3.8GB video usage
+          // did NOT come from D3D11 texture creation.
+          d3d_sizes_log("oom");
           // Guest ledger at the OOM point: the decisive H1 vs H2 line.
           // ledger ~=300-800MB => the 3.8GB video usage is the consumer
           // (H1); ledger ~=3.9GB => Godot's heap is the consumer (H2).
@@ -807,6 +915,9 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
         }
       }
       if (SUCCEEDED(hr) && im.tex2d) {
+        // .221 DIAG: D3D11 creation-size ledger.
+        im.d3d_bytes = d3d_tex_note_created(desc->vk_format, td.Width,
+                                            td.Height, 1u, mips, layers);
         if (bind_flags & D3D11_BIND_SHADER_RESOURCE) {
           D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
           sd.Format = depth ? depth_srv_fmt(desc->vk_format) : tex_fmt;

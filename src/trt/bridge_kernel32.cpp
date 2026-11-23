@@ -76,6 +76,7 @@ extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+extern "C" void trt_sync_parked_log(void);
 
 #include <atomic>
 #include <chrono>
@@ -5871,14 +5872,68 @@ struct syscall_trap_target {
   // before the death-phase wait; after 3 fires it stays dead.
   int fires;
 };
-static syscall_trap_target g_syscall_trap_targets[8];
+static syscall_trap_target g_syscall_trap_targets[10];
 static std::atomic<bool> g_syscall_trap_rearm{false};
 // .220 DIAG: trap flap counters (printed on every gap dump) + quiet
 // re-arm flag. The watchdog's own Sleep trips the trap every tick,
 // so each re-install is silent; only the launch arm logs.
 static std::atomic<u64> g_syscall_trap_host_trips{0};
 static std::atomic<u64> g_syscall_trap_rearms{0};
+// .221 DIAG: VEH-race trips -- a second thread tripping a target
+// whose VEH already set armed=false. Counted on the gap dump.
+static std::atomic<u64> g_syscall_trap_races{0};
 static bool g_syscall_trap_quiet_rearm = false;
+// .221 DIAG: per-caller fire budgets -- max 3 fires per distinct
+// guest return address per target, so one chatty caller (the
+// AudioDriverWASAPI poll loop burned the whole cap in .220)
+// cannot exhaust the trap. Small fixed table, guarded by a
+// spinlock: the VEH runs on arbitrary threads, so no blocking
+// lock and no allocation inside the handler. Fail-open: a full
+// table or a lock timeout counts as under budget.
+struct trap_caller_budget {
+  void* target = nullptr;
+  u64 caller = 0;
+  int fires = 0;
+  bool budget_logged = false;
+};
+static trap_caller_budget g_trap_caller_budgets[64];
+static std::atomic_flag g_trap_budget_lock = ATOMIC_FLAG_INIT;
+// Returns 0 = under budget (fire counted), 1 = just exhausted
+// (caller should log BUDGET-EXHAUSTED once), 2 = already
+// exhausted (silent).
+static int trap_caller_note_fire(void* target, u64 caller) {
+  int spins = 0;
+  while (g_trap_budget_lock.test_and_set(std::memory_order_acquire)) {
+    if (++spins > 10000) return 0;
+  }
+  int rc = 0;
+  trap_caller_budget* slot = nullptr;
+  trap_caller_budget* free_slot = nullptr;
+  for (int i = 0; i < 64; ++i) {
+    trap_caller_budget* e = &g_trap_caller_budgets[i];
+    if (e->target == target && e->caller == caller) { slot = e; break; }
+    if (!free_slot && !e->target) free_slot = e;
+  }
+  if (!slot) {
+    if (!free_slot) {
+      g_trap_budget_lock.clear(std::memory_order_release);
+      return 0;
+    }
+    slot = free_slot;
+    slot->target = target;
+    slot->caller = caller;
+    slot->fires = 0;
+    slot->budget_logged = false;
+  }
+  ++slot->fires;
+  if (slot->fires <= 3) rc = 0;
+  else if (slot->fires == 4 && !slot->budget_logged) {
+    slot->budget_logged = true;
+    rc = 1;
+  } else rc = 2;
+  g_trap_budget_lock.clear(std::memory_order_release);
+  return rc;
+}
 static bool caller_in_guest_image(u64 caller) {
   const int n = trt_images_count();
   for (int i = 0; i < n; ++i) {
@@ -5895,16 +5950,33 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
       ep->ExceptionRecord->ExceptionCode == 0x80000003u /*EXCEPTION_BREAKPOINT*/) {
     void* addr = ep->ExceptionRecord->ExceptionAddress;
     for (int i = 0; i < 8; ++i) {
-      if (g_real_exit_targets[i].armed && g_real_exit_targets[i].addr == addr) {
+      if (g_real_exit_targets[i].addr &&
+          g_real_exit_targets[i].addr == addr) {
+        // .221 DIAG: VEH RACE FIX -- a second thread can trip
+        // the same target while the first trip's VEH is still
+        // restoring the byte (armed already false). The old
+        // code only handled armed targets, so the second trip
+        // fell through to the host unhandled filter and
+        // killed the app (Ultrapool .220: HOST UNHANDLED
+        // 0x80000003 at ntdll!NtDelayExecution). armed gates
+        // INSTALLATION only, never VEH handling.
+        const bool was_armed = g_real_exit_targets[i].armed;
         u64 caller = 0;
         if (ep->ContextRecord) {
           const u64 rsp = (u64)ep->ContextRecord->Rsp;
           if (rsp) caller = *(const u64*)(uintptr_t)rsp;
         }
-        char line[192];
-        snprintf(line, sizeof(line), "real-exit: %s called from 0x%llx",
-                 g_real_exit_targets[i].name, (unsigned long long)caller);
-        trt_core_log(line);
+        if (!was_armed) {
+          char rl[192];
+          snprintf(rl, sizeof(rl), "real-exit: RACE %s called from 0x%llx",
+                   g_real_exit_targets[i].name, (unsigned long long)caller);
+          trt_core_log(rl);
+        } else {
+          char line[192];
+          snprintf(line, sizeof(line), "real-exit: %s called from 0x%llx",
+                   g_real_exit_targets[i].name, (unsigned long long)caller);
+          trt_core_log(line);
+        }
         // Restore the original byte and re-execute the real function.
         // NOTE: at an INT3 the context RIP points past the breakpoint
         // byte, so reset it to the patched address or the first
@@ -5928,25 +6000,57 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
     // death-phase wait; after 3 fires it stays dead. Host caller:
     // restore the byte so the host proceeds, count the trip,
     // re-arm on the next watchdog tick.
-    for (int i = 0; i < 8; ++i) {
-      if (g_syscall_trap_targets[i].armed &&
+    for (int i = 0; i < 10; ++i) {
+      if (g_syscall_trap_targets[i].addr &&
           g_syscall_trap_targets[i].addr == addr) {
+        // .221 DIAG: VEH RACE FIX -- handle ANY breakpoint at
+        // a known trap address regardless of armed (see the
+        // real-exit loop above). A second host thread
+        // tripping after the first trip's VEH set armed=false
+        // used to fall through to the host unhandled filter
+        // and kill the app (Ultrapool .220).
+        const bool was_armed = g_syscall_trap_targets[i].armed;
+        if (!was_armed) {
+          g_syscall_trap_races.fetch_add(1, std::memory_order_relaxed);
+        }
         u64 caller = 0;
         if (ep->ContextRecord) {
           const u64 rsp = (u64)ep->ContextRecord->Rsp;
           if (rsp) caller = *(const u64*)(uintptr_t)rsp;
         }
         if (caller_in_guest_image(caller)) {
-          char line[192];
-          snprintf(line, sizeof(line), "syscall-trap: %s called from 0x%llx",
-                   g_syscall_trap_targets[i].name,
-                   (unsigned long long)caller);
-          trt_core_log(line);
-          const int fires = ++g_syscall_trap_targets[i].fires;
-          if (fires < 3) {
+          // .221 DIAG: per-caller fire budget -- one caller
+          // (e.g. the audio poll loop) must not burn the
+          // target's 3-fire budget. A caller over its 3 fires
+          // logs BUDGET-EXHAUSTED once and no longer counts
+          // toward the target's fires; the trap still re-arms
+          // so other callers keep coverage.
+          const int budget = trap_caller_note_fire(
+              g_syscall_trap_targets[i].addr, caller);
+          if (budget == 1) {
+            char bl[192];
+            snprintf(bl, sizeof(bl),
+                     "syscall-trap: BUDGET-EXHAUSTED %s caller=0x%llx",
+                     g_syscall_trap_targets[i].name,
+                     (unsigned long long)caller);
+            trt_core_log(bl);
             g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
+          } else if (budget == 0) {
+            char line[192];
+            snprintf(line, sizeof(line),
+                     "syscall-trap: %s called from 0x%llx%s",
+                     g_syscall_trap_targets[i].name,
+                     (unsigned long long)caller,
+                     was_armed ? "" : " RACE");
+            trt_core_log(line);
+            const int fires = ++g_syscall_trap_targets[i].fires;
+            if (fires < 3) {
+              g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
+            } else {
+              g_syscall_trap_targets[i].fired = true;
+            }
           } else {
-            g_syscall_trap_targets[i].fired = true;
+            g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
           }
         } else {
           g_syscall_trap_host_trips.fetch_add(1, std::memory_order_relaxed);
@@ -6094,18 +6198,20 @@ extern "C" void trt_syscall_trap_install() {
     const wchar_t* mod;
     const char* fn;
     const char* name;
-  } k_targets[8] = {
+  } k_targets[10] = {
       {L"kernel32.dll", "Sleep", "kernel32!Sleep"},
       {L"kernel32.dll", "WaitForSingleObject", "kernel32!WaitForSingleObject"},
+      {L"kernel32.dll", "WaitForMultipleObjects", "kernel32!WaitForMultipleObjects"},
       {L"kernel32.dll", "SwitchToThread", "kernel32!SwitchToThread"},
       {L"kernel32.dll", "SleepConditionVariableSRW", "kernel32!SleepConditionVariableSRW"},
       {L"kernel32.dll", "SleepConditionVariableCS", "kernel32!SleepConditionVariableCS"},
       {L"ntdll.dll", "NtWaitForSingleObject", "ntdll!NtWaitForSingleObject"},
+      {L"ntdll.dll", "NtWaitForMultipleObjects", "ntdll!NtWaitForMultipleObjects"},
       {L"ntdll.dll", "NtDelayExecution", "ntdll!NtDelayExecution"},
       {L"ntdll.dll", "NtYieldExecution", "ntdll!NtYieldExecution"},
   };
   int installed = 0;
-  for (int i = 0; i < 8; ++i) {
+  for (int i = 0; i < 10; ++i) {
     if (g_syscall_trap_targets[i].fired) continue;
     HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
     if (!mod) {
@@ -6164,10 +6270,10 @@ extern "C" void trt_syscall_trap_install() {
     }
   }
   int armed = 0;
-  for (int i = 0; i < 8; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
+  for (int i = 0; i < 10; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
   {
     char line[128];
-    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/8 (armed %d)",
+    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/10 (armed %d)",
              installed, armed);
     TRAP_LOG(line);
   }
@@ -6859,14 +6965,16 @@ void gap_trace_dump_if_changed(void) {
   // trap path, so its diagnostic is compiled out elsewhere.
   {
     int armed_n = 0;
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < 10; ++i)
       if (g_syscall_trap_targets[i].armed) ++armed_n;
     char ts[192];
     snprintf(ts, sizeof(ts),
-             "syscall-trap: stats hosttrips=%llu rearms=%llu armed=%d/8",
+             "syscall-trap: stats hosttrips=%llu rearms=%llu races=%llu armed=%d/10",
              (unsigned long long)g_syscall_trap_host_trips.load(
                  std::memory_order_relaxed),
              (unsigned long long)g_syscall_trap_rearms.load(
+                 std::memory_order_relaxed),
+             (unsigned long long)g_syscall_trap_races.load(
                  std::memory_order_relaxed),
              armed_n);
     trt_core_log(ts);
@@ -6884,9 +6992,10 @@ void gap_trace_dump_if_changed(void) {
   // run_guest_trapped (main.cpp) is the primary arm; this is the
   // backup if it was skipped, and logs SKIP already-armed if it ran.
   // A PEB-walked / direct wait call (NtWaitForSingleObject,
-  // NtDelayExecution, NtYieldExecution, kernel32 Sleep /
-  // WaitForSingleObject / SwitchToThread / SleepConditionVariableSRW
-  // / SleepConditionVariableCS) is then caught with its guest caller.
+  // NtWaitForMultipleObjects, NtDelayExecution, NtYieldExecution,
+  // kernel32 Sleep / WaitForSingleObject / WaitForMultipleObjects /
+  // SwitchToThread / SleepConditionVariableSRW /
+  // SleepConditionVariableCS) is then caught with its guest caller.
   // One attempt per process: re-arms after host-caller restores go
   // through g_syscall_trap_rearm above.
 #ifdef _WIN32
@@ -6906,6 +7015,10 @@ void gap_trace_dump_if_changed(void) {
     char bl[512];
     snprintf(bl, sizeof(bl), "gap: commit-at-death %s", budget);
     trt_core_log(bl);
+    // .221 DIAG: parked-wait report -- who is parked on what at
+    // death (names the ping-pong partner / the event nothing
+    // sets). trt_sync_parked_log lives in bridge_thread.cpp.
+    trt_sync_parked_log();
   }
 #endif
 }
