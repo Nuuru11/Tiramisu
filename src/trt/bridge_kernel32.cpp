@@ -1457,6 +1457,13 @@ static wait_addr_state g_wait_addr[64];
 // lost wake is exactly the kind of wedge the ring can't report.
 std::atomic<u64> g_wa_waits{0}, g_wa_wake_single{0}, g_wa_wake_all{0},
     g_wa_wake_single_miss{0}, g_wa_wake_all_miss{0}, g_wa_timed_out{0};
+// .250 DIAG: address the RtlWaitOnAddress trap caught a guest thread
+// parking on (set by the VEH fire log in the snapshot trap
+// carryforward). The .249 park address is per-run (heap/ASLR), so it
+// is recorded dynamically, never hardcoded. The bridged
+// WakeByAddress* log TARGET lines for this address, and
+// trt_WaitOnAddress logs its polled value over time.
+static std::atomic<u64> g_wa_trap_addr{0};
 static wait_addr_state* wait_addr_slot(volatile void* addr) {
   const uintptr_t v = (uintptr_t)addr;
   return &g_wait_addr[((v >> 4) ^ (v >> 12)) & 63];
@@ -1553,6 +1560,43 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
       trt_core_log(line);
     }
   }
+  // .250 DIAG: value-over-time for the address the RtlWaitOnAddress
+  // trap caught a guest thread parking on. The worker polls it every
+  // 100ms via this bridge call; log the first 8 polls after the trap
+  // fires, then every 50th (~1 per 5s) -- does anything ever write
+  // to it? The .249 park value was stuck at 0x1.
+  {
+    const u64 trap_addr = g_wa_trap_addr.load(std::memory_order_relaxed);
+    if (trap_addr != 0 && (u64)(uintptr_t)addr == trap_addr) {
+      static std::atomic<u64> s_trap_poll_n{0};
+      const u64 n = s_trap_poll_n.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8 || n % 50 == 0) {
+        u64 cur = 0;
+        switch (size) {
+          case 1:
+            cur = __atomic_load_n((volatile u8*)addr, __ATOMIC_ACQUIRE);
+            break;
+          case 2:
+            cur = __atomic_load_n((volatile u16*)addr, __ATOMIC_ACQUIRE);
+            break;
+          case 4:
+            cur = __atomic_load_n((volatile u32*)addr, __ATOMIC_ACQUIRE);
+            break;
+          case 8:
+            cur = __atomic_load_n((volatile u64*)addr, __ATOMIC_ACQUIRE);
+            break;
+          default:
+            break;
+        }
+        char line[192];
+        snprintf(line, sizeof(line),
+                 "kernel32: WaitOnAddress TRAP-ADDR #%llu tid=%u cur=0x%llx",
+                 (unsigned long long)n, trt_GetCurrentThreadId(),
+                 (unsigned long long)cur);
+        trt_core_log(line);
+      }
+    }
+  }
   if (!wait_addr_same(addr, cmp, size)) return 1;
   if (ms == 0) {
     err_ref_for_current_thread() = 1460;
@@ -1613,6 +1657,23 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
 
 void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr) {
   if (!addr) return;
+  // .250 DIAG: log EVERY wake targeting the address the RtlWaitOnAddress
+  // trap caught a guest thread parking on. The .249 first-8 throttle
+  // was consumed by Sekiro, so Ultrapool's wakes to the park address
+  // were invisible. Includes the value at the address (size 4, the
+  // .249 park size).
+  {
+    const u64 trap_addr = g_wa_trap_addr.load(std::memory_order_relaxed);
+    if (trap_addr != 0 && (u64)(uintptr_t)addr == trap_addr) {
+      const u32 cur =
+          __atomic_load_n((volatile u32*)addr, __ATOMIC_ACQUIRE);
+      char line[160];
+      snprintf(line, sizeof(line),
+               "kernel32: WakeByAddressSingle TARGET addr=0x%llx cur=0x%x",
+               (unsigned long long)trap_addr, cur);
+      trt_core_log(line);
+    }
+  }
   // .249 DIAG: log the first 8 wake calls (the .248 Ultrapool park is a
   // wait that never resolves -- these lines say whether any wake fired).
   {
@@ -1653,6 +1714,20 @@ void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr) {
 
 void TRT_STDCALL trt_WakeByAddressAll(volatile void* addr) {
   if (!addr) return;
+  // .250 DIAG: log EVERY wake targeting the address the RtlWaitOnAddress
+  // trap caught a guest thread parking on (see WakeByAddressSingle).
+  {
+    const u64 trap_addr = g_wa_trap_addr.load(std::memory_order_relaxed);
+    if (trap_addr != 0 && (u64)(uintptr_t)addr == trap_addr) {
+      const u32 cur =
+          __atomic_load_n((volatile u32*)addr, __ATOMIC_ACQUIRE);
+      char line[160];
+      snprintf(line, sizeof(line),
+               "kernel32: WakeByAddressAll TARGET addr=0x%llx cur=0x%x",
+               (unsigned long long)trap_addr, cur);
+      trt_core_log(line);
+    }
+  }
   // .249 DIAG: log the first 8 wake calls (see WakeByAddressSingle).
   {
     static std::atomic<u64> s_wake_all_logged{0};
@@ -2043,12 +2118,23 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     if (!os && (disp == 1 || disp == 2 || disp == 5)) os = fopen(host, "w+b");
   }
   if (!os) {
+    // .250 DIAG: log the flags + whether the host path is a directory +
+    // errno. The .249 Sekiro tail loops 28x opening its own game
+    // directory (access=0, OPEN_EXISTING) and failing; the bridge
+    // ignores flags, so a FILE_FLAG_BACKUP_SEMANTICS directory open
+    // (0x02000000, the only way a directory open succeeds on real
+    // Windows) is dropped here. is_dir + errno say whether the
+    // failure is "is a directory" (EISDIR=21) or "not found".
+    const int open_errno = errno;
+    int cf_is_dir = 0;
+    (void)trt_vfs_stat(host, &cf_is_dir, nullptr);
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
     char plog[1100];
     snprintf(plog, sizeof(plog),
-             "  path was: %s (access=0x%08x disposition=%u write=%d)",
-             host, access, disp, write);
+             "  path was: %s (access=0x%08x disposition=%u write=%d "
+             "flags=0x%08x is_dir=%d errno=%d)",
+             host, access, disp, write, flags, cf_is_dir, open_errno);
     trt_core_log(plog);
     return (void*)(uintptr_t)-1;
   }
