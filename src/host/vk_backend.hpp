@@ -163,6 +163,15 @@ struct d3d11_call_counts {
   std::atomic<unsigned long long> pres_r{0};
   std::atomic<unsigned long long> sync_c{0};
   std::atomic<unsigned long long> newtex_c{0};
+  std::atomic<unsigned long long> draw_c{0};  // .245 DIAG: DrawIndexedInstanced/DrawInstanced
+  std::atomic<unsigned long long> draw_r{0};
+  std::atomic<unsigned long long> disp_c{0};  // .245 DIAG: Dispatch
+  std::atomic<unsigned long long> disp_r{0};
+  std::atomic<unsigned long long> state_c{0};  // .245 DIAG: setters/clears/OMSet/IASet/RSSet/VS/PS/CSSet*
+  std::atomic<unsigned long long> state_r{0};
+  std::atomic<unsigned long long> flush_c{0};  // .245 DIAG: Flush per submit
+  std::atomic<unsigned long long> flush_r{0};
+  std::atomic<unsigned long long> texskip_c{0};  // .245 DIAG: texture creation skipped, device removed
 };
 inline d3d11_call_counts g_d3d11c;
 
@@ -171,7 +180,9 @@ struct d3d11_counts_snap {
   unsigned long long tex2d_c, tex2d_r, tex3d_c, tex3d_r, srv_c,
       srv_r, rtv_c, rtv_r, dsv_c, dsv_r, uav_c, uav_r, upd_c,
       upd_r, map_c, map_r, unmap_c, unmap_r, copy_c, copy_r,
-      pres_c, pres_r, sync_c, newtex_c;
+      pres_c, pres_r, sync_c, newtex_c, draw_c, draw_r,
+      disp_c, disp_r, state_c, state_r, flush_c, flush_r,
+      texskip_c;
 };
 inline d3d11_counts_snap d3d11_snapshot() {
   d3d11_counts_snap d{};
@@ -199,6 +210,15 @@ inline d3d11_counts_snap d3d11_snapshot() {
   d.pres_r = g_d3d11c.pres_r.load(std::memory_order_relaxed);
   d.sync_c = g_d3d11c.sync_c.load(std::memory_order_relaxed);
   d.newtex_c = g_d3d11c.newtex_c.load(std::memory_order_relaxed);
+  d.draw_c = g_d3d11c.draw_c.load(std::memory_order_relaxed);
+  d.draw_r = g_d3d11c.draw_r.load(std::memory_order_relaxed);
+  d.disp_c = g_d3d11c.disp_c.load(std::memory_order_relaxed);
+  d.disp_r = g_d3d11c.disp_r.load(std::memory_order_relaxed);
+  d.state_c = g_d3d11c.state_c.load(std::memory_order_relaxed);
+  d.state_r = g_d3d11c.state_r.load(std::memory_order_relaxed);
+  d.flush_c = g_d3d11c.flush_c.load(std::memory_order_relaxed);
+  d.flush_r = g_d3d11c.flush_r.load(std::memory_order_relaxed);
+  d.texskip_c = g_d3d11c.texskip_c.load(std::memory_order_relaxed);
   return d;
 }
 
@@ -209,11 +229,15 @@ inline void d3d11_format_line(char* buf, size_t cap,
            "tex2d=%llu/%llu tex3d=%llu/%llu upd=%llu/%llu "
            "srv=%llu/%llu rtv=%llu/%llu dsv=%llu/%llu "
            "uav=%llu/%llu map=%llu/%llu copy=%llu/%llu "
-           "pres=%llu/%llu sync=%llu newtex=%llu",
+           "pres=%llu/%llu sync=%llu newtex=%llu "
+           "draw=%llu/%llu disp=%llu/%llu state=%llu/%llu "
+           "flush=%llu/%llu texskip=%llu",
            d.tex2d_c, d.tex2d_r, d.tex3d_c, d.tex3d_r, d.upd_c,
            d.upd_r, d.srv_c, d.srv_r, d.rtv_c, d.rtv_r, d.dsv_c,
            d.dsv_r, d.uav_c, d.uav_r, d.map_c, d.map_r, d.copy_c,
-           d.copy_r, d.pres_c, d.pres_r, d.sync_c, d.newtex_c);
+           d.copy_r, d.pres_c, d.pres_r, d.sync_c, d.newtex_c,
+           d.draw_c, d.draw_r, d.disp_c, d.disp_r, d.state_c,
+           d.state_r, d.flush_c, d.flush_r, d.texskip_c);
 }
 
 inline uint64_t fnv64_mix(uint64_t h, uint64_t v) {
@@ -1013,6 +1037,15 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
     free_img_rec(im);
     im.desc = *desc;
     ++g_d3d11c.newtex_c;  // .244 DIAG: new texture description (CreateTexture2D/3D follows)
+    // .245 DIAG+MITIGATION: once the device is removed, further
+    // texture creations fail AND still grow driver regions (.244:
+    // 726 failed creations after removal). Skip the creation and
+    // take the existing FAILED(hr) path with hr/hr3d =
+    // DXGI_ERROR_DEVICE_REMOVED (views/uploads are skipped
+    // because im.tex2d/tex3d stay null).
+    const HRESULT devrem_now =
+        g_vkrt.dev ? g_vkrt.dev->GetDeviceRemovedReason() : S_OK;
+    if (devrem_now != S_OK) ++g_d3d11c.texskip_c;
     const bool depth = is_depth_vk_fmt(desc->vk_format);
     const bool is_cube = ((desc->flags & 0x10u) != 0u) && desc->layers >= 6u;
 
@@ -1040,10 +1073,15 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Format = tex_fmt;
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
-      ++g_d3d11c.tex3d_c;  // .244 DIAG: D3D11 call/ret pair
-      d3d11_note_last("CreateTexture3D");
-      HRESULT hr3d = g_vkrt.dev->CreateTexture3D(&td, nullptr, &im.tex3d);
-      ++g_d3d11c.tex3d_r;
+      HRESULT hr3d = S_OK;
+      if (devrem_now != S_OK) {
+        hr3d = (HRESULT)0x887A0006;  // DXGI_ERROR_DEVICE_REMOVED
+      } else {
+        ++g_d3d11c.tex3d_c;  // .244 DIAG: D3D11 call/ret pair
+        d3d11_note_last("CreateTexture3D");
+        hr3d = g_vkrt.dev->CreateTexture3D(&td, nullptr, &im.tex3d);
+        ++g_d3d11c.tex3d_r;
+      }
       if (FAILED(hr3d)) {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -1079,17 +1117,22 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags;
       if (is_cube) td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
-      ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair
-      d3d11_note_last("CreateTexture2D");
-      HRESULT hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
-      ++g_d3d11c.tex2d_r;
-      if (FAILED(hr) && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
-        td.BindFlags &= ~D3D11_BIND_UNORDERED_ACCESS;
-        bind_flags = td.BindFlags;
-        ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair (UAV retry)
+      HRESULT hr = S_OK;
+      if (devrem_now != S_OK) {
+        hr = (HRESULT)0x887A0006;  // DXGI_ERROR_DEVICE_REMOVED
+      } else {
+        ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair
         d3d11_note_last("CreateTexture2D");
         hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
         ++g_d3d11c.tex2d_r;
+        if (FAILED(hr) && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
+          td.BindFlags &= ~D3D11_BIND_UNORDERED_ACCESS;
+          bind_flags = td.BindFlags;
+          ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair (UAV retry)
+          d3d11_note_last("CreateTexture2D");
+          hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
+          ++g_d3d11c.tex2d_r;
+        }
       }
       if (FAILED(hr)) {
         HRESULT rem = g_vkrt.dev ? g_vkrt.dev->GetDeviceRemovedReason() : S_OK;
@@ -1270,8 +1313,14 @@ inline void hk_begin_render_pass(const trt_vk_rp_begin* rp, void*) {
   if (!g_vkrt.initialized || !g_vkrt.ctx || !rp) return;
 
   ID3D11ShaderResourceView* null_srvs[16] = {};
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("VSSetShaderResources");
   g_vkrt.ctx->VSSetShaderResources(0, 16, null_srvs);
+  ++g_d3d11c.state_r;
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("PSSetShaderResources");
   g_vkrt.ctx->PSSetShaderResources(0, 16, null_srvs);
+  ++g_d3d11c.state_r;
 
   ID3D11RenderTargetView* rtvs[8] = {};
   UINT rtv_cnt = std::min<UINT>(8u, rp->color_count);
@@ -1288,7 +1337,10 @@ inline void hk_begin_render_pass(const trt_vk_rp_begin* rp, void*) {
       }
     }
     if (rtvs[i] && (rp->clear_color_mask & (1u << i))) {
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("ClearRenderTargetView");
       g_vkrt.ctx->ClearRenderTargetView(rtvs[i], rp->clear_rgba[i]);
+      ++g_d3d11c.state_r;
     }
   }
   if (rtv_cnt == 0 && !rp->depth_img) {
@@ -1304,17 +1356,26 @@ inline void hk_begin_render_pass(const trt_vk_rp_begin* rp, void*) {
   } else if (uses_swapchain) {
     dsv = g_vkrt.main_dsv;
     if (dsv) {
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("ClearDepthStencilView");
       g_vkrt.ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+      ++g_d3d11c.state_r;
     }
   }
   if (dsv && (rp->clear_depth || rp->clear_stencil)) {
     UINT cf = 0;
     if (rp->clear_depth) cf |= D3D11_CLEAR_DEPTH;
     if (rp->clear_stencil) cf |= D3D11_CLEAR_STENCIL;
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("ClearDepthStencilView");
     g_vkrt.ctx->ClearDepthStencilView(dsv, cf, rp->depth_val, (UINT8)rp->stencil_val);
+    ++g_d3d11c.state_r;
   }
 
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("OMSetRenderTargets");
   g_vkrt.ctx->OMSetRenderTargets(rtv_cnt, rtvs, dsv);
+  ++g_d3d11c.state_r;
 
   D3D11_VIEWPORT vp{};
   vp.TopLeftX = (FLOAT)rp->area_x;
@@ -1323,12 +1384,18 @@ inline void hk_begin_render_pass(const trt_vk_rp_begin* rp, void*) {
   vp.Height = (FLOAT)(rp->area_h ? rp->area_h : g_vkrt.height);
   vp.MinDepth = 0.0f;
   vp.MaxDepth = 1.0f;
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("RSSetViewports");
   g_vkrt.ctx->RSSetViewports(1, &vp);
+  ++g_d3d11c.state_r;
 
   D3D11_RECT sc{rp->area_x, rp->area_y,
                 rp->area_x + (LONG)(rp->area_w ? rp->area_w : g_vkrt.width),
                 rp->area_y + (LONG)(rp->area_h ? rp->area_h : g_vkrt.height)};
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("RSSetScissorRects");
   g_vkrt.ctx->RSSetScissorRects(1, &sc);
+  ++g_d3d11c.state_r;
 }
 
 inline void hk_end_render_pass(void*) {
@@ -1348,21 +1415,66 @@ inline void bind_descriptor_table(const trt_vk_desc_binding* bindings, u32 count
 
     auto bind_cb = [&](ID3D11Buffer* cb) {
       if (!cb || reg >= 14u) return;
-      if (to_cs) g_vkrt.ctx->CSSetConstantBuffers(reg, 1, &cb);
-      if (to_vs) g_vkrt.ctx->VSSetConstantBuffers(reg, 1, &cb);
-      if (to_ps) g_vkrt.ctx->PSSetConstantBuffers(reg, 1, &cb);
+      if (to_cs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("CSSetConstantBuffers");
+        g_vkrt.ctx->CSSetConstantBuffers(reg, 1, &cb);
+        ++g_d3d11c.state_r;
+      }
+      if (to_vs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("VSSetConstantBuffers");
+        g_vkrt.ctx->VSSetConstantBuffers(reg, 1, &cb);
+        ++g_d3d11c.state_r;
+      }
+      if (to_ps) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("PSSetConstantBuffers");
+        g_vkrt.ctx->PSSetConstantBuffers(reg, 1, &cb);
+        ++g_d3d11c.state_r;
+      }
     };
     auto bind_srv = [&](ID3D11ShaderResourceView* srv) {
       if (reg >= 128u) return;
-      if (to_cs) g_vkrt.ctx->CSSetShaderResources(reg, 1, &srv);
-      if (to_vs) g_vkrt.ctx->VSSetShaderResources(reg, 1, &srv);
-      if (to_ps) g_vkrt.ctx->PSSetShaderResources(reg, 1, &srv);
+      if (to_cs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("CSSetShaderResources");
+        g_vkrt.ctx->CSSetShaderResources(reg, 1, &srv);
+        ++g_d3d11c.state_r;
+      }
+      if (to_vs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("VSSetShaderResources");
+        g_vkrt.ctx->VSSetShaderResources(reg, 1, &srv);
+        ++g_d3d11c.state_r;
+      }
+      if (to_ps) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("PSSetShaderResources");
+        g_vkrt.ctx->PSSetShaderResources(reg, 1, &srv);
+        ++g_d3d11c.state_r;
+      }
     };
     auto bind_smp = [&](UINT sreg, ID3D11SamplerState* smp) {
       if (!smp || sreg >= 16u) return;
-      if (to_cs) g_vkrt.ctx->CSSetSamplers(sreg, 1, &smp);
-      if (to_vs) g_vkrt.ctx->VSSetSamplers(sreg, 1, &smp);
-      if (to_ps) g_vkrt.ctx->PSSetSamplers(sreg, 1, &smp);
+      if (to_cs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("CSSetSamplers");
+        g_vkrt.ctx->CSSetSamplers(sreg, 1, &smp);
+        ++g_d3d11c.state_r;
+      }
+      if (to_vs) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("VSSetSamplers");
+        g_vkrt.ctx->VSSetSamplers(sreg, 1, &smp);
+        ++g_d3d11c.state_r;
+      }
+      if (to_ps) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("PSSetSamplers");
+        g_vkrt.ctx->PSSetSamplers(sreg, 1, &smp);
+        ++g_d3d11c.state_r;
+      }
     };
 
     if (b.kind == SPV_BIND_CBV) {
@@ -1389,7 +1501,10 @@ inline void bind_descriptor_table(const trt_vk_desc_binding* bindings, u32 count
     } else if (b.kind == SPV_BIND_UAV_BUFFER) {
       auto bit = g_vkrt.bufs.find(b.buf_id);
       if (bit != g_vkrt.bufs.end() && bit->second.uav && is_compute && reg < 8u) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("CSSetUnorderedAccessViews");
         g_vkrt.ctx->CSSetUnorderedAccessViews(reg, 1, &bit->second.uav, nullptr);
+        ++g_d3d11c.state_r;
         if (uav_slots_to_clear) uav_slots_to_clear->push_back(reg);
       }
     } else if (b.kind == SPV_BIND_TEXTURE) {
@@ -1404,7 +1519,10 @@ inline void bind_descriptor_table(const trt_vk_desc_binding* bindings, u32 count
     } else if (b.kind == SPV_BIND_STORAGE_IMG) {
       auto iit = g_vkrt.imgs.find(b.img_id);
       if (iit != g_vkrt.imgs.end() && iit->second.uav && is_compute && reg < 8u) {
+        ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+        d3d11_note_last("CSSetUnorderedAccessViews");
         g_vkrt.ctx->CSSetUnorderedAccessViews(reg, 1, &iit->second.uav, nullptr);
+        ++g_d3d11c.state_r;
         if (uav_slots_to_clear) uav_slots_to_clear->push_back(reg);
       }
     }
@@ -1418,13 +1536,40 @@ inline void hk_draw(const trt_vk_draw_cmd* cmd, void*) {
   const pipe_rec& p = pit->second;
   if (!p.vs) return;
 
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("VSSetShader");
   g_vkrt.ctx->VSSetShader(p.vs, nullptr, 0);
+  ++g_d3d11c.state_r;
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("PSSetShader");
   g_vkrt.ctx->PSSetShader(p.ps, nullptr, 0);
+  ++g_d3d11c.state_r;
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("IASetInputLayout");
   g_vkrt.ctx->IASetInputLayout(p.il);
+  ++g_d3d11c.state_r;
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("IASetPrimitiveTopology");
   g_vkrt.ctx->IASetPrimitiveTopology(p.topo);
-  if (p.rs) g_vkrt.ctx->RSSetState(p.rs);
-  if (p.dss) g_vkrt.ctx->OMSetDepthStencilState(p.dss, 0);
-  if (p.bs) g_vkrt.ctx->OMSetBlendState(p.bs, cmd->blend_const, 0xFFFFFFFFu);
+  ++g_d3d11c.state_r;
+  if (p.rs) {
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("RSSetState");
+    g_vkrt.ctx->RSSetState(p.rs);
+    ++g_d3d11c.state_r;
+  }
+  if (p.dss) {
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("OMSetDepthStencilState");
+    g_vkrt.ctx->OMSetDepthStencilState(p.dss, 0);
+    ++g_d3d11c.state_r;
+  }
+  if (p.bs) {
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("OMSetBlendState");
+    g_vkrt.ctx->OMSetBlendState(p.bs, cmd->blend_const, 0xFFFFFFFFu);
+    ++g_d3d11c.state_r;
+  }
 
   if (cmd->has_vp && cmd->vp_w > 0.0f && fabsf(cmd->vp_h) > 0.0f) {
     D3D11_VIEWPORT vp{};
@@ -1434,12 +1579,18 @@ inline void hk_draw(const trt_vk_draw_cmd* cmd, void*) {
     vp.Height = fabsf(cmd->vp_h);
     vp.MinDepth = cmd->vp_min_z;
     vp.MaxDepth = cmd->vp_max_z;
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("RSSetViewports");
     g_vkrt.ctx->RSSetViewports(1, &vp);
+    ++g_d3d11c.state_r;
   }
   if (cmd->has_sc && cmd->sc_w > 0u && cmd->sc_h > 0u) {
     D3D11_RECT sc{cmd->sc_x, cmd->sc_y,
                   cmd->sc_x + (LONG)cmd->sc_w, cmd->sc_y + (LONG)cmd->sc_h};
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("RSSetScissorRects");
     g_vkrt.ctx->RSSetScissorRects(1, &sc);
+    ++g_d3d11c.state_r;
   }
 
   if (cmd->vb_count > 0) {
@@ -1453,7 +1604,10 @@ inline void hk_draw(const trt_vk_draw_cmd* cmd, void*) {
       strides[i] = p.vb_strides[i];
       offs[i] = (UINT)cmd->vb_offs[i];
     }
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("IASetVertexBuffers");
     g_vkrt.ctx->IASetVertexBuffers(0, cnt, vbs, strides, offs);
+    ++g_d3d11c.state_r;
   }
 
   if (cmd->indexed) {
@@ -1461,29 +1615,44 @@ inline void hk_draw(const trt_vk_draw_cmd* cmd, void*) {
     auto bit = g_vkrt.bufs.find(cmd->ib_id);
     if (bit != g_vkrt.bufs.end()) ib = bit->second.buf;
     if (!ib) return;
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("IASetIndexBuffer");
     g_vkrt.ctx->IASetIndexBuffer(
         ib, cmd->idx_is_u32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT,
         (UINT)cmd->ib_off);
+    ++g_d3d11c.state_r;
   }
 
   if (cmd->push_data && cmd->push_bytes && cmd->push_reg < 14u) {
     if (ensure_dyn_cb(g_vkrt.push_cb, g_vkrt.push_cb_cap, cmd->push_bytes,
                       cmd->push_data, cmd->push_bytes)) {
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("VSSetConstantBuffers");
       g_vkrt.ctx->VSSetConstantBuffers(cmd->push_reg, 1, &g_vkrt.push_cb);
+      ++g_d3d11c.state_r;
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("PSSetConstantBuffers");
       g_vkrt.ctx->PSSetConstantBuffers(cmd->push_reg, 1, &g_vkrt.push_cb);
+      ++g_d3d11c.state_r;
     }
   }
 
   bind_descriptor_table(cmd->bindings, cmd->binding_count, false, nullptr);
 
   if (cmd->indexed) {
+    ++g_d3d11c.draw_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("DrawIndexedInstanced");
     g_vkrt.ctx->DrawIndexedInstanced(
         cmd->vtx_count, std::max<u32>(1u, cmd->inst_count),
         cmd->first_vtx_or_idx, cmd->vtx_off, cmd->first_inst);
+    ++g_d3d11c.draw_r;
   } else {
+    ++g_d3d11c.draw_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("DrawInstanced");
     g_vkrt.ctx->DrawInstanced(
         cmd->vtx_count, std::max<u32>(1u, cmd->inst_count),
         cmd->first_vtx_or_idx, cmd->first_inst);
+    ++g_d3d11c.draw_r;
   }
 }
 
@@ -1492,26 +1661,41 @@ inline void hk_dispatch(const trt_vk_dispatch_cmd* cmd, void*) {
   auto pit = g_vkrt.pipes.find(cmd->pipeline_id);
   if (pit == g_vkrt.pipes.end() || !pit->second.cs) return;
 
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("CSSetShader");
   g_vkrt.ctx->CSSetShader(pit->second.cs, nullptr, 0);
+  ++g_d3d11c.state_r;
   if (cmd->push_data && cmd->push_bytes && cmd->push_reg < 14u) {
     if (ensure_dyn_cb(g_vkrt.push_cb, g_vkrt.push_cb_cap, cmd->push_bytes,
                       cmd->push_data, cmd->push_bytes)) {
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("CSSetConstantBuffers");
       g_vkrt.ctx->CSSetConstantBuffers(cmd->push_reg, 1, &g_vkrt.push_cb);
+      ++g_d3d11c.state_r;
     }
   }
 
   std::vector<u32> uav_slots;
   bind_descriptor_table(cmd->bindings, cmd->binding_count, true, &uav_slots);
 
+  ++g_d3d11c.disp_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("Dispatch");
   g_vkrt.ctx->Dispatch(std::max<u32>(1u, cmd->gx), std::max<u32>(1u, cmd->gy),
                        std::max<u32>(1u, cmd->gz));
+  ++g_d3d11c.disp_r;
 
   ID3D11UnorderedAccessView* null_uav = nullptr;
   for (u32 slot : uav_slots) {
+    ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+    d3d11_note_last("CSSetUnorderedAccessViews");
     g_vkrt.ctx->CSSetUnorderedAccessViews(slot, 1, &null_uav, nullptr);
+    ++g_d3d11c.state_r;
   }
   ID3D11ShaderResourceView* null_srvs[16] = {};
+  ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("CSSetShaderResources");
   g_vkrt.ctx->CSSetShaderResources(0, 16, null_srvs);
+  ++g_d3d11c.state_r;
 }
 
 inline void hk_copy_buffer(u64 src_buf, u64 dst_buf, u64 src_off, u64 dst_off,
@@ -1620,9 +1804,22 @@ inline void hk_present(u64, u32, void*) {
     g_vkrt.swap->Present(1, 0);
     ++g_d3d11c.pres_r;
     if (g_vkrt.ctx && g_vkrt.main_rtv) {
+      ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+      d3d11_note_last("OMSetRenderTargets");
       g_vkrt.ctx->OMSetRenderTargets(1, &g_vkrt.main_rtv, g_vkrt.main_dsv);
+      ++g_d3d11c.state_r;
     }
   }
+}
+
+// .245 DIAG: Flush the immediate context (called per vkQueueSubmit
+// via the hooks). Counts + note_last like every other D3D11 call.
+inline void hk_flush(void*) {
+  if (!g_vkrt.initialized || !g_vkrt.ctx) return;
+  ++g_d3d11c.flush_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)
+  d3d11_note_last("Flush");
+  g_vkrt.ctx->Flush();
+  ++g_d3d11c.flush_r;
 }
 
 inline void shutdown() {
@@ -1734,6 +1931,7 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
   hk.copy_buffer = &hk_copy_buffer;
   hk.copy_buf_to_img = &hk_copy_buf_to_img;
   hk.present = &hk_present;
+  hk.flush = &hk_flush;  // .245 DIAG: Flush per submit
   trt_vk_set_hooks(&hk);
 }
 
@@ -1979,6 +2177,10 @@ extern "C" void trt_video_sample_log() {
         static unsigned long long s_prev_tex2d_c = 0;  // .244 DIAG
         static unsigned long long s_prev_upd_c = 0;  // .244 DIAG
         static unsigned long long s_prev_pres_c = 0;  // .244 DIAG
+        static unsigned long long s_prev_draw_c = 0;  // .245 DIAG
+        static unsigned long long s_prev_state_c = 0;  // .245 DIAG
+        static unsigned long long s_prev_flush_c = 0;  // .245 DIAG
+        static unsigned s_prev_devrem = 0;  // .245 DIAG
         const unsigned long long tex_n =
             (unsigned long long)vk_rt::g_d3d_tex_created_n;
         const unsigned long long tex_created_mb =
@@ -2094,9 +2296,37 @@ extern "C" void trt_video_sample_log() {
         d3d11_last_call(&last_name, &last_tick);
         const unsigned long long last_age_ms =
             last_tick ? (GetTickCount64() - last_tick) : 0;
-        char vb[2048];  // .244 DIAG: +d3d11=/dtex2d=/dupd=/dpres=/devrem=/lastd3d11=
+        // .245 DIAG: draw/state/flush per-interval deltas (is
+        // the draw/state path still issuing calls in the
+        // terminal intervals, or is main parked?).
+        const long long ddraw_c = first_sample
+            ? 0 : (long long)d3d.draw_c - (long long)s_prev_draw_c;
+        const long long dstate_c = first_sample
+            ? 0 : (long long)d3d.state_c - (long long)s_prev_state_c;
+        const long long dflush_c = first_sample
+            ? 0 : (long long)d3d.flush_c - (long long)s_prev_flush_c;
+        s_prev_draw_c = d3d.draw_c;
+        s_prev_state_c = d3d.state_c;
+        s_prev_flush_c = d3d.flush_c;
+        // .245 DIAG: DEVREM-FLIP -- the device was removed
+        // between the previous sample and this one. Log the
+        // transition with the video usage, privn, the interval
+        // deltas, and the last bridge D3D11 call -- this names
+        // the removal point (video over-budget? a bad call?
+        // unsubmitted-work growth?).
+        if (s_prev_devrem == 0 && devrem != 0) {
+          char flip[512];
+          snprintf(flip, sizeof(flip),
+                   "[vk_backend] DEVREM-FLIP #%u devrem=0x%08x video=%lluMB privn=%u dtex2d=%+lld dupd=%+lld ddraw=%+lld dstate=%+lld dflush=%+lld lastd3d11=%s %llums",
+                   s_sample_n, devrem, cur_local_mb, priv_n,
+                   dtex2d_c, dupd_c, ddraw_c, dstate_c, dflush_c,
+                   last_name ? last_name : "none", last_age_ms);
+          trt_core_log(flip);
+        }
+        s_prev_devrem = devrem;
+        char vb[2304];  // .245 DIAG: +ddraw=/dstate=/dflush=
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu privn=%u privb0=%u privb1=%u privb2=%u privb3=%u d3d11=%s dtex2d=%+lld dupd=%+lld dpres=%+lld devrem=0x%08x lastd3d11=%s %llums",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu privn=%u privb0=%u privb1=%u privb2=%u privb3=%u d3d11=%s dtex2d=%+lld dupd=%+lld dpres=%+lld ddraw=%+lld dstate=%+lld dflush=%+lld devrem=0x%08x lastd3d11=%s %llums",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -2125,7 +2355,8 @@ extern "C" void trt_video_sample_log() {
                  (unsigned long long)(trt_ntalloc_bytes() >> 20),
                  priv_n, priv_bk[0], priv_bk[1], priv_bk[2],
                  priv_bk[3], d3d_line, dtex2d_c, dupd_c, dpres_c,
-                 devrem, last_name ? last_name : "none", last_age_ms);
+                 ddraw_c, dstate_c, dflush_c, devrem,
+                 last_name ? last_name : "none", last_age_ms);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top

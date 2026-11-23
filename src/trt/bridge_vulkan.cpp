@@ -3136,6 +3136,10 @@ i32 TRT_GUEST_ABI trt_vkQueueSubmit(void* q_v, u32 cnt, const vk_submit_info* su
       }
     }
   }
+  // .245 EXPERIMENT: Flush per submit (the bridge NEVER called
+  // Flush, so D3D12 work was only submitted on Present). Under
+  // g_vk_mu, like the submit translation above.
+  if (g_vk_hooks_set && g_vk_hooks.flush) g_vk_hooks.flush(g_vk_hooks.user);
   return VK_SUCCESS_V;
 }
 i32 TRT_GUEST_ABI trt_vkQueueSubmit2(void* q_v, u32 cnt, const vk_submit_info2* subs, u64) {
@@ -3157,6 +3161,8 @@ i32 TRT_GUEST_ABI trt_vkQueueSubmit2(void* q_v, u32 cnt, const vk_submit_info2* 
       }
     }
   }
+  // .245 EXPERIMENT: Flush per submit (see trt_vkQueueSubmit).
+  if (g_vk_hooks_set && g_vk_hooks.flush) g_vk_hooks.flush(g_vk_hooks.user);
   return VK_SUCCESS_V;
 }
 

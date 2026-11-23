@@ -156,6 +156,7 @@ struct trt_vk_hooks {
                           u32 mip, u32 layer, const void* cpu_bytes,
                           u64 byte_len, void* user);
   void (*present)(u64 swapchain_id, u32 image_index, void* user);
+  void (*flush)(void* user);  // .245: Flush per submit
 };
 
 int trt_bridge_register_vulkan(void);
