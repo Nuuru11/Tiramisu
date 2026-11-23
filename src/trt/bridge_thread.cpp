@@ -543,6 +543,12 @@ static std::atomic<bool> g_spin_sampler_started{false};
 static std::atomic<bool> g_spin_worker_exit_seen{false};
 static std::atomic<unsigned> g_spin_samples_done{0};
 static void spin_main_ip_sampler();
+// .229 DIAG: helpers for the richer MAIN-IP sample (defined
+// after the sampler, before thread_alive_locked).
+static bool spin_host_nearest_export(u64 rip, char* name_buf,
+                                     size_t name_cap, u64* off_out);
+static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
+                                       unsigned n);
 static unsigned long long spin_now_ms() {
   return (unsigned long long)std::chrono::duration_cast<
       std::chrono::milliseconds>(
@@ -599,10 +605,10 @@ static void woke_record(u32 tid, u64 handle) {
 // .228 DIAG: main-IP sampler -- Sekiro's main thread makes no
 // bridged calls after the spin loop ends (#506), so the bridge
 // cannot see what it does next. This host watchdog samples the
-// main thread's RIP directly: after the spinning tid goes 500ms
+// main thread's RIP directly: after the spinning tid goes 200ms
 // without a fast wait AND a worker ExitThread has been seen, it
 // OpenThread/SuspendThread/GetThreadContext/ResumeThread's the
-// main thread 3x (~300ms apart) and logs the RIP + enclosing
+// main thread 3x (~100ms apart) and logs the RIP + enclosing
 // .pdata function + RSP. The sample reads the context only --
 // no bridge lock is held while the target is suspended, and all
 // logging + fn lookup happen AFTER ResumeThread, so a main
@@ -612,6 +618,16 @@ static void woke_record(u32 tid, u64 handle) {
 // guest code patch (no VEH, no INT3 -- see the header note on
 // why the spin-return trap was not done). POSIX: no sampler
 // (OpenThread is Win32-only); the thread exits immediately.
+// .229 DIAG: faster + richer -- first sample at +200ms of main
+// silence, then every ~100ms (3 samples inside ~500ms, before
+// the PLM suspend freezes the sampler); CONTEXT_FULL for the
+// argument registers (RCX = the waited-on handle for
+// NtWaitForSingleObject); the stack qwords [RSP..RSP+64] read
+// while suspended; and the nearest host export for the RIP
+// (the .pdata lookup only covers guest images, so it reports
+// fn_off 0 for host code). The stack return address [RSP] is
+// resolved through the guest .pdata as well (stkfn=) -- it is
+// where main returns when the host wait ends.
 static void spin_main_ip_sampler() {
 #if defined(_WIN32)
   for (int iter = 0; iter < 6000; ++iter) {  // up to ~10 min
@@ -625,7 +641,7 @@ static void spin_main_ip_sampler() {
     const unsigned long long last =
         g_spin_last_fast_ms.load(std::memory_order_relaxed);
     if (!last) continue;
-    if (spin_now_ms() < last + 500) continue;
+    if (spin_now_ms() < last + 200) continue;
     const unsigned n =
         g_spin_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
     HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
@@ -651,10 +667,24 @@ static void spin_main_ip_sampler() {
       return;
     }
     CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_CONTROL;
+    ctx.ContextFlags = CONTEXT_FULL;
     const BOOL ok = ::GetThreadContext(h, &ctx);
     const u64 rip = ok ? (u64)ctx.Rip : 0;
     const u64 rsp = ok ? (u64)ctx.Rsp : 0;
+    // .229 DIAG: first four argument registers (NtWaitForSingle-
+    // Object takes its handle in RCX; RtlExitUserProcess its
+    // code in RCX; NtTerminateProcess its process handle in RCX
+    // + code in RDX) + the stack qwords at [RSP..RSP+64], read
+    // WHILE suspended (the target runs again after Resume-
+    // Thread, so a later read would race). Same-process reads
+    // via the POD helper below (no C++ objects across __try).
+    const u64 rcx = ok ? (u64)ctx.Rcx : 0;
+    const u64 rdx = ok ? (u64)ctx.Rdx : 0;
+    const u64 r8 = ok ? (u64)ctx.R8 : 0;
+    const u64 r9 = ok ? (u64)ctx.R9 : 0;
+    u64 stk[9] = {};
+    const unsigned stk_n =
+        (ok && rsp) ? spin_read_stack_qwords(rsp, stk, 9) : 0;
     ::ResumeThread(h);
     ::CloseHandle(h);
     // Fn lookup AFTER resume (see header comment).
@@ -667,20 +697,135 @@ static void spin_main_ip_sampler() {
         if (rip >= b && rip < b + img->size_of_image) rip_off = rip - b;
       }
     }
-    char sl[256];
+    // .229 DIAG: nearest host export for the RIP (the .pdata
+    // lookup only covers guest images) + the guest fn of the
+    // stack return address [RSP] (where main returns when the
+    // host wait ends).
+    char ntfn[160];
+    snprintf(ntfn, sizeof(ntfn), "none");
+    u64 ntoff = 0;
+    if (rip) spin_host_nearest_export(rip, ntfn, sizeof(ntfn), &ntoff);
+    u64 stk_fn_off = 0, stk_fn_len = 0;
+    if (stk_n > 0) spin_fn_range(stk[0], &stk_fn_off, &stk_fn_len);
+    char sl[512];
     snprintf(sl, sizeof(sl),
-             "sync: MAIN-IP-SAMPLE n=%u tid=%u rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d",
+             "sync: MAIN-IP-SAMPLE n=%u tid=%u rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx",
              n, tid, (unsigned long long)rip,
              (unsigned long long)rip_off,
              (unsigned long long)fn_off,
              (unsigned long long)fn_len,
              (unsigned long long)rsp, (unsigned long)sus,
-             ok ? 1 : 0);
+             ok ? 1 : 0, ntfn, (unsigned long long)ntoff,
+             (unsigned long long)rcx, (unsigned long long)rdx,
+             (unsigned long long)r8, (unsigned long long)r9,
+             (unsigned long long)(stk_n > 0 ? stk[0] : 0),
+             (unsigned long long)stk_fn_off);
     trt_core_log(sl);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    {
+      char kl[640];
+      snprintf(kl, sizeof(kl),
+               "sync: MAIN-IP-STACK n=%u rsp=0x%llx n=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx q5=0x%llx q6=0x%llx q7=0x%llx q8=0x%llx",
+               n, (unsigned long long)rsp, stk_n,
+               (unsigned long long)stk[0], (unsigned long long)stk[1],
+               (unsigned long long)stk[2], (unsigned long long)stk[3],
+               (unsigned long long)stk[4], (unsigned long long)stk[5],
+               (unsigned long long)stk[6], (unsigned long long)stk[7],
+               (unsigned long long)stk[8]);
+      trt_core_log(kl);
+    }
+    // .229 DIAG: no post-sample sleep -- the loop 100ms sleep
+    // at the top sets the ~100ms sample cadence (the .228
+    // 200ms sleep put samples 2-3 past the PLM suspend).
   }
 #else
   (void)0;
+#endif
+}
+
+// .229 DIAG: nearest host export for a sampled RIP, by
+// enumerating the export directory of the loaded host images
+// (exe + ntdll + kernel32 + kernelbase + user32). The sampler
+// RIP is in host code; the .pdata lookup only covers guest
+// images, so without this the RIP is an unnamed address.
+// Read-only PE parsing, no patching; forwarded exports are
+// skipped (their EAT entry is a string RVA, not code).
+// Returns false when no export sits at or below the RIP.
+static bool spin_host_nearest_export(u64 rip, char* name_buf,
+                                     size_t name_cap, u64* off_out) {
+#if defined(_WIN32)
+  static const struct {
+    const wchar_t* mod;
+    const char* label;
+  } k_mods[] = {
+      {nullptr, "exe"}, {L"ntdll.dll", "ntdll"},
+      {L"kernel32.dll", "kernel32"}, {L"kernelbase.dll", "kernelbase"},
+      {L"user32.dll", "user32"},
+  };
+  u64 best = 0;
+  const char* best_name = nullptr;
+  const char* best_mod = nullptr;
+  for (unsigned mi = 0; mi < sizeof(k_mods) / sizeof(k_mods[0]); ++mi) {
+    HMODULE h = ::GetModuleHandleW(k_mods[mi].mod);
+    if (!h) continue;
+    const u8* base = (const u8*)h;
+    if (*(const u16*)base != 0x5A4D) continue;
+    const u32 pe_off = *(const u32*)(base + 0x3C);
+    if (pe_off > 4096) continue;
+    const IMAGE_NT_HEADERS64* nt =
+        (const IMAGE_NT_HEADERS64*)(base + pe_off);
+    if (nt->Signature != 0x4550) continue;
+    if (nt->OptionalHeader.Magic != 0x20B) continue;
+    const IMAGE_DATA_DIRECTORY& dd =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (!dd.VirtualAddress || !dd.Size) continue;
+    const IMAGE_EXPORT_DIRECTORY* exp =
+        (const IMAGE_EXPORT_DIRECTORY*)(base + dd.VirtualAddress);
+    if (exp->NumberOfNames == 0 || exp->NumberOfNames > 100000) continue;
+    const u32* names = (const u32*)(base + exp->AddressOfNames);
+    const u16* ords = (const u16*)(base + exp->AddressOfNameOrdinals);
+    const u32* funcs = (const u32*)(base + exp->AddressOfFunctions);
+    for (u32 i = 0; i < exp->NumberOfNames; ++i) {
+      const u32 fva = funcs[ords[i]];
+      if (fva >= dd.VirtualAddress && fva < dd.VirtualAddress + dd.Size)
+        continue;
+      const u64 addr = (u64)(uintptr_t)(base + fva);
+      if (addr <= rip && addr > best) {
+        best = addr;
+        best_name = (const char*)(base + names[i]);
+        best_mod = k_mods[mi].label;
+      }
+    }
+  }
+  if (!best || !best_name) return false;
+  snprintf(name_buf, name_cap, "%s!%s", best_mod, best_name);
+  if (off_out) *off_out = rip - best;
+  return true;
+#else
+  (void)rip; (void)name_buf; (void)name_cap; (void)off_out;
+  return false;
+#endif
+}
+
+// .229 DIAG: __try-guarded stack-qword reader for the sampler.
+// A standalone POD-only helper: __try in the sampler itself
+// would risk C2712 (objects with destructors across __try),
+// so the guarded reads live here, where every local is POD.
+// Returns how many qwords were read before a fault (if any).
+static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
+                                       unsigned n) {
+#if defined(_WIN32)
+  unsigned got = 0;
+  __try {
+    for (unsigned i = 0; i < n; ++i) {
+      out[i] = *(const u64*)(uintptr_t)(rsp + (u64)i * 8);
+      ++got;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return got;
+#else
+  (void)rsp; (void)out; (void)n;
+  return 0;
 #endif
 }
 
@@ -726,6 +871,21 @@ static void dump_spin_summary() {
              (unsigned long long)g_spin_tab[i].last_ret_off,
              (unsigned long long)g_spin_tab[i].last_fn_off);
     trt_core_log(line);
+    // .229 DIAG: grep-friendly SPIN-LAST line (the last fast
+    // wait per handle -- the final loop iteration, previously
+    // only visible as fields inside SPIN-SUMMARY, so a grep
+    // for the literal SPIN-LAST missed in .228).
+    {
+      char last[192];
+      snprintf(last, sizeof(last),
+               "sync: SPIN-LAST handle=%llx kind=%u lastn=%llu lastret=0x%llx lastfn=0x%llx",
+               (unsigned long long)g_spin_tab[i].handle,
+               (unsigned)g_spin_tab[i].kind,
+               (unsigned long long)g_spin_tab[i].last_n,
+               (unsigned long long)g_spin_tab[i].last_ret_off,
+               (unsigned long long)g_spin_tab[i].last_fn_off);
+      trt_core_log(last);
+    }
   }
 }
 
@@ -1638,7 +1798,7 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
     trt_core_log(xl);
     // .228 DIAG: a worker ExitThread arms the main-IP
     // sampler's post-exit gate (the sampler fires only after
-    // this + 500ms of main silence).
+    // this + 200ms of main silence).
     g_spin_worker_exit_seen.store(true, std::memory_order_relaxed);
   }
   notify_thread_exit_once();
