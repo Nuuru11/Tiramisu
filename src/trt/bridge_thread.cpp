@@ -1165,9 +1165,74 @@ static void spin_capture_stage(u32 tid, const char* stage) {
   trt_core_log(sl);
 }
 
+// .238 FIX: buffer the in-suspension stage markers -- the .237
+// markers logged via trt_core_log WHILE the target was
+// suspended; if main was suspended holding the log lock
+// (g_ring_mu), the watchdog's "suspend" marker blocked on it
+// forever, freezing all logging and deadlocking the watchdog
+// before ResumeThread (the .237 Sekiro run froze at
+// stage=open, 1 heartbeat, launch wedge). Buffer "suspend" /
+// "context" here, flush them AFTER ResumeThread returns (see
+// spin_capture_ip). "open" / "resume" / "close" / "fnlookup"
+// still log live -- the target is running at those points.
+// Never trt_core_log while the target is suspended.
+static void spin_capture_stage_buf(u32 tid, const char* stage,
+                                   const char** buf, int* n) {
+  (void)tid;
+  if (*n < 2) buf[(*n)++] = stage;
+}
+static void spin_capture_stage_flush(u32 tid, const char** buf,
+                                     int n) {
+  for (int i = 0; i < n; ++i) spin_capture_stage(tid, buf[i]);
+}
+
+// .238 FIX: the .237 HOST UNHANDLED (0xc0000005,
+// rip_rva=0xecbb4, spin_capture_ip+0x184) is THIS deref:
+// `mov (%r15),%rax` with r15 = ctx.Rdx. The source wraps it
+// in a nested __try, but the .237 binary's .xdata proves the
+// guard is NOT real: spin_capture_ip's scope table has only
+// 2 entries (outer __try +0xdd..+0x14b, fn-lookup __try
+// +0x253..+0x2eb) while the deref sits at +0x184, OUTSIDE
+// every scope -- the nested inner __try got no scope entry
+// (MSVC moved the post-call code out of the outer try's
+// region). So the AV propagated to the unhandled filter and
+// terminated the process. This function reads the qword in
+// its OWN frame whose entire body is ONE top-level __try --
+// the pattern MSVC reliably scopes (both top-level __trys
+// in spin_capture_ip got scopes). MSVC does not inline
+// functions containing __try, so the guard stays in its own
+// frame with its own scope table. ALSO: ctx.Rdx is often not
+// a pointer at all (for a thread parked in
+// NtWaitForSingleObject it is the alertable flag, 0/1) -- a
+// fault here is EXPECTED, and the guarded read reports ok=0
+// instead of killing the host. Verify in the built .238 exe's
+// .xdata that this function's scope covers its deref (HOST
+// SYMS read_qword=<rva> + /tmp/xdata238.py) before deploying.
+static int spin_read_qword_guarded(u64 addr, u64* out) {
+#if defined(_WIN32)
+  int ok = 0;
+  __try {
+    *out = *(const u64*)(uintptr_t)addr;
+    ok = 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ok = 0;
+  }
+  return ok;
+#else
+  (void)addr;
+  (void)out;
+  return 0;
+#endif
+}
+
 static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
 #if defined(_WIN32)
   if (!tid || !s) return 0;
+  // .238 FIX: stage-marker buffer -- "suspend" / "context"
+  // are logged AFTER ResumeThread (see the flush below), never
+  // while the target is suspended (.237 Sekiro deadlock).
+  const char* cap_stages[2];
+  int cap_stages_n = 0;
   HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                               THREAD_QUERY_INFORMATION,
                           FALSE, tid);
@@ -1178,7 +1243,7 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     ::CloseHandle(h);
     return -1;
   }
-  spin_capture_stage(tid, "suspend");
+  spin_capture_stage_buf(tid, "suspend", cap_stages, &cap_stages_n);
   // .236 FIX: guard the capture -- both .235 Ultrapool runs crashed
   // on the watchdog thread immediately after a GAP-HOOK dump with
   // stid!=0, with no GAP-IP-SAMPLE line between the dump and the
@@ -1208,21 +1273,28 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 24) : 0;
     s->rdx_qword = 0;
     s->rdx_qword_ok = 0;
+    // .238 FIX: the inline nested __try around this deref had
+    // NO scope entry in the .237 binary (fault at +0x184,
+    // scopes end +0x14b) -- the AV killed the host. Read it
+    // through spin_read_qword_guarded (own function, top-level
+    // __try). ctx.Rdx is often not a pointer (alertable flag
+    // 0/1 for a thread in NtWaitForSingleObject), so a fault
+    // is expected and reports ok=0.
     if (ctx.Rdx) {
-      __try {
-        s->rdx_qword = *(const u64*)(uintptr_t)ctx.Rdx;
-        s->rdx_qword_ok = 1;
-      } __except (EXCEPTION_EXECUTE_HANDLER) {
-        s->rdx_qword_ok = 0;
-      }
+      s->rdx_qword_ok =
+          spin_read_qword_guarded((u64)ctx.Rdx, &s->rdx_qword) ? 1 : 0;
+      if (!s->rdx_qword_ok) s->rdx_qword = 0;
     }
     s->stkret = (s->stk_n > 0) ? s->stk[0] : 0;
   }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     cap_rc = -2;
   }
-  spin_capture_stage(tid, "context");
+  spin_capture_stage_buf(tid, "context", cap_stages, &cap_stages_n);
   ::ResumeThread(h);
+  // .238 FIX: flush the buffered in-suspension markers NOW --
+  // the target is running again and the log lock is free.
+  spin_capture_stage_flush(tid, cap_stages, cap_stages_n);
   spin_capture_stage(tid, "resume");
   ::CloseHandle(h);
   spin_capture_stage(tid, "close");
@@ -2798,12 +2870,14 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
       char yl[512];
       snprintf(yl, sizeof(yl),
                "sync: HOST SYMS capture_ip=0x%llx sample_gap=0x%llx "
-               "read_stack=0x%llx fn_range=0x%llx nearest_export=0x%llx",
+               "read_stack=0x%llx fn_range=0x%llx nearest_export=0x%llx "
+               "read_qword=0x%llx",
                (unsigned long long)((uintptr_t)&spin_capture_ip - eb),
                (unsigned long long)((uintptr_t)&spin_sample_main_ip_gap - eb),
                (unsigned long long)((uintptr_t)&spin_read_stack_qwords - eb),
                (unsigned long long)((uintptr_t)&spin_fn_range - eb),
-               (unsigned long long)((uintptr_t)&spin_host_nearest_export - eb));
+               (unsigned long long)((uintptr_t)&spin_host_nearest_export - eb),
+               (unsigned long long)((uintptr_t)&spin_read_qword_guarded - eb));
       trt_core_log(yl);
     }
   }
@@ -4065,6 +4139,33 @@ u64 TRT_STDCALL trt_CreateSemaphoreW(void* attrs, u32 initial, u32 maximum,
     o->name = "S:" + key;
     g_named_objects[o->name] = h;
   }
+  // .238 DIAG: name the creator of every bridged semaphore --
+  // the .237 wait (main on h=0x654, type=Semaphore, infinite)
+  // needs its creator named. Bridge handles are
+  // 0x5B00xxxx-tagged (make_handle), so a bridged create NEVER
+  // yields 0x654; if no GAP-SEM-CREATE line matches the waited
+  // handle, the semaphore is ntdll-internal
+  // (SleepConditionVariableSRW's wait semaphore for the host
+  // CONDITION_VARIABLE backing Godot's CommandQueueMT sync CV)
+  // and the signal target is the CV wake (already happening --
+  // GAP-CV-WAKER), not a semaphore handle. Creator tid + guest
+  // ret name the guest code that created it.
+  o->creator_tid = trt_GetCurrentThreadId();
+  {
+    static std::atomic<unsigned> s_sem_create_n{0};
+    const unsigned cn =
+        s_sem_create_n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (cn <= 32 || (cn % 128) == 0) {
+      char sl[256];
+      snprintf(sl, sizeof(sl),
+               "sync: GAP-SEM-CREATE tid=%u h=0x%llx init=%u max=%u name=%s ret=0x%llx n=%u",
+               o->creator_tid, h, initial, maximum,
+               key.empty() ? "none" : key.c_str(),
+               (unsigned long long)(uintptr_t)__builtin_return_address(0),
+               cn);
+      trt_core_log(sl);
+    }
+  }
   trt_SetLastError(0);
   return h;
 }
@@ -4108,6 +4209,22 @@ int TRT_STDCALL trt_ReleaseSemaphore(u64 handle, u32 count, u32* previous) {
   if (previous) *previous = (u32)o->lock_count;
   o->lock_count += (int)count;
   g_sync_cv.notify_all();
+  // .238 DIAG: name what signals bridged semaphores -- the
+  // releaser side of the .237 wait question. Throttled: first
+  // 32 + every 128th.
+  {
+    static std::atomic<unsigned> s_sem_release_n{0};
+    const unsigned rn =
+        s_sem_release_n.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (rn <= 32 || (rn % 128) == 0) {
+      char sl[256];
+      snprintf(sl, sizeof(sl),
+               "sync: GAP-SEM-RELEASE tid=%u h=0x%llx count=%u prev=%u n=%u",
+               trt_GetCurrentThreadId(), handle, count,
+               previous ? *previous : 0, rn);
+      trt_core_log(sl);
+    }
+  }
   return 1;
 }
 
