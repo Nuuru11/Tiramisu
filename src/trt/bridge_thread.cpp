@@ -545,6 +545,10 @@ static std::atomic<unsigned> g_spin_samples_done{0};
 // .230 FIX: the WAKE-MAIN SetEvent fires at most once per
 // process run (see the sampler).
 static std::atomic<bool> g_spin_wake_done{false};
+// .231 DIAG: tid of the most recent ExitThread (set in
+// trt_ExitThread); the WAITED-THREAD line compares it
+// with the waited-on TID.
+static std::atomic<u32> g_spin_worker_exit_tid{0};
 static void spin_main_ip_sampler();
 // .229 DIAG: helpers for the richer MAIN-IP sample (defined
 // after the sampler, before thread_alive_locked).
@@ -781,6 +785,90 @@ static void spin_main_ip_sampler() {
                  n, (unsigned long long)rcx, hname,
                  set_ok ? 1 : 0, (unsigned long)set_err);
         trt_core_log(wl);
+      }
+      // .231 DIAG: the waited-on handle is a THREAD, not
+      // an Event -- name the thread (GetThreadId) + whether
+      // it is still alive (GetExitCodeThread: STILL_ACTIVE
+      // = 259) + whether it is main itself (self-wait: the
+      // wait can never return) or the worker that already
+      // exited (the wait should already have returned).
+      // Then sample the waited-on thread once (same
+      // suspend trick as the main sampler) so .232 knows
+      // what THAT thread is blocked on. No wait-faking
+      // here: terminating the waited-on thread or faking
+      // the syscall return is not safe until the TID is
+      // known.
+      if (hok && std::string(htype) == "Thread") {
+        const DWORD wtid = ::GetThreadId((HANDLE)(uintptr_t)rcx);
+        const DWORD wtid_err = wtid ? 0 : ::GetLastError();
+        DWORD wexit = 0;
+        const BOOL wok = ::GetExitCodeThread((HANDLE)(uintptr_t)rcx,
+                                           &wexit);
+        const bool walive = wok && wexit == STILL_ACTIVE;
+        const u32 wexittid = g_spin_worker_exit_tid.load(
+            std::memory_order_relaxed);
+        char tl[384];
+        snprintf(tl, sizeof(tl),
+                 "sync: WAITED-THREAD n=%u handle=0x%llx wtid=%lu wtid_err=%lu exit_ok=%d exitcode=%lu alive=%d workertid=%u ismain=%d isworker=%d",
+                 n, (unsigned long long)rcx,
+                 (unsigned long)wtid, (unsigned long)wtid_err,
+                 wok ? 1 : 0, (unsigned long)wexit,
+                 walive ? 1 : 0, wexittid,
+                 (wtid && wtid == tid) ? 1 : 0,
+                 (wtid && wexittid && wtid == wexittid) ? 1 : 0);
+        trt_core_log(tl);
+        // Sample the waited-on thread's RIP (skip when it
+        // is main itself -- MAIN-IP-SAMPLE above already
+        // has it -- or when it already exited / has no TID).
+        if (wtid && wtid != tid && walive) {
+          HANDLE wh = ::OpenThread(THREAD_SUSPEND_RESUME |
+                                   THREAD_GET_CONTEXT |
+                                   THREAD_QUERY_INFORMATION,
+                                   FALSE, wtid);
+          if (!wh) {
+            char cl[192];
+            snprintf(cl, sizeof(cl),
+                     "sync: WAITED-THREAD-CTX n=%u wtid=%lu open=0 err=%lu",
+                     n, (unsigned long)wtid,
+                     (unsigned long)::GetLastError());
+            trt_core_log(cl);
+          } else {
+            const DWORD wsus = ::SuspendThread(wh);
+            if (wsus == (DWORD)-1) {
+              const DWORD werr = ::GetLastError();
+              ::CloseHandle(wh);
+              char cl[192];
+              snprintf(cl, sizeof(cl),
+                       "sync: WAITED-THREAD-CTX n=%u wtid=%lu open=1 sus-fail err=%lu",
+                       n, (unsigned long)wtid, (unsigned long)werr);
+              trt_core_log(cl);
+            } else {
+              CONTEXT wctx{};
+              wctx.ContextFlags = CONTEXT_FULL;
+              const BOOL wok2 = ::GetThreadContext(wh, &wctx);
+              const u64 wrip = wok2 ? (u64)wctx.Rip : 0;
+              const u64 wrcx = wok2 ? (u64)wctx.Rcx : 0;
+              const u64 wrdx = wok2 ? (u64)wctx.Rdx : 0;
+              ::ResumeThread(wh);
+              ::CloseHandle(wh);
+              char wntfn[160];
+              snprintf(wntfn, sizeof(wntfn), "none");
+              u64 wntoff = 0;
+              if (wrip)
+                spin_host_nearest_export(wrip, wntfn, sizeof(wntfn),
+                                         &wntoff);
+              char cl[448];
+              snprintf(cl, sizeof(cl),
+                       "sync: WAITED-THREAD-CTX n=%u wtid=%lu ok=%d rip=0x%llx ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx",
+                       n, (unsigned long)wtid, wok2 ? 1 : 0,
+                       (unsigned long long)wrip, wntfn,
+                       (unsigned long long)wntoff,
+                       (unsigned long long)wrcx,
+                       (unsigned long long)wrdx);
+              trt_core_log(cl);
+            }
+          }
+        }
       }
     }
     {
@@ -1922,6 +2010,10 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
     // sampler's post-exit gate (the sampler fires only after
     // this + 200ms of main silence).
     g_spin_worker_exit_seen.store(true, std::memory_order_relaxed);
+    // .231 DIAG: remember WHICH thread exited, for the
+    // WAITED-THREAD comparison in the sampler.
+    g_spin_worker_exit_tid.store(current_tid(),
+                                 std::memory_order_relaxed);
   }
   notify_thread_exit_once();
 #if defined(_WIN32)
