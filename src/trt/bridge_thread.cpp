@@ -1472,6 +1472,19 @@ extern "C" void trt_sync_parked_log(void) {
   if (!any) trt_core_log("sync: PARKED none");
 }
 
+// .223 DIAG: parked-thread count for the gap SILENCE dump --
+// returns the number of threads currently parked, or -1 if
+// the table is busy (same try-lock as trt_sync_parked_log).
+extern "C" int trt_sync_parked_count(void) {
+  std::unique_lock<std::mutex> lk(g_obj_mu, std::try_to_lock);
+  if (!lk.owns_lock()) return -1;
+  int n = 0;
+  for (int i = 0; i < 32; ++i) {
+    if (g_parked_waits[i].tid) ++n;
+  }
+  return n;
+}
+
 u32 TRT_STDCALL trt_WaitForSingleObjectEx(u64 handle, u32 ms, int alertable) {
   return wait_single_impl(handle, ms, alertable != 0);
 }

@@ -13,16 +13,31 @@
 #include "../trt/thunk.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <vector>
 
 // Guest memory-budget ledger (bridge_membudget.cpp); declared extern "C"
 // here as in main.cpp:1034 / bridge_kernel32.cpp:75.
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+// .223 DIAG: cross-TU diagnostic accessors (defined in
+// bridge_vulkan.cpp / bridge_kernel32.cpp; declared here,
+// not in trt.h, so trt.h stays untouched). All are
+// lock-free atomics -- safe to call from the watchdog
+// thread and from the present hook while g_vk_mu is held.
+extern "C" u64 trt_vk_alloc_live_bytes(void);
+extern "C" u64 trt_vk_alloc_live_n(void);
+extern "C" u64 trt_vk_imgs_live_n(void);
+extern "C" u64 trt_vk_imgs_est_bytes(void);
+extern "C" u64 trt_vk_presents(void);
+extern "C" u64 trt_vk_biggest_alloc_bytes(void);
+extern "C" u64 trt_video_app_mem_mb(void);
+extern "C" u64 gap_trace_seq(void);
 
 namespace vk_rt {
 
@@ -321,6 +336,20 @@ static u32 g_d3d_swap_buffers = 0;
 static u32 g_d3d_swap_w = 0, g_d3d_swap_h = 0, g_d3d_swap_fmt = 0;
 static u64 g_video_last_local_mb = 0;
 static bool g_video_sample_seen = false;
+// .223 DIAG: cached buf_live total -- the .222 VIDEO-SAMPLE
+// read g_vkrt.bufs (a std::map) from the watchdog thread
+// while the render thread inserts/erases it: a data race
+// (iterator invalidation + torn reads). The render thread
+// now publishes a single atomic total (refreshed at every
+// bufs mutation + inside d3d_sizes_log); the watchdog
+// reads ONLY this cached value, never the map. Same
+// pattern as the gap CPU feed.
+static std::atomic<u64> g_d3d_buf_live_cached{0};
+static inline void d3d_buf_live_refresh() {
+  u64 total = 0;
+  for (const auto& kv : g_vkrt.bufs) total += kv.second.bytes;
+  g_d3d_buf_live_cached.store(total, std::memory_order_relaxed);
+}
 static inline u32 dxgi_bpp(DXGI_FORMAT fmt) {
   switch (fmt) {
     case DXGI_FORMAT_R16G16B16A16_FLOAT:
@@ -346,8 +375,13 @@ static inline u64 d3d_tex_est_bytes(u32 vk_fmt, UINT w, UINT h, UINT d,
   return total;
 }
 static inline void d3d_sizes_log(const char* why) {
-  u64 buf_live = 0;
-  for (const auto& kv : g_vkrt.bufs) buf_live += kv.second.bytes;
+  // .223 DIAG: refresh the cached buf_live total (render
+  // thread) and read the cache -- d3d_sizes_log runs on the
+  // render thread, so the map walk is safe here, but every
+  // reader goes through the one cached value.
+  d3d_buf_live_refresh();
+  const u64 buf_live =
+      g_d3d_buf_live_cached.load(std::memory_order_relaxed);
   // .222 DIAG: unaccounted residual -- video usage from the
   // last VIDEO-SAMPLE minus every consumer the bridge logs.
   // If resid stays ~3.6GB, the consumer is a driver/segment
@@ -785,6 +819,9 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
     if (b.shadow.size() < bytes) b.shadow.resize((size_t)bytes);
     memcpy(b.shadow.data(), data, (size_t)bytes);
   }
+  // .223 DIAG: publish the new buf_live total (bufs mutated
+  // above: insert / realloc / usage change).
+  d3d_buf_live_refresh();
   return 1;
 }
 
@@ -794,6 +831,8 @@ inline void hk_destroy_buffer(u64 buf_id, void*) {
     free_buf_rec(it->second);
     g_vkrt.bufs.erase(it);
   }
+  // .223 DIAG: publish the new buf_live total.
+  d3d_buf_live_refresh();
 }
 
 inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* data,
@@ -1383,6 +1422,8 @@ inline void shutdown() {
   g_vkrt.pipes.clear();
   g_vkrt.bufs.clear();
   g_vkrt.imgs.clear();
+  // .223 DIAG: buf_live is 0 after the clear.
+  d3d_buf_live_refresh();
   g_vkrt.samps.clear();
   if (g_vkrt.push_cb) { g_vkrt.push_cb->Release(); g_vkrt.push_cb = nullptr; }
   g_vkrt.push_cb_cap = 0;
@@ -1507,16 +1548,21 @@ extern "C" void trt_video_sample_log() {
       const bool ok_nl = SUCCEEDED(adapter3->QueryVideoMemoryInfo(
           0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vmi_nl));
       if (ok_local) {
-        // .222 DIAG: (a) BOTH segments + driver reservation
-        // (CurrentReservation) -- which segment holds the
-        // ~3.7GB, and is it a reservation the bridge cannot
-        // allocate? (b) jump vs the previous sample ALONGSIDE
-        // the D3D11 creation totals at this moment (one line,
-        // so a video jump is correlated with creation bursts
-        // IN TIME -- a jump with flat tex_created is
-        // independent of creation; a jump tracking tex_created
-        // names the burst. buf_live is the bufs-map sum, as
-        // in d3d_sizes_log.
+        // .223 DIAG: (a) buf_live is now the RENDER-THREAD
+        // cached atomic (see d3d_buf_live_refresh) -- the
+        // .222 code walked g_vkrt.bufs from this watchdog
+        // thread while the render thread mutated the map
+        // (data race). (b) Per-interval deltas since the
+        // previous sample (tex/buf/vk/presents/bridged-calls/
+        // appmem) + the app working set, so a ~2GB jump is
+        // correlated with WHAT HAPPENED between the samples,
+        // not just the totals at the sample. (c)
+        // VIDEO-BIGJUMP companion line on jumps >= 500MB
+        // with the largest single allocations. A static
+        // mutex serialises the watchdog (5s cadence) and
+        // the one-shot frame-1 sample from the present hook.
+        static std::mutex s_sample_mu;
+        std::lock_guard<std::mutex> sample_lk(s_sample_mu);
         static unsigned s_sample_n = 0;
         static unsigned long long s_prev_local_mb = 0;
         ++s_sample_n;
@@ -1528,11 +1574,60 @@ extern "C" void trt_video_sample_log() {
         s_prev_local_mb = cur_local_mb;
         vk_rt::g_video_last_local_mb = cur_local_mb;
         vk_rt::g_video_sample_seen = true;
-        u64 buf_live = 0;
-        for (const auto& kv : vk_rt::g_vkrt.bufs) buf_live += kv.second.bytes;
-        char vb[640];
+        const u64 buf_live =
+            vk_rt::g_d3d_buf_live_cached.load(std::memory_order_relaxed);
+        // .223 DIAG: per-interval deltas -- what happened
+        // between this sample and the previous one.
+        static unsigned long long s_prev_tex_n = 0;
+        static unsigned long long s_prev_tex_created_mb = 0;
+        static unsigned long long s_prev_vkalloc_mb = 0;
+        static unsigned long long s_prev_vkimg_n = 0;
+        static unsigned long long s_prev_presents = 0;
+        static unsigned long long s_prev_calls = 0;
+        static unsigned long long s_prev_appmem_mb = 0;
+        const unsigned long long tex_n =
+            (unsigned long long)vk_rt::g_d3d_tex_created_n;
+        const unsigned long long tex_created_mb =
+            (unsigned long long)(vk_rt::g_d3d_tex_created_bytes >> 20);
+        const unsigned long long vkalloc_mb =
+            (unsigned long long)(trt_vk_alloc_live_bytes() >> 20);
+        const unsigned long long vkalloc_n =
+            (unsigned long long)trt_vk_alloc_live_n();
+        const unsigned long long vkimg_n =
+            (unsigned long long)trt_vk_imgs_live_n();
+        const unsigned long long vkimg_est_mb =
+            (unsigned long long)(trt_vk_imgs_est_bytes() >> 20);
+        const unsigned long long presents =
+            (unsigned long long)trt_vk_presents();
+        const unsigned long long calls =
+            (unsigned long long)gap_trace_seq();
+        const unsigned long long appmem_mb =
+            (unsigned long long)trt_video_app_mem_mb();
+        const bool first_sample = (s_sample_n == 1);
+        const long long dtex_n = first_sample
+            ? 0 : (long long)tex_n - (long long)s_prev_tex_n;
+        const long long dtex_mb = first_sample
+            ? 0 : (long long)tex_created_mb - (long long)s_prev_tex_created_mb;
+        const long long dvkalloc_mb = first_sample
+            ? 0 : (long long)vkalloc_mb - (long long)s_prev_vkalloc_mb;
+        const long long dvkimg = first_sample
+            ? 0 : (long long)vkimg_n - (long long)s_prev_vkimg_n;
+        const long long dpres = first_sample
+            ? 0 : (long long)presents - (long long)s_prev_presents;
+        const long long dcalls = first_sample
+            ? 0 : (long long)calls - (long long)s_prev_calls;
+        const long long dappmem_mb = first_sample
+            ? 0 : (long long)appmem_mb - (long long)s_prev_appmem_mb;
+        s_prev_tex_n = tex_n;
+        s_prev_tex_created_mb = tex_created_mb;
+        s_prev_vkalloc_mb = vkalloc_mb;
+        s_prev_vkimg_n = vkimg_n;
+        s_prev_presents = presents;
+        s_prev_calls = calls;
+        s_prev_appmem_mb = appmem_mb;
+        char vb[1024];
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1544,12 +1639,36 @@ extern "C" void trt_video_sample_log() {
                  ok_nl ? (long long)(vmi_nl.CurrentReservation >> 20) : -1ll,
                  jump_mb,
                  (unsigned long long)(vk_rt::g_d3d_tex_live_bytes >> 20),
-                 (unsigned long long)(vk_rt::g_d3d_tex_created_bytes >> 20),
-                 (unsigned long long)vk_rt::g_d3d_tex_created_n,
+                 tex_created_mb,
+                 tex_n,
                  (unsigned long long)(buf_live >> 20),
                  (unsigned long long)(vk_rt::g_d3d_ds_bytes >> 20),
-                 (unsigned long long)(vk_rt::g_d3d_swap_bytes >> 20));
+                 (unsigned long long)(vk_rt::g_d3d_swap_bytes >> 20),
+                 appmem_mb, dappmem_mb,
+                 vkalloc_mb, vkalloc_n, vkimg_n, vkimg_est_mb,
+                 presents, calls,
+                 dtex_n, dtex_mb, dvkalloc_mb, dvkimg, dpres, dcalls);
         trt_core_log(vb);
+        // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
+        // the largest single allocations alive: if the top
+        // D3D11 texture and the biggest live Vulkan alloc
+        // are MBs while the jump is GBs, no bridge-visible
+        // allocation explains it and the consumer is
+        // driver-internal heap growth in the LOCAL segment
+        // (resv=0 already rules out a reservation).
+        if (jump_mb >= 500) {
+          char bj[1024];
+          snprintf(bj, sizeof(bj),
+                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB",
+                   s_sample_n, jump_mb, appmem_mb, dappmem_mb,
+                   tex_n, dtex_n, tex_created_mb, dtex_mb,
+                   vkalloc_mb, dvkalloc_mb, vkimg_n, dvkimg, presents,
+                   (unsigned long long)(vk_rt::g_d3d_top_bytes >> 20),
+                   vk_rt::g_d3d_top_w, vk_rt::g_d3d_top_h, vk_rt::g_d3d_top_d,
+                   vk_rt::g_d3d_top_fmt,
+                   (unsigned long long)(trt_vk_biggest_alloc_bytes() >> 20));
+          trt_core_log(bj);
+        }
       }
       adapter3->Release();
     }

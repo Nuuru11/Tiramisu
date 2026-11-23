@@ -77,6 +77,7 @@ extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
 extern "C" void trt_sync_parked_log(void);
+extern "C" int trt_sync_parked_count(void);
 
 #include <atomic>
 #include <chrono>
@@ -5871,7 +5872,7 @@ struct syscall_trap_target {
   // the cap is per-caller now, the target always re-arms).
   int fires;
 };
-static syscall_trap_target g_syscall_trap_targets[10];
+static syscall_trap_target g_syscall_trap_targets[11];
 static std::atomic<bool> g_syscall_trap_rearm{false};
 // .220 DIAG: trap flap counters (printed on every gap dump) + quiet
 // re-arm flag. The watchdog's own Sleep trips the trap every tick,
@@ -6000,7 +6001,7 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
     // before the death-phase wait. Host caller: restore the
     // byte so the host proceeds, count the trip, re-arm on
     // the next watchdog tick.
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 11; ++i) {
       if (g_syscall_trap_targets[i].addr &&
           g_syscall_trap_targets[i].addr == addr) {
         // .221 DIAG: VEH RACE FIX -- handle ANY breakpoint at
@@ -6200,10 +6201,15 @@ extern "C" void trt_syscall_trap_install() {
     const wchar_t* mod;
     const char* fn;
     const char* name;
-  } k_targets[10] = {
+  } k_targets[11] = {
       {L"kernel32.dll", "Sleep", "kernel32!Sleep"},
       {L"kernel32.dll", "WaitForSingleObject", "kernel32!WaitForSingleObject"},
       {L"kernel32.dll", "WaitForMultipleObjects", "kernel32!WaitForMultipleObjects"},
+      // .223 DIAG: the message-pump wait -- a game main
+      // thread that MsgWaits on its window queue never
+      // trips the WaitFor* targets, so Sekiro death-by-
+      // message-wait was invisible to the trap.
+      {L"kernel32.dll", "MsgWaitForMultipleObjects", "kernel32!MsgWaitForMultipleObjects"},
       {L"kernel32.dll", "SwitchToThread", "kernel32!SwitchToThread"},
       {L"kernel32.dll", "SleepConditionVariableSRW", "kernel32!SleepConditionVariableSRW"},
       {L"kernel32.dll", "SleepConditionVariableCS", "kernel32!SleepConditionVariableCS"},
@@ -6213,7 +6219,7 @@ extern "C" void trt_syscall_trap_install() {
       {L"ntdll.dll", "NtYieldExecution", "ntdll!NtYieldExecution"},
   };
   int installed = 0;
-  for (int i = 0; i < 10; ++i) {
+  for (int i = 0; i < 11; ++i) {
     if (g_syscall_trap_targets[i].fired) continue;
     HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
     if (!mod) {
@@ -6272,10 +6278,10 @@ extern "C" void trt_syscall_trap_install() {
     }
   }
   int armed = 0;
-  for (int i = 0; i < 10; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
+  for (int i = 0; i < 11; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
   {
     char line[128];
-    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/10 (armed %d)",
+    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/11 (armed %d)",
              installed, armed);
     TRAP_LOG(line);
   }
@@ -6916,6 +6922,7 @@ void gap_trace_dump_if_changed(void) {
   u64 guest_cpu = 0, proc_cpu = 0;
   int n = 0;
   bool final_dump = false;
+  long long quiet_ms = 0;
   {
     std::lock_guard<std::mutex> lk(g_gap_mu);
     seq = g_gap_seq;
@@ -6932,6 +6939,8 @@ void gap_trace_dump_if_changed(void) {
                now - s_last_change >= std::chrono::seconds(2)) {
       // final dump after 2s of wall-time quiet
       final_dump = true;
+      quiet_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - s_last_change).count();
     } else {
       return;
     }
@@ -6967,11 +6976,11 @@ void gap_trace_dump_if_changed(void) {
   // trap path, so its diagnostic is compiled out elsewhere.
   {
     int armed_n = 0;
-    for (int i = 0; i < 10; ++i)
+    for (int i = 0; i < 11; ++i)
       if (g_syscall_trap_targets[i].armed) ++armed_n;
     char ts[192];
     snprintf(ts, sizeof(ts),
-             "syscall-trap: stats hosttrips=%llu rearms=%llu races=%llu armed=%d/10",
+             "syscall-trap: stats hosttrips=%llu rearms=%llu races=%llu armed=%d/11",
              (unsigned long long)g_syscall_trap_host_trips.load(
                  std::memory_order_relaxed),
              (unsigned long long)g_syscall_trap_rearms.load(
@@ -6996,8 +7005,9 @@ void gap_trace_dump_if_changed(void) {
   // A PEB-walked / direct wait call (NtWaitForSingleObject,
   // NtWaitForMultipleObjects, NtDelayExecution, NtYieldExecution,
   // kernel32 Sleep / WaitForSingleObject / WaitForMultipleObjects /
-  // SwitchToThread / SleepConditionVariableSRW /
-  // SleepConditionVariableCS) is then caught with its guest caller.
+  // MsgWaitForMultipleObjects / SwitchToThread /
+  // SleepConditionVariableSRW / SleepConditionVariableCS) is
+  // then caught with its guest caller.
   // One attempt per process: re-arms after host-caller restores go
   // through g_syscall_trap_rearm above.
 #ifdef _WIN32
@@ -7025,12 +7035,83 @@ void gap_trace_dump_if_changed(void) {
   // fires at death. trt_sync_parked_log lives in
   // bridge_thread.cpp.
   trt_sync_parked_log();
+  // .223 DIAG: SILENCE dump -- when the guest goes quiet (no
+  // new bridged calls for 2s+ of wall time, i.e. this final
+  // dump) with NO parked wait the bridge can see, log the
+  // last bridged call + the thread state (which tids made
+  // the recent calls, what each was last doing). This
+  // addresses the .222 Ultrapool anomaly (guest silent
+  // ~170s, PARKED none) and Sekiro death (dies with PARKED
+  // none): if nothing is parked and nothing calls, the
+  // guest is spinning on a non-bridged path or dead.
+  // Parked > 0 explains the silence already (PARKED lines
+  // above); parked < 0 means the table was busy, so skip
+  // rather than lie.
+  if (final_dump && n > 0) {
+    const int parked_n = trt_sync_parked_count();
+    if (parked_n == 0) {
+      // Distinct tids in the last-8 ring, oldest first.
+      u32 seen_tids[8];
+      int seen_n = 0;
+      for (int i = 0; i < n; ++i) {
+        bool dup = false;
+        for (int j = 0; j < seen_n; ++j) {
+          if (seen_tids[j] == snap[i].tid) { dup = true; break; }
+        }
+        if (!dup) seen_tids[seen_n++] = snap[i].tid;
+      }
+      const gap_entry& last = snap[n - 1];
+      char sl[256];
+      snprintf(sl, sizeof(sl),
+               "gap: SILENCE quiet=%llums last=#%llu tid=%u %s x%u guestcpu=%llums proccpu=%llums parked=0 threads=%d",
+               (unsigned long long)quiet_ms,
+               (unsigned long long)last.seq, last.tid,
+               last.name ? last.name : "(null)", last.repeats,
+               (unsigned long long)guest_cpu,
+               (unsigned long long)proc_cpu, seen_n);
+      trt_core_log(sl);
+      // One line per distinct tid, each with its MOST
+      // RECENT ring entry (scan from the newest).
+      for (int t = 0; t < seen_n; ++t) {
+        const gap_entry* e = nullptr;
+        for (int i = n - 1; i >= 0; --i) {
+          if (snap[i].tid == seen_tids[t]) { e = &snap[i]; break; }
+        }
+        if (!e) continue;
+        char tl[192];
+        snprintf(tl, sizeof(tl), "gap: SILENCE thread tid=%u last=#%llu %s x%u",
+                 e->tid, (unsigned long long)e->seq,
+                 e->name ? e->name : "(null)", e->repeats);
+        trt_core_log(tl);
+      }
+    }
+  }
 #endif
 }
 
 void gap_trace_set_guest_cpu_ms(u64 guest_ms, u64 proc_ms) {
   g_gap_guest_cpu_ms.store(guest_ms, std::memory_order_relaxed);
   g_gap_proc_cpu_ms.store(proc_ms, std::memory_order_relaxed);
+}
+// .223 DIAG: app working-set feed -- the watchdog (main.cpp,
+// snapshot-only) publishes MemoryManager::AppMemoryUsage()
+// here once per tick, so the VIDEO-SAMPLE can print appmem
+// next to the video usage without paying for a second ~1s
+// WinRT call. The .222 re-test showed app memory tracking
+// video usage in lockstep (+1847MB app vs +1779MB video,
+// +2044MB vs +2001MB), so the ~2GB is real process memory,
+// not a phantom reservation. gap_trace_seq: total bridged
+// calls recorded, for the VIDEO-SAMPLE per-interval deltas.
+static std::atomic<u64> g_video_app_mem_mb{0};
+extern "C" void trt_video_set_app_mem_mb(u64 mb) {
+  g_video_app_mem_mb.store(mb, std::memory_order_relaxed);
+}
+extern "C" u64 trt_video_app_mem_mb(void) {
+  return g_video_app_mem_mb.load(std::memory_order_relaxed);
+}
+extern "C" u64 gap_trace_seq(void) {
+  std::lock_guard<std::mutex> lk(g_gap_mu);
+  return g_gap_seq;
 }
 
 u64 gap_trace_note_tex_fail(void) {

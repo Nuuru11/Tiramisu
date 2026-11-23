@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -27,6 +28,51 @@
 extern "C" int trt_settings_shader_cache_int(void) __attribute__((weak));
 // .216 DIAG: thread id for the Vulkan frame-loop trace.
 extern "C" u32 TRT_STDCALL trt_GetCurrentThreadId(void);
+// .223 DIAG: one-shot video sample right after the first
+// present (see trt_vkQueuePresentKHR) -- pins the first
+// ~2GB jump to the first present vs the post-frame-1 burst.
+// Defined in vk_backend.hpp, bound in swapchain.cpp;
+// declared here like main.cpp does.
+extern "C" void trt_video_sample_log(void);
+#if !defined(_WIN32)
+// The real definition lives in src/host/vk_backend.hpp, bound into
+// src/host/swapchain.cpp — a Windows-side TU not compiled into libtrt.a on
+// Linux. Provide the diagnostic no-op binding so pulling bridge_vulkan.o on
+// the Linux host links; the console keeps its real binding.
+extern "C" void trt_video_sample_log(void) {}
+#endif
+// .223 DIAG: lock-free Vulkan allocation totals for the
+// video hunt -- read by the watchdog-thread VIDEO-SAMPLE
+// (and the frame-1 sample from the present hook, while
+// g_vk_mu is held), so they must be atomics, never a map
+// walk under a lock. Updated under g_vk_mu at every
+// alloc/free/create/destroy; the live totals are exact,
+// the biggest-live value is recomputed by a scan on free
+// when the biggest block is freed.
+static std::atomic<u64> g_vk_alloc_live_bytes{0};
+static std::atomic<u64> g_vk_alloc_live_n{0};
+static std::atomic<u64> g_vk_biggest_alloc_bytes{0};
+static std::atomic<u64> g_vk_imgs_live_n{0};
+static std::atomic<u64> g_vk_imgs_est_bytes{0};
+static std::atomic<u64> g_vk_presents{0};
+extern "C" u64 trt_vk_alloc_live_bytes(void) {
+  return g_vk_alloc_live_bytes.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_alloc_live_n(void) {
+  return g_vk_alloc_live_n.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_imgs_live_n(void) {
+  return g_vk_imgs_live_n.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_imgs_est_bytes(void) {
+  return g_vk_imgs_est_bytes.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_presents(void) {
+  return g_vk_presents.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_biggest_alloc_bytes(void) {
+  return g_vk_biggest_alloc_bytes.load(std::memory_order_relaxed);
+}
 
 // ---- shader compile cache (settings knob: shader_cache) -------------------
 // SPIR-V -> HLSL compilation is the single most expensive path on the Vulkan
@@ -1739,6 +1785,15 @@ i32 TRT_GUEST_ABI trt_vkQueuePresentKHR(void*, const vk_present_info* pi) {
   // .218 DIAG: remember the presenting thread (main-thread proxy) +
   // record the present in the gap trace.
   if (s_presents == 1) gap_trace_note_frame1(trt_GetCurrentThreadId());
+  // .223 DIAG: count presents for the VIDEO-SAMPLE deltas,
+  // and take a one-shot video sample right after the FIRST
+  // present: the .222 re-test jumped +1779MB between samples
+  // #1 and #2 with frame=1 inside that window, so this
+  // sample pins the jump to the first present vs the
+  // post-frame-1 burst. Safe under g_vk_mu: the sample
+  // reads only lock-free atomics.
+  g_vk_presents.fetch_add(1, std::memory_order_relaxed);
+  if (s_presents == 1) trt_video_sample_log();
   gap_trace_record("vkQueuePresentKHR");
   // .216 DIAG: log EVERY present with tid (was first 10 + every 60th).
   vk_logf("vulkan: vkQueuePresentKHR frame=%llu sc=%llu idx=%u tid=%u",
@@ -1778,6 +1833,30 @@ i32 TRT_GUEST_ABI trt_vkAllocateMemory(void* dev_v, const vk_mem_alloc_info* ai,
   snprintf(buf, sizeof(buf), "[vulkan] vkAllocateMemory id=%llu size=%llu type=%u host_vec=%zu",
            (unsigned long long)id, (unsigned long long)ai->allocationSize, ai->memoryTypeIndex, m.data.size());
   trt_core_log(buf);
+  // .223 DIAG: lock-free live totals for the VIDEO-SAMPLE,
+  // plus a BIG line for any single allocation over 100MB
+  // (size + caller tid): the .222 re-test grew video by
+  // ~2GB twice while the only Vulkan allocations were
+  // 32/32/32/64MB, so a BIG line firing (or not firing) is
+  // itself the verdict.
+  g_vk_alloc_live_bytes.fetch_add(ai->allocationSize, std::memory_order_relaxed);
+  g_vk_alloc_live_n.fetch_add(1, std::memory_order_relaxed);
+  {
+    u64 prev_big = g_vk_biggest_alloc_bytes.load(std::memory_order_relaxed);
+    while (ai->allocationSize > prev_big &&
+           !g_vk_biggest_alloc_bytes.compare_exchange_weak(
+               prev_big, ai->allocationSize, std::memory_order_relaxed)) {
+    }
+  }
+  if (ai->allocationSize > (100ull << 20)) {
+    char bb[192];
+    snprintf(bb, sizeof(bb),
+             "[vulkan] vkAllocateMemory BIG id=%llu size=%lluMB type=%u tid=%u",
+             (unsigned long long)id,
+             (unsigned long long)(ai->allocationSize >> 20),
+             ai->memoryTypeIndex, trt_GetCurrentThreadId());
+    trt_core_log(bb);
+  }
   *pMem = id;
   return VK_SUCCESS_V;
 }
@@ -1787,7 +1866,22 @@ void TRT_GUEST_ABI trt_vkFreeMemory(void* dev_v, u64 mem, const void*) {
     char buf[64];
     snprintf(buf, sizeof(buf), "[vulkan] vkFreeMemory id=%llu", (unsigned long long)mem);
     trt_core_log(buf);
-    d->mems.erase(mem);
+    // .223 DIAG: keep the live Vulkan totals exact; if the
+    // freed block was the biggest, rescan for the new one.
+    auto it = d->mems.find(mem);
+    if (it != d->mems.end()) {
+      const u64 freed = it->second.size;
+      g_vk_alloc_live_bytes.fetch_sub(freed, std::memory_order_relaxed);
+      g_vk_alloc_live_n.fetch_sub(1, std::memory_order_relaxed);
+      if (freed >= g_vk_biggest_alloc_bytes.load(std::memory_order_relaxed)) {
+        u64 biggest = 0;
+        for (const auto& kv : d->mems) {
+          if (kv.first != mem && kv.second.size > biggest) biggest = kv.second.size;
+        }
+        g_vk_biggest_alloc_bytes.store(biggest, std::memory_order_relaxed);
+      }
+      d->mems.erase(it);
+    }
   }
 }
 i32 TRT_GUEST_ABI trt_vkMapMemory(void* dev_v, u64 mem, u64 offset, u64 size, u32, void** ppData) {
@@ -1897,13 +1991,48 @@ i32 TRT_GUEST_ABI trt_vkCreateImage(void* dev_v, const vk_img_ci* ci, const void
              std::max(1u, ci->mipLevels), std::max(1u, ci->arrayLayers),
              ci->usage, ci->flags, 0, {}};
   d->imgs[id] = im;
+  // .223 DIAG: the image census the .222 log never had --
+  // trt_vkCreateImage logged NOTHING, so the number/sizes
+  // of Vulkan images were invisible while video grew ~2GB
+  // twice. Track the live count + estimated bytes (same
+  // w*h*depth*layers*4 formula as
+  // GetImageMemoryRequirements) for the VIDEO-SAMPLE, and
+  // log every creation (counts are in the low hundreds;
+  // the line names the image behind each D3D11 texture).
+  {
+    const u64 est = (u64)im.desc.w * (u64)im.desc.h *
+        (u64)std::max(1u, im.desc.depth) *
+        (u64)std::max(1u, im.desc.layers) * 4ull;
+    g_vk_imgs_live_n.fetch_add(1, std::memory_order_relaxed);
+    g_vk_imgs_est_bytes.fetch_add(est, std::memory_order_relaxed);
+    char ib[192];
+    snprintf(ib, sizeof(ib),
+             "[vulkan] vkCreateImage id=%llu %ux%ux%u fmt=%u mips=%u layers=%u usage=0x%x est=%lluMB tid=%u",
+             (unsigned long long)id, im.desc.w, im.desc.h,
+             im.desc.depth, im.desc.vk_format, im.desc.mips,
+             im.desc.layers, im.desc.usage,
+             (unsigned long long)(est >> 20), trt_GetCurrentThreadId());
+    trt_core_log(ib);
+  }
   sync_img_obj(d, im);
   *pImg = id;
   return VK_SUCCESS_V;
 }
 void TRT_GUEST_ABI trt_vkDestroyImage(void* dev_v, u64 img, const void*) {
   std::lock_guard<std::mutex> lk(g_vk_mu);
-  if (vk_device_obj* d = dev_from(dev_v)) d->imgs.erase(img);
+  // .223 DIAG: keep the live image totals exact (see
+  // trt_vkCreateImage).
+  if (vk_device_obj* d = dev_from(dev_v)) {
+    auto it = d->imgs.find(img);
+    if (it != d->imgs.end()) {
+      const auto& ds = it->second.desc;
+      const u64 est = (u64)ds.w * (u64)ds.h *
+          (u64)std::max(1u, ds.depth) * (u64)std::max(1u, ds.layers) * 4ull;
+      g_vk_imgs_live_n.fetch_sub(1, std::memory_order_relaxed);
+      g_vk_imgs_est_bytes.fetch_sub(est, std::memory_order_relaxed);
+      d->imgs.erase(it);
+    }
+  }
   if (g_vk_hooks_set && g_vk_hooks.destroy_image) g_vk_hooks.destroy_image(img, g_vk_hooks.user);
 }
 void TRT_GUEST_ABI trt_vkGetImageMemoryRequirements(void* dev_v, u64 img, vk_mem_reqs* mr) {
