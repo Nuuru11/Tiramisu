@@ -38,6 +38,8 @@
 #include "thunk.h"
 
 #include <atomic>
+
+extern "C" void trt_crt_forget_all(void);  // .251 FIX: bridge_msvcrt.cpp
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -304,6 +306,15 @@ void trt_mem_budget_reset(void) {
   const u64 va = g_va_reserved.exchange(0);
   g_soft80.store(false);
   g_soft90.store(false);
+  // .251 FIX: the dead guest's tracked CRT blocks are still in the
+  // registry (bridge_msvcrt.cpp); freeing them after this reset
+  // discharges against the zeroed ledger and trips the over-discharge
+  // tripwire (the .250 9/16-byte warnings). Forget the registry so
+  // those frees land as foreign pointers. The heap-record and VA-extent
+  // registries are NOT cleared here (their discharges are large /
+  // page-rounded and did not trip in .250); if they trip on a later
+  // run, they get the same treatment.
+  trt_crt_forget_all();
   char line[256];
   snprintf(line, sizeof(line),
            "[trt] mem: BUDGET RESET after guest force-kill: ledger zeroed "

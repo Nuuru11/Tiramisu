@@ -6590,7 +6590,32 @@ static bool k32_cpp_eh_type_name_249(const u64* args, u32 count,
   const u64 img = (count >= 4) ? args[3] : 0;
   if (!ti) return false;
   u64 cta_qw = 0;
-  if (!k32_read_qword_guarded_249(ti + 24, &cta_qw)) return false;
+  // .251 DIAG: pCatchableTypeArray is a 32-bit RVA at ti+12 (the x64
+  // image _ThrowInfo is 16 bytes: attributes @0, pfnUnwind @4,
+  // pfnForwardCompat @8, pCatchableTypeArray @12). The .249 code read
+  // ti+24 -- past the struct -- so it always failed (ntypes=0 in both
+  // .250 runs). Dump the raw ThrowInfo qwords first (guarded), then
+  // take the RVA from ti+12 (high 32 bits of the ti+8 qword); fall
+  // back to the .249 ti+24 reading if it is 0.
+  {
+    u64 qw0 = 0, qw1 = 0, qw2 = 0, qw3 = 0;
+    (void)k32_read_qword_guarded_249(ti, &qw0);
+    (void)k32_read_qword_guarded_249(ti + 8, &qw1);
+    (void)k32_read_qword_guarded_249(ti + 16, &qw2);
+    (void)k32_read_qword_guarded_249(ti + 24, &qw3);
+    char dl[256];
+    snprintf(dl, sizeof(dl),
+             "kernel32: C++ ThrowInfo dump ti=0x%llx img=0x%llx "
+             "qw0=0x%llx qw1=0x%llx qw2=0x%llx qw3=0x%llx",
+             (unsigned long long)ti, (unsigned long long)img,
+             (unsigned long long)qw0, (unsigned long long)qw1,
+             (unsigned long long)qw2, (unsigned long long)qw3);
+    boot_log(dl);
+    cta_qw = (u32)(qw1 >> 32);
+    if (!cta_qw) {
+      if (!k32_read_qword_guarded_249(ti + 24, &cta_qw)) return false;
+    }
+  }
   u64 cta = 0;
   u64 n_qw = 0;
   if (k32_read_qword_guarded_249(cta_qw, &n_qw) &&
@@ -6618,6 +6643,24 @@ static bool k32_cpp_eh_type_name_249(const u64* args, u32 count,
   }
   u64 t_qw = 0;
   if (!k32_read_qword_guarded_249(ct + 4, &t_qw)) return false;
+  // .251 DIAG: the type name lives INLINE in the _TypeDescriptor at
+  // pType+16 (pVFTable @0, spare @8, name[] @16). The .249 code read
+  // a pointer at +8 (the spare field, usually 0), so it never
+  // resolved. Resolve pType as img+RVA (primary) or direct.
+  {
+    u64 ptype = 0;
+    if (img && (u32)t_qw) {
+      ptype = img + (u32)t_qw;
+    } else if (t_qw) {
+      ptype = t_qw;
+    }
+    if (ptype) {
+      const int n = k32_read_guest_str_249(ptype + 16, name_buf, name_cap);
+      if (n >= 4 && name_buf[0] == '.' && name_buf[1] == '?' &&
+          name_buf[2] == 'A')
+        return true;
+    }
+  }
   if (img) {
     u64 name_qw = 0;
     if (k32_read_qword_guarded_249(img + (u32)t_qw + 8, &name_qw) &&

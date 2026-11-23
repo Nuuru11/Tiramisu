@@ -574,6 +574,23 @@ size_t crt_tracked_size(void* p) {
 }
 }  // namespace
 
+// .251 FIX: forget the CRT allocation registry on budget reset. After
+// a guest force-kill, trt_mem_budget_reset() zeroes the ledgers, but
+// the dead guest's tracked blocks stay in this registry; when teardown
+// frees them, crt_free discharges against the zeroed ledger and trips
+// the over-discharge tripwire (the .250 9/16-byte warnings, 13 lines
+// after the reset). Clearing the registry makes those frees land as
+// foreign pointers (freed uncharged, memory still released), matching
+// the reset's fresh-start fiction. Called only from
+// trt_mem_budget_reset(), after the guest thread is joined, so no
+// guest thread can be mid-alloc; a live host thread freeing a tracked
+// block across the clear either discharges before it (normal) or finds
+// no entry after it (freed uncharged) -- both safe.
+extern "C" void trt_crt_forget_all(void) {
+  std::lock_guard<std::mutex> lk(g_crt_alloc_mu);
+  g_crt_alloc.clear();
+}
+
 void* TRT_GUEST_ABI crt_malloc(u64 sz) {
   // Settings knob: memory_budget_mb caps the single-allocation refusal
   // threshold. Default 256 MB; a user can raise it for big allocators
