@@ -444,6 +444,210 @@ static void maybe_log_lost_wakeup(u32 spin_tid) {
   }
 }
 
+// .226 DIAG: spin-function range + post-wake watch (Sekiro). All state
+// lives in this file and is guarded by g_obj_mu; the helpers below
+// REQUIRE the lock held (same as the .225 helpers above).
+//
+// (a) FN-OFF: the WAIT-FAST ret_off names a call site, not its function.
+// spin_fn_range binary-searches the main image's own .pdata (the same
+// table lookup_guest_pdata uses in bridge_kernel32.cpp) for the
+// RUNTIME_FUNCTION whose [begin,end) contains the return address, and
+// returns its start offset + length -- so the five spin sites
+// (0x1a5e26c..0x1a5e555) resolve to one function span, from runtime
+// data only (no game-file inspection, no symbols needed).
+// (b) SPIN TABLE: every immediate-return (fast) wait is counted per
+// handle, not just the sampled ones, so the census can say exactly how
+// many times the loop waited on each object.
+// (c) POST-WAKE: when a watched start event wakes a worker, record the
+// wake; the census then reports whether that worker ever called again
+// and whether its thread is still alive -- the exit-vs-stuck
+// discriminator for the silent death (no bridged exit call exists).
+struct spin_pdata_fn {
+  u32 begin = 0;
+  u32 end = 0;
+  u32 unwind = 0;
+};
+
+static bool spin_fn_range(u64 retaddr, u64* fn_off, u64* fn_len) {
+  if (fn_off) *fn_off = 0;
+  if (fn_len) *fn_len = 0;
+  if (!retaddr) return false;
+  const trt_image* img = trt_images_first();
+  if (!img || !img->base || !img->size_of_image || !img->pdata ||
+      !img->pdata_count)
+    return false;
+  const u64 b = (u64)(uintptr_t)img->base;
+  if (retaddr < b || retaddr >= b + img->size_of_image) return false;
+  const u32 rva = (u32)(retaddr - b);
+  const spin_pdata_fn* fns = (const spin_pdata_fn*)img->pdata;
+  u32 lo = 0, hi = img->pdata_count;
+  while (lo < hi) {
+    const u32 mid = lo + (hi - lo) / 2;
+    if (rva < fns[mid].begin) {
+      hi = mid;
+    } else if (rva >= fns[mid].end) {
+      lo = mid + 1;
+    } else {
+      if (fn_off) *fn_off = (u64)fns[mid].begin;
+      if (fn_len) *fn_len = (u64)(fns[mid].end - fns[mid].begin);
+      return true;
+    }
+  }
+  return false;
+}
+
+struct spin_tab_entry {
+  u64 handle = 0;
+  u32 kind = 0;
+  unsigned long long fast = 0;
+};
+static spin_tab_entry g_spin_tab[16];
+static unsigned g_spin_tab_n = 0;
+static void spin_tab_count(u64 handle, u32 kind) {
+  for (unsigned i = 0; i < g_spin_tab_n; ++i) {
+    if (g_spin_tab[i].handle == handle) {
+      ++g_spin_tab[i].fast;
+      return;
+    }
+  }
+  if (g_spin_tab_n >= 16) return;
+  g_spin_tab[g_spin_tab_n].handle = handle;
+  g_spin_tab[g_spin_tab_n].kind = kind;
+  g_spin_tab[g_spin_tab_n].fast = 1;
+  ++g_spin_tab_n;
+}
+
+struct woke_entry {
+  u32 tid = 0;
+  u64 handle = 0;
+  std::chrono::steady_clock::time_point at{};
+  bool reported = false;
+};
+static woke_entry g_woke[4];
+static unsigned g_woke_n = 0;
+static void woke_record(u32 tid, u64 handle) {
+  for (unsigned i = 0; i < g_woke_n; ++i) {
+    if (g_woke[i].handle == handle && g_woke[i].tid == tid) {
+      g_woke[i].at = std::chrono::steady_clock::now();
+      g_woke[i].reported = false;
+      return;
+    }
+  }
+  if (g_woke_n >= 4) return;
+  g_woke[g_woke_n].tid = tid;
+  g_woke[g_woke_n].handle = handle;
+  g_woke[g_woke_n].at = std::chrono::steady_clock::now();
+  g_woke[g_woke_n].reported = false;
+  ++g_woke_n;
+}
+
+// Requires g_obj_mu held. Refresh + read a guest thread's liveness:
+// alive=true means the thread is still executing somewhere (guest code
+// or an unbridged block); alive=false (or the object reclaimed away)
+// means it exited. Mirrors the WIN32 handle poll wait_single_impl does.
+static bool thread_alive_locked(u32 tid, u32* exit_code) {
+  if (exit_code) *exit_code = 0;
+  for (u32 i = 0; i < (u32)g_objects.size(); ++i) {
+    sync_object& o = g_objects[i];
+    if (o.kind != OBJ_THREAD || o.tid != tid) continue;
+#if defined(_WIN32)
+    if (!o.signalled && o.win_handle &&
+        ::WaitForSingleObject(o.win_handle, 0) == WAIT_OBJECT_0) {
+      o.signalled = true;
+      o.alive.store(false, std::memory_order_release);
+    }
+#endif
+    if (exit_code) *exit_code = o.exit_code;
+    return o.alive.load(std::memory_order_acquire);
+  }
+  if (exit_code) *exit_code = 0xFFFFFFFFu;  // object gone: reclaimed after exit
+  return false;
+}
+
+static void dump_spin_summary() {
+  // Requires g_obj_mu held.
+  for (unsigned i = 0; i < g_spin_tab_n; ++i) {
+    const sync_object* o = object_for_locked(g_spin_tab[i].handle, nullptr);
+    char line[256];
+    snprintf(line, sizeof(line),
+             "sync: SPIN-SUMMARY handle=%llx kind=%u fast=%llu owner=%u lock=%d sets=%llu lastset=%u",
+             (unsigned long long)g_spin_tab[i].handle,
+             (unsigned)g_spin_tab[i].kind,
+             (unsigned long long)g_spin_tab[i].fast,
+             o ? o->owner_tid : 0u, o ? o->lock_count : 0,
+             o ? (unsigned long long)o->set_count : 0ull,
+             o ? o->last_set_tid : 0u);
+    trt_core_log(line);
+  }
+}
+
+static void dump_post_wake_summary(const char* tag) {
+  // Requires g_obj_mu held. tag is POST-WAKE-FINAL (census).
+  const auto now = std::chrono::steady_clock::now();
+  for (unsigned i = 0; i < g_woke_n; ++i) {
+    const unsigned long long ms_ago =
+        (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_woke[i].at).count();
+    u32 exit_code = 0;
+    const bool alive = thread_alive_locked(g_woke[i].tid, &exit_code);
+    char line[256];
+    snprintf(line, sizeof(line),
+             "sync: %s tid=%u handle=%llx woke_ms_ago=%llu alive=%d exit=%u",
+             tag, g_woke[i].tid, (unsigned long long)g_woke[i].handle,
+             ms_ago, alive ? 1 : 0, exit_code);
+    trt_core_log(line);
+  }
+}
+
+static void maybe_log_post_wake() {
+  // Requires g_obj_mu held. One live line per wake, from the WAIT-FAST
+  // sample block (every 100th sample after the first 32) -- the census
+  // carries the final state regardless.
+  for (unsigned i = 0; i < g_woke_n; ++i) {
+    if (g_woke[i].reported) continue;
+    g_woke[i].reported = true;
+    const auto now = std::chrono::steady_clock::now();
+    const unsigned long long ms_ago =
+        (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - g_woke[i].at).count();
+    u32 exit_code = 0;
+    const bool alive = thread_alive_locked(g_woke[i].tid, &exit_code);
+    char line[256];
+    snprintf(line, sizeof(line),
+             "sync: POST-WAKE tid=%u handle=%llx woke_ms_ago=%llu alive=%d exit=%u",
+             g_woke[i].tid, (unsigned long long)g_woke[i].handle,
+             ms_ago, alive ? 1 : 0, exit_code);
+    trt_core_log(line);
+  }
+}
+
+static void dump_threads_summary() {
+  // Requires g_obj_mu held. Every live guest thread object: the
+  // exit-vs-stuck discriminator at dump time. A thread whose routine
+  // returned (or that exited via any bridged path) shows alive=0;
+  // a thread stuck in pure guest code (or an unbridged block) shows
+  // alive=1 with no further bridged calls.
+  unsigned shown = 0;
+  for (u32 i = 0; i < (u32)g_objects.size() && shown < 16; ++i) {
+    sync_object& o = g_objects[i];
+    if (o.kind != OBJ_THREAD) continue;
+#if defined(_WIN32)
+    if (!o.signalled && o.win_handle &&
+        ::WaitForSingleObject(o.win_handle, 0) == WAIT_OBJECT_0) {
+      o.signalled = true;
+      o.alive.store(false, std::memory_order_release);
+    }
+#endif
+    ++shown;
+    char line[192];
+    snprintf(line, sizeof(line),
+             "sync: THREAD tid=%u alive=%d exit=%u routine=%p",
+             o.tid, o.alive.load(std::memory_order_acquire) ? 1 : 0,
+             o.exit_code, o.start_routine);
+    trt_core_log(line);
+  }
+}
+
 u32 current_tid() {
   return trt_GetCurrentThreadId();
 }
@@ -1383,7 +1587,10 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
     {
       static unsigned long long s_fast_n = 0;
       ++s_fast_n;
-      if (s_fast_n <= 32 || (s_fast_n % 100000) == 0) {
+      // .226 DIAG: count every fast wait per handle (census
+      // SPIN-SUMMARY), not just the sampled ones.
+      spin_tab_count(handle, (unsigned)o->kind);
+      if (s_fast_n <= 32 || (s_fast_n % 100) == 0) {
         // .225 DIAG: spin return address -- guest_ret is the guest
         // call site of this WaitForSingleObject (threaded down from
         // the export wrapper); validated against the guest images,
@@ -1403,18 +1610,27 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
               ret_off = retaddr - b;
           }
         }
-        char fl[320];
+        // .226 DIAG: enclosing .pdata function of the spin call
+        // site (runtime data only) + the wait timeout, so an
+        // INFINITE always-ready wait reads differently from a
+        // 0-timeout poll.
+        u64 fn_off = 0, fn_len = 0;
+        spin_fn_range(retaddr, &fn_off, &fn_len);
+        char fl[384];
         snprintf(fl, sizeof(fl),
-                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu owner=%u lock=%d retaddr=%llx ret_off=%llx",
-                 (unsigned long long)handle, (unsigned)o->kind, my_tid,
+                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 ms=%u lastset=%u sets=%llu n=%llu owner=%u lock=%d retaddr=%llx ret_off=%llx fn_off=%llx fn_len=%llx",
+                 (unsigned long long)handle, (unsigned)o->kind, my_tid, ms,
                  o->last_set_tid, (unsigned long long)o->set_count,
                  s_fast_n, o->owner_tid, o->lock_count,
-                 (unsigned long long)retaddr, (unsigned long long)ret_off);
+                 (unsigned long long)retaddr, (unsigned long long)ret_off,
+                 (unsigned long long)fn_off, (unsigned long long)fn_len);
         trt_core_log(fl);
         // .225 DIAG: lost-wakeup pairing, first sampled spin point
-        // (retries at every 100000th sample if the worker has not
-        // parked yet when the spin starts).
+        // (retries at every 100th sample -- .226: the 100000th
+        // never fires inside a 506-call Sekiro session).
         maybe_log_lost_wakeup(my_tid);
+        // .226 DIAG: live post-wake line once per woken worker.
+        maybe_log_post_wake();
       }
     }
     return 0;
@@ -1517,6 +1733,10 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
                    o->last_set_tid, (unsigned long long)o->set_count);
           trt_core_log(wl);
         }
+        // .226 DIAG: post-wake watch -- record every wake of a
+        // watched start event (not just the logged ones) so the
+        // census can report the worker's fate.
+        if (watched_find(handle)) woke_record(my_tid, handle);
       }
       return 0;
     }
@@ -2450,6 +2670,12 @@ extern "C" void trt_sync_census_log(void) {
   // trace for the creation-to-first-dump window.
   maybe_log_lost_wakeup(0);
   dump_gate_trace("census");
+  // .226 DIAG: spin shape (exact per-handle fast counts),
+  // woken-worker fate (exit vs stuck), and thread liveness
+  // at dump time.
+  dump_spin_summary();
+  dump_post_wake_summary("POST-WAKE-FINAL");
+  dump_threads_summary();
 }
 
 // --- semaphore ---
