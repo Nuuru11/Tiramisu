@@ -292,6 +292,23 @@ int heap_pool_free_locked(void* p, size_t n) {
   if (h->slab != s) {
     trt_core_log("kernel32: HeapFree corruption: block header slab disagrees "
                  "with the live slab list (proceeding with the live slab)");
+// .252 FIX: forget the VA-extent registry on budget reset
+// (mirror of trt_crt_forget_all, .251). After a guest
+// force-kill, trt_mem_budget_reset() zeroes the ledgers, but
+// the dead guest's VA regions stay in g_va; when teardown
+// frees them, VirtualFree finds the extent and discharges
+// against the zeroed ledger, tripping the over-discharge
+// tripwire (the .251 1 MB VA discharge). Clearing the
+// registry makes those frees land as foreign (no discharge,
+// memory still released), matching the reset's fresh-start
+// fiction. Called only from trt_mem_budget_reset(), after
+// the guest thread is joined.
+extern "C" void trt_va_forget_all(void) {
+  std::lock_guard<std::mutex> lk(g_va_mu);
+  g_va.clear();
+  g_extra_pending_rx.clear();
+}
+
   }
   *(void**)p = s->free_list;  // link into the free list via the user area
   s->free_list = blk;
@@ -1897,7 +1914,10 @@ int file_release_locked(u32 idx) {
     --g_files[idx].refs;
     return 1;
   }
-  fclose((FILE*)g_files[idx].os);
+  // .252 FIX: directory handles hold a real host HANDLE
+  // (mode 'd'), not a FILE* -- CloseHandle it instead of fclose.
+  if (g_files[idx].mode == 'd') ::CloseHandle((HANDLE)g_files[idx].os);
+  else fclose((FILE*)g_files[idx].os);
   g_files[idx].os = nullptr;
   g_files[idx].refs = 0;
   g_files[idx].vpath[0] = 0;
@@ -1907,7 +1927,12 @@ int file_release_locked(u32 idx) {
 FILE* file_os(void* h) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* r = file_at_locked(h);
-  return r ? (FILE*)r->os : nullptr;
+  // .252 FIX: directory handles (mode 'd', host HANDLE in os)
+  // are not FILE* -- return null so ReadFile/WriteFile/
+  // GetFileSizeEx/GetFileInformationByHandle fail gracefully
+  // (ERROR_INVALID_HANDLE) instead of passing a HANDLE to stdio.
+  if (!r || r->mode == 'd') return nullptr;
+  return (FILE*)r->os;
 }
 
 // extern-C accessors for gap / ntdll bridges
@@ -1948,6 +1973,41 @@ void build_guest_vpath(const u16* name, char* out, size_t cap) {
 void* file_alloc(FILE* os, u8 mode, const char* vpath = nullptr) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   for (size_t i = 0; i < g_files.size(); ++i) {
+    // .252 FIX: directory open with FILE_FLAG_BACKUP_SEMANTICS --
+    // the .251 Sekiro run 2 proves the guest opens its game
+    // directory the correct Windows way (flags=0x02000080,
+    // is_dir=1) and the bridge drops it (fopen cannot open a
+    // directory, errno=EACCES). Open the directory with the
+    // REAL host CreateFileW and return a directory handle
+    // (mode 'd', host HANDLE in os). GetFileType reports
+    // FILE_TYPE_DISK; ReadFile/WriteFile/Seek fail with
+    // ERROR_ACCESS_DENIED / INVALID_HANDLE, as on real Windows.
+    if ((flags & 0x02000000u) && cf_is_dir) {
+      wchar_t wdir[1024];
+      if (::MultiByteToWideChar(CP_UTF8, 0, host, -1, wdir, 1024) > 0) {
+        HANDLE hdir = ::CreateFileW(wdir, 0x80000000u /*GENERIC_READ*/,
+                                    share ? share : 0x00000007u, nullptr,
+                                    3u /*OPEN_EXISTING*/,
+                                    0x02000000u /*FILE_FLAG_BACKUP_SEMANTICS*/,
+                                    nullptr);
+        if (hdir != INVALID_HANDLE_VALUE) {
+          char vpath[512];
+          build_guest_vpath(name, vpath, sizeof(vpath));
+          char dlog[1100];
+          snprintf(dlog, sizeof(dlog),
+                   "kernel32: CreateFileW directory open -> handle (path: %s flags=0x%08x)",
+                   host, flags);
+          trt_core_log(dlog);
+          return file_alloc((FILE*)hdir, 'd', vpath);
+        }
+      }
+      // Host open failed -- fall through to the .250 DIAG failure log.
+      char flog[1100];
+      snprintf(flog, sizeof(flog),
+               "kernel32: CreateFileW directory host-open failed (path: %s flags=0x%08x err=%u)",
+               host, flags, (unsigned)::GetLastError());
+      trt_core_log(flog);
+    }
     if (!g_files[i].os) {
       g_files[i].os = os;
       g_files[i].mode = mode;
@@ -2010,6 +2070,15 @@ void trt_bridge_set_cwd(const char* guest_dir) {
     g_cwd[sizeof(g_cwd) - 1] = 0;
     for (char* p = g_cwd; *p; ++p) {
       if (*p == '/') *p = '\\';
+  // .252 FIX: directory handles (mode 'd') are not FILE* --
+  // ReadFile/WriteFile on a directory fails with
+  // ERROR_ACCESS_DENIED on real Windows, so fail here instead
+  // of passing a HANDLE to stdio.
+  if (rec && rec->mode == 'd') {
+    trt_SetLastError(5);
+    if (n_out) *n_out = 0;
+    return 0;
+  }
     }
   }
 }
@@ -2176,6 +2245,10 @@ static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
       if (io_err_out) *io_err_out = (bytes > 0 && got == 0) ? 38u : 0u;
       return 1;
     }
+  // .252 FIX: directory handles are not FILE* -- GetFileSize
+  // on a directory returns failure here (real Windows:
+  // INVALID_FILE_SIZE).
+  if (rec->mode == 'd') return 0;
   }
   if (overlapped) {
     const u64 off = ((const u64*)overlapped)[2];
@@ -2261,6 +2334,9 @@ int TRT_STDCALL trt_ReadFileEx(void* h, void* buf, u32 bytes, void* overlapped,
     trt_SetLastError(87);
     return 0;
   }
+  // .252 FIX: directory handles are not FILE* -- pread on a
+  // directory fails (real Windows: ERROR_ACCESS_DENIED).
+  if (rec->mode == 'd') return 0;
   size_t n = 0;
   u32 io_err = 0;
   if (!file_xfer_impl(h, buf, bytes, 0, overlapped, &n, &io_err)) return 0;
@@ -2342,6 +2418,12 @@ static bool file_pread_mmap_locked(FILE* os, u64 offset, void* dst,
   if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return false;
   const u64 fsize = (u64)st.st_size;
   if (offset >= fsize) {  // at/past EOF: a clean zero-byte read
+  // .252 FIX: directory handles are not FILE* -- SetFilePointer
+  // on a directory fails on real Windows (ERROR_INVALID_HANDLE).
+  if (rec->mode == 'd') {
+    err_ref_for_current_thread() = 6;
+    return 0xFFFFFFFFu;
+  }
     if (got_out) *got_out = 0;
     return true;
   }
@@ -7884,6 +7966,9 @@ int TRT_STDCALL trt_FindNextFileW(void* handle, void* info) {
       }
       memcpy(info, &native_fd, sizeof(WIN32_FIND_DATAW));
       return 1;
+  // .252 FIX: directory handles are not FILE* -- fail (real
+  // Windows: SetFilePointerEx on a directory fails).
+  if (rec->mode == 'd') return 0;
     }
     if (c.os_dir) { FindClose((HANDLE)c.os_dir); c.os_dir = nullptr; }
     if (!c.is_z || c.opaque_ro || !c.host_path2[0]) {
@@ -8007,8 +8092,12 @@ int TRT_STDCALL trt_FlushFileBuffers(void* h) {
 }
 
 u32 TRT_STDCALL trt_GetFileType(void* h) {
-  // FILE_TYPE_DISK = 1 (every VFS handle is a disk file; no console/pipe)
-  return file_os(h) ? 1u : 0u;
+  // FILE_TYPE_DISK = 1 (every VFS handle is a disk file; no console/pipe).
+  // .252 FIX: directory handles (mode 'd') are disk objects too --
+  // check the record directly (file_os returns null for them,
+  // correctly, since they hold a HANDLE not a FILE*).
+  std::lock_guard<std::mutex> lk(g_files_mu);
+  return file_at_locked(h) ? 1u : 0u;
 }
 
 u32 TRT_STDCALL trt_GetCurrentProcessId(void) { return 4242; }

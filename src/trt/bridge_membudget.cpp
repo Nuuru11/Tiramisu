@@ -42,6 +42,7 @@
 extern "C" void trt_crt_forget_all(void);  // .251 FIX: bridge_msvcrt.cpp
 #include <cstdio>
 #include <cstdlib>
+extern "C" void trt_va_forget_all(void);  // .252 FIX: bridge_kernel32.cpp
 #include <cstring>
 
 extern "C" void TRT_STDCALL trt_SetLastError(u32 err);
@@ -310,10 +311,12 @@ void trt_mem_budget_reset(void) {
   // registry (bridge_msvcrt.cpp); freeing them after this reset
   // discharges against the zeroed ledger and trips the over-discharge
   // tripwire (the .250 9/16-byte warnings). Forget the registry so
-  // those frees land as foreign pointers. The heap-record and VA-extent
-  // registries are NOT cleared here (their discharges are large /
-  // page-rounded and did not trip in .250); if they trip on a later
-  // run, they get the same treatment.
+  // those frees land as foreign pointers. The heap-record registry
+  // is NOT cleared here (its discharges are large / page-rounded
+  // and did not trip in .250); if it trips on a later run, it gets
+  // the same treatment.
+  // .252 FIX: the VA-extent registry DID trip on .251 (1 MB VA
+  // over-discharge after /api/stop) -- forget it too, same treatment.
   trt_crt_forget_all();
   char line[256];
   snprintf(line, sizeof(line),
