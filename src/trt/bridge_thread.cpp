@@ -3261,7 +3261,14 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   d3d11_last_call(&last_name, &last_tick);
   const unsigned long long last_age_ms =
       last_tick ? (unsigned long long)GetTickCount64() - last_tick : 0;
-  char sl[832];  // .244 DIAG: +lastd3d11=
+  // .246 DIAG: name the host function that called
+  // NtWaitForAlertByThreadId (stkret) -- identifies main's
+  // second-wait primitive (WaitOnAddress vs another alertable
+  // wait). spin_host_nearest_export lives in this file.
+  char stkret_fn[64] = "";
+  u64 stkret_off = 0;
+  if (s.stkret) spin_host_nearest_export(s.stkret, stkret_fn, sizeof(stkret_fn), &stkret_off);
+  char sl[960];  // .244 DIAG: +lastd3d11=
   snprintf(sl, sizeof(sl),
            // .240 DIAG: r12/rbx/r13/r15 on EVERY sample --
            // the true suspended-thread callee-saved regs
@@ -3271,7 +3278,7 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            // mutex). The .239 samples captured them but
            // never logged them -- only GAP-GROUP did, and
            // its rip-based gate never fired.
-           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx r12=0x%llx rbx=0x%llx r13=0x%llx r15=0x%llx lastd3d11=%s %llums",
+           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx r12=0x%llx rbx=0x%llx r13=0x%llx r15=0x%llx lastd3d11=%s %llums stkretfn=%s+0x%llx",
            n, tid, is_final ? 1 : 0,
            (unsigned long long)s.rip,
            (unsigned long long)s.rip_off,
@@ -3289,7 +3296,8 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            (unsigned long long)s.rdx_qword,
            (unsigned long long)s.r12, (unsigned long long)s.rbx,
            (unsigned long long)s.r13, (unsigned long long)s.r15,
-           last_name ? last_name : "none", last_age_ms);
+           last_name ? last_name : "none", last_age_ms,
+           stkret_fn[0] ? stkret_fn : "?", (unsigned long long)stkret_off);
   trt_core_log(sl);
   // .240 FIX: the .239 rip-based gate never fired (GAP-GROUP 0)
   // although main IS in wait_for_group_task_completion -- the
