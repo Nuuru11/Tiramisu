@@ -4,7 +4,7 @@
 #
 # Sources:
 #   package/branding/logo.png   1254x1254 — the Tiramisu logo
-#   package/branding/banner.jpg 3584x1184 — the banner art
+#   package/branding/banner.jpg 3584x1184 — the banner art (tiramisunewlogo)
 #
 # Every asset the AppxManifest references is produced here at the exact
 # pixel size Windows expects, cover-cropped so art never stretches.
@@ -46,6 +46,20 @@ def pad_fit(im, w, h, scale=0.86):
     return out
 
 
+def fit_pad(im, w, h, bg=(255, 255, 255)):
+    """Whole image scaled to fit inside (w, h), centred on bg — never cropped.
+
+    The banner art is 3:1, so cover-cropping it into 16:9 or 2.07:1 tiles
+    cuts the wordmark and the mascot off at the edges.
+    """
+    ratio = min(w / im.width, h / im.height)
+    im = im.resize((max(1, int(im.width * ratio)), max(1, int(im.height * ratio))),
+                   Image.LANCZOS)
+    out = Image.new("RGB", (w, h), bg)
+    out.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+    return out
+
+
 def save(im, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     im.convert("RGB").save(path, "PNG")
@@ -76,10 +90,10 @@ def main(out_dir):
              os.path.join(out_dir, "Square44x44Logo",
                           f"Square44x44Logo-targetsize-{ts}.png"))
 
-    # Cover + splash: the banner art
-    save(cover_fit(banner, 310, 150),
+    # Wide tile + splash: the banner art, whole (fit + pad, not cropped)
+    save(fit_pad(banner, 310, 150),
          os.path.join(out_dir, "Wide310x150Logo.png"))
-    save(cover_fit(banner, 1920, 1080),
+    save(fit_pad(banner, 1920, 1080),
          os.path.join(out_dir, "SplashScreen.png"))
     print("assets written to", out_dir)
 
