@@ -1542,6 +1542,20 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
 // Called from the watchdog (main.cpp, snapshot-only) every ~5s.
 // Defined here (single-TU header, bound in swapchain.cpp) so no
 // new trt.h declaration is needed; main.cpp declares it locally.
+// .241 DIAG: one of the three largest MEM_PRIVATE committed
+// regions (base + MB) -- WHERE the ~4.3GB untracked consumer
+// sits. The .240 split proved the consumer is private
+// committed memory outside any heap (heap 532MB, priv
+// 4904MB); the valloc caller log (snapshot-only kernel32
+// delta) names WHO reserves it if it goes through the
+// bridge, and these bases bound WHERE it sits if it bypasses
+// the bridge (direct NtAllocateVirtualMemory via the real
+// ntdll, or host driver allocations).
+struct trt_mem_privtop {
+  unsigned long long base = 0;
+  unsigned long long mb = 0;
+};
+
 // .240 DIAG: split appresid (VIDEO-SAMPLE) into guest-heap
 // vs the rest. The .239 run left a ~4.9GB untracked CPU
 // consumer (appresid +4865MB, hostvec 96MB max, shadow 1MB,
@@ -1578,12 +1592,17 @@ static inline void trt_mem_split240(unsigned long long* heap_mb,
                                      unsigned* heap_part,
                                      unsigned long long* priv_mb,
                                      unsigned long long* img_mb,
-                                     unsigned long long* map_mb) {
+                                     unsigned long long* map_mb,
+                                     trt_mem_privtop* top3) {
   unsigned long long heap_b = 0;
   unsigned part = 0;
   unsigned long long priv_b = 0;
   unsigned long long img_b = 0;
   unsigned long long map_b = 0;
+  // .241 DIAG: top-3 private-region bases + exact byte sizes
+  // (compared exact; converted to MB at the end).
+  unsigned long long top_base[3] = {};
+  unsigned long long top_sz[3] = {};
 #if defined(_WIN32)
   __try {
     // (2) VirtualQuery walk first (no locks, cannot block).
@@ -1593,9 +1612,31 @@ static inline void trt_mem_split240(unsigned long long* heap_mb,
       const SIZE_T r = ::VirtualQuery(addr, &mbi, sizeof(mbi));
       if (!r) break;
       if (mbi.State == MEM_COMMIT) {
-        if (mbi.Type == MEM_PRIVATE)
+        if (mbi.Type == MEM_PRIVATE) {
           priv_b += (unsigned long long)mbi.RegionSize;
-        else if (mbi.Type == MEM_IMAGE)
+          // .241 DIAG: track the 3 largest private regions
+          // (descending by exact byte size).
+          const unsigned long long rsz =
+              (unsigned long long)mbi.RegionSize;
+          const unsigned long long rbase =
+              (unsigned long long)(uintptr_t)mbi.BaseAddress;
+          if (rsz > top_sz[0]) {
+            top_base[2] = top_base[1];
+            top_sz[2] = top_sz[1];
+            top_base[1] = top_base[0];
+            top_sz[1] = top_sz[0];
+            top_base[0] = rbase;
+            top_sz[0] = rsz;
+          } else if (rsz > top_sz[1]) {
+            top_base[2] = top_base[1];
+            top_sz[2] = top_sz[1];
+            top_base[1] = rbase;
+            top_sz[1] = rsz;
+          } else if (rsz > top_sz[2]) {
+            top_base[2] = rbase;
+            top_sz[2] = rsz;
+          }
+        } else if (mbi.Type == MEM_IMAGE)
           img_b += (unsigned long long)mbi.RegionSize;
         else if (mbi.Type == MEM_MAPPED)
           map_b += (unsigned long long)mbi.RegionSize;
@@ -1637,6 +1678,12 @@ static inline void trt_mem_split240(unsigned long long* heap_mb,
   if (priv_mb) *priv_mb = priv_b >> 20;
   if (img_mb) *img_mb = img_b >> 20;
   if (map_mb) *map_mb = map_b >> 20;
+  if (top3) {
+    for (int i = 0; i < 3; ++i) {
+      top3[i].base = top_base[i];
+      top3[i].mb = top_sz[i] >> 20;
+    }
+  }
 }
 
 extern "C" void trt_video_sample_log() {
@@ -1744,8 +1791,11 @@ extern "C" void trt_video_sample_log() {
         unsigned long long heap_mb = 0, priv_mb = 0, img_mb = 0,
             map_mb = 0;
         unsigned heap_part = 0;
+        // .241 DIAG: top-3 largest private regions (see
+        // trt_mem_split240 / trt_mem_privtop).
+        trt_mem_privtop privtop[3] = {};
         trt_mem_split240(&heap_mb, &heap_part, &priv_mb, &img_mb,
-                         &map_mb);
+                         &map_mb, privtop);
         const long long apres_other_mb =
             appresid_mb - (long long)heap_mb;
         const bool first_sample = (s_sample_n == 1);
@@ -1772,7 +1822,7 @@ extern "C" void trt_video_sample_log() {
         s_prev_appmem_mb = appmem_mb;
         char vb[1280];
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1795,7 +1845,9 @@ extern "C" void trt_video_sample_log() {
                  dtex_n, dtex_mb, dvkalloc_mb, dvkimg, dpres, dcalls,
                  hostvec_mb, shadow_mb, ledger_mb, appresid_mb,
                  heap_mb, heap_part, priv_mb, img_mb, map_mb,
-                 apres_other_mb);
+                 apres_other_mb, privtop[0].base, privtop[0].mb,
+                 privtop[1].base, privtop[1].mb, privtop[2].base,
+                 privtop[2].mb);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top

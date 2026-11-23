@@ -559,6 +559,10 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
                                      size_t name_cap, u64* off_out);
 static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
                                        unsigned n);
+// .241 FIX: the stack reader calls the guarded qword read
+// (defined below); the forward declaration keeps the call
+// compiling.
+static int spin_read_qword_guarded(u64 addr, u64* out);
 // .230 FIX-DESIGN: NtQueryObject type (+ name) for the
 // waited-on handle (defined after the sampler, next to
 // the other .229 helpers).
@@ -1023,13 +1027,32 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
 static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
                                        unsigned n) {
 #if defined(_WIN32)
+  // .241 FIX: this function NO LONGER has a __try. The .240
+  // build compiled the __try loop below into a bare memcpy
+  // (disasm of the .240 exe at RVA 0xf0d20..0xf0db3: unrolled
+  // mov loop, no SEH setup; UNWIND_INFO flags=0x0, no
+  // exception handler) -- so a fault on a torn-down stack
+  // escaped to spin_capture_ip's CAPTURE scope (fn+0xc0..
+  // +0x1a0, which covers the call) and blacklisted the tid
+  // (the .240 Ultrapool attempt-#3 fault: stages through
+  // close, no fnlookup, FAULT 1, TRY stuck at 3). The .238
+  // comment's claim that MSVC reliably scopes a top-level
+  // __try is WRONG for a try body with no calls: both small
+  // guards (this loop and spin_read_qword_guarded, .240 RVA
+  // 0xf0a80: 11 bytes, no handler, no .pdata entry) lost
+  // their handlers, while spin_fnlookup_guarded (try body
+  // WITH calls) kept its scope. So each qword now goes
+  // through spin_read_qword_guarded (own frame, call inside
+  // its __try -- the surviving shape); a faulting qword
+  // stops the loop and the capture returns partial instead
+  // of faulting. Verify the guard's scope in the .241 exe's
+  // .xdata before deploying.
   unsigned got = 0;
-  __try {
-    for (unsigned i = 0; i < n; ++i) {
-      out[i] = *(const u64*)(uintptr_t)(rsp + (u64)i * 8);
-      ++got;
-    }
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  for (unsigned i = 0; i < n; ++i) {
+    u64 qw = 0;
+    if (!spin_read_qword_guarded(rsp + (u64)i * 8, &qw)) break;
+    out[i] = qw;
+    ++got;
   }
   return got;
 #else
@@ -1144,7 +1167,12 @@ struct spin_ip_sample {
   // .234 DIAG: 9 -> 24 qwords -- the guest caller of Sleep
   // (Sekiro) / WaitForSingleObjectEx (Ultrapool) sits deeper
   // than q8 (the .233 window showed only ntdll/kernel32).
-  u64 stk[24] = {};
+  // .241 DIAG: 24 -> 48 qwords -- the .240 samples had
+  // stkguest=0x0 both (main deep in ntdll/heap, no guest
+  // addresses in 24 qwords); the wider window gives the
+  // GAP-GROUP gate + stkguest more slots to find the guest
+  // caller.
+  u64 stk[48] = {};
   // .234 DIAG: first guest-image address in stk[] (the guest
   // caller) + the qword at rdx (Sleep DelayInterval / wait
   // timeout, read while the target is suspended).
@@ -1155,6 +1183,13 @@ struct spin_ip_sample {
   unsigned stk_n = 0;
   unsigned long sus = 0;
   int ok = 0;
+  // .241 DIAG: capture-step discriminator -- the sub-step
+  // inside spin_capture_ip's CAPTURE __try where a fault
+  // fired (1 = GetThreadContext, 2 = context copy,
+  // 3 = stack read, 4 = rdx read, 5 = done). 0 = the capture
+  // never entered the __try. Read by the GAP-CAPTURE-FAULT
+  // logger (step=). The .240 fault carried no sub-step.
+  int cap_step = 0;
   char ntfn[160] = {};
   u64 ntoff = 0;
 };
@@ -1224,11 +1259,33 @@ static void spin_capture_stage_flush(u32 tid, const char** buf,
 // instead of killing the host. Verify in the built .238 exe's
 // .xdata that this function's scope covers its deref (HOST
 // SYMS read_qword=<rva> + /tmp/xdata238.py) before deploying.
-static int spin_read_qword_guarded(u64 addr, u64* out) {
+// .241 FIX: the .238 guard above is NOT real in the .240
+// binary. The .240 exe at RVA 0xf0a80 holds 11 straight-line
+// bytes (mov rax,[rcx]; mov [rdx],rax; mov eax,1; ret) -- no
+// handler, no .pdata entry: the direct deref inside the
+// __try was compiled bare, so a fault escaped to the
+// CAPTURE scope (same mechanism as spin_read_stack_qwords).
+// The deref now goes through a __declspec(noinline) call
+// INSIDE the __try -- the surviving spin_fnlookup_guarded
+// shape (try body with calls keeps its scope: 1 scope,
+// 49.0% in .240). Verify in the .241 exe's .xdata
+// (xdata241.py) before deploying; if the scope is absent,
+// do NOT deploy -- fall back to a ReadProcessMemory stack
+// read instead.
+static __declspec(noinline) u64 spin_deref_qword(u64 addr) {
+  return *(const u64*)(uintptr_t)addr;
+}
+
+static __declspec(noinline) int spin_read_qword_guarded(u64 addr,
+                                                       u64* out) {
 #if defined(_WIN32)
   int ok = 0;
   __try {
-    *out = *(const u64*)(uintptr_t)addr;
+    // CALL inside the __try (see the note above): a call in
+    // the try body forces MSVC to emit the scope, and the
+    // callee is noinline so the call survives optimization.
+    // A fault in the callee unwinds to this scope.
+    *out = spin_deref_qword(addr);
     ok = 1;
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     ok = 0;
@@ -1362,13 +1419,19 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
   // fault or not. (The guard lives here, not in the gap sampler:
   // __try cannot live there -- C2712, destructible locals.)
   int cap_rc = 1;
+  // .241 DIAG: capture-step discriminator (see the cap_step
+  // field note): set before each sub-step inside the
+  // CAPTURE __try, so a fault caught here names the step.
+  s->cap_step = 0;
   __try {
+  s->cap_step = 1;
   CONTEXT ctx{};
   ctx.ContextFlags = CONTEXT_FULL;
   const BOOL ok = ::GetThreadContext(h, &ctx);
   s->ok = ok ? 1 : 0;
   s->sus = (unsigned long)sus;
   if (ok) {
+    s->cap_step = 2;
     s->rip = (u64)ctx.Rip;
     s->rsp = (u64)ctx.Rsp;
     s->rcx = (u64)ctx.Rcx;
@@ -1388,9 +1451,12 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     // target is still suspended. Direct deref under __try
     // (the spin_read_stack_qwords pattern): ReadProcessMemory
     // is desktop-only, undeclared in the UWP SDK partition.
-    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 24) : 0;
+    // .241 DIAG: 24 -> 48 qwords (see the struct note).
+    s->cap_step = 3;
+    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 48) : 0;
     s->rdx_qword = 0;
     s->rdx_qword_ok = 0;
+    s->cap_step = 4;
     // .238 FIX: the inline nested __try around this deref had
     // NO scope entry in the .237 binary (fault at +0x184,
     // scopes end +0x14b) -- the AV killed the host. Read it
@@ -1404,6 +1470,7 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
       if (!s->rdx_qword_ok) s->rdx_qword = 0;
     }
     s->stkret = (s->stk_n > 0) ? s->stk[0] : 0;
+    s->cap_step = 5;
   }
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     cap_rc = -2;
@@ -1448,6 +1515,14 @@ static std::atomic<unsigned long long> g_gap_last_sample_ms{0};
 // .236 FIX: tid whose capture faulted (GAP-CAPTURE-FAULT) -- never
 // capture it again (GAP-CAPTURE-SKIP). Set in the gap sampler.
 static std::atomic<u32> g_gap_capture_fault_tid{0};
+// .241 FIX: two-strike blacklist -- strike 1 only records
+// (last-fault tid + count in the atomics below); strike 2
+// (consecutive fault on the same tid) sets the blacklist
+// above. A single transient capture fault no longer kills
+// the tid forever (the .240 Ultrapool run: TRY stuck at 3
+// vs .238's 171). A capture success resets the count.
+static std::atomic<u32> g_gap_last_fault_tid{0};
+static std::atomic<unsigned> g_gap_capture_fault_strikes{0};
 
 // Requires g_obj_mu held. Refresh + read a guest thread's liveness:
 // alive=true means the thread is still executing somewhere (guest code
@@ -2984,7 +3059,7 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
       snprintf(yl, sizeof(yl),
                "sync: HOST SYMS capture_ip=0x%llx sample_gap=0x%llx "
                "read_stack=0x%llx fn_range=0x%llx nearest_export=0x%llx "
-               "read_qword=0x%llx fnlookup240=0x%llx",
+               "read_qword=0x%llx fnlookup241=0x%llx",
                (unsigned long long)((uintptr_t)&spin_capture_ip - eb),
                (unsigned long long)((uintptr_t)&spin_sample_main_ip_gap - eb),
                (unsigned long long)((uintptr_t)&spin_read_stack_qwords - eb),
@@ -2998,9 +3073,25 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   spin_ip_sample s;
   const int cap = spin_capture_ip(tid, &s);
   if (cap == -2) {
-    g_gap_capture_fault_tid.store(tid, std::memory_order_relaxed);
-    char fl[128];
-    snprintf(fl, sizeof(fl), "sync: GAP-CAPTURE-FAULT tid=%u", tid);
+    // .241 FIX: two-strike blacklist (see the state note
+    // above). The per-qword guard should make stack-read
+    // faults return partial instead of faulting at all;
+    // the discriminator (s.cap_step) names the sub-step
+    // when one still faults.
+    const u32 prev_fault =
+        g_gap_last_fault_tid.load(std::memory_order_relaxed);
+    const unsigned prev_strikes =
+        g_gap_capture_fault_strikes.load(std::memory_order_relaxed);
+    const unsigned strikes = (prev_fault == tid) ? prev_strikes + 1 : 1;
+    g_gap_last_fault_tid.store(tid, std::memory_order_relaxed);
+    g_gap_capture_fault_strikes.store(strikes,
+                                      std::memory_order_relaxed);
+    if (strikes >= 2)
+      g_gap_capture_fault_tid.store(tid, std::memory_order_relaxed);
+    char fl[160];
+    snprintf(fl, sizeof(fl),
+             "sync: GAP-CAPTURE-FAULT tid=%u step=%d strike=%u",
+             tid, s.cap_step, strikes);
     trt_core_log(fl);
     return;
   }
@@ -3018,6 +3109,8 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
     trt_core_log(fl);
     return;
   }
+  // .241 FIX: a capture success resets the two-strike count.
+  g_gap_capture_fault_strikes.store(0, std::memory_order_relaxed);
   const unsigned n =
       g_gap_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
   g_gap_last_sample_ms.store(spin_now_ms(), std::memory_order_relaxed);
