@@ -2791,36 +2791,50 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   // can: repeated finite Sleep samples = a poll loop; a
   // single INFINITE = main waits on something that never
   // fires. Diagnostic only: no wake, no fix.
+  // .235 DIAG: place the Sleep caller (stkguest) in its function -- in
+  // .234 stkguest_off (0x23a1c34) numerically EQUALS the worker routine
+  // address, so q4 is either a return address INTO the worker proc
+  // (main runs the job-system worker proc inline) or a stored routine
+  // pointer. spin_fn_range decides: fn_off == stkguest_off means q4
+  // IS the function start (stored pointer); fn_off < stkguest_off
+  // means q4 is a return address inside the worker proc.
+  u64 sg_fn_off = 0, sg_fn_len = 0;
+  if (s.stkguest) spin_fn_range(s.stkguest, &sg_fn_off, &sg_fn_len);
   if (std::string(s.ntfn) == "ntdll!NtDelayExecution") {
     char dl[256];
     if (!s.rdx) {
       snprintf(dl, sizeof(dl),
-               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0 iv=INFINITE",
-               n, (unsigned long long)s.rcx);
+               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0 iv=INFINITE stkguest_fn_off=0x%llx fn_len=0x%llx",
+               n, (unsigned long long)s.rcx,
+               (unsigned long long)sg_fn_off, (unsigned long long)sg_fn_len);
     } else if (s.rdx_qword_ok) {
       const long long iv = (long long)s.rdx_qword;
       if (iv < 0) {
         snprintf(dl, sizeof(dl),
-                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=%lld",
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=%lld stkguest_fn_off=0x%llx fn_len=0x%llx",
                  n, (unsigned long long)s.rcx,
-                 (unsigned long long)s.rdx, (long long)(-iv / 10000));
+                 (unsigned long long)s.rdx, (long long)(-iv / 10000),
+                 (unsigned long long)sg_fn_off, (unsigned long long)sg_fn_len);
       } else if (iv == 0) {
         snprintf(dl, sizeof(dl),
-                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=0",
-                 n, (unsigned long long)s.rcx,
-                 (unsigned long long)s.rdx);
-      } else {
-        snprintf(dl, sizeof(dl),
-                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_abs=0x%llx",
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=0 stkguest_fn_off=0x%llx fn_len=0x%llx",
                  n, (unsigned long long)s.rcx,
                  (unsigned long long)s.rdx,
-                 (unsigned long long)s.rdx_qword);
+                 (unsigned long long)sg_fn_off, (unsigned long long)sg_fn_len);
+      } else {
+        snprintf(dl, sizeof(dl),
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_abs=0x%llx stkguest_fn_off=0x%llx fn_len=0x%llx",
+                 n, (unsigned long long)s.rcx,
+                 (unsigned long long)s.rdx,
+                 (unsigned long long)s.rdx_qword,
+                 (unsigned long long)sg_fn_off, (unsigned long long)sg_fn_len);
       }
     } else {
       snprintf(dl, sizeof(dl),
-               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ok=0",
+               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ok=0 stkguest_fn_off=0x%llx fn_len=0x%llx",
                n, (unsigned long long)s.rcx,
-               (unsigned long long)s.rdx);
+               (unsigned long long)s.rdx,
+               (unsigned long long)sg_fn_off, (unsigned long long)sg_fn_len);
     }
     trt_core_log(dl);
   }
@@ -2944,6 +2958,32 @@ extern "C" u32 trt_spin_main_tid(void) {
   return g_spin_main_tid.load(std::memory_order_relaxed);
 }
 
+// .235 DIAG: attribute a host crash address (module + offset) for the
+// HOST UNHANDLED logger (main.cpp, snapshot-only caller). The .234
+// Ultrapool host crash (0xc0000005 at 00007FF71C1AB112) named neither
+// the faulting thread nor the module. Reuses spin_host_nearest_export
+// (same GetModuleHandleW + export walk, no new UWP-partition APIs);
+// falls back to the exe-base offset when no export precedes the
+// address. Diagnostic only. Outside the anonymous namespace +
+// extern "C" (cross-TU, .233 link lesson).
+extern "C" void trt_host_crash_addr(u64 addr, char* buf, size_t cap) {
+  if (!buf || cap == 0) return;
+  buf[0] = 0;
+  char nm[160];
+  u64 off = 0;
+  if (spin_host_nearest_export(addr, nm, sizeof(nm), &off)) {
+    snprintf(buf, cap, "%s+0x%llx", nm, (unsigned long long)off);
+    return;
+  }
+  HMODULE exe = ::GetModuleHandleW(nullptr);
+  if (exe && addr >= (u64)(uintptr_t)exe) {
+    snprintf(buf, cap, "exe+0x%llx",
+             (unsigned long long)(addr - (u64)(uintptr_t)exe));
+    return;
+  }
+  snprintf(buf, cap, "none");
+}
+
 extern "C" void trt_sync_parked_log(void) {
   std::unique_lock<std::mutex> lk(g_obj_mu, std::try_to_lock);
   if (!lk.owns_lock()) {
@@ -2957,13 +2997,17 @@ extern "C" void trt_sync_parked_log(void) {
     const sync_object* o = object_for_locked(g_parked_waits[i].handle);
     char pl[256];
     snprintf(pl, sizeof(pl),
-             "sync: PARKED tid=%u handle=%llx kind=%u handles=%u parked_ms=%llu lastset=%u sets=%llu",
+             // .235 DIAG: creator_tid -- who created the event the parked
+             // thread waits on (Sekiro: who created the workers'
+             // never-set events 25b00042f/35b00042f/25b000438).
+             "sync: PARKED tid=%u handle=%llx kind=%u handles=%u parked_ms=%llu lastset=%u sets=%llu creator=%u",
              g_parked_waits[i].tid,
              (unsigned long long)g_parked_waits[i].handle,
              g_parked_waits[i].kind, g_parked_waits[i].handle_count,
              (unsigned long long)(park_now_ms() - g_parked_waits[i].since_ms),
              o ? o->last_set_tid : 0u,
-             o ? (unsigned long long)o->set_count : 0ull);
+             o ? (unsigned long long)o->set_count : 0ull,
+             o ? o->creator_tid : 0u);
     trt_core_log(pl);
   }
   if (!any) trt_core_log("sync: PARKED none");
