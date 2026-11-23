@@ -23,6 +23,8 @@
 #include <mutex>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <fstream>
 
 // 5 GB memory-budget governor (bridge_membudget.cpp): a mapped PE image is
 // SizeOfImage bytes of real committed memory — charge it (commit + VA) at
@@ -844,18 +846,6 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
           return fail(&img, be, TRT_ERR_IMPORT, det);
         }
         memcpy(img.base + t, &fn, 8);  // bind IAT
-        // .214 DIAG: IAT-bind exit-name -- does this image import an exit
-        // path? (Sekiro silent death: no bridge-visible ExitProcess call,
-        // so find out whether it even imports one.)
-        if (sym_name && (strcmp(sym_name, "ExitProcess") == 0 ||
-                         strcmp(sym_name, "FatalExit") == 0 ||
-                         strcmp(sym_name, "TerminateProcess") == 0 ||
-                         strcmp(sym_name, "RtlExitUserProcess") == 0)) {
-          char line[256];
-          snprintf(line, sizeof(line), "iat-bind: %s!%s -> %p", mod_name,
-                   sym_name, fn);
-          logf_be(be, line);
-        }
         if (n_symbols == 0) {
           char line[256];
           snprintf(line, sizeof(line), "trt: bind %s!%s -> %p", mod_name,
@@ -1849,4 +1839,172 @@ extern "C" int trt_audit_imports(const u8* file, size_t file_size,
   if (machine == TRT_PE_MACHINE_I386 && magic == TRT_PE_OPT32_MAGIC)
     return audit_imports_impl(file, file_size, missing, 1);
   return TRT_ERR_NOT_PE64;
+}
+
+// ---------------------------------------------------------------------------
+// Universal engine: import-surface enumeration (Phase 2)
+// ---------------------------------------------------------------------------
+// Reads a PE file from disk and fills a bounded trt_universal_profile with
+// one entry per importable symbol (direct + delay-load). Module/symbol names
+// are lower-cased; entries are sorted by module, symbol, ordinal. Read-only:
+// no mapping, no execution, the file bytes are never modified. This is the
+// "pull APIs" feed for the universal engine / PC-to-Xbox translator.
+// ---------------------------------------------------------------------------
+extern "C" int trt_pe_enumerate_imports(const char* path,
+                                        trt_universal_profile* up,
+                                        uint32_t up_cap) {
+  if (!path || !path[0] || !up || up_cap == 0) return -1;
+  memset(up, 0, sizeof(*up));
+
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return -1;
+  std::vector<u8> buf((std::istreambuf_iterator<char>(f)),
+                      std::istreambuf_iterator<char>());
+  if (buf.size() < sizeof(trt_dos_header)) return -1;
+  const u8* file = buf.data();
+  const size_t file_size = buf.size();
+
+  const trt_dos_header* dos = (const trt_dos_header*)file;
+  if (rd16(file) != 0x5A4D) return -1;
+  const size_t nt = (size_t)dos->e_lfanew;
+  if (nt + 4 + sizeof(trt_file_header) > file_size) return -1;
+  const trt_nt_headers64* nt64 = (const trt_nt_headers64*)(file + nt);
+  if (rd32((const u8*)&nt64->signature) != 0x00004550) return -1;
+  const u16 machine = rd16((const u8*)&nt64->file_header.machine);
+  const u16 magic = rd16(file + nt + 24);
+  if (machine != TRT_PE_MACHINE_X64 || magic != TRT_PE_OPT64_MAGIC)
+    return -1;  // PE32 support joins in Phase 3
+  const u32 nsec = rd16(file + nt + 6);
+  if (nsec == 0 || nsec > 96) return -1;
+  const u8* opt = file + nt + 24;
+  const u64 preferred = rd64(opt + 24);
+  const u32 size_of_image = rd32(opt + 56);
+  const trt_data_directory* dirs = trt_pe_directories(opt, magic);
+  const u32 num_dirs = rd32(opt + 108);
+
+  const u64 sec_off = nt + 24 + rd16(file + nt + 20);
+  file_view fv{file, file_size, sec_off, nsec};
+
+  up->machine = machine;
+  up->is_managed =
+      (num_dirs > TRT_PE_DIR_COM_DESCRIPTOR &&
+       dirs[TRT_PE_DIR_COM_DESCRIPTOR].virtual_address != 0);
+
+  auto ub_lower = [](char c) -> char {
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+  };
+  auto ub_copy = [&](char* dst, uint32_t cap, const char* src) {
+    const size_t n = std::min((size_t)(cap - 1), strnlen(src, 255));
+    for (size_t i = 0; i < n; ++i) dst[i] = ub_lower(src[i]);
+    dst[n] = '\0';
+    return n;
+  };
+
+  std::string cur_mod;
+  auto add_imp = [&](const char* sym, uint16_t ord, size_t sym_off) {
+    if (up->import_count >= up_cap) return;
+    trt_universal_import* imp = &up->imports[up->import_count];
+    memset(imp, 0, sizeof(*imp));
+    if (sym) {
+      const size_t sl = ub_copy(imp->symbol, sizeof(imp->symbol), sym);
+      ub_copy(imp->module, sizeof(imp->module), cur_mod.c_str());
+      imp->symbol_offset = (sym_off >= file_size) ? 0 : (uint32_t)sym_off;
+      imp->name_len = (uint32_t)sl;
+    } else {
+      ub_copy(imp->module, sizeof(imp->module), cur_mod.c_str());
+      imp->name_len = (uint32_t)strnlen(imp->module, sizeof(imp->module));
+      imp->ordinal = ord;
+    }
+    up->import_count++;
+  };
+
+  // Walk an INT thunk stream at RVA `tbase`; one entry per symbol; stops at
+  // the terminator (0) or on any read failure.
+  auto walk_thunks = [&](u64 tbase) {
+    for (u64 t = 0;; t += 8) {
+      u64 toff;
+      if (!fv_rva2off(fv, tbase + t, &toff)) break;
+      if (toff + 8 > file_size) break;
+      const u64 thunk = rd64(file + toff);
+      if (thunk == 0) break;
+      if (thunk & 0x8000000000000000ULL) {
+        add_imp(nullptr, (uint16_t)(thunk & 0xFFFFULL), 0);
+      } else {
+        u64 hoff;
+        if (!fv_rva2off(fv, thunk & 0x7fffffffffffULL, &hoff) ||
+            hoff + 2 >= file_size)
+          break;
+        add_imp((const char*)(file + hoff + 2), 0, hoff + 2);
+      }
+    }
+  };
+
+  // ---- direct imports (IMAGE_DIRECTORY_ENTRY_IMPORT = 1) ----
+  const u32 imp_rva = dirs[TRT_PE_DIR_IMPORT].virtual_address;
+  const u64 imp_sz = dirs[TRT_PE_DIR_IMPORT].size;
+  for (u64 d = 0; d + sizeof(trt_import_descriptor) <= imp_sz;
+       d += sizeof(trt_import_descriptor)) {
+    u64 doff;
+    if (!fv_rva2off(fv, imp_rva + d, &doff)) break;
+    const trt_import_descriptor* desc =
+        (const trt_import_descriptor*)(file + doff);
+    if (!desc->name && !desc->original_first_thunk && !desc->first_thunk) break;
+    u64 name_off;
+    if (!fv_rva2off(fv, desc->name, &name_off) || name_off >= file_size)
+      continue;
+    char mod[256] = {0};
+    const size_t cap = std::min((size_t)255, file_size - name_off);
+    size_t n = 0;
+    while (n < cap && file[name_off + n] != '\0') {
+      mod[n] = (char)file[name_off + n];
+      ++n;
+    }
+    mod[n] = '\0';
+    if (!mod[0]) continue;
+    cur_mod = mod;
+    const u32 ilt_rva =
+        desc->original_first_thunk ? desc->original_first_thunk
+                                   : desc->first_thunk;
+    if (ilt_rva) walk_thunks(ilt_rva);
+  }
+
+  // ---- delay imports (IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT = 13) ----
+  const u32 dl_rva = dirs[TRT_PE_DIR_DELAY_IMPORT].virtual_address;
+  const u64 dl_sz = dirs[TRT_PE_DIR_DELAY_IMPORT].size;
+  for (u64 d = 0; d + sizeof(trt_delayload_descriptor) <= dl_sz;
+       d += sizeof(trt_delayload_descriptor)) {
+    u64 doff;
+    if (!fv_rva2off(fv, dl_rva + d, &doff)) break;
+    const trt_delayload_descriptor* dd =
+        (const trt_delayload_descriptor*)(file + doff);
+    if (!dd->name_rva && !dd->iat_rva && !dd->int_rva) break;
+    if (!(dd->attributes & 1u) || !dd->name_rva) continue;  // RVA-based only
+    const bool rva_based = (dd->attributes & 1u) != 0;
+    const u64 name_rva = rva_based ? dd->name_rva : dd->name_rva - preferred;
+    if (name_rva >= size_of_image) break;
+    u64 name_off;
+    if (!fv_rva2off(fv, name_rva, &name_off) || name_off >= file_size) break;
+    char mod[256] = {0};
+    const size_t cap = std::min((size_t)255, file_size - name_off);
+    size_t n = 0;
+    while (n < cap && file[name_off + n] != '\0') {
+      mod[n] = (char)file[name_off + n];
+      ++n;
+    }
+    mod[n] = '\0';
+    if (!mod[0]) continue;
+    cur_mod = mod;
+    const u64 int_rva = rva_based ? dd->int_rva : dd->int_rva - preferred;
+    if (int_rva) walk_thunks(int_rva);
+  }
+
+  std::sort(up->imports, up->imports + up->import_count,
+            [](const trt_universal_import& a, const trt_universal_import& b) {
+              const int c = strcmp(a.module, b.module);
+              if (c) return c < 0;
+              const int cs = strcmp(a.symbol, b.symbol);
+              if (cs) return cs < 0;
+              return a.ordinal < b.ordinal;
+            });
+  return (int)up->import_count;
 }

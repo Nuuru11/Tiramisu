@@ -235,6 +235,21 @@ typedef struct trt_import_descriptor {
   u32 first_thunk;          // RVA of IAT
 } trt_import_descriptor;
 
+// ---- UNIVERSAL engine: auto import-surface extraction ----
+struct trt_universal_profile;  // defined below: the import-surface feed
+// Enumerate every import (direct + delay-load) from a PE file. Fills `up`
+// (bounded by up_cap). Returns the number of entries written, or -1 if the
+// file is not a readable PE. This is the "pull APIs to run any PC game"
+// primitive: dump the game's full import surface.
+#ifdef __cplusplus
+extern "C" {
+#endif
+int trt_pe_enumerate_imports(const char* path, trt_universal_profile* up,
+                             uint32_t up_cap);
+#ifdef __cplusplus
+}
+#endif
+
 // ---- delay imports (delay-load directory) ----
 // Modern linkers set attributes bit 0 ("RVA based"): every field below is an
 // RVA. Legacy images use VAs instead - the loader handles both.
@@ -251,6 +266,25 @@ typedef struct trt_delayload_descriptor {
 
 // thunk value: bit63 set => import by ordinal (low 16 bits), else RVA of
 // IMAGE_IMPORT_BY_NAME { u16 hint; char name[]; }
+
+// ---- UNIVERSAL engine: import surface enumeration (Phase 2) ----
+// One entry per importable symbol. This is the "pull APIs" feed for the
+// universal engine — dump every import of a PE (direct + delay) as a stable
+// list, so the universal guest can service/re-synthesize them dynamically.
+struct trt_universal_import {
+  char module[256];         // lower-case, NUL-terminated
+  char symbol[256];         // lower-case, NUL-terminated; empty for ordinal-only
+  uint16_t ordinal;         // for ordinal-only imports
+  u32 symbol_offset;        // file offset of symbol name (0 if none)
+  uint32_t name_len;        // length of module/symbol names used for sizing
+};
+struct trt_universal_profile {
+  u16 machine;              // TRT_PE_MACHINE_X64 / I386
+  u16 subsystem;
+  bool is_managed;
+  trt_universal_import imports[1024];
+  uint32_t import_count;
+};
 
 // ---- TLS ----
 typedef struct trt_tls_directory64 {

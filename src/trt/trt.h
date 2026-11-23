@@ -9,6 +9,9 @@
 
 #ifdef __cplusplus
 extern "C" {
+// Fault attribution for the fault loggers: 1 when addr belongs to a loaded
+// guest image (the title's fault), 0 for a host/unknown address.
+int trt_fault_is_guest(const void* addr);
 #endif
 
 // ---- guest ABI ----
@@ -165,6 +168,14 @@ int trt_unseal_image(const trt_backend* be, trt_image* img);
 // TRT_ERR_* for malformed PEs / usage errors.
 int trt_audit_imports(const u8* file, size_t file_size,
                       void* missing_out /* std::vector<std::string>* */);
+
+// ---- universal engine: import-surface enumeration (Phase 2) --------------
+// Enumerate every import (direct + delay-load) from a PE file. Fills `up`
+// (bounded by up_cap). Returns the number of entries written, or -1 if the
+// file is not a readable PE. This is the "pull APIs to run any PC game"
+// primitive: dump the game's full import surface.
+int trt_pe_enumerate_imports(const char* path, trt_universal_profile* up,
+                             uint32_t up_cap);
 
 // free the image and its mapping
 void trt_unmap(const trt_backend* be, trt_image* img);

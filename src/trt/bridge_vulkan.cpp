@@ -26,6 +26,12 @@
 // The real definition (settings.cpp) returns the bool getter as int; weak
 // missing resolves to 0 handled by check_enabled()'s default-on logic.
 extern "C" int trt_settings_shader_cache_int(void) __attribute__((weak));
+// Same weak pattern: offline test binaries without settings.cpp resolve this
+// to null, so the disk layer stays off while the in-memory cache keeps
+// working. The host hands us <LocalState>\cache\shaders.
+extern "C" const char* trt_settings_shader_cache_dir(void) __attribute__((weak));
+
+#include "spirv_cache.h"
 // .216 DIAG: thread id for the Vulkan frame-loop trace.
 extern "C" u32 TRT_STDCALL trt_GetCurrentThreadId(void);
 // .223 DIAG: one-shot video sample right after the first
@@ -109,7 +115,14 @@ static void check_enabled() {
   // Weak-missing symbol resolves to nullptr at link time (same pattern as
   // trt_settings_write_watch in bridge_kernel32): call only when linked.
   g_enabled = true;  // default on
-  if (trt_settings_shader_cache_int) g_enabled = (trt_settings_shader_cache_int() != 0);}
+  if (trt_settings_shader_cache_int) g_enabled = (trt_settings_shader_cache_int() != 0);
+  // Same weak pattern: the disk layer lives in the host's LocalState, so
+  // translations survive a relaunch instead of being redone every boot.
+  if (g_enabled && trt_settings_shader_cache_dir) {
+    const char* dir = trt_settings_shader_cache_dir();
+    if (dir && *dir) spirv_cache_open(dir);
+  }
+}
 
 static u64 fnv1a(const u32* w, u32 n) {
   u64 h = 0xcbf29ce484222325ull;
@@ -129,30 +142,51 @@ static u64 spec_fnv(const spirv_spec_entry* s, u32 n) {
 }
 }  // namespace vkshader_cache
 
-// Memoized compile: returns nullptr when the knob is off or on cache miss
-// (caller compiles + stores through spirv_cache_store).
-static const spirv_compile_result* spirv_cache_lookup(const u32* words, u32 wc,
-                                                      spirv_stage st, const char* name,
-                                                      const spirv_spec_entry* specs,
-                                                      u32 spec_n) {
+// Memoized compile: memory first, then the on-disk cache, then a real
+// translation (the caller compiles and stores through spirv_cache_store).
+// Returns through `out` rather than a pointer into the map: handing that
+// pointer out was a use-after-rehash as soon as a second thread inserted.
+static bool spirv_cache_lookup(const u32* words, u32 wc, spirv_stage st,
+                               const char* name, const spirv_spec_entry* specs,
+                               u32 spec_n, spirv_compile_result* out) {
   using namespace vkshader_cache;
   check_enabled();
-  if (!g_enabled) return nullptr;
-  cache_key k{fnv1a(words, wc), (u32)st,
-              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
-  std::lock_guard<std::mutex> lk(g_mu);
-  auto it = g_cache.find(k);
-  return it == g_cache.end() ? nullptr : &it->second;
+  if (!g_enabled || !out) return false;
+  const cache_key k{fnv1a(words, wc), (u32)st,
+                    spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    auto it = g_cache.find(k);
+    if (it != g_cache.end()) {
+      *out = it->second;
+      return true;
+    }
+  }
+  // Not compiled in this run yet: a previously stored translation is still a
+  // hit, and warming the memory cache keeps later pipelines cheap.
+  spirv_compile_result disk;
+  if (!spirv_cache_load(spirv_cache_key(words, wc, st, name, specs, spec_n), &disk))
+    return false;
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_cache.emplace(k, disk);
+  }
+  *out = std::move(disk);
+  return true;
 }
 static void spirv_cache_store(const u32* words, u32 wc, spirv_stage st,
                               const char* name, const spirv_spec_entry* specs,
                               u32 spec_n, const spirv_compile_result& cr) {
   using namespace vkshader_cache;
   if (!g_enabled) return;
-  cache_key k{fnv1a(words, wc), (u32)st,
-              spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
-  std::lock_guard<std::mutex> lk(g_mu);
-  g_cache.emplace(k, cr);
+  const cache_key k{fnv1a(words, wc), (u32)st,
+                    spec_fnv(specs, spec_n) ^ (u64)(uintptr_t)name};
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_cache.emplace(k, cr);
+  }
+  // Persist so the next launch skips this translation entirely.
+  spirv_cache_save(spirv_cache_key(words, wc, st, name, specs, spec_n), cr);
 }
 #include <cstdlib>
 #include <cstring>
@@ -2314,13 +2348,11 @@ i32 TRT_GUEST_ABI trt_vkCreateGraphicsPipelines(void* dev_v, u64, u32 count,
       collect_spec(st.pSpecializationInfo, specs);
       const auto& spv = d->shaders[st.module].spv;
       spirv_stage sst = (st.stage == 0x10u) ? SPV_STAGE_FRAGMENT : SPV_STAGE_VERTEX;
-      const spirv_compile_result* cached = spirv_cache_lookup(
-          spv.data(), (u32)spv.size(), sst, st.pName,
-          specs.empty() ? nullptr : specs.data(), (u32)specs.size());
       spirv_compile_result cr;
-      if (cached) {
-        cr = *cached;
-      } else {
+      const bool cached = spirv_cache_lookup(
+          spv.data(), (u32)spv.size(), sst, st.pName,
+          specs.empty() ? nullptr : specs.data(), (u32)specs.size(), &cr);
+      if (!cached) {
         cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), sst, st.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());
@@ -2437,14 +2469,12 @@ i32 TRT_GUEST_ABI trt_vkCreateComputePipelines(void* dev_v, u64, u32 count,
       std::vector<spirv_spec_entry> specs;
       collect_spec(cis[i].stage.pSpecializationInfo, specs);
       const auto& spv = d->shaders[cis[i].stage.module].spv;
-      const spirv_compile_result* cached = spirv_cache_lookup(
+      spirv_compile_result cr;
+      const bool cached = spirv_cache_lookup(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE,
           cis[i].stage.pName, specs.empty() ? nullptr : specs.data(),
-          (u32)specs.size());
-      spirv_compile_result cr;
-      if (cached) {
-        cr = *cached;
-      } else {
+          (u32)specs.size(), &cr);
+      if (!cached) {
         cr = spirv_to_hlsl(
           spv.data(), (u32)spv.size(), SPV_STAGE_COMPUTE, cis[i].stage.pName,
           specs.empty() ? nullptr : specs.data(), (u32)specs.size());

@@ -91,6 +91,29 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_pe32"
 "$out/test_pe32" "$out/guest_hello32.exe" "$out/guest_lib32.dll"
 
+# --- 3e. Phase 3: PC->Xbox API translator -----------------------------------
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_pc2xb_translator.cpp "$out/libtrt.a" \
+  -o "$out/test_pc2xb_translator"
+"$out/test_pc2xb_translator" "$out/guest_hello.exe"
+clang++ -std=c++20 -O2 -Wall -no-pie tools/pc2xb.cpp "$out/libtrt.a" \
+  -o "$out/pc2xb"
+"$out/pc2xb" "$out/guest_hello.exe" "$out/xb_out"
+
+# --- 3f. Phase 4: universal guest runner --------------------------------------
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_universal_guest.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_universal_guest"
+"$out/test_universal_guest" "$out/guest_hello.exe"
+
+# --- 3d. Universal engine (Phase 1+2): import-surface enumerator + universal
+#         profile mode. Runs the enumerator against the built guest_hello.exe
+#         and asserts trt_synthesize_engine classifies it UNIVERSAL. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_universal_profile.cpp "$out/libtrt.a" \
+  -o "$out/test_universal_profile"
+"$out/test_universal_profile" "$out/guest_hello.exe"
+
 # --- 3c. x86 interpreter EXECUTION gate: the instruction bytes must compute.
 #         CPUID/RDTSC, SSE2 packed double + integer SIMD, MMX, 8-bit ALU,
 #         0x80 group, REP MOVSB, PUSHA/POPA, FXSAVE/FXRSTOR, ModRM disp/SIB
@@ -910,3 +933,26 @@ if command -v mcs >/dev/null && [[ -f "$MONO_LIB" ]]; then
 else
   echo "SKIP fna/platform: mcs or libmono missing"
 fi
+
+# --- 47. Autonomous Engine Synthesizer & Dynamic API Synthesizer:
+#         introspection, engine scoring, profile generation, Steam AppID
+#         auto-synthesis, adaptive thunk invocation, arity deduction ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_engine_synthesizer.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_engine_synthesizer"
+"$out/test_engine_synthesizer"
+
+# --- 48. Persistent SPIR-V->HLSL cache: codec round-trip (every field the
+#         pipeline builder reads), key sensitivity, corrupt-entry rejection,
+#         and pruning that never drops the entry the caller is using ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_spirv_cache.cpp src/trt/spirv_cache.cpp \
+  -o "$out/test_spirv_cache"
+"$out/test_spirv_cache"
+
+# --- 49. Crash report bundle: fault/registers/settings/census/log sections,
+#         explicit empty sections, and a bounded report directory ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_crash_report.cpp src/host/crash_report.cpp \
+  -o "$out/test_crash_report"
+"$out/test_crash_report"
