@@ -542,6 +542,9 @@ static std::atomic<unsigned long long> g_spin_last_fast_ms{0};
 static std::atomic<bool> g_spin_sampler_started{false};
 static std::atomic<bool> g_spin_worker_exit_seen{false};
 static std::atomic<unsigned> g_spin_samples_done{0};
+// .233 DIAG: wall time of the last loop-sampler sample -- the
+// 2s spacing gate below reads it (see spin_main_ip_sampler).
+static std::atomic<unsigned long long> g_spin_last_sample_ms{0};
 // .230 FIX: the WAKE-MAIN SetEvent fires at most once per
 // process run (see the sampler).
 static std::atomic<bool> g_spin_wake_done{false};
@@ -655,7 +658,7 @@ static void spin_main_ip_sampler() {
 #if defined(_WIN32)
   for (int iter = 0; iter < 6000; ++iter) {  // up to ~10 min
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (g_spin_samples_done.load(std::memory_order_relaxed) >= 3)
+    if (g_spin_samples_done.load(std::memory_order_relaxed) >= 6)
       return;
     const u32 tid = g_spin_main_tid.load(std::memory_order_relaxed);
     if (!tid) continue;
@@ -665,8 +668,18 @@ static void spin_main_ip_sampler() {
         g_spin_last_fast_ms.load(std::memory_order_relaxed);
     if (!last) continue;
     if (spin_now_ms() < last + 200) continue;
+    // .233 DIAG: space loop samples >=2s apart -- .232 spent its
+    // whole 3-sample budget on ONE silence (audio init), so the
+    // second death (after main advanced past the first fix) got
+    // no sample. A slot now costs once per 2s, so n=2 can land on
+    // the next silence instead of 100ms after n=1.
+    if (spin_now_ms() <
+        g_spin_last_sample_ms.load(std::memory_order_relaxed) + 2000)
+      continue;
     const unsigned n =
         g_spin_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_spin_last_sample_ms.store(spin_now_ms(),
+                                std::memory_order_relaxed);
     HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
                             THREAD_QUERY_INFORMATION,
                             FALSE, tid);
@@ -1078,6 +1091,217 @@ static bool spin_query_handle_info(HANDLE h, char* type_buf,
   (void)name_cap;
   return false;
 #endif
+}
+
+// .233 DIAG: gap-dump sampler -- sample the main thread's RIP from
+// the gap-dump path (bridge_kernel32.cpp, snapshot-only), NOT from
+// the loop sampler thread. The loop thread fires ~10s late under
+// watchdog starvation and .232 spent its budget on the first
+// silence (audio init), so the second Sekiro death got no sample;
+// and it never starts for Ultrapool at all (no fast waits, so
+// spin_note_fast_wait never arms it). The gap dump runs on the
+// watchdog tick and fires on every 2s-quiet final dump, so this is
+// the path that can name the SECOND death (Sekiro) and the
+// post-startup idle stall (Ultrapool, frame-1 tid). Diagnostic
+// only: names the waited-on handle/thread when main is in
+// NtWaitForSingleObject; never wakes, signals, or fakes anything
+// (the .230 WAKE-MAIN stays loop-only). One sample per call;
+// throttled to 6 per run, >=5s apart. The suspend window is
+// microseconds (one GetThreadContext); logging + fn lookup happen
+// AFTER ResumeThread, same contract as the loop sampler.
+struct spin_ip_sample {
+  u64 rip = 0;
+  u64 rsp = 0;
+  u64 rcx = 0;
+  u64 rdx = 0;
+  u64 r8 = 0;
+  u64 r9 = 0;
+  u64 fn_off = 0;
+  u64 fn_len = 0;
+  u64 rip_off = 0;
+  u64 stkret = 0;
+  u64 stkfn = 0;
+  u64 stk[9] = {};
+  unsigned stk_n = 0;
+  unsigned long sus = 0;
+  int ok = 0;
+  char ntfn[160] = {};
+  u64 ntoff = 0;
+};
+// Capture one thread's IP + context (suspend / GetThreadContext /
+// resume) + the enclosing guest .pdata fn + nearest host export +
+// stack return address. No logging inside: callers log after the
+// target resumes. Returns 1 on success, 0 when the thread could
+// not be opened, -1 when it could not be suspended.
+static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
+#if defined(_WIN32)
+  if (!tid || !s) return 0;
+  HANDLE h = ::OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                              THREAD_QUERY_INFORMATION,
+                          FALSE, tid);
+  if (!h) return 0;
+  const DWORD sus = ::SuspendThread(h);
+  if (sus == (DWORD)-1) {
+    ::CloseHandle(h);
+    return -1;
+  }
+  CONTEXT ctx{};
+  ctx.ContextFlags = CONTEXT_FULL;
+  const BOOL ok = ::GetThreadContext(h, &ctx);
+  s->ok = ok ? 1 : 0;
+  s->sus = (unsigned long)sus;
+  if (ok) {
+    s->rip = (u64)ctx.Rip;
+    s->rsp = (u64)ctx.Rsp;
+    s->rcx = (u64)ctx.Rcx;
+    s->rdx = (u64)ctx.Rdx;
+    s->r8 = (u64)ctx.R8;
+    s->r9 = (u64)ctx.R9;
+    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 9) : 0;
+    s->stkret = (s->stk_n > 0) ? s->stk[0] : 0;
+  }
+  ::ResumeThread(h);
+  ::CloseHandle(h);
+  // Fn lookup AFTER resume (see the header comment).
+  if (s->rip) {
+    spin_fn_range(s->rip, &s->fn_off, &s->fn_len);
+    const trt_image* img = trt_images_first();
+    if (img && img->base && img->size_of_image) {
+      const u64 b = (u64)(uintptr_t)img->base;
+      if (s->rip >= b && s->rip < b + img->size_of_image)
+        s->rip_off = s->rip - b;
+    }
+    snprintf(s->ntfn, sizeof(s->ntfn), "none");
+    spin_host_nearest_export(s->rip, s->ntfn, sizeof(s->ntfn), &s->ntoff);
+    if (s->stk_n > 0) {
+      u64 stk_len = 0;
+      spin_fn_range(s->stk[0], &s->stkfn, &stk_len);
+    }
+  }
+  return 1;
+#else
+  (void)tid;
+  (void)s;
+  return 0;
+#endif
+}
+static std::atomic<unsigned> g_gap_samples_done{0};
+static std::atomic<unsigned long long> g_gap_last_sample_ms{0};
+// One gap-dump sample of the given tid. Called from
+// gap_trace_dump_if_changed (bridge_kernel32.cpp, snapshot-only)
+// on every gap dump: tid is the frame-1 tid when known (Ultrapool
+// main), else the spinning tid (Sekiro main). Non-static: the
+// caller lives in another TU.
+void spin_sample_main_ip_gap(u32 tid, int is_final) {
+#if defined(_WIN32)
+  if (!tid) return;
+  if (g_gap_samples_done.load(std::memory_order_relaxed) >= 6) return;
+  if (spin_now_ms() <
+      g_gap_last_sample_ms.load(std::memory_order_relaxed) + 5000)
+    return;
+  spin_ip_sample s;
+  const int cap = spin_capture_ip(tid, &s);
+  if (cap != 1) {
+    // Bound failure spam the same way as successes: consume a
+    // slot so a thread that can never be opened/suspended logs
+    // at most 6 lines, one per 5s.
+    (void)g_gap_samples_done.fetch_add(1, std::memory_order_relaxed);
+    g_gap_last_sample_ms.store(spin_now_ms(),
+                               std::memory_order_relaxed);
+    char fl[160];
+    snprintf(fl, sizeof(fl),
+             "sync: GAP-IP-SAMPLE tid=%u final=%d capture-fail=%d",
+             tid, is_final ? 1 : 0, cap);
+    trt_core_log(fl);
+    return;
+  }
+  const unsigned n =
+      g_gap_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
+  g_gap_last_sample_ms.store(spin_now_ms(), std::memory_order_relaxed);
+  char sl[512];
+  snprintf(sl, sizeof(sl),
+           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx",
+           n, tid, is_final ? 1 : 0,
+           (unsigned long long)s.rip,
+           (unsigned long long)s.rip_off,
+           (unsigned long long)s.fn_off,
+           (unsigned long long)s.fn_len,
+           (unsigned long long)s.rsp, (unsigned long)s.sus,
+           s.ok, s.ntfn, (unsigned long long)s.ntoff,
+           (unsigned long long)s.rcx, (unsigned long long)s.rdx,
+           (unsigned long long)s.r8, (unsigned long long)s.r9,
+           (unsigned long long)s.stkret,
+           (unsigned long long)s.stkfn);
+  trt_core_log(sl);
+  {
+    char kl[640];
+    snprintf(kl, sizeof(kl),
+             "sync: GAP-IP-STACK n=%u rsp=0x%llx n=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx q5=0x%llx q6=0x%llx q7=0x%llx q8=0x%llx",
+             n, (unsigned long long)s.rsp, s.stk_n,
+             (unsigned long long)s.stk[0], (unsigned long long)s.stk[1],
+             (unsigned long long)s.stk[2], (unsigned long long)s.stk[3],
+             (unsigned long long)s.stk[4], (unsigned long long)s.stk[5],
+             (unsigned long long)s.stk[6], (unsigned long long)s.stk[7],
+             (unsigned long long)s.stk[8]);
+    trt_core_log(kl);
+  }
+  // Name the waited-on handle when main is in
+  // NtWaitForSingleObject (same naming as the loop sampler's
+  // MAIN-HANDLE / WAITED-THREAD, GAP-prefixed so the two
+  // samplers' lines stay greppable apart). Diagnostic only: no
+  // wake, no fix -- if this names another thread-wait like the
+  // first death, the WAIT-THREAD-DEAD shape may apply in .234.
+  if (std::string(s.ntfn) == "ntdll!NtWaitForSingleObject") {
+    char stkhost[160];
+    snprintf(stkhost, sizeof(stkhost), "none");
+    u64 stkoff = 0;
+    if (s.stk_n > 0)
+      spin_host_nearest_export(s.stk[0], stkhost, sizeof(stkhost),
+                               &stkoff);
+    char htype[64];
+    char hname[128];
+    snprintf(htype, sizeof(htype), "unknown");
+    snprintf(hname, sizeof(hname), "none");
+    const bool hok = spin_query_handle_info(
+        (void*)(uintptr_t)s.rcx, htype, sizeof(htype), hname,
+        sizeof(hname));
+    char hl[384];
+    snprintf(hl, sizeof(hl),
+             "sync: GAP-HANDLE n=%u handle=0x%llx ok=%d type=%s name=%s stkhost=%s stkoff=0x%llx",
+             n, (unsigned long long)s.rcx, hok ? 1 : 0, htype,
+             hname, stkhost, (unsigned long long)stkoff);
+    trt_core_log(hl);
+    if (hok && std::string(htype) == "Thread") {
+      const DWORD wtid = ::GetThreadId((HANDLE)(uintptr_t)s.rcx);
+      const DWORD wtid_err = wtid ? 0 : ::GetLastError();
+      DWORD wexit = 0;
+      const BOOL wok = ::GetExitCodeThread((HANDLE)(uintptr_t)s.rcx,
+                                         &wexit);
+      const bool walive = wok && wexit == STILL_ACTIVE;
+      const u32 wexittid = g_spin_worker_exit_tid.load(
+          std::memory_order_relaxed);
+      char tl[384];
+      snprintf(tl, sizeof(tl),
+               "sync: GAP-WAITED-THREAD n=%u handle=0x%llx wtid=%lu wtid_err=%lu exit_ok=%d exitcode=%lu alive=%d workertid=%u ismain=%d isworker=%d",
+               n, (unsigned long long)s.rcx,
+               (unsigned long)wtid, (unsigned long)wtid_err,
+               wok ? 1 : 0, (unsigned long)wexit,
+               walive ? 1 : 0, wexittid,
+               (wtid && wtid == tid) ? 1 : 0,
+               (wtid && wexittid && wtid == wexittid) ? 1 : 0);
+      trt_core_log(tl);
+    }
+  }
+#else
+  (void)tid;
+  (void)is_final;
+#endif
+}
+
+// The gap-dump hook needs the spinning tid (Sekiro main).
+// Non-static: the caller lives in bridge_kernel32.cpp.
+u32 trt_spin_main_tid(void) {
+  return g_spin_main_tid.load(std::memory_order_relaxed);
 }
 
 // Requires g_obj_mu held. Refresh + read a guest thread's liveness:
