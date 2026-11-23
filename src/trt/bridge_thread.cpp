@@ -307,6 +307,143 @@ struct parked_wait_guard {
   }
 };
 
+// .225 DIAG: guest return-address validation + lost-wakeup pairing +
+// gate trace (Sekiro). All state lives in this file and is guarded by
+// g_obj_mu; the helpers below REQUIRE the lock held. Three parts:
+// (1) SPIN RETADDR: wait_single_impl threads the export wrapper guest
+// return address down as guest_ret; an address in a guest image is the
+// spin loop call site, an off-image address (the internal
+// WaitForMultipleObjects path) is 0. The offset is against the main
+// guest image, like the .219/.224 CV wait-site.
+// (2) LOST-WAKEUP: the pairing of a thread spinning on self-owned
+// objects with the only worker parked on a never-set start event.
+// (3) GATE TRACE: the sync-level record of what the start event
+// creator does between the event creation and the death -- event
+// allocs, sets, and INFINITE parks, in order -- plus a positive
+// SET-NEVER line for a watched start event nobody ever sets.
+sync_object* object_for_locked(u64 h, u32* out_idx);
+
+static bool ret_in_guest_image(u64 addr) {
+  if (!addr) return false;
+  const int n = trt_images_count();
+  for (int i = 0; i < n; ++i) {
+    const trt_image* im = trt_images_nth(i);
+    if (!im || !im->base || !im->size_of_image) continue;
+    const u64 b = (u64)(uintptr_t)im->base;
+    if (addr >= b && addr < b + im->size_of_image) return true;
+  }
+  return false;
+}
+
+struct gate_ring_entry {
+  u32 tid = 0;
+  u32 op = 0;  // 1=ALLOC-EVENT 2=SET 3=PARK
+  u64 handle = 0;
+  u32 kind = 0;
+};
+static gate_ring_entry g_gate_ring[64];
+static unsigned g_gate_ring_n = 0;
+static void gate_ring_record(u32 tid, u32 op, u64 handle, u32 kind) {
+  if (g_gate_ring_n >= 64) return;
+  g_gate_ring[g_gate_ring_n].tid = tid;
+  g_gate_ring[g_gate_ring_n].op = op;
+  g_gate_ring[g_gate_ring_n].handle = handle;
+  g_gate_ring[g_gate_ring_n].kind = kind;
+  ++g_gate_ring_n;
+}
+
+struct watched_start {
+  u64 handle = 0;
+  u32 creator_tid = 0;
+  u32 parked_tid = 0;
+  unsigned set_hits = 0;
+};
+static watched_start g_watched[8];
+static int g_watched_n = 0;
+static watched_start* watched_find(u64 handle) {
+  for (int i = 0; i < g_watched_n; ++i)
+    if (g_watched[i].handle == handle) return &g_watched[i];
+  return nullptr;
+}
+static void watched_add(u64 handle, u32 creator_tid, u32 parked_tid) {
+  if (watched_find(handle)) return;
+  if (g_watched_n >= 8) return;
+  g_watched[g_watched_n].handle = handle;
+  g_watched[g_watched_n].creator_tid = creator_tid;
+  g_watched[g_watched_n].parked_tid = parked_tid;
+  g_watched[g_watched_n].set_hits = 0;
+  ++g_watched_n;
+}
+
+static void dump_gate_trace(const char* why) {
+  // Requires g_obj_mu held (all call sites hold it).
+  char head[160];
+  snprintf(head, sizeof(head),
+           "gap: GATE-TRACE why=%s entries=%u watched=%d", why,
+           g_gate_ring_n, g_watched_n);
+  trt_core_log(head);
+  for (unsigned i = 0; i < g_gate_ring_n; ++i) {
+    const gate_ring_entry& e = g_gate_ring[i];
+    char line[192];
+    snprintf(line, sizeof(line),
+             "gap: GATE-TRACE #%u tid=%u op=%u handle=%llx kind=%u", i,
+             e.tid, e.op, (unsigned long long)e.handle, e.kind);
+    trt_core_log(line);
+  }
+  for (int i = 0; i < g_watched_n; ++i) {
+    const sync_object* o = object_for_locked(g_watched[i].handle, nullptr);
+    char line[256];
+    if (o && o->set_count == 0) {
+      snprintf(line, sizeof(line),
+               "sync: SET-NEVER handle=%llx parked_tid=%u creator=%u sets=0",
+               (unsigned long long)g_watched[i].handle,
+               g_watched[i].parked_tid, g_watched[i].creator_tid);
+    } else {
+      snprintf(line, sizeof(line),
+               "sync: SET-WATCHED-SUMMARY handle=%llx parked_tid=%u creator=%u sets=%llu lastset=%u hits=%u",
+               (unsigned long long)g_watched[i].handle,
+               g_watched[i].parked_tid, g_watched[i].creator_tid,
+               o ? (unsigned long long)o->set_count : 0ull,
+               o ? o->last_set_tid : 0u, g_watched[i].set_hits);
+    }
+    trt_core_log(line);
+  }
+}
+
+static void maybe_log_lost_wakeup(u32 spin_tid) {
+  // Requires g_obj_mu held. One shot: the first time a spinning
+  // thread (self-owned mutexes) pairs with a worker parked forever
+  // on a never-set start event created by that same thread.
+  static bool done = false;
+  if (done) return;
+  for (int i = 0; i < 32; ++i) {
+    if (!g_parked_waits[i].tid) continue;
+    const sync_object* o = object_for_locked(g_parked_waits[i].handle, nullptr);
+    if (!o || o->kind != OBJ_EVENT || o->set_count != 0) continue;
+    if (spin_tid != 0 && o->creator_tid != spin_tid) continue;
+    const u32 creator = o->creator_tid;
+    bool self_owned = false;
+    for (u32 idx = 0; idx < g_objects.size(); ++idx) {
+      const sync_object& m = g_objects[idx];
+      if (m.kind == OBJ_MUTEX && m.creator_tid == creator &&
+          m.owner_tid == creator && m.lock_count >= 1) {
+        self_owned = true;
+        break;
+      }
+    }
+    if (!self_owned) continue;
+    done = true;
+    char line[256];
+    snprintf(line, sizeof(line),
+             "gap: LOST-WAKEUP spin_tid=%u parked_tid=%u handle=%llx creator=%u sets=0",
+             creator, g_parked_waits[i].tid,
+             (unsigned long long)g_parked_waits[i].handle, creator);
+    trt_core_log(line);
+    dump_gate_trace("spin-trip");
+    return;
+  }
+}
+
 u32 current_tid() {
   return trt_GetCurrentThreadId();
 }
@@ -411,7 +548,14 @@ u64 alloc_object_locked(obj_kind kind) {
   // .224 DIAG: creator is the calling thread at allocation.
   o.creator_tid = current_tid();
   o.handle_refs = 1;
-  return make_handle(idx, next_gen);
+  // .225 DIAG: gate-trace record of event creation (the start
+  // events are born here, in the kernel32 CreateEventW wrapper).
+  // Mutexes are not recorded: about 1070 of them would flood the
+  // 64-entry ring; the census already proves the burst.
+  const u64 new_handle = make_handle(idx, next_gen);
+  if (kind == OBJ_EVENT)
+    gate_ring_record(o.creator_tid, 1, new_handle, (u32)kind);
+  return new_handle;
 }
 
 // Discharge a thread's stack VA charge exactly once. Called wherever the
@@ -1181,7 +1325,7 @@ int TRT_STDCALL trt_TerminateThread(u64 thread, u32 code) {
   return 1;
 }
 
-static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
+static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret) {
   if (handle == (u64)(i64)-2 || handle == (u64)(i64)-1) {
     if (alertable) {
       std::unique_lock<std::mutex> lk(g_obj_mu);
@@ -1240,13 +1384,37 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
       static unsigned long long s_fast_n = 0;
       ++s_fast_n;
       if (s_fast_n <= 32 || (s_fast_n % 100000) == 0) {
-        char fl[256];
+        // .225 DIAG: spin return address -- guest_ret is the guest
+        // call site of this WaitForSingleObject (threaded down from
+        // the export wrapper); validated against the guest images,
+        // with the offset against the main image for the offline
+        // map. An off-image ret (the internal WaitForMultipleObjects
+        // path) logs as 0.
+        u64 ret_off = 0;
+        const u64 retaddr =
+            ret_in_guest_image((u64)(uintptr_t)guest_ret)
+                ? (u64)(uintptr_t)guest_ret
+                : 0;
+        if (retaddr) {
+          const trt_image* first_img = trt_images_first();
+          if (first_img && first_img->base && first_img->size_of_image) {
+            const u64 b = (u64)(uintptr_t)first_img->base;
+            if (retaddr >= b && retaddr < b + first_img->size_of_image)
+              ret_off = retaddr - b;
+          }
+        }
+        char fl[320];
         snprintf(fl, sizeof(fl),
-                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu owner=%u lock=%d",
+                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu owner=%u lock=%d retaddr=%llx ret_off=%llx",
                  (unsigned long long)handle, (unsigned)o->kind, my_tid,
                  o->last_set_tid, (unsigned long long)o->set_count,
-                 s_fast_n, o->owner_tid, o->lock_count);
+                 s_fast_n, o->owner_tid, o->lock_count,
+                 (unsigned long long)retaddr, (unsigned long long)ret_off);
         trt_core_log(fl);
+        // .225 DIAG: lost-wakeup pairing, first sampled spin point
+        // (retries at every 100000th sample if the worker has not
+        // parked yet when the spin starts).
+        maybe_log_lost_wakeup(my_tid);
       }
     }
     return 0;
@@ -1295,6 +1463,13 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
   // even if the thread never wakes. The RAII guard clears the
   // entry on every exit path.
   parked_wait_guard park_guard(my_tid, handle, (u32)o->kind, 1);
+  // .225 DIAG: watch an INFINITE park on a never-set event -- the
+  // worker start signal. The creator thread is the one that must
+  // set it; the gate trace records what that thread does instead.
+  if (ms == 0xFFFFFFFFu && o->kind == OBJ_EVENT && o->set_count == 0) {
+    watched_add(handle, o->creator_tid, my_tid);
+    gate_ring_record(my_tid, 3, handle, (u32)o->kind);
+  }
   if (ms == 0xFFFFFFFFu) {
     static unsigned s_park_logged = 0;
     ++s_park_logged;
@@ -1452,7 +1627,7 @@ static u32 wait_multiple_impl(u32 count, const u64* handles, bool wait_all, u32 
 // WaitForSingleObject(handle, ms): 0 signalled, 0x102 timeout, 0xFFFFFFFF failed
 u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
   gap_trace_record("WaitForSingleObject");
-  return wait_single_impl(handle, ms, false);
+  return wait_single_impl(handle, ms, false, __builtin_return_address(0));
 }
 
 // .221 DIAG: log the parked-wait table (called from the gap final
@@ -1485,6 +1660,10 @@ extern "C" void trt_sync_parked_log(void) {
     trt_core_log(pl);
   }
   if (!any) trt_core_log("sync: PARKED none");
+  // .225 DIAG: pairing check on the final dump (fires for a graceful
+  // stop / Ultrapool clear; the Sekiro final dump never runs, so the
+  // live pairing comes from the WAIT-FAST trip).
+  maybe_log_lost_wakeup(0);
 }
 
 // .223 DIAG: parked-thread count for the gap SILENCE dump --
@@ -1501,7 +1680,7 @@ extern "C" int trt_sync_parked_count(void) {
 }
 
 u32 TRT_STDCALL trt_WaitForSingleObjectEx(u64 handle, u32 ms, int alertable) {
-  return wait_single_impl(handle, ms, alertable != 0);
+  return wait_single_impl(handle, ms, alertable != 0, __builtin_return_address(0));
 }
 
 u32 TRT_STDCALL trt_WaitForMultipleObjects(u32 count, const u64* handles,
@@ -2051,6 +2230,22 @@ int TRT_STDCALL trt_SetEvent(u64 handle) {
                (unsigned long long)o->set_count);
       trt_core_log(el);
     }
+    // .225 DIAG: a set of a watched start event (expect none for
+    // the start handle) + gate-trace record of the creator
+    // thread sets. The ring keeps the first 64 sets overall:
+    // init sets, not the spin loop repeats.
+    watched_start* w = watched_find(handle);
+    if (w && w->set_hits < 8) {
+      ++w->set_hits;
+      char wl[192];
+      snprintf(wl, sizeof(wl),
+               "sync: SET-WATCHED handle=%llx tid=%u sets=%llu",
+               (unsigned long long)handle, o->last_set_tid,
+               (unsigned long long)o->set_count);
+      trt_core_log(wl);
+    }
+    if (s_set_event_logged <= 64)
+      gate_ring_record(o->last_set_tid, 2, handle, (u32)o->kind);
   }
   g_sync_cv.notify_all();
   return 1;
@@ -2249,6 +2444,12 @@ extern "C" void trt_sync_census_log(void) {
   char tl[128];
   snprintf(tl, sizeof(tl), "sync: CENSUS total=%d shown=%d", live, shown);
   trt_core_log(tl);
+  // .225 DIAG: lost-wakeup pairing at first-dump time (usually too
+  // early -- the spin has not started, owner=0 lock=0 -- so the live
+  // pairing fires from the WAIT-FAST spin-trip instead) + the gate
+  // trace for the creation-to-first-dump window.
+  maybe_log_lost_wakeup(0);
+  dump_gate_trace("census");
 }
 
 // --- semaphore ---
