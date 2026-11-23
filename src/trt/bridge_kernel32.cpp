@@ -4643,6 +4643,15 @@ const u8* safe_unwind_info(const u8* ui, const u8* image_end) {
 }
 }  // namespace
 
+// Fault attribution: a fault whose address lies in a loaded guest image is
+// the title's; anything else (host heap, wild pointer, low null page) is ours
+// and must not be blamed on the game. The host fault loggers use this to
+// label a crash, so "the title crashed" and "we crashed" stop looking alike
+// in a bug report.
+extern "C" int trt_fault_is_guest(const void* addr) {
+  return (addr && ptr_in_guest_image(addr)) ? 1 : 0;
+}
+
 u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
                                      u64 ctrl_pc, void* fn_entry, void* ctx_in,
                                      void** handler_data, u64* establisher,

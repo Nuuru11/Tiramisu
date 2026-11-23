@@ -144,6 +144,10 @@ struct sync_object {
   // WaitForSingleObject on this event.
   u32 last_set_tid = 0;
   u64 set_count = 0;
+  // .224 DIAG: thread that created this object -- names the
+  // creator of the Sekiro spin mutexes (allocated right after
+  // the main event, same generation, adjacent indices).
+  u32 creator_tid = 0;
   std::atomic<int> suspend_count{0};
   int priority = 0;
   u32 tid = 0;
@@ -189,6 +193,12 @@ struct sync_object {
     lock_count = 0;
     max_count = 0x7FFFFFFF;
     owner_tid = 0;
+    // .224 FIX: these were never reset on slot reuse, so a
+    // recycled slot carried a dead object set/creator history
+    // into the census.
+    last_set_tid = 0;
+    set_count = 0;
+    creator_tid = 0;
     suspend_count.store(0, std::memory_order_relaxed);
     priority = 0;
     tid = 0;
@@ -398,6 +408,8 @@ u64 alloc_object_locked(obj_kind kind) {
   o.clear_payload();
   o.generation = next_gen;
   o.kind = kind;
+  // .224 DIAG: creator is the calling thread at allocation.
+  o.creator_tid = current_tid();
   o.handle_refs = 1;
   return make_handle(idx, next_gen);
 }
@@ -660,17 +672,20 @@ static void log_worker_fault(void* ep_v) {
   snprintf(where, sizeof(where), "%s+0x%llx (pc=%p)", module,
            (unsigned long long)offset, (void*)pc);
   char line[320];
+  // Whose fault is it: a guest-image pc is the title's, anything else is a
+  // host-side address and must not be reported as a guest crash.
+  const char* side = trt_fault_is_guest(record.ExceptionAddress) ? "guest" : "host";
   if (record.ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
       record.NumberParameters >= 2) {
     const ULONG_PTR kind = record.ExceptionInformation[0];
     snprintf(line, sizeof(line),
-             "guest fault [worker tid=%u]: 0x%08lx at %s, %s address %p",
+             "%s fault [worker tid=%u]: 0x%08lx at %s, %s address %p", side,
              current_tid(), (unsigned long)record.ExceptionCode, where,
              kind == 0 ? "read" : kind == 1 ? "write" : "execute",
              (void*)record.ExceptionInformation[1]);
   } else {
     snprintf(line, sizeof(line),
-             "guest fault [worker tid=%u]: 0x%08lx at %s",
+             "%s fault [worker tid=%u]: 0x%08lx at %s", side,
              current_tid(), (unsigned long)record.ExceptionCode, where);
   }
   trt_core_log(line);
@@ -1227,10 +1242,10 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
       if (s_fast_n <= 32 || (s_fast_n % 100000) == 0) {
         char fl[256];
         snprintf(fl, sizeof(fl),
-                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu",
+                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu owner=%u lock=%d",
                  (unsigned long long)handle, (unsigned)o->kind, my_tid,
                  o->last_set_tid, (unsigned long long)o->set_count,
-                 s_fast_n);
+                 s_fast_n, o->owner_tid, o->lock_count);
         trt_core_log(fl);
       }
     }
@@ -2116,6 +2131,21 @@ u64 TRT_STDCALL trt_CreateMutexW(void* attrs, bool initial_owner,
     o->name = "M:" + key;
     g_named_objects[o->name] = h;
   }
+  {
+    // .224 DIAG: log mutex creation (first 64) -- CreateEvent
+    // has logged since .208 but CreateMutex never did, so the
+    // Sekiro spin mutexes 25b000001/2 had no provenance at all.
+    static unsigned s_create_mutex_logged = 0;
+    if (s_create_mutex_logged < 64) {
+      ++s_create_mutex_logged;
+      char ml[256];
+      snprintf(ml, sizeof(ml),
+               "sync: CreateMutex handle=%llx initial_owner=%u name=%s tid=%u",
+               (unsigned long long)h, initial_owner ? 1u : 0u,
+               key.empty() ? "(anon)" : key.c_str(), my_tid);
+      trt_core_log(ml);
+    }
+  }
   trt_SetLastError(0);
   return h;
 }
@@ -2161,11 +2191,64 @@ int TRT_STDCALL trt_ReleaseMutex(u64 handle) {
     return 0;
   }
   --o->lock_count;
+  // .224 DIAG: a release is a signal for mutexes -- record the
+  // releaser (mirrors SetEvent). Before .224, set_count stayed
+  // 0 for mutexes forever, so WAIT-FAST lastset=0/sets=0 did
+  // NOT mean "never released", it meant "never counted".
+  o->last_set_tid = current_tid();
+  ++o->set_count;
   if (o->lock_count == 0) {
     o->owner_tid = 0;
     g_sync_cv.notify_all();
   }
+  {
+    // .224 DIAG: log releases (first 64 + every 256th,
+    // mirroring SetEvent) -- shows who releases the spin
+    // mutexes, if anyone.
+    static unsigned s_release_mutex_logged = 0;
+    ++s_release_mutex_logged;
+    if (s_release_mutex_logged <= 64 ||
+        (s_release_mutex_logged % 256) == 0) {
+      char rl[192];
+      snprintf(rl, sizeof(rl),
+               "sync: ReleaseMutex handle=%llx tid=%u releases=%llu",
+               (unsigned long long)handle, o->last_set_tid,
+               (unsigned long long)o->set_count);
+      trt_core_log(rl);
+    }
+  }
   return 1;
+}
+
+// .224 DIAG: sync-object census -- one line per live sync object
+// (handle, kind, name, creator tid, owner, lock count, sets,
+// last setter, refs) + a total line, capped at 64 shown. Called
+// once from the first gap dump, so the Sekiro spin handles are
+// identified while the guest still runs. Logging under g_obj_mu
+// matches the WAIT-FAST path, which logs under the same lock.
+extern "C" void trt_sync_census_log(void) {
+  std::lock_guard<std::mutex> lk(g_obj_mu);
+  int live = 0, shown = 0;
+  for (u32 idx = 0; idx < g_objects.size(); ++idx) {
+    const sync_object& o = g_objects[idx];
+    if (o.kind == OBJ_NONE) continue;
+    ++live;
+    if (shown >= 64) continue;
+    ++shown;
+    const u64 h = make_handle(idx, o.generation);
+    char line[256];
+    snprintf(line, sizeof(line),
+             "sync: CENSUS handle=%llx kind=%u name=%s creator=%u owner=%u lock=%d sets=%llu lastset=%u refs=%u",
+             (unsigned long long)h, (unsigned)o.kind,
+             o.name.empty() ? "(anon)" : o.name.c_str(),
+             o.creator_tid, o.owner_tid, o.lock_count,
+             (unsigned long long)o.set_count, o.last_set_tid,
+             o.handle_refs);
+    trt_core_log(line);
+  }
+  char tl[128];
+  snprintf(tl, sizeof(tl), "sync: CENSUS total=%d shown=%d", live, shown);
+  trt_core_log(tl);
 }
 
 // --- semaphore ---
