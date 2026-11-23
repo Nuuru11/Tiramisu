@@ -39,6 +39,10 @@ extern "C" u64 trt_vk_imgs_live_n(void);
 extern "C" u64 trt_vk_imgs_est_bytes(void);
 extern "C" u64 trt_vk_presents(void);
 extern "C" u64 trt_vk_biggest_alloc_bytes(void);
+// .242 DIAG: bridged NtAllocateVirtualMemory(Ex) totals
+// (bridge_ntdll.cpp) -- VIDEO-SAMPLE ntalloc_calls=/ntalloc_mb=.
+extern "C" u64 trt_ntalloc_calls(void);
+extern "C" u64 trt_ntalloc_bytes(void);
 extern "C" u64 trt_vk_hostvec_live_bytes(void);
 extern "C" u64 trt_video_app_mem_mb(void);
 extern "C" u64 gap_trace_seq(void);
@@ -1820,9 +1824,9 @@ extern "C" void trt_video_sample_log() {
         s_prev_presents = presents;
         s_prev_calls = calls;
         s_prev_appmem_mb = appmem_mb;
-        char vb[1280];
+        char vb[1408];  // .242 DIAG: +ntalloc_calls=/ntalloc_mb=
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1847,7 +1851,8 @@ extern "C" void trt_video_sample_log() {
                  heap_mb, heap_part, priv_mb, img_mb, map_mb,
                  apres_other_mb, privtop[0].base, privtop[0].mb,
                  privtop[1].base, privtop[1].mb, privtop[2].base,
-                 privtop[2].mb);
+                 privtop[2].mb, trt_ntalloc_calls(),
+                 (unsigned long long)(trt_ntalloc_bytes() >> 20));
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top

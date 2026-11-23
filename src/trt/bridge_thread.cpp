@@ -973,6 +973,14 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
       // XAudio callers resolve instead of "none".
       {L"vulkan-1.dll", "vulkan"}, {L"d3d11.dll", "d3d11"},
       {L"xaudio2_9.dll", "xaudio2"},
+      // .242 DIAG: the 0x644 waiter's second return
+      // (q20=0x7ff80f6cad16) sits in a host module the
+      // .236 list never covered -- let CRT/COM/winmm
+      // callers resolve instead of "none".
+      {L"ucrtbase.dll", "ucrtbase"}, {L"msvcrt.dll", "msvcrt"},
+      {L"combase.dll", "combase"}, {L"rpcrt4.dll", "rpcrt4"},
+      {L"sechost.dll", "sechost"}, {L"winmm.dll", "winmm"},
+      {L"bcrypt.dll", "bcrypt"},
   };
   u64 best = 0;
   const char* best_name = nullptr;
@@ -1172,7 +1180,15 @@ struct spin_ip_sample {
   // addresses in 24 qwords); the wider window gives the
   // GAP-GROUP gate + stkguest more slots to find the guest
   // caller.
-  u64 stk[48] = {};
+  // .242 DIAG: 48 -> 96 qwords -- the .241 Ultrapool
+  // samples 9-12 (terminal 0x644 wait) show NO guest code
+  // address in 48 qwords: the wait goes through host
+  // frames and the guest return sits deeper than 384
+  // bytes up the stack. The gate + stkguest search scan
+  // the full window, so widening costs 48 more guarded
+  // derefs per sample. GAP-IP-STACK still prints q0..q23
+  // only (hardcoded 24 slots), so the log line is unchanged.
+  u64 stk[96] = {};
   // .234 DIAG: first guest-image address in stk[] (the guest
   // caller) + the qword at rdx (Sleep DelayInterval / wait
   // timeout, read while the target is suspended).
@@ -1452,8 +1468,9 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     // (the spin_read_stack_qwords pattern): ReadProcessMemory
     // is desktop-only, undeclared in the UWP SDK partition.
     // .241 DIAG: 24 -> 48 qwords (see the struct note).
+    // .242 DIAG: 48 -> 96 qwords (see the struct note).
     s->cap_step = 3;
-    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 48) : 0;
+    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 96) : 0;
     s->rdx_qword = 0;
     s->rdx_qword_ok = 0;
     s->cap_step = 4;
@@ -3382,32 +3399,42 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
     }
     // .236 DIAG: name the host caller chain above the wait -- 0x62c
     // is a host Semaphore (GAP-HANDLE type=Semaphore, bridge=0),
-    // so the waiter is host code, not the bridge. Resolving
-    // stk[1..4] to nearest host exports names the DLL/function
-    // that waits (Vulkan loader? D3D? XAudio?) and points at what
-    // creates the handle. Diagnostic only: no wake, no fix.
+    // so the waiter is host code, not the bridge.
+    // .242 DIAG: the .241 GAP-STACK-HOST resolved stk[1..4],
+    // but the .241 Ultrapool samples prove stk[1..4] are
+    // LOCALS (stack addr / 0 / heap ptr / the handle),
+    // not return addresses: all four resolved to none+0x0
+    // while the real second return sits at q20
+    // (0x7ff80f6cad16, a host address). Scan the whole
+    // (now 96-qword) window for qwords that look like host
+    // code addresses (0x7FF000000000..0x800000000000) and
+    // resolve up to 6 of them to nearest host exports --
+    // that names the DLL/fn above
+    // kernelbase!WaitForSingleObjectEx for the 0x644 wait.
+    // Diagnostic only: no wake, no fix.
     {
-      char h1[160], h2[160], h3[160], h4[160];
-      u64 o1 = 0, o2 = 0, o3 = 0, o4 = 0;
-      snprintf(h1, sizeof(h1), "none");
-      snprintf(h2, sizeof(h2), "none");
-      snprintf(h3, sizeof(h3), "none");
-      snprintf(h4, sizeof(h4), "none");
-      if (s.stk_n > 1)
-        spin_host_nearest_export(s.stk[1], h1, sizeof(h1), &o1);
-      if (s.stk_n > 2)
-        spin_host_nearest_export(s.stk[2], h2, sizeof(h2), &o2);
-      if (s.stk_n > 3)
-        spin_host_nearest_export(s.stk[3], h3, sizeof(h3), &o3);
-      if (s.stk_n > 4)
-        spin_host_nearest_export(s.stk[4], h4, sizeof(h4), &o4);
       char sh[1024];
-      snprintf(sh, sizeof(sh),
-               "sync: GAP-STACK-HOST n=%u q1=%s+0x%llx q2=%s+0x%llx q3=%s+0x%llx q4=%s+0x%llx",
-               n, h1, (unsigned long long)o1, h2,
-               (unsigned long long)o2, h3, (unsigned long long)o3,
-               h4, (unsigned long long)o4);
-      trt_core_log(sh);
+      size_t sh_n = 0;
+      unsigned sh_found = 0;
+      sh[0] = 0;
+      for (unsigned gi = 1; gi < s.stk_n && sh_found < 6; ++gi) {
+        const u64 hv = s.stk[gi];
+        if (hv < 0x7ff000000000ULL || hv >= 0x800000000000ULL) continue;
+        char hn[160];
+        u64 ho = 0;
+        snprintf(hn, sizeof(hn), "none");
+        if (!spin_host_nearest_export(hv, hn, sizeof(hn), &ho)) continue;
+        const int w = snprintf(sh + sh_n, sizeof(sh) - sh_n,
+                               "%sq%u=%s+0x%llx", sh_found ? " " : "",
+                               gi, hn, (unsigned long long)ho);
+        if (w <= 0 || (size_t)w >= sizeof(sh) - sh_n) break;
+        sh_n += (size_t)w;
+        ++sh_found;
+      }
+      char shl[1152];
+      snprintf(shl, sizeof(shl), "sync: GAP-STACK-HOST n=%u found=%u %s",
+               n, sh_found, sh_found ? sh : "none");
+      trt_core_log(shl);
     }
   }
 #else

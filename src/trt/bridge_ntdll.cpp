@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <thread>
+#include <atomic>  // .242 DIAG: NTALLOC counters
 #include <unordered_set>
 
 extern "C" {
@@ -297,11 +298,26 @@ u32 dos_to_ntstatus(u32 e) {
   }
 }
 
+// .242 DIAG: bridged NtAllocateVirtualMemory(Ex) totals --
+// nt_NtAllocateVirtualMemoryEx routes into trt_VirtualAlloc2
+// -> trt_VirtualAlloc, so the .241 VALLOC-CUM 0 already
+// covers this path; but VALLOC-CUM only logs per-caller at
+// 256MB crossings and is snapshot-only. These two atomics
+// are the committed, always-on witness: the VIDEO-SAMPLE
+// line reads them every 5s, so a zero is PROVEN zero (a
+// line every 5s), not absence of a line. If they ever go
+// nonzero while VALLOC-CUM stays quiet, the two paths
+// disagree and the ledger is wrong.
+static std::atomic<unsigned long long> g_ntalloc242_calls{0};
+static std::atomic<unsigned long long> g_ntalloc242_bytes{0};
+
 u32 TRT_GUEST_ABI nt_NtAllocateVirtualMemoryEx(void* proc, void** base_ptr,
                                               u64* region_size, u32 alloc_type,
                                               u32 protect, void* ext_params,
                                               u32 param_count) {
   if (!base_ptr || !region_size || *region_size == 0) return 0xC000000Du;
+  g_ntalloc242_calls.fetch_add(1, std::memory_order_relaxed);
+  g_ntalloc242_bytes.fetch_add(*region_size, std::memory_order_relaxed);
   void* p = trt_VirtualAlloc2(proc, *base_ptr, *region_size, alloc_type,
                               protect, ext_params, param_count);
   if (!p) return dos_to_ntstatus(trt_GetLastError());
@@ -1013,6 +1029,14 @@ u32 TRT_GUEST_ABI nt_NtQueryVirtualMemory(void* proc, const void* addr, u32 cls,
 }
 
 } // namespace
+
+// .242 DIAG: NTALLOC accessors for VIDEO-SAMPLE (vk_backend.hpp).
+unsigned long long trt_ntalloc_calls(void) {
+  return g_ntalloc242_calls.load(std::memory_order_relaxed);
+}
+unsigned long long trt_ntalloc_bytes(void) {
+  return g_ntalloc242_bytes.load(std::memory_order_relaxed);
+}
 
 int trt_bridge_register_ntdll(void) {
   static const trt_named_fn k_fns[] = {
