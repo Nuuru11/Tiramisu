@@ -46,6 +46,19 @@ extern "C" u64 trt_ntalloc_bytes(void);
 extern "C" u64 trt_vk_hostvec_live_bytes(void);
 extern "C" u64 trt_video_app_mem_mb(void);
 extern "C" u64 gap_trace_seq(void);
+// .244 DIAG: last bridge-issued D3D11 call (defined in
+// bridge_thread.cpp, outside the anonymous namespace +
+// extern "C" -- the .233 cross-TU lesson; declared here,
+// not in trt.h, so trt.h stays untouched). d3d11_note_last
+// records the call name (a string literal) + the
+// GetTickCount64 tick; d3d11_last_call reads both back
+// (atomics -- safe from the sampler/video threads). The
+// GAP-IP-SAMPLE line and VIDEO-SAMPLE print the name + its
+// age, so the terminal wait can be tied to the last D3D11
+// call the bridge issued.
+extern "C" void d3d11_note_last(const char* name);
+extern "C" void d3d11_last_call(const char** name_out,
+                                unsigned long long* tick_ms_out);
 
 namespace vk_rt {
 
@@ -108,6 +121,100 @@ struct vk_state {
 };
 
 inline vk_state g_vkrt;
+
+// .244 DIAG: D3D11 call/ret counters -- which D3D11 call is the main
+// thread parked inside, and which call's count tracks the 4.3GB region
+// growth. Every bridge-issued D3D11 call in this header increments
+// its _c counter before the call and its _r counter after it returns,
+// and records the call name via d3d11_note_last (bridge_thread.cpp).
+// The terminal state names the waiter: main parks in
+// d3d11on12.dll+0x3ad16 waiting on a host Event (a D3D12 completion
+// the layer waits on -- .243). If one pair shows calls = rets + 1 at
+// the terminal sample, main is parked INSIDE that D3D11 call (the
+// layer waits for the D3D12 fence inside it). If ALL pairs balance,
+// main parked without an outstanding bridge D3D11 call -- the wait
+// was entered from a non-vk_backend path, and .245 chases that.
+// The per-interval deltas on VIDEO-SAMPLE (dtex2d/dupd/dpres vs
+// privn) name the allocator: creation (CreateTexture2D) vs the
+// upload path (UpdateSubresource). Atomics: the render thread
+// increments, the video thread reads.
+struct d3d11_call_counts {
+  std::atomic<unsigned long long> tex2d_c{0};
+  std::atomic<unsigned long long> tex2d_r{0};
+  std::atomic<unsigned long long> tex3d_c{0};
+  std::atomic<unsigned long long> tex3d_r{0};
+  std::atomic<unsigned long long> srv_c{0};
+  std::atomic<unsigned long long> srv_r{0};
+  std::atomic<unsigned long long> rtv_c{0};
+  std::atomic<unsigned long long> rtv_r{0};
+  std::atomic<unsigned long long> dsv_c{0};
+  std::atomic<unsigned long long> dsv_r{0};
+  std::atomic<unsigned long long> uav_c{0};
+  std::atomic<unsigned long long> uav_r{0};
+  std::atomic<unsigned long long> upd_c{0};
+  std::atomic<unsigned long long> upd_r{0};
+  std::atomic<unsigned long long> map_c{0};
+  std::atomic<unsigned long long> map_r{0};
+  std::atomic<unsigned long long> unmap_c{0};
+  std::atomic<unsigned long long> unmap_r{0};
+  std::atomic<unsigned long long> copy_c{0};
+  std::atomic<unsigned long long> copy_r{0};
+  std::atomic<unsigned long long> pres_c{0};
+  std::atomic<unsigned long long> pres_r{0};
+  std::atomic<unsigned long long> sync_c{0};
+  std::atomic<unsigned long long> newtex_c{0};
+};
+inline d3d11_call_counts g_d3d11c;
+
+// Plain snapshot of the counters (one atomic load each).
+struct d3d11_counts_snap {
+  unsigned long long tex2d_c, tex2d_r, tex3d_c, tex3d_r, srv_c,
+      srv_r, rtv_c, rtv_r, dsv_c, dsv_r, uav_c, uav_r, upd_c,
+      upd_r, map_c, map_r, unmap_c, unmap_r, copy_c, copy_r,
+      pres_c, pres_r, sync_c, newtex_c;
+};
+inline d3d11_counts_snap d3d11_snapshot() {
+  d3d11_counts_snap d{};
+  d.tex2d_c = g_d3d11c.tex2d_c.load(std::memory_order_relaxed);
+  d.tex2d_r = g_d3d11c.tex2d_r.load(std::memory_order_relaxed);
+  d.tex3d_c = g_d3d11c.tex3d_c.load(std::memory_order_relaxed);
+  d.tex3d_r = g_d3d11c.tex3d_r.load(std::memory_order_relaxed);
+  d.srv_c = g_d3d11c.srv_c.load(std::memory_order_relaxed);
+  d.srv_r = g_d3d11c.srv_r.load(std::memory_order_relaxed);
+  d.rtv_c = g_d3d11c.rtv_c.load(std::memory_order_relaxed);
+  d.rtv_r = g_d3d11c.rtv_r.load(std::memory_order_relaxed);
+  d.dsv_c = g_d3d11c.dsv_c.load(std::memory_order_relaxed);
+  d.dsv_r = g_d3d11c.dsv_r.load(std::memory_order_relaxed);
+  d.uav_c = g_d3d11c.uav_c.load(std::memory_order_relaxed);
+  d.uav_r = g_d3d11c.uav_r.load(std::memory_order_relaxed);
+  d.upd_c = g_d3d11c.upd_c.load(std::memory_order_relaxed);
+  d.upd_r = g_d3d11c.upd_r.load(std::memory_order_relaxed);
+  d.map_c = g_d3d11c.map_c.load(std::memory_order_relaxed);
+  d.map_r = g_d3d11c.map_r.load(std::memory_order_relaxed);
+  d.unmap_c = g_d3d11c.unmap_c.load(std::memory_order_relaxed);
+  d.unmap_r = g_d3d11c.unmap_r.load(std::memory_order_relaxed);
+  d.copy_c = g_d3d11c.copy_c.load(std::memory_order_relaxed);
+  d.copy_r = g_d3d11c.copy_r.load(std::memory_order_relaxed);
+  d.pres_c = g_d3d11c.pres_c.load(std::memory_order_relaxed);
+  d.pres_r = g_d3d11c.pres_r.load(std::memory_order_relaxed);
+  d.sync_c = g_d3d11c.sync_c.load(std::memory_order_relaxed);
+  d.newtex_c = g_d3d11c.newtex_c.load(std::memory_order_relaxed);
+  return d;
+}
+
+// One-line "calls/rets" table for VIDEO-SAMPLE / VIDEO-BIGJUMP.
+inline void d3d11_format_line(char* buf, size_t cap,
+                               const d3d11_counts_snap& d) {
+  snprintf(buf, cap,
+           "tex2d=%llu/%llu tex3d=%llu/%llu upd=%llu/%llu "
+           "srv=%llu/%llu rtv=%llu/%llu dsv=%llu/%llu "
+           "uav=%llu/%llu map=%llu/%llu copy=%llu/%llu "
+           "pres=%llu/%llu sync=%llu newtex=%llu",
+           d.tex2d_c, d.tex2d_r, d.tex3d_c, d.tex3d_r, d.upd_c,
+           d.upd_r, d.srv_c, d.srv_r, d.rtv_c, d.rtv_r, d.dsv_c,
+           d.dsv_r, d.uav_c, d.uav_r, d.map_c, d.map_r, d.copy_c,
+           d.copy_r, d.pres_c, d.pres_r, d.sync_c, d.newtex_c);
+}
 
 inline uint64_t fnv64_mix(uint64_t h, uint64_t v) {
   h ^= v;
@@ -571,12 +678,18 @@ inline bool ensure_dyn_cb(ID3D11Buffer*& cb, uint32_t& cap, uint32_t want_bytes,
   }
   if (data && data_bytes) {
     D3D11_MAPPED_SUBRESOURCE ms{};
+    ++g_d3d11c.map_c;  // .244 DIAG: D3D11 call/ret pair (see g_d3d11c)
+    d3d11_note_last("Map");
     if (SUCCEEDED(g_vkrt.ctx->Map(cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &ms))) {
       const uint32_t cp = std::min<uint32_t>(cap, data_bytes);
       memset(ms.pData, 0, cap);
       memcpy(ms.pData, data, cp);
+      ++g_d3d11c.unmap_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("Unmap");
       g_vkrt.ctx->Unmap(cb, 0);
+      ++g_d3d11c.unmap_r;
     }
+    ++g_d3d11c.map_r;
   }
   return true;
 }
@@ -764,7 +877,10 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
     }
     if (b.buf && data && bytes && g_vkrt.ctx && !init.pSysMem) {
       D3D11_BOX box{0, 0, 0, (UINT)std::min<uint64_t>(bytes, bd.ByteWidth), 1, 1};
+      ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("UpdateSubresource");
       g_vkrt.ctx->UpdateSubresource(b.buf, 0, &box, data, 0, 0);
+      ++g_d3d11c.upd_r;
     }
 
     if (b.buf && (bind_flags & D3D11_BIND_SHADER_RESOURCE)) {
@@ -773,7 +889,10 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
       sd.ViewDimension = D3D11_SRV_DIMENSION_BUFFEREX;
       sd.BufferEx.NumElements = std::max<UINT>(1u, bd.ByteWidth / 4u);
       sd.BufferEx.Flags = D3D11_BUFFEREX_SRV_FLAG_RAW;
+      ++g_d3d11c.srv_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("CreateShaderResourceView");
       g_vkrt.dev->CreateShaderResourceView(b.buf, &sd, &b.srv);
+      ++g_d3d11c.srv_r;
     }
     if (b.buf && (bind_flags & D3D11_BIND_UNORDERED_ACCESS)) {
       D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
@@ -781,7 +900,10 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
       ud.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
       ud.Buffer.NumElements = std::max<UINT>(1u, bd.ByteWidth / 4u);
       ud.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+      ++g_d3d11c.uav_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("CreateUnorderedAccessView");
       g_vkrt.dev->CreateUnorderedAccessView(b.buf, &ud, &b.uav);
+      ++g_d3d11c.uav_r;
     }
     if (is_cb) {
       D3D11_BUFFER_DESC cbd{};
@@ -807,11 +929,17 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
         }
         if (b.cb && data && bytes && g_vkrt.ctx) {
           if (bytes >= cbd.ByteWidth) {
+            ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+            d3d11_note_last("UpdateSubresource");
             g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, data, 0, 0);
+            ++g_d3d11c.upd_r;
           } else {
             std::vector<uint8_t> pad(cbd.ByteWidth, 0);
             memcpy(pad.data(), data, (size_t)bytes);
+            ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+            d3d11_note_last("UpdateSubresource");
             g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, pad.data(), 0, 0);
+            ++g_d3d11c.upd_r;
           }
         }
       }
@@ -819,17 +947,26 @@ inline u32 hk_sync_buffer(u64 buf_id, u32 usage, const void* data, u64 bytes, vo
   } else if (data && bytes && g_vkrt.ctx) {
     if (b.buf) {
       D3D11_BOX box{0, 0, 0, (UINT)std::min<uint64_t>(bytes, b.bytes), 1, 1};
+      ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("UpdateSubresource");
       g_vkrt.ctx->UpdateSubresource(b.buf, 0, &box, data, 0, 0);
+      ++g_d3d11c.upd_r;
     }
     if (b.cb && bytes <= 65536ull) {
       D3D11_BUFFER_DESC cbd{};
       b.cb->GetDesc(&cbd);
       if (bytes >= cbd.ByteWidth) {
+        ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+        d3d11_note_last("UpdateSubresource");
         g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, data, 0, 0);
+        ++g_d3d11c.upd_r;
       } else {
         std::vector<uint8_t> pad(cbd.ByteWidth, 0);
         memcpy(pad.data(), data, (size_t)bytes);
+        ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+        d3d11_note_last("UpdateSubresource");
         g_vkrt.ctx->UpdateSubresource(b.cb, 0, nullptr, pad.data(), 0, 0);
+        ++g_d3d11c.upd_r;
       }
     }
   }
@@ -857,6 +994,7 @@ inline void hk_destroy_buffer(u64 buf_id, void*) {
 inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* data,
                          u64 bytes, u32 mip, u32 layer, void*) {
   if (!g_vkrt.initialized || !g_vkrt.dev || !desc) return 0;
+  ++g_d3d11c.sync_c;  // .244 DIAG: hk_sync_image entries (per-texture call sequence)
   img_rec& im = g_vkrt.imgs[img_id];
   if (desc->is_swapchain) {
     free_img_rec(im);
@@ -874,6 +1012,7 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
   if (!same) {
     free_img_rec(im);
     im.desc = *desc;
+    ++g_d3d11c.newtex_c;  // .244 DIAG: new texture description (CreateTexture2D/3D follows)
     const bool depth = is_depth_vk_fmt(desc->vk_format);
     const bool is_cube = ((desc->flags & 0x10u) != 0u) && desc->layers >= 6u;
 
@@ -901,7 +1040,10 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Format = tex_fmt;
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags & (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS);
+      ++g_d3d11c.tex3d_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("CreateTexture3D");
       HRESULT hr3d = g_vkrt.dev->CreateTexture3D(&td, nullptr, &im.tex3d);
+      ++g_d3d11c.tex3d_r;
       if (FAILED(hr3d)) {
         char buf[256];
         snprintf(buf, sizeof(buf),
@@ -914,10 +1056,16 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
         im.d3d_bytes = d3d_tex_note_created(desc->vk_format, td.Width,
                                             td.Height, td.Depth, mips, 1u);
         if (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+          ++g_d3d11c.srv_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateShaderResourceView");
           g_vkrt.dev->CreateShaderResourceView(im.tex3d, nullptr, &im.srv);
+          ++g_d3d11c.srv_r;
         }
         if (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS) {
+          ++g_d3d11c.uav_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateUnorderedAccessView");
           g_vkrt.dev->CreateUnorderedAccessView(im.tex3d, nullptr, &im.uav);
+          ++g_d3d11c.uav_r;
         }
       }
     } else {
@@ -931,11 +1079,17 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       td.Usage = D3D11_USAGE_DEFAULT;
       td.BindFlags = bind_flags;
       if (is_cube) td.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
+      ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("CreateTexture2D");
       HRESULT hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
+      ++g_d3d11c.tex2d_r;
       if (FAILED(hr) && (td.BindFlags & D3D11_BIND_UNORDERED_ACCESS)) {
         td.BindFlags &= ~D3D11_BIND_UNORDERED_ACCESS;
         bind_flags = td.BindFlags;
+        ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair (UAV retry)
+        d3d11_note_last("CreateTexture2D");
         hr = g_vkrt.dev->CreateTexture2D(&td, nullptr, &im.tex2d);
+        ++g_d3d11c.tex2d_r;
       }
       if (FAILED(hr)) {
         HRESULT rem = g_vkrt.dev ? g_vkrt.dev->GetDeviceRemovedReason() : S_OK;
@@ -1029,10 +1183,16 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
             sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
             sd.Texture2D.MipLevels = mips;
           }
+          ++g_d3d11c.srv_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateShaderResourceView");
           g_vkrt.dev->CreateShaderResourceView(im.tex2d, &sd, &im.srv);
+          ++g_d3d11c.srv_r;
         }
         if (bind_flags & D3D11_BIND_RENDER_TARGET) {
+          ++g_d3d11c.rtv_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateRenderTargetView");
           g_vkrt.dev->CreateRenderTargetView(im.tex2d, nullptr, &im.rtv);
+          ++g_d3d11c.rtv_r;
         }
         if (bind_flags & D3D11_BIND_DEPTH_STENCIL) {
           D3D11_DEPTH_STENCIL_VIEW_DESC dsd{};
@@ -1040,10 +1200,16 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
           dsd.ViewDimension = (layers > 1u) ? D3D11_DSV_DIMENSION_TEXTURE2DARRAY
                                             : D3D11_DSV_DIMENSION_TEXTURE2D;
           if (layers > 1u) dsd.Texture2DArray.ArraySize = 1;
+          ++g_d3d11c.dsv_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateDepthStencilView");
           g_vkrt.dev->CreateDepthStencilView(im.tex2d, &dsd, &im.dsv);
+          ++g_d3d11c.dsv_r;
         }
         if (bind_flags & D3D11_BIND_UNORDERED_ACCESS) {
+          ++g_d3d11c.uav_c;  // .244 DIAG: D3D11 call/ret pair
+          d3d11_note_last("CreateUnorderedAccessView");
           g_vkrt.dev->CreateUnorderedAccessView(im.tex2d, nullptr, &im.uav);
+          ++g_d3d11c.uav_r;
         }
       }
     }
@@ -1067,16 +1233,25 @@ inline u32 hk_sync_image(u64 img_id, const trt_vk_image_desc* desc, const void* 
       }
       UINT rp = mw * 16u;
       UINT sp = rp * mh;
+      ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("UpdateSubresource");
       g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, converted.data(), rp, sp);
+      ++g_d3d11c.upd_r;
     } else {
       UINT rp = 0, sp = 0;
       calc_img_pitch(desc->vk_format, mw, mh, &rp, &sp);
       if (bytes < (u64)sp) {
         std::vector<uint8_t> pad((size_t)sp, 0);
         memcpy(pad.data(), data, (size_t)bytes);
+        ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+        d3d11_note_last("UpdateSubresource");
         g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, pad.data(), rp, sp);
+        ++g_d3d11c.upd_r;
       } else {
+        ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+        d3d11_note_last("UpdateSubresource");
         g_vkrt.ctx->UpdateSubresource(res, sub, nullptr, data, rp, sp);
+        ++g_d3d11c.upd_r;
       }
     }
   }
@@ -1347,8 +1522,11 @@ inline void hk_copy_buffer(u64 src_buf, u64 dst_buf, u64 src_off, u64 dst_off,
   if (sit == g_vkrt.bufs.end() || dit == g_vkrt.bufs.end()) return;
   if (sit->second.buf && dit->second.buf) {
     D3D11_BOX box{(UINT)src_off, 0, 0, (UINT)(src_off + size), 1, 1};
+    ++g_d3d11c.copy_c;  // .244 DIAG: D3D11 call/ret pair
+    d3d11_note_last("CopySubresourceRegion");
     g_vkrt.ctx->CopySubresourceRegion(dit->second.buf, 0, (UINT)dst_off, 0, 0,
                                       sit->second.buf, 0, &box);
+    ++g_d3d11c.copy_r;
   }
   if (src_off < sit->second.shadow.size()) {
     u64 cp = std::min<u64>(size, (u64)(sit->second.shadow.size() - src_off));
@@ -1358,8 +1536,11 @@ inline void hk_copy_buffer(u64 src_buf, u64 dst_buf, u64 src_off, u64 dst_off,
     memcpy(dit->second.shadow.data() + dst_off,
            sit->second.shadow.data() + src_off, (size_t)cp);
     if (dit->second.cb && dst_off == 0) {
+      ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("UpdateSubresource");
       g_vkrt.ctx->UpdateSubresource(dit->second.cb, 0, nullptr,
                                     dit->second.shadow.data(), 0, 0);
+      ++g_d3d11c.upd_r;
     }
   }
 }
@@ -1407,7 +1588,10 @@ inline void hk_copy_buf_to_img(u64 src_buf, u64 dst_img, u64 buf_off, u32 w,
     }
     UINT rp = pw * 16u;
     UINT sp = rp * ph;
+    ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+    d3d11_note_last("UpdateSubresource");
     g_vkrt.ctx->UpdateSubresource(res, sub, pbox, converted.data(), rp, sp);
+    ++g_d3d11c.upd_r;
     return;
   }
 
@@ -1416,16 +1600,25 @@ inline void hk_copy_buf_to_img(u64 src_buf, u64 dst_img, u64 buf_off, u32 w,
   if (src_len < (u64)sp) {
     std::vector<uint8_t> pad((size_t)sp, 0);
     memcpy(pad.data(), src_ptr, (size_t)src_len);
+    ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+    d3d11_note_last("UpdateSubresource");
     g_vkrt.ctx->UpdateSubresource(res, sub, pbox, pad.data(), rp, sp);
+    ++g_d3d11c.upd_r;
   } else {
+    ++g_d3d11c.upd_c;  // .244 DIAG: D3D11 call/ret pair
+    d3d11_note_last("UpdateSubresource");
     g_vkrt.ctx->UpdateSubresource(res, sub, pbox, src_ptr, rp, sp);
+    ++g_d3d11c.upd_r;
   }
 }
 
 inline void hk_present(u64, u32, void*) {
   if (g_vkrt.swap) {
     longan::draw_pointer(false);
+    ++g_d3d11c.pres_c;  // .244 DIAG: D3D11 call/ret pair (a returned Present = the D3D12 queue drained at least this far)
+    d3d11_note_last("Present");
     g_vkrt.swap->Present(1, 0);
+    ++g_d3d11c.pres_r;
     if (g_vkrt.ctx && g_vkrt.main_rtv) {
       g_vkrt.ctx->OMSetRenderTargets(1, &g_vkrt.main_rtv, g_vkrt.main_dsv);
     }
@@ -1481,8 +1674,15 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
     dd.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
     dd.SampleDesc.Count = 1;
     dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
-    if (SUCCEEDED(dev->CreateTexture2D(&dd, nullptr, &g_vkrt.ds_tex))) {
+    ++g_d3d11c.tex2d_c;  // .244 DIAG: D3D11 call/ret pair
+    d3d11_note_last("CreateTexture2D");
+    const HRESULT hr_ds = dev->CreateTexture2D(&dd, nullptr, &g_vkrt.ds_tex);
+    ++g_d3d11c.tex2d_r;
+    if (SUCCEEDED(hr_ds)) {
+      ++g_d3d11c.dsv_c;  // .244 DIAG: D3D11 call/ret pair
+      d3d11_note_last("CreateDepthStencilView");
       dev->CreateDepthStencilView(g_vkrt.ds_tex, nullptr, &g_vkrt.main_dsv);
+      ++g_d3d11c.dsv_r;
       // .222 DIAG: main depth-stencil texture -- D24+S8 is
       // 4 bytes/px. One buffer at bind size (1920x1080 is
       // ~8MB: small, but it is a logged consumer now).
@@ -1776,6 +1976,9 @@ extern "C" void trt_video_sample_log() {
         static unsigned long long s_prev_presents = 0;
         static unsigned long long s_prev_calls = 0;
         static unsigned long long s_prev_appmem_mb = 0;
+        static unsigned long long s_prev_tex2d_c = 0;  // .244 DIAG
+        static unsigned long long s_prev_upd_c = 0;  // .244 DIAG
+        static unsigned long long s_prev_pres_c = 0;  // .244 DIAG
         const unsigned long long tex_n =
             (unsigned long long)vk_rt::g_d3d_tex_created_n;
         const unsigned long long tex_created_mb =
@@ -1855,9 +2058,45 @@ extern "C" void trt_video_sample_log() {
         s_prev_presents = presents;
         s_prev_calls = calls;
         s_prev_appmem_mb = appmem_mb;
-        char vb[1536];  // .243 DIAG: +privn=/privb0..3=
+        // .244 DIAG: D3D11 call/ret table + per-interval deltas. If
+        // the main thread parks inside a bridge-issued D3D11 call,
+        // that call shows calls = rets + 1 at the terminal sample
+        // while every other pair balances -- that names the D3D11
+        // entry the d3d11on12 layer is waiting inside. The
+        // per-interval deltas (dtex2d/dupd/dpres) correlate with
+        // the privn growth per interval: if dupd tracks the
+        // +700-950 regions per BIGJUMP while dtex2d tracks only
+        // the +83-136 new textures, the regions come from the
+        // upload path (UpdateSubresource staging retained per
+        // call), not from creation. devrem =
+        // GetDeviceRemovedReason at sample time (S_OK = 0: the
+        // device is alive; the D3D12 queue signalled at least as
+        // far as the last returned Present). lastd3d11 = the last
+        // bridge-issued D3D11 call + its age (d3d11_note_last).
+        const vk_rt::d3d11_counts_snap d3d = vk_rt::d3d11_snapshot();
+        const long long dtex2d_c = first_sample
+            ? 0 : (long long)d3d.tex2d_c - (long long)s_prev_tex2d_c;
+        const long long dupd_c = first_sample
+            ? 0 : (long long)d3d.upd_c - (long long)s_prev_upd_c;
+        const long long dpres_c = first_sample
+            ? 0 : (long long)d3d.pres_c - (long long)s_prev_pres_c;
+        s_prev_tex2d_c = d3d.tex2d_c;
+        s_prev_upd_c = d3d.upd_c;
+        s_prev_pres_c = d3d.pres_c;
+        char d3d_line[640];
+        vk_rt::d3d11_format_line(d3d_line, sizeof(d3d_line), d3d);
+        const unsigned devrem =
+            vk_rt::g_vkrt.dev
+                ? (unsigned)vk_rt::g_vkrt.dev->GetDeviceRemovedReason()
+                : 0;
+        const char* last_name = "none";
+        unsigned long long last_tick = 0;
+        d3d11_last_call(&last_name, &last_tick);
+        const unsigned long long last_age_ms =
+            last_tick ? (GetTickCount64() - last_tick) : 0;
+        char vb[2048];  // .244 DIAG: +d3d11=/dtex2d=/dupd=/dpres=/devrem=/lastd3d11=
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu privn=%u privb0=%u privb1=%u privb2=%u privb3=%u",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu privn=%u privb0=%u privb1=%u privb2=%u privb3=%u d3d11=%s dtex2d=%+lld dupd=%+lld dpres=%+lld devrem=0x%08x lastd3d11=%s %llums",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1885,7 +2124,8 @@ extern "C" void trt_video_sample_log() {
                  privtop[2].mb, trt_ntalloc_calls(),
                  (unsigned long long)(trt_ntalloc_bytes() >> 20),
                  priv_n, priv_bk[0], priv_bk[1], priv_bk[2],
-                 priv_bk[3]);
+                 priv_bk[3], d3d_line, dtex2d_c, dupd_c, dpres_c,
+                 devrem, last_name ? last_name : "none", last_age_ms);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top
@@ -1895,9 +2135,9 @@ extern "C" void trt_video_sample_log() {
         // driver-internal heap growth in the LOCAL segment
         // (resv=0 already rules out a reservation).
         if (jump_mb >= 500) {
-          char bj[1280];
+          char bj[1536];  // .244 DIAG: +d3d11=/devrem=
           snprintf(bj, sizeof(bj),
-                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB hostvec=%lluMB appresid=%+lldMB heap=%lluMB apres_other=%+lldMB",
+                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB hostvec=%lluMB appresid=%+lldMB heap=%lluMB apres_other=%+lldMB d3d11=%s devrem=0x%08x",
                    s_sample_n, jump_mb, appmem_mb, dappmem_mb,
                    tex_n, dtex_n, tex_created_mb, dtex_mb,
                    vkalloc_mb, dvkalloc_mb, vkimg_n, dvkimg, presents,
@@ -1905,7 +2145,8 @@ extern "C" void trt_video_sample_log() {
                    vk_rt::g_d3d_top_w, vk_rt::g_d3d_top_h, vk_rt::g_d3d_top_d,
                    vk_rt::g_d3d_top_fmt,
                    (unsigned long long)(trt_vk_biggest_alloc_bytes() >> 20),
-                   hostvec_mb, appresid_mb, heap_mb, apres_other_mb);
+                   hostvec_mb, appresid_mb, heap_mb, apres_other_mb,
+                   d3d_line, devrem);
           trt_core_log(bj);
         }
       }

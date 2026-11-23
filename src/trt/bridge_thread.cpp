@@ -3126,6 +3126,32 @@ u32 TRT_STDCALL trt_WaitForSingleObject(u64 handle, u32 ms) {
 // the implicit using-directive, the same pattern
 // trt_sync_parked_log uses below.
 
+// .244 DIAG: last bridge-issued D3D11 call (see vk_backend.hpp
+// g_d3d11c). The bridge's D3D11 calls are the only D3D11 entry
+// points the Vulkan guest reaches (Godot never calls D3D11
+// directly -- D3D11CreateDevice count is 0 in the .243 Ultrapool
+// log), so the last call + its age ties the terminal d3d11on12
+// wait to the bridge's most recent D3D11 work. The name is a
+// string literal (atomic pointer store -- no torn reads); the
+// tick is GetTickCount64 ms. The sampler reads both without any
+// lock. Outside the anonymous namespace + extern "C" (cross-TU,
+// .233 lesson: cross-TU functions must live outside the
+// anonymous namespace).
+static std::atomic<const char*> g_d3d11_last_name{nullptr};
+static std::atomic<unsigned long long> g_d3d11_last_tick_ms{0};
+extern "C" void d3d11_note_last(const char* name) {
+  g_d3d11_last_name.store(name, std::memory_order_relaxed);
+  g_d3d11_last_tick_ms.store((unsigned long long)GetTickCount64(),
+                             std::memory_order_relaxed);
+}
+extern "C" void d3d11_last_call(const char** name_out,
+                                unsigned long long* tick_ms_out) {
+  if (name_out)
+    *name_out = g_d3d11_last_name.load(std::memory_order_relaxed);
+  if (tick_ms_out)
+    *tick_ms_out = g_d3d11_last_tick_ms.load(std::memory_order_relaxed);
+}
+
 extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
 #if defined(_WIN32)
   if (!tid) return;
@@ -3227,7 +3253,15 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   const unsigned n =
       g_gap_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
   g_gap_last_sample_ms.store(spin_now_ms(), std::memory_order_relaxed);
-  char sl[768];
+  // .244 DIAG: last bridge-issued D3D11 call + its age -- ties the
+  // terminal wait to the bridge's most recent D3D11 work (see the
+  // d3d11_note_last note above spin_sample_main_ip_gap).
+  const char* last_name = nullptr;
+  unsigned long long last_tick = 0;
+  d3d11_last_call(&last_name, &last_tick);
+  const unsigned long long last_age_ms =
+      last_tick ? (unsigned long long)GetTickCount64() - last_tick : 0;
+  char sl[832];  // .244 DIAG: +lastd3d11=
   snprintf(sl, sizeof(sl),
            // .240 DIAG: r12/rbx/r13/r15 on EVERY sample --
            // the true suspended-thread callee-saved regs
@@ -3237,7 +3271,7 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            // mutex). The .239 samples captured them but
            // never logged them -- only GAP-GROUP did, and
            // its rip-based gate never fired.
-           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx r12=0x%llx rbx=0x%llx r13=0x%llx r15=0x%llx",
+           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx r12=0x%llx rbx=0x%llx r13=0x%llx r15=0x%llx lastd3d11=%s %llums",
            n, tid, is_final ? 1 : 0,
            (unsigned long long)s.rip,
            (unsigned long long)s.rip_off,
@@ -3254,7 +3288,8 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            s.rdx_qword_ok,
            (unsigned long long)s.rdx_qword,
            (unsigned long long)s.r12, (unsigned long long)s.rbx,
-           (unsigned long long)s.r13, (unsigned long long)s.r15);
+           (unsigned long long)s.r13, (unsigned long long)s.r15,
+           last_name ? last_name : "none", last_age_ms);
   trt_core_log(sl);
   // .240 FIX: the .239 rip-based gate never fired (GAP-GROUP 0)
   // although main IS in wait_for_group_task_completion -- the
