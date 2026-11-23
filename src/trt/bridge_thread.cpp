@@ -48,6 +48,7 @@ extern "C" int trt_file_io_modes(void* file_handle);
 
 #if defined(_WIN32)
 #  include <windows.h>
+#  include <intrin.h>  // .243 DIAG: __readgsqword for the PEB LDR module walk
 // TerminateThread is desktop-partition in the SDK headers (not declared
 // under WINAPI_FAMILY_APP), but callable from the AppContainer at runtime —
 // declared directly.
@@ -959,6 +960,94 @@ static void spin_main_ip_sampler() {
 // Read-only PE parsing, no patching; forwarded exports are
 // skipped (their EAT entry is a string RVA, not code).
 // Returns false when no export sits at or below the RIP.
+// .243 DIAG: PEB LDR module walk -- which host module contains addr?
+// The .242 GAP-STACK-HOST resolved q20 (0x7ff80f6cad16) to
+// user32!wvsprintfA+0x2440656, an impossible offset (~38MB past the
+// export): nearest-export is meaningless when no export sits near
+// the address. The containing module + module-relative offset names
+// the waiter anyway (d3d11.dll+0x12345, or a host thread-pool DLL).
+// Reads the current process's PEB loader list (GS:0x60 -> PEB+0x18
+// Ldr -> InMemoryOrderModuleList); EVERY pointer is read through
+// spin_read_qword_guarded -- the loader may mutate the list while
+// a DLL loads, and a torn read must stop the walk, never fault.
+// LDR_DATA_TABLE_ENTRY (x64): InMemoryOrderLinks +0x10, DllBase
+// +0x30, SizeOfImage +0x40, BaseDllName (UNICODE_STRING) +0x58
+// (Length +0x58, Buffer +0x60). Validates MZ + sane SizeOfImage
+// per entry. Name is copied qword-wise (guarded) and truncated to
+// the buffer. Returns false when no loaded module contains addr.
+static bool spin_host_module_of(u64 addr, char* name_buf, size_t name_cap,
+                                u64* off_out) {
+#if defined(_WIN32)
+  if (!addr || !name_buf || name_cap == 0) return false;
+  const u64 peb = (u64)(uintptr_t)__readgsqword(0x60);
+  if (!peb) return false;
+  u64 ldr = 0;
+  if (!spin_read_qword_guarded(peb + 0x18, &ldr) || !ldr) return false;
+  u64 first = 0;
+  if (!spin_read_qword_guarded(ldr + 0x20, &first) || !first) return false;
+  const u64 head_addr = ldr + 0x20;
+  u64 link = first;
+  for (unsigned i = 0; i < 512; ++i) {
+    if (!link || link == head_addr) break;
+    u64 next = 0;
+    if (!spin_read_qword_guarded(link, &next)) return false;
+    const u64 entry = link - 0x10;
+    u64 base = 0;
+    u64 size_qw = 0;
+    if (!spin_read_qword_guarded(entry + 0x30, &base) ||
+        !spin_read_qword_guarded(entry + 0x40, &size_qw)) {
+      if (!next || next == head_addr) break;
+      link = next;
+      continue;
+    }
+    const u64 size = size_qw & 0xffffffffULL;
+    if (base >= 0x10000ULL && size >= 0x1000ULL && size < 0x80000000ULL &&
+        addr >= base && addr < base + size) {
+      u64 mz_qw = 0;
+      if (!spin_read_qword_guarded(base, &mz_qw) ||
+          (mz_qw & 0xffffULL) != 0x5a4dULL)
+        return false;
+      u64 name_qw = 0;
+      u64 name_buf_ptr = 0;
+      if (!spin_read_qword_guarded(entry + 0x58, &name_qw) ||
+          !spin_read_qword_guarded(entry + 0x60, &name_buf_ptr) ||
+          !name_buf_ptr)
+        return false;
+      const unsigned nchars = (unsigned)((name_qw & 0xffffULL) / 2);
+      const unsigned want = nchars < (unsigned)(name_cap - 1)
+                                ? nchars
+                                : (unsigned)(name_cap - 1);
+      unsigned got = 0;
+      for (unsigned j = 0; j < (want + 3) / 4 && got < want; ++j) {
+        u64 qw = 0;
+        if (!spin_read_qword_guarded(name_buf_ptr + (u64)j * 8, &qw)) break;
+        for (unsigned k = 0; k < 4 && got < want; ++k) {
+          const unsigned wc = (unsigned)((qw >> (k * 16)) & 0xffffU);
+          if (wc == 0 || wc >= 0x80U) {
+            name_buf[got] = 0;
+            if (off_out) *off_out = addr - base;
+            return got > 0;
+          }
+          name_buf[got++] = (char)wc;
+        }
+      }
+      name_buf[got] = 0;
+      if (off_out) *off_out = addr - base;
+      return got > 0;
+    }
+    if (!next || next == head_addr) break;
+    link = next;
+  }
+  return false;
+#else
+  (void)addr;
+  (void)name_buf;
+  (void)name_cap;
+  (void)off_out;
+  return false;
+#endif
+}
+
 static bool spin_host_nearest_export(u64 rip, char* name_buf,
                                      size_t name_cap, u64* off_out) {
 #if defined(_WIN32)
@@ -1018,6 +1107,13 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
     }
   }
   if (!best || !best_name) return false;
+  // .243 DIAG: offset sanity bound -- the .242 q20 resolved to
+  // user32!wvsprintfA+0x2440656 (~38MB past the export), an
+  // impossible offset: nearest-export is meaningless when no
+  // export sits near the address. An offset >64KB is "unknown"
+  // (the GAP-STACK-HOST scan now names the containing module
+  // + module-relative offset instead, so nothing is lost).
+  if (rip - best > 0x10000ULL) return false;
   snprintf(name_buf, name_cap, "%s!%s", best_mod, best_name);
   if (off_out) *off_out = rip - best;
   return true;
@@ -3411,27 +3507,57 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
     // resolve up to 6 of them to nearest host exports --
     // that names the DLL/fn above
     // kernelbase!WaitForSingleObjectEx for the 0x644 wait.
+    // .243 DIAG: the .242 scan resolved q20 to
+    // user32!wvsprintfA+0x2440656 -- an impossible offset
+    // (~38MB past the export), a nearest-export artifact,
+    // NOT a naming. Two fixes: (1) spin_host_nearest_export
+    // now rejects offsets >64KB (see that function);
+    // (2) each found qword is ALSO resolved to its
+    // containing host module via the PEB LDR walk
+    // (spin_host_module_of) and printed as mod+off -- the
+    // module name + module-relative offset names the waiter
+    // even when no export sits near it. The export name
+    // (when within 64KB) is printed in parens after it.
+    // The scan no longer SKIPS a qword whose export fails
+    // to resolve: the module name alone is the deliverable.
     // Diagnostic only: no wake, no fix.
     {
-      char sh[1024];
+      char sh[1536];
       size_t sh_n = 0;
       unsigned sh_found = 0;
       sh[0] = 0;
       for (unsigned gi = 1; gi < s.stk_n && sh_found < 6; ++gi) {
         const u64 hv = s.stk[gi];
         if (hv < 0x7ff000000000ULL || hv >= 0x800000000000ULL) continue;
+        char mod[72];
+        u64 moff = 0;
+        const bool has_mod = spin_host_module_of(hv, mod, sizeof(mod), &moff);
         char hn[160];
         u64 ho = 0;
-        snprintf(hn, sizeof(hn), "none");
-        if (!spin_host_nearest_export(hv, hn, sizeof(hn), &ho)) continue;
-        const int w = snprintf(sh + sh_n, sizeof(sh) - sh_n,
-                               "%sq%u=%s+0x%llx", sh_found ? " " : "",
-                               gi, hn, (unsigned long long)ho);
+        const bool has_exp =
+            spin_host_nearest_export(hv, hn, sizeof(hn), &ho);
+        int w = 0;
+        if (has_mod && has_exp) {
+          w = snprintf(sh + sh_n, sizeof(sh) - sh_n,
+                       "%sq%u=%s+0x%llx(%s+0x%llx)", sh_found ? " " : "",
+                       gi, mod, (unsigned long long)moff,
+                       hn, (unsigned long long)ho);
+        } else if (has_mod) {
+          w = snprintf(sh + sh_n, sizeof(sh) - sh_n,
+                       "%sq%u=%s+0x%llx", sh_found ? " " : "",
+                       gi, mod, (unsigned long long)moff);
+        } else if (has_exp) {
+          w = snprintf(sh + sh_n, sizeof(sh) - sh_n,
+                       "%sq%u=%s+0x%llx", sh_found ? " " : "",
+                       gi, hn, (unsigned long long)ho);
+        } else {
+          continue;
+        }
         if (w <= 0 || (size_t)w >= sizeof(sh) - sh_n) break;
         sh_n += (size_t)w;
         ++sh_found;
       }
-      char shl[1152];
+      char shl[1664];
       snprintf(shl, sizeof(shl), "sync: GAP-STACK-HOST n=%u found=%u %s",
                n, sh_found, sh_found ? sh : "none");
       trt_core_log(shl);

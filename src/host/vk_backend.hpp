@@ -1592,17 +1592,28 @@ struct trt_mem_privtop {
 // name, at the call site).
 extern "C" BOOL WINAPI HeapWalk(HANDLE hHeap,
                                  LPPROCESS_HEAP_ENTRY lpEntry);
+// .243 DIAG: private-region census -- total committed MEM_PRIVATE
+// region count + counts in size buckets (<1MB / 1-16MB / 16-64MB /
+// >=64MB), via the new priv_n / priv_bk[4] out-params. The .242
+// privtop top-3 are 75/64/32MB while priv is 4903MB: the 4.3GB
+// is spread over MANY regions, and the bucket shape says whether
+// they are heap-like small blocks (driver sub-allocator / direct
+// small VirtualAllocs) or a few huge reservations.
 static inline void trt_mem_split240(unsigned long long* heap_mb,
                                      unsigned* heap_part,
                                      unsigned long long* priv_mb,
                                      unsigned long long* img_mb,
                                      unsigned long long* map_mb,
-                                     trt_mem_privtop* top3) {
+                                    trt_mem_privtop* top3,
+                                     unsigned* priv_n,
+                                     unsigned* priv_bk) {
   unsigned long long heap_b = 0;
   unsigned part = 0;
   unsigned long long priv_b = 0;
   unsigned long long img_b = 0;
   unsigned long long map_b = 0;
+  unsigned priv_cnt = 0;  // .243 DIAG: region census
+  unsigned priv_bk0 = 0, priv_bk1 = 0, priv_bk2 = 0, priv_bk3 = 0;
   // .241 DIAG: top-3 private-region bases + exact byte sizes
   // (compared exact; converted to MB at the end).
   unsigned long long top_base[3] = {};
@@ -1640,6 +1651,16 @@ static inline void trt_mem_split240(unsigned long long* heap_mb,
             top_base[2] = rbase;
             top_sz[2] = rsz;
           }
+          // .243 DIAG: region census (see the signature note).
+          ++priv_cnt;
+          if (rsz < (1ULL << 20))
+            ++priv_bk0;
+          else if (rsz < (16ULL << 20))
+            ++priv_bk1;
+          else if (rsz < (64ULL << 20))
+            ++priv_bk2;
+          else
+            ++priv_bk3;
         } else if (mbi.Type == MEM_IMAGE)
           img_b += (unsigned long long)mbi.RegionSize;
         else if (mbi.Type == MEM_MAPPED)
@@ -1687,6 +1708,13 @@ static inline void trt_mem_split240(unsigned long long* heap_mb,
       top3[i].base = top_base[i];
       top3[i].mb = top_sz[i] >> 20;
     }
+  }
+  if (priv_n) *priv_n = priv_cnt;  // .243 DIAG: region census
+  if (priv_bk) {
+    priv_bk[0] = priv_bk0;
+    priv_bk[1] = priv_bk1;
+    priv_bk[2] = priv_bk2;
+    priv_bk[3] = priv_bk3;
   }
 }
 
@@ -1797,9 +1825,12 @@ extern "C" void trt_video_sample_log() {
         unsigned heap_part = 0;
         // .241 DIAG: top-3 largest private regions (see
         // trt_mem_split240 / trt_mem_privtop).
+        // .243 DIAG: private-region census (see trt_mem_split240).
         trt_mem_privtop privtop[3] = {};
+        unsigned priv_n = 0;
+        unsigned priv_bk[4] = {};
         trt_mem_split240(&heap_mb, &heap_part, &priv_mb, &img_mb,
-                         &map_mb, privtop);
+                         &map_mb, privtop, &priv_n, priv_bk);
         const long long apres_other_mb =
             appresid_mb - (long long)heap_mb;
         const bool first_sample = (s_sample_n == 1);
@@ -1824,9 +1855,9 @@ extern "C" void trt_video_sample_log() {
         s_prev_presents = presents;
         s_prev_calls = calls;
         s_prev_appmem_mb = appmem_mb;
-        char vb[1408];  // .242 DIAG: +ntalloc_calls=/ntalloc_mb=
+        char vb[1536];  // .243 DIAG: +privn=/privb0..3=
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB privtop1=0x%llx:%lluMB privtop2=0x%llx:%lluMB privtop3=0x%llx:%lluMB ntalloc_calls=%llu ntalloc_mb=%llu privn=%u privb0=%u privb1=%u privb2=%u privb3=%u",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1852,7 +1883,9 @@ extern "C" void trt_video_sample_log() {
                  apres_other_mb, privtop[0].base, privtop[0].mb,
                  privtop[1].base, privtop[1].mb, privtop[2].base,
                  privtop[2].mb, trt_ntalloc_calls(),
-                 (unsigned long long)(trt_ntalloc_bytes() >> 20));
+                 (unsigned long long)(trt_ntalloc_bytes() >> 20),
+                 priv_n, priv_bk[0], priv_bk[1], priv_bk[2],
+                 priv_bk[3]);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top
