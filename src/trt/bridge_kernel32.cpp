@@ -5881,7 +5881,7 @@ struct syscall_trap_target {
   // the cap is per-caller now, the target always re-arms).
   int fires;
 };
-static syscall_trap_target g_syscall_trap_targets[11];
+static syscall_trap_target g_syscall_trap_targets[12];
 static std::atomic<bool> g_syscall_trap_rearm{false};
 // .220 DIAG: trap flap counters (printed on every gap dump) + quiet
 // re-arm flag. The watchdog's own Sleep trips the trap every tick,
@@ -5954,6 +5954,51 @@ static bool caller_in_guest_image(u64 caller) {
   return false;
 }
 
+// .224 DIAG: validate a level-1 return address as the call site
+// of WorkerThreadPool::wait_for_group_task_completion: it must
+// sit in a guest image AND the 5 bytes before it must be a
+// direct relative call (E8 rel32) whose target is also in a
+// guest image. Best effort: an indirect call or a tail jump
+// fails validation (valid=0) and is simply not reported,
+// never trusted. The addr-5 read is itself range-checked
+// first, so it cannot fault on an image edge.
+static bool guest_call_site_valid(u64 addr) {
+  if (!addr || !caller_in_guest_image(addr)) return false;
+  if (!caller_in_guest_image(addr - 5)) return false;
+  const u8* p = (const u8*)(uintptr_t)(addr - 5);
+  if (*p != 0xE8) return false;
+  i32 rel = 0;
+  memcpy(&rel, p + 1, sizeof(rel));
+  const u64 target = addr + (i64)rel;
+  return caller_in_guest_image(target);
+}
+
+// .224 DIAG: level-1 return address of the guest caller of a
+// bridged CV wait, from the frame-pointer chain. fp is the
+// frame pointer captured in the bridged wait wrapper
+// (__builtin_frame_address(0)): when the wrapper omits its
+// own frame pointer, fp is the guest caller frame and
+// [fp+8] is its return address; when it keeps one, [fp] is
+// the guest frame and [[fp]+8] is the return address. Every
+// dereference is stack-bounds-checked
+// (GetCurrentThreadStackLimits) and the result is validated
+// by guest_call_site_valid before use; a missing frame chain
+// (FPO guest code) just yields 0.
+static u64 guest_caller2_from_fp(void* fp) {
+  if (!fp) return 0;
+  ULONG_PTR low = 0, high = 0;
+  ::GetCurrentThreadStackLimits(&low, &high);
+  const uintptr_t f = (uintptr_t)fp;
+  if (f < (uintptr_t)low || f + 16 > (uintptr_t)high) return 0;
+  const u64 cand_a = *(const u64*)(f + 8);
+  if (guest_call_site_valid(cand_a)) return cand_a;
+  const u64 saved = *(const u64*)f;
+  if (saved < (uintptr_t)low || saved + 16 > (uintptr_t)high) return 0;
+  const u64 cand_b = *(const u64*)(saved + 8);
+  if (guest_call_site_valid(cand_b)) return cand_b;
+  return 0;
+}
+
 static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
   if (ep && ep->ExceptionRecord &&
       ep->ExceptionRecord->ExceptionCode == 0x80000003u /*EXCEPTION_BREAKPOINT*/) {
@@ -6010,7 +6055,7 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
     // before the death-phase wait. Host caller: restore the
     // byte so the host proceeds, count the trip, re-arm on
     // the next watchdog tick.
-    for (int i = 0; i < 11; ++i) {
+    for (int i = 0; i < 12; ++i) {
       if (g_syscall_trap_targets[i].addr &&
           g_syscall_trap_targets[i].addr == addr) {
         // .221 DIAG: VEH RACE FIX -- handle ANY breakpoint at
@@ -6210,7 +6255,7 @@ extern "C" void trt_syscall_trap_install() {
     const wchar_t* mod;
     const char* fn;
     const char* name;
-  } k_targets[11] = {
+  } k_targets[12] = {
       {L"kernel32.dll", "Sleep", "kernel32!Sleep"},
       {L"kernel32.dll", "WaitForSingleObject", "kernel32!WaitForSingleObject"},
       {L"kernel32.dll", "WaitForMultipleObjects", "kernel32!WaitForMultipleObjects"},
@@ -6218,7 +6263,12 @@ extern "C" void trt_syscall_trap_install() {
       // thread that MsgWaits on its window queue never
       // trips the WaitFor* targets, so Sekiro death-by-
       // message-wait was invisible to the trap.
-      {L"kernel32.dll", "MsgWaitForMultipleObjects", "kernel32!MsgWaitForMultipleObjects"},
+      // .224 FIX: MsgWaitForMultipleObjects lives in
+      // user32.dll, NOT kernel32.dll -- the .223 target
+      // resolved GetProcAddress null and never armed.
+      // Ex variant added as a second target.
+      {L"user32.dll", "MsgWaitForMultipleObjects", "user32!MsgWaitForMultipleObjects"},
+      {L"user32.dll", "MsgWaitForMultipleObjectsEx", "user32!MsgWaitForMultipleObjectsEx"},
       {L"kernel32.dll", "SwitchToThread", "kernel32!SwitchToThread"},
       {L"kernel32.dll", "SleepConditionVariableSRW", "kernel32!SleepConditionVariableSRW"},
       {L"kernel32.dll", "SleepConditionVariableCS", "kernel32!SleepConditionVariableCS"},
@@ -6228,9 +6278,13 @@ extern "C" void trt_syscall_trap_install() {
       {L"ntdll.dll", "NtYieldExecution", "ntdll!NtYieldExecution"},
   };
   int installed = 0;
-  for (int i = 0; i < 11; ++i) {
+  for (int i = 0; i < 12; ++i) {
     if (g_syscall_trap_targets[i].fired) continue;
     HMODULE mod = ::GetModuleHandleW(k_targets[i].mod);
+    // .224 FIX: user32.dll may not be loaded yet -- a plain
+    // GetModuleHandleW miss used to SKIP the target. Load it
+    // (no-op refcount bump when already loaded) before giving up.
+    if (!mod) mod = ::LoadLibraryW(k_targets[i].mod);
     if (!mod) {
       char line[192];
       snprintf(line, sizeof(line), "syscall-trap: %s SKIP module not loaded",
@@ -6287,10 +6341,10 @@ extern "C" void trt_syscall_trap_install() {
     }
   }
   int armed = 0;
-  for (int i = 0; i < 11; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
+  for (int i = 0; i < 12; ++i) if (g_syscall_trap_targets[i].armed) ++armed;
   {
     char line[128];
-    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/11 (armed %d)",
+    snprintf(line, sizeof(line), "syscall-trap: hook installed %d/12 (armed %d)",
              installed, armed);
     TRAP_LOG(line);
   }
@@ -6898,6 +6952,8 @@ void gap_trace_record(const char* name) {
   if (g_gap_entries < (u64)k_gap_ring_n) ++g_gap_entries;
 }
 
+extern "C" void trt_sync_census_log(void);  // .224 DIAG: bridge_thread.cpp
+
 void gap_trace_dump_if_changed(void) {
   // Called every watchdog tick (nominally 10ms). .219 DIAG: WALL-CLOCK
   // cadence -- the .218 tick-count cadence (100 ticks periodic, 50 ticks
@@ -6976,6 +7032,18 @@ void gap_trace_dump_if_changed(void) {
            (unsigned long long)guest_cpu, (unsigned long long)proc_cpu,
            (unsigned long long)newcalls, final_dump ? " final" : "");
   trt_core_log(line);
+  // .224 DIAG: sync census on the FIRST dump only -- the Sekiro
+  // spin handles (event 25b000000 + mutexes 25b000001/2) are
+  // created in the first second, so the first periodic dump
+  // already names them; the final dump never runs for Sekiro
+  // (it exits <2s after the last bridged call).
+  {
+    static bool s_census_done = false;
+    if (!s_census_done) {
+      s_census_done = true;
+      trt_sync_census_log();
+    }
+  }
   // .220 DIAG: trap flap stats on every dump -- how much did the
   // trap flap (host trips vs re-arms) and how many targets are
   // still armed? If hosttrips is huge and armed is 0 most of the
@@ -6985,11 +7053,11 @@ void gap_trace_dump_if_changed(void) {
   // trap path, so its diagnostic is compiled out elsewhere.
   {
     int armed_n = 0;
-    for (int i = 0; i < 11; ++i)
+    for (int i = 0; i < 12; ++i)
       if (g_syscall_trap_targets[i].armed) ++armed_n;
     char ts[192];
     snprintf(ts, sizeof(ts),
-             "syscall-trap: stats hosttrips=%llu rearms=%llu races=%llu armed=%d/11",
+             "syscall-trap: stats hosttrips=%llu rearms=%llu races=%llu armed=%d/12",
              (unsigned long long)g_syscall_trap_host_trips.load(
                  std::memory_order_relaxed),
              (unsigned long long)g_syscall_trap_rearms.load(
@@ -7014,7 +7082,8 @@ void gap_trace_dump_if_changed(void) {
   // A PEB-walked / direct wait call (NtWaitForSingleObject,
   // NtWaitForMultipleObjects, NtDelayExecution, NtYieldExecution,
   // kernel32 Sleep / WaitForSingleObject / WaitForMultipleObjects /
-  // MsgWaitForMultipleObjects / SwitchToThread /
+  // user32 MsgWaitForMultipleObjects / MsgWaitForMultipleObjectsEx /
+  // kernel32 SwitchToThread /
   // SleepConditionVariableSRW / SleepConditionVariableCS) is
   // then caught with its guest caller.
   // One attempt per process: re-arms after host-caller restores go
@@ -7145,6 +7214,12 @@ u32 gap_trace_frame1_tid(void) {
   return g_gap_frame1_tid.load(std::memory_order_relaxed);
 }
 
+// .224 DIAG: ret2 side-channel (see cv_wait_locked). trt.h
+// declares gap_trace_note_main_cv_wait 2-arg and trt.h is
+// breadth-agent-owned, so the signature stays 2-arg and the
+// 3rd datum rides here, set + cleared around each call.
+static thread_local void* s_gap_main_cv_ret2 = nullptr;
+
 int gap_trace_note_main_cv_wait(void* cv, void* ret) {
   const u32 ftid = g_gap_frame1_tid.load(std::memory_order_relaxed);
   if (!ftid || trt_GetCurrentThreadId() != ftid) return 0;
@@ -7180,11 +7255,32 @@ int gap_trace_note_main_cv_wait(void* cv, void* ret) {
         const trt_image* first = trt_images_first();
         const u64 base =
             (first && first->base) ? (u64)(uintptr_t)first->base : 0;
-        char line[256];
+        // .224 DIAG: CALLER2 -- ret2 is the level-1 return address,
+        // i.e. the engine call site of
+        // wait_for_group_task_completion (ret 0x2DC5F72). It is
+        // pre-validated by guest_caller2_from_fp; the offset is
+        // only computed when it lands in the first image, so
+        // the offline .pdata map can name the caller. It arrives
+        // via the thread_local s_gap_main_cv_ret2 (signature
+        // stays 2-arg per trt.h).
+        void* ret2 = s_gap_main_cv_ret2;
+        u64 c2_off = 0;
+        unsigned c2_valid = 0;
+        if (ret2 && first && first->base && first->size_of_image) {
+          const u64 b = (u64)(uintptr_t)first->base;
+          const u64 c = (u64)(uintptr_t)ret2;
+          if (c >= b && c < b + first->size_of_image) {
+            c2_off = c - b;
+            c2_valid = 1;
+          }
+        }
+        char line[320];
         snprintf(line, sizeof(line),
-                 "gap: main CV-wait after frame=1 cv=%p ret=0x%llx base=0x%llx tid=%u (first sight)",
+                 "gap: main CV-wait after frame=1 cv=%p ret=0x%llx base=0x%llx tid=%u caller2=0x%llx caller2_off=0x%llx caller2_valid=%u (first sight)",
                  cv, (unsigned long long)(uintptr_t)ret,
-                 (unsigned long long)base, ftid);
+                 (unsigned long long)base, ftid,
+                 (unsigned long long)(uintptr_t)ret2,
+                 (unsigned long long)c2_off, c2_valid);
         trt_core_log(line);
         return 1;
       }
@@ -7193,14 +7289,20 @@ int gap_trace_note_main_cv_wait(void* cv, void* ret) {
   return 0;
 }
 
-static int cv_wait_locked(cv_slot* s, u32 ms, void* ret) {
+static int cv_wait_locked(cv_slot* s, u32 ms, void* ret, void* ret2) {
   // .219 DIAG: Ultrapool main-thread trace -- when the frame-1 thread
   // waits on a CV after frame=1, log the first sight of each CV with the
   // guest return address (the wait-site) + sampled re-waits with the
   // tex-fail count. ret is the guest return address of the
   // SleepConditionVariable call, captured by the caller.
+  // .224 DIAG: ret2 rides a thread_local into
+  // gap_trace_note_main_cv_wait (its trt.h declaration is 2-arg
+  // and trt.h is breadth-agent-owned). Set + cleared around
+  // the call.
+  s_gap_main_cv_ret2 = ret2;
   if (gap_trace_note_main_cv_wait(s ? s->key : nullptr, ret))
     g_gap_main_cv_waits.fetch_add(1, std::memory_order_relaxed);
+  s_gap_main_cv_ret2 = nullptr;
   const u64 wn = g_cv_waits.fetch_add(1, std::memory_order_relaxed) + 1;
   if (s) s->wait_n.fetch_add(1, std::memory_order_relaxed);
   // .217 DIAG: CV summary every 256th wait (.216 never fired: 971 waits < 1024).
@@ -7266,7 +7368,13 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
              srw, flags, trt_GetCurrentThreadId());
     trt_core_log(iw);
   }
-  const int r = cv_wait_locked(s, ms, __builtin_return_address(0));
+  // .224 DIAG: capture the level-1 return address (engine call
+  // site of the group wait) before entering the wait; the
+  // frame walk is bounds-checked + validated, 0 on failure.
+  const u64 caller2 =
+      guest_caller2_from_fp(__builtin_frame_address(0));
+  const int r =
+      cv_wait_locked(s, ms, __builtin_return_address(0), (void*)caller2);
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke -- log when a waiter EXITS the CV wait (wake->work
   // vs wake->immediate re-wait). Fires for ALL waits (incl. timed), so
@@ -7309,7 +7417,13 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
              cs, trt_GetCurrentThreadId());
     trt_core_log(iw);
   }
-  const int r = cv_wait_locked(s, ms, __builtin_return_address(0));
+  // .224 DIAG: capture the level-1 return address (engine call
+  // site of the group wait) before entering the wait; the
+  // frame walk is bounds-checked + validated, 0 on failure.
+  const u64 caller2 =
+      guest_caller2_from_fp(__builtin_frame_address(0));
+  const int r =
+      cv_wait_locked(s, ms, __builtin_return_address(0), (void*)caller2);
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
   // .215 DIAG: CV-woke (CS variant) -- see SleepConditionVariableSRW.
   // .216: cap 16 -> 64, same reason as the SRW variant.
