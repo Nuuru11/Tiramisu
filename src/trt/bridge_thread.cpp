@@ -1134,6 +1134,11 @@ struct spin_ip_sample {
   u64 fn_off = 0;
   u64 fn_len = 0;
   u64 rip_off = 0;
+  // .240 DIAG: first-image base captured by the fnlookup
+  // step (inside its __try) -- the stack-gated GAP-GROUP
+  // below turns stk[] return addresses into offsets with
+  // it. 0 when the image table was gone at lookup time.
+  u64 img_base = 0;
   u64 stkret = 0;
   u64 stkfn = 0;
   // .234 DIAG: 9 -> 24 qwords -- the guest caller of Sleep
@@ -1266,14 +1271,32 @@ static int spin_fnlookup_guarded(spin_ip_sample* s, int* step_out) {
   if (!s || !s->rip) return 1;
   int ok = 0;
   __try {
+    // .240 FIX: hoist the image base/end into locals HERE
+    // (inside the guarded region) and NEVER re-read img
+    // below. The .239 fault was the [img]/[img+0x10]
+    // re-read in the step-4 loop: the loop sat OUTSIDE
+    // the guard's single SEH scope (fn+0x100..+0x161 vs
+    // scope fn+0x52..+0xff in the .239 exe), so the
+    // dangling re-read faulted unguarded -- teardown race
+    // on Sekiro (image unload between the in-scope
+    // validation and the out-of-scope re-read),
+    // image-table realloc race mid-run on Ultrapool.
+    // Step 4 now touches only these locals + s->stk[]
+    // (caller stack, always valid), so it cannot fault
+    // even outside the scope.
+    u64 img_b = 0, img_e = 0;
     if (step_out) *step_out = 1;
     spin_fn_range(s->rip, &s->fn_off, &s->fn_len);
-    const trt_image* img = trt_images_first();
-    if (img && img->base && img->size_of_image) {
-      const u64 b = (u64)(uintptr_t)img->base;
-      if (s->rip >= b && s->rip < b + img->size_of_image)
-        s->rip_off = s->rip - b;
+    {
+      const trt_image* img = trt_images_first();
+      if (img && img->base && img->size_of_image) {
+        img_b = (u64)(uintptr_t)img->base;
+        img_e = img_b + img->size_of_image;
+      }
     }
+    s->img_base = img_b;
+    if (img_b && s->rip >= img_b && s->rip < img_e)
+      s->rip_off = s->rip - img_b;
     snprintf(s->ntfn, sizeof(s->ntfn), "none");
     if (step_out) *step_out = 2;
     spin_host_nearest_export(s->rip, s->ntfn, sizeof(s->ntfn), &s->ntoff);
@@ -1286,14 +1309,16 @@ static int spin_fnlookup_guarded(spin_ip_sample* s, int* step_out) {
     // stack -- the guest caller of the host function main is
     // parked in (Sleep / WaitForSingleObjectEx). Same main
     // image range rip_off uses above.
+    // .240 FIX: NO img re-read here -- see the step-1 note.
+    // The loop uses only the step-1 locals (img_b/img_e) +
+    // s->stk[] (caller stack), so it cannot fault even
+    // though it sits outside the guard's SEH scope.
     if (step_out) *step_out = 4;
-    if (img && img->base && img->size_of_image) {
-      const u64 b = (u64)(uintptr_t)img->base;
-      const u64 e = b + img->size_of_image;
+    if (img_b && img_e > img_b) {
       for (unsigned i = 0; i < s->stk_n; ++i) {
-        if (s->stk[i] >= b && s->stk[i] < e) {
+        if (s->stk[i] >= img_b && s->stk[i] < img_e) {
           s->stkguest = s->stk[i];
-          s->stkguest_off = s->stk[i] - b;
+          s->stkguest_off = s->stk[i] - img_b;
           break;
         }
       }
@@ -2959,7 +2984,7 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
       snprintf(yl, sizeof(yl),
                "sync: HOST SYMS capture_ip=0x%llx sample_gap=0x%llx "
                "read_stack=0x%llx fn_range=0x%llx nearest_export=0x%llx "
-               "read_qword=0x%llx fnlookup239=0x%llx",
+               "read_qword=0x%llx fnlookup240=0x%llx",
                (unsigned long long)((uintptr_t)&spin_capture_ip - eb),
                (unsigned long long)((uintptr_t)&spin_sample_main_ip_gap - eb),
                (unsigned long long)((uintptr_t)&spin_read_stack_qwords - eb),
@@ -2996,9 +3021,17 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   const unsigned n =
       g_gap_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
   g_gap_last_sample_ms.store(spin_now_ms(), std::memory_order_relaxed);
-  char sl[640];
+  char sl[768];
   snprintf(sl, sizeof(sl),
-           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx",
+           // .240 DIAG: r12/rbx/r13/r15 on EVERY sample --
+           // the true suspended-thread callee-saved regs
+           // (R12 = WorkerThreadPool group ID when main is
+           // in wait_for_group_task_completion; RBX = the
+           // group inner struct, R15 = its CV, R13 = its
+           // mutex). The .239 samples captured them but
+           // never logged them -- only GAP-GROUP did, and
+           // its rip-based gate never fired.
+           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx r12=0x%llx rbx=0x%llx r13=0x%llx r15=0x%llx",
            n, tid, is_final ? 1 : 0,
            (unsigned long long)s.rip,
            (unsigned long long)s.rip_off,
@@ -3013,9 +3046,26 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            (unsigned long long)s.stkguest,
            (unsigned long long)s.stkguest_off,
            s.rdx_qword_ok,
-           (unsigned long long)s.rdx_qword);
+           (unsigned long long)s.rdx_qword,
+           (unsigned long long)s.r12, (unsigned long long)s.rbx,
+           (unsigned long long)s.r13, (unsigned long long)s.r15);
   trt_core_log(sl);
-  // .239 DIAG: name the WorkerThreadPool group main waits on.
+  // .240 FIX: the .239 rip-based gate never fired (GAP-GROUP 0)
+  // although main IS in wait_for_group_task_completion -- the
+  // .239 CV-wait lines at 6836/7366 prove it (retfn=0x2dc5df0).
+  // While main sits inside the SleepConditionVariable call,
+  // RIP is in ntdll/kernel32, not in the wait fn: the wait fn
+  // is only on the STACK (its return address, the address
+  // after the +0x182 wait call). Gate on the stack instead:
+  // any stk[] entry inside [0x2dc5df0, +0x57d) names the wait
+  // (grp_stkidx = the matching slot; -1 when only RIP
+  // matched, i.e. main was caught between wait calls).
+  // The gap-hook R12 log the .240 brief asked for is NOT
+  // done: the .239 GROUPID lines (6831, 7361) prove the
+  // bridge-side R12 is 0 -- RtlCaptureContext inside the
+  // wrapper reads the wrapper's R12, not the guest's.
+  // The sampler's GetThreadContext R12 here is the true
+  // guest value (and GAP-IP-SAMPLE now logs it always).
   // wait_for_group_task_completion (template RVA 0x2dc5df0,
   // len 0x57d): the group ID is the 2nd arg (RDX on entry),
   // saved in R12 at +0x1a (callee-saved, still live at the
@@ -3024,9 +3074,21 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   // loops while it is 0, decrements once it is nonzero);
   // R15 = the group CV, R13 = its mutex. Guarded reads: the
   // target is running again, the group heap is stable, and
-  // a fault reports ok=0 instead of killing the host. Only
-  // logged when the RIP is inside the wait fn.
-  if (s.rip_off >= 0x2dc5df0ull && s.rip_off < (0x2dc5df0ull + 0x57dull)) {
+  // a fault reports ok=0 instead of killing the host.
+  int grp_stkidx = -1;
+  if (s.img_base) {
+    for (unsigned gi = 0; gi < s.stk_n; ++gi) {
+      if (s.stk[gi] < s.img_base) continue;
+      const u64 so = s.stk[gi] - s.img_base;
+      if (so >= 0x2dc5df0ull && so < (0x2dc5df0ull + 0x57dull)) {
+        grp_stkidx = (int)gi;
+        break;
+      }
+    }
+  }
+  if (grp_stkidx >= 0 ||
+      (s.rip_off >= 0x2dc5df0ull &&
+       s.rip_off < (0x2dc5df0ull + 0x57dull))) {
     u64 g_cnt28 = 0, g_cnt34 = 0;
     const int g_ok28 =
         (s.rbx && spin_read_qword_guarded(s.rbx + 0x28, &g_cnt28)) ? 1 : 0;
@@ -3034,12 +3096,12 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
         (s.rbx && spin_read_qword_guarded(s.rbx + 0x34, &g_cnt34)) ? 1 : 0;
     char gl[320];
     snprintf(gl, sizeof(gl),
-             "sync: GAP-GROUP n=%u group_id=%llu inner=0x%llx cnt28=%u cnt28_ok=%d cnt34=0x%llx cnt34_ok=%d cv=0x%llx mutex=0x%llx fn_off=0x%llx",
+             "sync: GAP-GROUP n=%u group_id=%llu inner=0x%llx cnt28=%u cnt28_ok=%d cnt34=0x%llx cnt34_ok=%d cv=0x%llx mutex=0x%llx fn_off=0x%llx stkidx=%d",
              n, (unsigned long long)s.r12, (unsigned long long)s.rbx,
              (unsigned)(g_cnt28 & 0xffffffffu), g_ok28,
              (unsigned long long)g_cnt34, g_ok34,
              (unsigned long long)s.r15, (unsigned long long)s.r13,
-             (unsigned long long)s.fn_off);
+             (unsigned long long)s.fn_off, grp_stkidx);
     trt_core_log(gl);
   }
   {
