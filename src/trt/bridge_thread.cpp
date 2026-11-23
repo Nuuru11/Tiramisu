@@ -503,7 +503,11 @@ struct spin_tab_entry {
 };
 static spin_tab_entry g_spin_tab[16];
 static unsigned g_spin_tab_n = 0;
+// .227 DIAG: total fast waits (all handles), for the
+// before/after-wake split in the census SPIN-SUMMARY.
+static unsigned long long g_spin_fast_total = 0;
 static void spin_tab_count(u64 handle, u32 kind) {
+  ++g_spin_fast_total;
   for (unsigned i = 0; i < g_spin_tab_n; ++i) {
     if (g_spin_tab[i].handle == handle) {
       ++g_spin_tab[i].fast;
@@ -525,7 +529,20 @@ struct woke_entry {
 };
 static woke_entry g_woke[4];
 static unsigned g_woke_n = 0;
+// .227 DIAG: spin split at first wake -- per-handle fast counts
+// frozen when the first watched worker wakes, so the census can
+// say whether the spin loop stopped at the wake
+// (worker-exit-driven) or ran on (bounded count / timeout).
+// Snapshot taken once, in woke_record.
+static unsigned long long g_spin_tab_at_wake[16];
+static bool g_wake_split_done = false;
 static void woke_record(u32 tid, u64 handle) {
+  // .227 DIAG: freeze the spin table at the first wake (see above).
+  if (!g_wake_split_done) {
+    g_wake_split_done = true;
+    for (unsigned i = 0; i < g_spin_tab_n; ++i)
+      g_spin_tab_at_wake[i] = g_spin_tab[i].fast;
+  }
   for (unsigned i = 0; i < g_woke_n; ++i) {
     if (g_woke[i].handle == handle && g_woke[i].tid == tid) {
       g_woke[i].at = std::chrono::steady_clock::now();
@@ -570,10 +587,12 @@ static void dump_spin_summary() {
     const sync_object* o = object_for_locked(g_spin_tab[i].handle, nullptr);
     char line[256];
     snprintf(line, sizeof(line),
-             "sync: SPIN-SUMMARY handle=%llx kind=%u fast=%llu owner=%u lock=%d sets=%llu lastset=%u",
+             "sync: SPIN-SUMMARY handle=%llx kind=%u fast=%llu wake=%llu after=%llu owner=%u lock=%d sets=%llu lastset=%u",
              (unsigned long long)g_spin_tab[i].handle,
              (unsigned)g_spin_tab[i].kind,
              (unsigned long long)g_spin_tab[i].fast,
+             (unsigned long long)(g_wake_split_done ? g_spin_tab_at_wake[i] : 0ull),
+             (unsigned long long)(g_spin_tab[i].fast - (g_wake_split_done ? g_spin_tab_at_wake[i] : 0ull)),
              o ? o->owner_tid : 0u, o ? o->lock_count : 0,
              o ? (unsigned long long)o->set_count : 0ull,
              o ? o->last_set_tid : 0u);
@@ -1097,10 +1116,14 @@ static int win_thread_seh_filter(void* ep) {
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
-static u64 win_call_guest_seh(void* routine, u64 arg) {
+static u64 win_call_guest_seh(void* routine, u64 arg, bool* seh_out = nullptr) {
+  // .227 DIAG: seh_out reports whether the __except path fired,
+  // so the trampoline can tell routine-return from an SEH fault.
+  if (seh_out) *seh_out = false;
   __try {
     return trt_call_guest(routine, arg, 0, 0, 0);
   } __except (win_thread_seh_filter(GetExceptionInformation())) {
+    if (seh_out) *seh_out = true;
     return (u64)(u32)GetExceptionCode();
   }
 }
@@ -1151,7 +1174,20 @@ DWORD WINAPI win_thread_trampoline(LPVOID raw) {
       trt_core_log(el);
     }
   }
-  const u64 ret = win_call_guest_seh(routine, arg);
+  bool seh_took = false;
+  const u64 ret = win_call_guest_seh(routine, arg, &seh_took);
+  // .227 DIAG: thread-exit path -- routine-return vs SEH fault,
+  // with the exit code. The worker's fate in .226 was decided
+  // at census (routine returned, exit 0); this line proves it
+  // live, per thread, instead of at the census only.
+  {
+    char xl[192];
+    snprintf(xl, sizeof(xl),
+             "sync: THREAD-EXIT tid=%u routine=0x%llx exit=%u via=%s",
+             my_tid, (unsigned long long)(uintptr_t)routine,
+             (u32)ret, seh_took ? "seh" : "routine-return");
+    trt_core_log(xl);
+  }
   notify_thread_exit_once();
 
   {
@@ -1216,6 +1252,16 @@ void* thread_trampoline(void* raw) {
   trt_images_notify_thread(2 /*DLL_THREAD_ATTACH*/);
   u64 ret = 0;
   if (routine) ret = trt_call_guest(routine, arg, 0, 0, 0);
+  // .227 DIAG: thread-exit path (POSIX trampoline, see the
+  // Windows trampoline above).
+  {
+    char xl[192];
+    snprintf(xl, sizeof(xl),
+             "sync: THREAD-EXIT tid=%u routine=0x%llx exit=%u via=%s",
+             my_tid, (unsigned long long)(uintptr_t)routine,
+             (u32)ret, "routine-return");
+    trt_core_log(xl);
+  }
   notify_thread_exit_once();
 
   {
@@ -1451,6 +1497,17 @@ u64 TRT_STDCALL trt_CreateThread(void* attrs, void* stack_size, void* routine,
 }
 
 u32 TRT_STDCALL trt_ExitThread(u32 code) {
+  // .227 DIAG: UNCONDITIONAL -- the main thread has no
+  // OBJ_THREAD, so a main ExitThread would otherwise be
+  // invisible; this line is the main-exit witness if the
+  // guest entry never returns. Logged before ExitThread.
+  {
+    char xl[128];
+    snprintf(xl, sizeof(xl),
+             "sync: THREAD-EXIT tid=%u code=%u via=ExitThread",
+             current_tid(), code);
+    trt_core_log(xl);
+  }
   notify_thread_exit_once();
 #if defined(_WIN32)
   {
@@ -1505,6 +1562,14 @@ int TRT_STDCALL trt_TerminateThread(u64 thread, u32 code) {
   std::lock_guard<std::mutex> lk(g_obj_mu);
   sync_object* o = object_for_locked(thread);
   if (!o || o->kind != OBJ_THREAD) return 0;
+  // .227 DIAG: forced thread death, with target + caller tids.
+  {
+    char xl[160];
+    snprintf(xl, sizeof(xl),
+             "sync: THREAD-EXIT target_tid=%u code=%u via=TerminateThread caller_tid=%u",
+             o->tid, code, current_tid());
+    trt_core_log(xl);
+  }
   o->alive.store(false, std::memory_order_release);
   o->exit_code = code;  // the terminated thread's exit code IS the code
   o->signalled = true;
