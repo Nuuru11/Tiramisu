@@ -1673,6 +1673,16 @@ void handle_client(sock_t s) {
 }
 
 void listener_thread() {
+  // .237 FIX: the app server goes deaf during guest runs (both
+  // games) -- the listener runs at normal priority and starves
+  // while the guest spins at ~100% CPU (the watchdog shows the
+  // same starvation: 10ms cadence ticks at ~100ms gaps). One
+  // notch up so /api/status + /api/stop stay reachable during a
+  // run; the server does milliseconds of work per request, so
+  // the guest is unaffected. If :9127 still goes deaf in .237,
+  // the cause is a lock (g_mu), not scheduling, and .238
+  // investigates. Does NOT change /api/stop behavior.
+  ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   while (!g_stop) {
     sock_t c = accept(g_listener, nullptr, nullptr);
     if (c == kBadSock) {
@@ -1698,6 +1708,12 @@ void listener_thread() {
     if (g_workers.load() < 16) {
       g_workers.fetch_add(1);
       std::thread([c]() {
+        // .237 FIX: same starvation as the listener -- a worker
+        // that never gets scheduled leaves its request unanswered
+        // and holds a worker slot (16 cap), so a starved pool
+        // refuses new connections. One notch up.
+        ::SetThreadPriority(::GetCurrentThread(),
+                            THREAD_PRIORITY_ABOVE_NORMAL);
         handle_client(c);  // sock_guard closes c
         g_workers.fetch_sub(1);
       }).detach();
