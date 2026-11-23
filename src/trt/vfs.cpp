@@ -28,6 +28,31 @@ static int vfs_mkdir_one(const char* p) {
   if (CreateDirectoryW(wbuf, NULL)) return 0;
   DWORD err = GetLastError();
   if (err == ERROR_ALREADY_EXISTS) return 0;
+  // .234 FIX: long-path retry -- Godot's shader-cache leaf
+  // dirs (248-252 chars on the host path) fail the plain
+  // CreateDirectoryW while their parents (~185 chars) are
+  // created fine. Retry with the long-path prefix (limit
+  // ~32k). Only fires on failure, so short paths behave
+  // exactly as before, and the retry names the same
+  // directory as the plain path. Proved (or not) by the
+  // .234 Ultrapool run: "Unable to create shader cache
+  // directory" -> 0 means it worked.
+  {
+    size_t n = 0;
+    while (wbuf[n]) ++n;
+    if (n + 4 < 1024) {
+      wchar_t wlong[1028];
+      // Long-path prefix as codes (92 = backslash, 63 = '?'),
+      // so no backslash literal is needed here.
+      wlong[0] = (wchar_t)92;
+      wlong[1] = (wchar_t)92;
+      wlong[2] = (wchar_t)63;
+      wlong[3] = (wchar_t)92;
+      for (size_t i = 0; i <= n; ++i) wlong[4 + i] = wbuf[i];
+      if (CreateDirectoryW(wlong, NULL)) return 0;
+      if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    }
+  }
   return -1;
 }
 static int vfs_rmdir_one(const char* p) {
