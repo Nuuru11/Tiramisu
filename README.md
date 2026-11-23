@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/banner-v2.jpg" alt="Tiramisu — PC games on Xbox Series X|S" width="100%"/>
+<img src="docs/banner.png" alt="Tiramisu — PC games on Xbox Series X|S" width="100%"/>
 
 ### Run PC games on Xbox Series X|S — natively.
 

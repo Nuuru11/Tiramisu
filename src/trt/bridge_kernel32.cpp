@@ -1496,8 +1496,63 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
     err_ref_for_current_thread() = 87;
     return 0;
   }
-  g_wa_waits.fetch_add(1, std::memory_order_relaxed);
+  const u64 wa_n = g_wa_waits.fetch_add(1, std::memory_order_relaxed);
   std::atomic_thread_fence(std::memory_order_seq_cst);
+  // .249 DIAG: log the first 16 bridged WaitOnAddress calls (addr/size/ms
+  // + the value currently at addr) and a counter summary every 1000
+  // waits. The .248 Ultrapool park is NtWaitForAlertByThreadId -- if the
+  // bridged WaitOnAddress is never called by the guest main thread, the
+  // park is via the real ntdll RtlWaitOnAddress (bypassing the bridge
+  // IAT bind) or another primitive entirely.
+  {
+    static std::atomic<u64> s_wa_logged{0};
+    if (s_wa_logged.load(std::memory_order_relaxed) < 16) {
+      s_wa_logged.fetch_add(1, std::memory_order_relaxed);
+      u64 cur = 0;
+      switch (size) {
+        case 1:
+          cur = __atomic_load_n((volatile u8*)addr, __ATOMIC_ACQUIRE);
+          break;
+        case 2:
+          cur = __atomic_load_n((volatile u16*)addr, __ATOMIC_ACQUIRE);
+          break;
+        case 4:
+          cur = __atomic_load_n((volatile u32*)addr, __ATOMIC_ACQUIRE);
+          break;
+        case 8:
+          cur = __atomic_load_n((volatile u64*)addr, __ATOMIC_ACQUIRE);
+          break;
+        default:
+          break;
+      }
+      char line[192];
+      snprintf(line, sizeof(line),
+               "kernel32: WaitOnAddress #%llu tid=%u addr=0x%llx size=%u "
+               "ms=%u cur=0x%llx",
+               (unsigned long long)wa_n + 1, trt_GetCurrentThreadId(),
+               (unsigned long long)(uintptr_t)addr, size, ms,
+               (unsigned long long)cur);
+      trt_core_log(line);
+    }
+    if ((wa_n + 1) % 1000 == 0) {
+      char line[256];
+      snprintf(line, sizeof(line),
+               "kernel32: wa: waits=%llu wake_single=%llu wake_all=%llu "
+               "miss_single=%llu miss_all=%llu timed_out=%llu",
+               (unsigned long long)g_wa_waits.load(std::memory_order_relaxed),
+               (unsigned long long)g_wa_wake_single.load(
+                   std::memory_order_relaxed),
+               (unsigned long long)g_wa_wake_all.load(
+                   std::memory_order_relaxed),
+               (unsigned long long)g_wa_wake_single_miss.load(
+                   std::memory_order_relaxed),
+               (unsigned long long)g_wa_wake_all_miss.load(
+                   std::memory_order_relaxed),
+               (unsigned long long)g_wa_timed_out.load(
+                   std::memory_order_relaxed));
+      trt_core_log(line);
+    }
+  }
   if (!wait_addr_same(addr, cmp, size)) return 1;
   if (ms == 0) {
     err_ref_for_current_thread() = 1460;
@@ -1558,6 +1613,21 @@ int TRT_STDCALL trt_WaitOnAddress(volatile void* addr, void* cmp,
 
 void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr) {
   if (!addr) return;
+  // .249 DIAG: log the first 8 wake calls (the .248 Ultrapool park is a
+  // wait that never resolves -- these lines say whether any wake fired).
+  {
+    static std::atomic<u64> s_wake_single_logged{0};
+    const u64 n =
+        s_wake_single_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8) {
+      char line[128];
+      snprintf(line, sizeof(line),
+               "kernel32: WakeByAddressSingle #%llu addr=0x%llx",
+               (unsigned long long)n,
+               (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+    }
+  }
 #if defined(_WIN32)
   init_win_wait_api();
   if (g_win_wait_api.wake_single) {
@@ -1583,6 +1653,20 @@ void TRT_STDCALL trt_WakeByAddressSingle(volatile void* addr) {
 
 void TRT_STDCALL trt_WakeByAddressAll(volatile void* addr) {
   if (!addr) return;
+  // .249 DIAG: log the first 8 wake calls (see WakeByAddressSingle).
+  {
+    static std::atomic<u64> s_wake_all_logged{0};
+    const u64 n =
+        s_wake_all_logged.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8) {
+      char line[128];
+      snprintf(line, sizeof(line),
+               "kernel32: WakeByAddressAll #%llu addr=0x%llx",
+               (unsigned long long)n,
+               (unsigned long long)(uintptr_t)addr);
+      trt_core_log(line);
+    }
+  }
 #if defined(_WIN32)
   init_win_wait_api();
   if (g_win_wait_api.wake_all) {
@@ -6352,6 +6436,124 @@ extern "C" void trt_syscall_trap_install() {
 }
 #endif
 
+// .249 DIAG: guarded guest reads + MSVC C++ exception type resolution.
+// Mirrors spin_read_qword_guarded (bridge_thread.cpp): the deref goes
+// through a noinline call inside a top-level __try, so a fault in the
+// callee unwinds to this scope instead of faulting the host. A try body
+// with no call does not survive this build optimizer (.241 lesson).
+static __attribute__((noinline)) u64 k32_deref_qword_249(u64 addr) {
+  return *(const u64*)(uintptr_t)addr;
+}
+
+static __attribute__((noinline)) int k32_read_qword_guarded_249(u64 addr,
+                                                                u64* out) {
+#if defined(_WIN32)
+  int ok = 0;
+  __try {
+    *out = k32_deref_qword_249(addr);
+    ok = 1;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    ok = 0;
+  }
+  return ok;
+#else
+  (void)addr;
+  (void)out;
+  return 0;
+#endif
+}
+
+// Read a NUL-terminated guest string, qword-wise through the guarded
+// reader, into buf (truncated at cap-1). Returns bytes copied.
+static int k32_read_guest_str_249(u64 addr, char* buf, size_t cap) {
+  if (!addr || !buf || cap < 2) return 0;
+  size_t n = 0;
+  const size_t max_qw = (cap - 1) / 8;
+  for (size_t q = 0; q < max_qw; ++q) {
+    u64 qw = 0;
+    if (!k32_read_qword_guarded_249(addr + q * 8, &qw)) break;
+    for (int b = 0; b < 8; ++b) {
+      if (n + 1 >= cap) {
+        buf[cap - 1] = '\0';
+        return (int)(cap - 1);
+      }
+      char c = (char)((qw >> (b * 8)) & 0xff);
+      if (c == '\0') {
+        buf[n] = '\0';
+        return (int)n;
+      }
+      buf[n++] = c;
+    }
+  }
+  buf[n] = '\0';
+  return (int)n;
+}
+
+// Resolve the MSVC C++ exception type name from the RaiseException args
+// (0xe06d7363: [0]=magic 0x19930520, [1]=exception object,
+// [2]=_ThrowInfo, [3]=image base). The x64 EH data uses image-relative
+// RVAs, resolved against [3]; each level also tries the direct-pointer
+// reading, and the final name must start with ".?A" (MSVC mangled type
+// name) to count as resolved. Returns true and fills name_buf on
+// success; ntypes_out (when non-null) gets the catchable-type count.
+static bool k32_cpp_eh_type_name_249(const u64* args, u32 count,
+                                     char* name_buf, size_t name_cap,
+                                     u32* ntypes_out) {
+  if (!args || count < 3 || args[0] != 0x19930520ull) return false;
+  const u64 ti = args[2];
+  const u64 img = (count >= 4) ? args[3] : 0;
+  if (!ti) return false;
+  u64 cta_qw = 0;
+  if (!k32_read_qword_guarded_249(ti + 24, &cta_qw)) return false;
+  u64 cta = 0;
+  u64 n_qw = 0;
+  if (k32_read_qword_guarded_249(cta_qw, &n_qw) &&
+      (u32)n_qw >= 1 && (u32)n_qw <= 64) {
+    cta = cta_qw;
+  } else if (img &&
+             k32_read_qword_guarded_249(img + (u32)cta_qw, &n_qw) &&
+             (u32)n_qw >= 1 && (u32)n_qw <= 64) {
+    cta = img + (u32)cta_qw;
+  } else {
+    return false;
+  }
+  const u32 ntypes = (u32)n_qw;
+  if (ntypes_out) *ntypes_out = ntypes;
+  u64 e_qw = 0;
+  if (!k32_read_qword_guarded_249(cta + 4, &e_qw)) return false;
+  u64 ct = 0;
+  u64 probe = 0;
+  if (img && k32_read_qword_guarded_249(img + (u32)e_qw, &probe)) {
+    ct = img + (u32)e_qw;
+  } else if (k32_read_qword_guarded_249(e_qw, &probe)) {
+    ct = e_qw;
+  } else {
+    return false;
+  }
+  u64 t_qw = 0;
+  if (!k32_read_qword_guarded_249(ct + 4, &t_qw)) return false;
+  if (img) {
+    u64 name_qw = 0;
+    if (k32_read_qword_guarded_249(img + (u32)t_qw + 8, &name_qw) &&
+        name_qw) {
+      const int n = k32_read_guest_str_249(name_qw, name_buf, name_cap);
+      if (n >= 4 && name_buf[0] == '.' && name_buf[1] == '?' &&
+          name_buf[2] == 'A')
+        return true;
+    }
+  }
+  {
+    u64 name_qw = 0;
+    if (k32_read_qword_guarded_249(t_qw + 8, &name_qw) && name_qw) {
+      const int n = k32_read_guest_str_249(name_qw, name_buf, name_cap);
+      if (n >= 4 && name_buf[0] == '.' && name_buf[1] == '?' &&
+          name_buf[2] == 'A')
+        return true;
+    }
+  }
+  return false;
+}
+
 // RaiseException: run registered guest VEHs first, then native OS RaiseException on UWP.
 void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
   // MS_VC_EXCEPTION (0x406D1388): the legacy SetThreadName trick. Real
@@ -6413,6 +6615,25 @@ void TRT_STDCALL trt_RaiseException(u32 code, u32 flags, u32 count, u64* args) {
              "kernel32: RaiseException(code=0x%08x flags=%u count=%u arg0=0x%llx)",
              code, flags, count, count ? (unsigned long long)args[0] : 0ull);
     boot_log(line);
+    // .249 DIAG: name the C++ exception type (the .248 Sekiro death is a
+    // 0xe06d7363 whose type was unknown -- the bridge logged only
+    // code/flags/count/arg0). Throttled with the line above (first 4).
+    if (code == 0xe06d7363u) {
+      char tname[128];
+      u32 ntypes = 0;
+      const bool ok = k32_cpp_eh_type_name_249(
+          args, count, tname, sizeof(tname), &ntypes);
+      char tline[256];
+      snprintf(tline, sizeof(tline),
+               "kernel32: C++ exception type=%s ntypes=%u obj=0x%llx "
+               "throwinfo=0x%llx img=0x%llx",
+               ok ? tname : "?",
+               ntypes,
+               (args && count > 1) ? (unsigned long long)args[1] : 0ull,
+               (args && count > 2) ? (unsigned long long)args[2] : 0ull,
+               (args && count > 3) ? (unsigned long long)args[3] : 0ull);
+      boot_log(tline);
+    }
   }
   if (trt_boot_raise_trap) { trt_boot_raise_trap(code); }
 #ifdef _WIN32

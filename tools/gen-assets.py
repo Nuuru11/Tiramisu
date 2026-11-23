@@ -15,7 +15,9 @@ from PIL import Image
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOGO = os.path.join(HERE, "..", "package", "branding", "logo.png")
-BANNER = os.path.join(HERE, "..", "package", "branding", "banner.jpg")
+BANNER = os.path.join(HERE, "..", "package", "branding", "banner.png")
+if not os.path.exists(BANNER):
+    BANNER = os.path.join(HERE, "..", "package", "branding", "banner.jpg")
 BG = (14, 17, 22, 255)  # #0E1116 — the manifest BackgroundColor
 
 
@@ -46,17 +48,18 @@ def pad_fit(im, w, h, scale=0.86):
     return out
 
 
-def fit_pad(im, w, h, bg=(255, 255, 255)):
+def fit_pad(im, w, h, bg=BG):
     """Whole image scaled to fit inside (w, h), centred on bg — never cropped.
 
     The banner art is 3:1, so cover-cropping it into 16:9 or 2.07:1 tiles
     cuts the wordmark and the mascot off at the edges.
     """
+    im = im.convert("RGBA")
     ratio = min(w / im.width, h / im.height)
     im = im.resize((max(1, int(im.width * ratio)), max(1, int(im.height * ratio))),
                    Image.LANCZOS)
-    out = Image.new("RGB", (w, h), bg)
-    out.paste(im, ((w - im.width) // 2, (h - im.height) // 2))
+    out = Image.new("RGBA", (w, h), bg)
+    out.paste(im, ((w - im.width) // 2, (h - im.height) // 2), im)
     return out
 
 
