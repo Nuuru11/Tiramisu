@@ -964,6 +964,10 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
       {nullptr, "exe"}, {L"ntdll.dll", "ntdll"},
       {L"kernel32.dll", "kernel32"}, {L"kernelbase.dll", "kernelbase"},
       {L"user32.dll", "user32"},
+      // .236 DIAG: the 0x62c waiter is host code -- let Vulkan / D3D11 /
+      // XAudio callers resolve instead of "none".
+      {L"vulkan-1.dll", "vulkan"}, {L"d3d11.dll", "d3d11"},
+      {L"xaudio2_9.dll", "xaudio2"},
   };
   u64 best = 0;
   const char* best_name = nullptr;
@@ -1155,6 +1159,15 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     ::CloseHandle(h);
     return -1;
   }
+  // .236 FIX: guard the capture -- both .235 Ultrapool runs crashed
+  // on the watchdog thread immediately after a GAP-HOOK dump with
+  // stid!=0, with no GAP-IP-SAMPLE line between the dump and the
+  // crash, i.e. inside this capture. A faulting capture returns -2,
+  // never kills the host; the target is ALWAYS resumed below,
+  // fault or not. (The guard lives here, not in the gap sampler:
+  // __try cannot live there -- C2712, destructible locals.)
+  int cap_rc = 1;
+  __try {
   CONTEXT ctx{};
   ctx.ContextFlags = CONTEXT_FULL;
   const BOOL ok = ::GetThreadContext(h, &ctx);
@@ -1185,9 +1198,14 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     }
     s->stkret = (s->stk_n > 0) ? s->stk[0] : 0;
   }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    cap_rc = -2;
+  }
   ::ResumeThread(h);
   ::CloseHandle(h);
+  if (cap_rc == -2) return -2;
   // Fn lookup AFTER resume (see the header comment).
+  __try {
   if (s->rip) {
     spin_fn_range(s->rip, &s->fn_off, &s->fn_len);
     const trt_image* img = trt_images_first();
@@ -1218,6 +1236,9 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
       }
     }
   }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return -2;
+  }
   return 1;
 #else
   (void)tid;
@@ -1227,6 +1248,9 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
 }
 static std::atomic<unsigned> g_gap_samples_done{0};
 static std::atomic<unsigned long long> g_gap_last_sample_ms{0};
+// .236 FIX: tid whose capture faulted (GAP-CAPTURE-FAULT) -- never
+// capture it again (GAP-CAPTURE-SKIP). Set in the gap sampler.
+static std::atomic<u32> g_gap_capture_fault_tid{0};
 
 // Requires g_obj_mu held. Refresh + read a guest thread's liveness:
 // alive=true means the thread is still executing somewhere (guest code
@@ -2724,8 +2748,33 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   if (spin_now_ms() <
       g_gap_last_sample_ms.load(std::memory_order_relaxed) + 5000)
     return;
+  // .236 FIX: log the capture attempt + guard its outcome -- the
+  // .235 crash pattern is dump-with-stid!=0 then HOST UNHANDLED
+  // with no sample line between, i.e. inside the capture. A
+  // faulted tid is never captured again.
+  {
+    char tl[128];
+    snprintf(tl, sizeof(tl), "sync: GAP-CAPTURE-TRY tid=%u done=%u",
+             tid,
+             g_gap_samples_done.load(std::memory_order_relaxed));
+    trt_core_log(tl);
+  }
+  if (tid == g_gap_capture_fault_tid.load(std::memory_order_relaxed)) {
+    char fl[128];
+    snprintf(fl, sizeof(fl), "sync: GAP-CAPTURE-SKIP tid=%u faulted",
+             tid);
+    trt_core_log(fl);
+    return;
+  }
   spin_ip_sample s;
   const int cap = spin_capture_ip(tid, &s);
+  if (cap == -2) {
+    g_gap_capture_fault_tid.store(tid, std::memory_order_relaxed);
+    char fl[128];
+    snprintf(fl, sizeof(fl), "sync: GAP-CAPTURE-FAULT tid=%u", tid);
+    trt_core_log(fl);
+    return;
+  }
   if (cap != 1) {
     // Bound failure spam the same way as successes: consume a
     // slot so a thread that can never be opened/suspended logs
@@ -2944,6 +2993,35 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
                  rwinguest ? 1 : 0, (unsigned long long)rwinguest, rparked);
         trt_core_log(rl);
       }
+    }
+    // .236 DIAG: name the host caller chain above the wait -- 0x62c
+    // is a host Semaphore (GAP-HANDLE type=Semaphore, bridge=0),
+    // so the waiter is host code, not the bridge. Resolving
+    // stk[1..4] to nearest host exports names the DLL/function
+    // that waits (Vulkan loader? D3D? XAudio?) and points at what
+    // creates the handle. Diagnostic only: no wake, no fix.
+    {
+      char h1[160], h2[160], h3[160], h4[160];
+      u64 o1 = 0, o2 = 0, o3 = 0, o4 = 0;
+      snprintf(h1, sizeof(h1), "none");
+      snprintf(h2, sizeof(h2), "none");
+      snprintf(h3, sizeof(h3), "none");
+      snprintf(h4, sizeof(h4), "none");
+      if (s.stk_n > 1)
+        spin_host_nearest_export(s.stk[1], h1, sizeof(h1), &o1);
+      if (s.stk_n > 2)
+        spin_host_nearest_export(s.stk[2], h2, sizeof(h2), &o2);
+      if (s.stk_n > 3)
+        spin_host_nearest_export(s.stk[3], h3, sizeof(h3), &o3);
+      if (s.stk_n > 4)
+        spin_host_nearest_export(s.stk[4], h4, sizeof(h4), &o4);
+      char sh[1024];
+      snprintf(sh, sizeof(sh),
+               "sync: GAP-STACK-HOST n=%u q1=%s+0x%llx q2=%s+0x%llx q3=%s+0x%llx q4=%s+0x%llx",
+               n, h1, (unsigned long long)o1, h2,
+               (unsigned long long)o2, h3, (unsigned long long)o3,
+               h4, (unsigned long long)o4);
+      trt_core_log(sh);
     }
   }
 #else
