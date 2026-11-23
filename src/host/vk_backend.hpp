@@ -1542,6 +1542,91 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
 // Called from the watchdog (main.cpp, snapshot-only) every ~5s.
 // Defined here (single-TU header, bound in swapchain.cpp) so no
 // new trt.h declaration is needed; main.cpp declares it locally.
+// .240 DIAG: split appresid (VIDEO-SAMPLE) into guest-heap
+// vs the rest. The .239 run left a ~4.9GB untracked CPU
+// consumer (appresid +4865MB, hostvec 96MB max, shadow 1MB,
+// ledger 470MB, tex_live 151MB) -- most likely the guest
+// heap, but the bridge could not see it. Two independent
+// measures, both taken on the watchdog thread at
+// VIDEO-SAMPLE cadence (~5s): (1) HeapWalk over every
+// process heap sums live busy blocks = the guest heap
+// (Godot mallocs through the process heap; the bridge
+// budget ledger only sees bridged allocs -- contrast
+// Sekiro, whose 4668MB ledger ~= its 4840MB appmem).
+// (2) VirtualQuery walk sums committed bytes by type
+// (MEM_PRIVATE / MEM_IMAGE / MEM_MAPPED) -- private
+// committed minus the heap total is driver CPU + direct
+// VirtualAlloc + stacks. HeapWalk is time-capped (150ms,
+// checked every 4096 entries) and the whole walk runs
+// under one top-level __try: a corrupted guest heap
+// reports partial=1, never kills the watchdog thread.
+// All locals are POD (no C2712: __try + destructibles
+// does not compile). Out-params are MB (>> 20).
+static inline void trt_mem_split240(unsigned long long* heap_mb,
+                                     unsigned* heap_part,
+                                     unsigned long long* priv_mb,
+                                     unsigned long long* img_mb,
+                                     unsigned long long* map_mb) {
+  unsigned long long heap_b = 0;
+  unsigned part = 0;
+  unsigned long long priv_b = 0;
+  unsigned long long img_b = 0;
+  unsigned long long map_b = 0;
+#if defined(_WIN32)
+  __try {
+    // (2) VirtualQuery walk first (no locks, cannot block).
+    MEMORY_BASIC_INFORMATION mbi{};
+    unsigned char* addr = 0;
+    for (unsigned it = 0; it < 2000000u; ++it) {
+      const SIZE_T r = ::VirtualQuery(addr, &mbi, sizeof(mbi));
+      if (!r) break;
+      if (mbi.State == MEM_COMMIT) {
+        if (mbi.Type == MEM_PRIVATE)
+          priv_b += (unsigned long long)mbi.RegionSize;
+        else if (mbi.Type == MEM_IMAGE)
+          img_b += (unsigned long long)mbi.RegionSize;
+        else if (mbi.Type == MEM_MAPPED)
+          map_b += (unsigned long long)mbi.RegionSize;
+      }
+      unsigned char* next =
+          (unsigned char*)mbi.BaseAddress + mbi.RegionSize;
+      if (next <= addr) break;
+      addr = next;
+    }
+    // (1) HeapWalk, time-capped.
+    HANDLE heaps[64];
+    const DWORD nheaps = ::GetProcessHeaps(64, heaps);
+    if (nheaps == 0 || nheaps > 64) part = 1;
+    const unsigned long long t0 =
+        (unsigned long long)::GetTickCount64();
+    const DWORD nwalk = nheaps > 64 ? 64 : nheaps;
+    for (DWORD h = 0; h < nwalk; ++h) {
+      PROCESS_HEAP_ENTRY e{};
+      unsigned entries = 0;
+      while (::HeapWalk(heaps[h], &e)) {
+        if (e.wFlags & PROCESS_HEAP_ENTRY_BUSY)
+          heap_b += (unsigned long long)e.cbData;
+        if ((++entries & 0xFFFu) == 0) {
+          if ((unsigned long long)::GetTickCount64() - t0 > 150ull) {
+            part = 1;
+            break;
+          }
+        }
+      }
+      if (part) break;
+      if (::GetLastError() != ERROR_NO_MORE_ITEMS) part = 1;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    part = 1;
+  }
+#endif
+  if (heap_mb) *heap_mb = heap_b >> 20;
+  if (heap_part) *heap_part = part;
+  if (priv_mb) *priv_mb = priv_b >> 20;
+  if (img_mb) *img_mb = img_b >> 20;
+  if (map_mb) *map_mb = map_b >> 20;
+}
+
 extern "C" void trt_video_sample_log() {
   if (!vk_rt::g_vkrt.dev) return;
   IDXGIDevice* dxgi_dev = nullptr;
@@ -1639,6 +1724,18 @@ extern "C" void trt_video_sample_log() {
         const long long appresid_mb =
             (long long)appmem_mb - (long long)hostvec_mb -
             (long long)shadow_mb;
+        // .240 DIAG: split appresid into guest-heap vs the
+        // rest (driver CPU + direct VirtualAlloc + stacks).
+        // heap = HeapWalk live busy bytes over every
+        // process heap; priv/img/map = VirtualQuery
+        // committed bytes by type. See trt_mem_split240.
+        unsigned long long heap_mb = 0, priv_mb = 0, img_mb = 0,
+            map_mb = 0;
+        unsigned heap_part = 0;
+        trt_mem_split240(&heap_mb, &heap_part, &priv_mb, &img_mb,
+                         &map_mb);
+        const long long apres_other_mb =
+            appresid_mb - (long long)heap_mb;
         const bool first_sample = (s_sample_n == 1);
         const long long dtex_n = first_sample
             ? 0 : (long long)tex_n - (long long)s_prev_tex_n;
@@ -1661,9 +1758,9 @@ extern "C" void trt_video_sample_log() {
         s_prev_presents = presents;
         s_prev_calls = calls;
         s_prev_appmem_mb = appmem_mb;
-        char vb[1024];
+        char vb[1280];
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB heap=%lluMB heap_part=%u priv=%lluMB img=%lluMB map=%lluMB apres_other=%+lldMB",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1684,7 +1781,9 @@ extern "C" void trt_video_sample_log() {
                  vkalloc_mb, vkalloc_n, vkimg_n, vkimg_est_mb,
                  presents, calls,
                  dtex_n, dtex_mb, dvkalloc_mb, dvkimg, dpres, dcalls,
-                 hostvec_mb, shadow_mb, ledger_mb, appresid_mb);
+                 hostvec_mb, shadow_mb, ledger_mb, appresid_mb,
+                 heap_mb, heap_part, priv_mb, img_mb, map_mb,
+                 apres_other_mb);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top
@@ -1694,9 +1793,9 @@ extern "C" void trt_video_sample_log() {
         // driver-internal heap growth in the LOCAL segment
         // (resv=0 already rules out a reservation).
         if (jump_mb >= 500) {
-          char bj[1024];
+          char bj[1280];
           snprintf(bj, sizeof(bj),
-                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB hostvec=%lluMB appresid=%+lldMB",
+                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB hostvec=%lluMB appresid=%+lldMB heap=%lluMB apres_other=%+lldMB",
                    s_sample_n, jump_mb, appmem_mb, dappmem_mb,
                    tex_n, dtex_n, tex_created_mb, dtex_mb,
                    vkalloc_mb, dvkalloc_mb, vkimg_n, dvkimg, presents,
@@ -1704,7 +1803,7 @@ extern "C" void trt_video_sample_log() {
                    vk_rt::g_d3d_top_w, vk_rt::g_d3d_top_h, vk_rt::g_d3d_top_d,
                    vk_rt::g_d3d_top_fmt,
                    (unsigned long long)(trt_vk_biggest_alloc_bytes() >> 20),
-                   hostvec_mb, appresid_mb);
+                   hostvec_mb, appresid_mb, heap_mb, apres_other_mb);
           trt_core_log(bj);
         }
       }
