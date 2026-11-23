@@ -849,6 +849,40 @@ static void spin_main_ip_sampler() {
               const u64 wrip = wok2 ? (u64)wctx.Rip : 0;
               const u64 wrcx = wok2 ? (u64)wctx.Rcx : 0;
               const u64 wrdx = wok2 ? (u64)wctx.Rdx : 0;
+              const u64 wrsp = wok2 ? (u64)wctx.Rsp : 0;
+              u64 wstk[5] = {};
+              const unsigned wstk_n =
+                  (wok2 && wrsp)
+                      ? spin_read_stack_qwords(wrsp, wstk, 5)
+                      : 0;
+              // .232 DIAG: Win32 start address of the
+              // waited-on thread (NtQueryInformationThread,
+              // ThreadQuerySetWin32StartAddress = 9). The
+              // worker was created by ::CreateThread with
+              // win_thread_trampoline, so start should
+              // name the trampoline; anything else names
+              // a foreign thread.
+              u64 wstart = 0;
+              {
+                typedef long(NTAPI* NtQueryInformationThread_fn)(
+                    HANDLE, unsigned long, void*, unsigned long,
+                    unsigned long*);
+                static NtQueryInformationThread_fn wqit = nullptr;
+                static bool wqit_tried = false;
+                if (!wqit_tried) {
+                  wqit_tried = true;
+                  HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+                  if (ntdll)
+                    wqit = (NtQueryInformationThread_fn)::GetProcAddress(
+                        ntdll, "NtQueryInformationThread");
+                }
+                if (wqit) {
+                  void* sa = nullptr;
+                  unsigned long rl = 0;
+                  if (wqit(wh, 9, &sa, sizeof(sa), &rl) == 0)
+                    wstart = (u64)(uintptr_t)sa;
+                }
+              }
               ::ResumeThread(wh);
               ::CloseHandle(wh);
               char wntfn[160];
@@ -857,14 +891,21 @@ static void spin_main_ip_sampler() {
               if (wrip)
                 spin_host_nearest_export(wrip, wntfn, sizeof(wntfn),
                                          &wntoff);
-              char cl[448];
+              char cl[640];
               snprintf(cl, sizeof(cl),
-                       "sync: WAITED-THREAD-CTX n=%u wtid=%lu ok=%d rip=0x%llx ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx",
+                       "sync: WAITED-THREAD-CTX n=%u wtid=%lu ok=%d rip=0x%llx ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx rsp=0x%llx start=0x%llx q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx",
                        n, (unsigned long)wtid, wok2 ? 1 : 0,
                        (unsigned long long)wrip, wntfn,
                        (unsigned long long)wntoff,
                        (unsigned long long)wrcx,
-                       (unsigned long long)wrdx);
+                       (unsigned long long)wrdx,
+                       (unsigned long long)wrsp,
+                       (unsigned long long)wstart,
+                       (unsigned long long)(wstk_n > 0 ? wstk[0] : 0),
+                       (unsigned long long)(wstk_n > 1 ? wstk[1] : 0),
+                       (unsigned long long)(wstk_n > 2 ? wstk[2] : 0),
+                       (unsigned long long)(wstk_n > 3 ? wstk[3] : 0),
+                       (unsigned long long)(wstk_n > 4 ? wstk[4] : 0));
               trt_core_log(cl);
             }
           }
@@ -2016,6 +2057,18 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
                                  std::memory_order_relaxed);
   }
   notify_thread_exit_once();
+  // .232 DIAG: exit-path localization -- if THREAD-EXIT
+  // logged but this does not, the worker is stuck inside
+  // notify_thread_exit_once (DLL_THREAD_DETACH handler,
+  // FLS callback, or g_obj_mu). If this logs but
+  // THREAD-EXIT-MARKED does not, the marking loop wedged.
+  {
+    char dl[128];
+    snprintf(dl, sizeof(dl),
+             "sync: THREAD-EXIT-DETACHED tid=%u code=%u",
+             current_tid(), code);
+    trt_core_log(dl);
+  }
 #if defined(_WIN32)
   {
     const u32 self_tid = current_tid();
@@ -2035,6 +2088,17 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
         break;
       }
     }
+  }
+  // .232 DIAG: exit-path localization -- the marking
+  // loop ran (bridge object dead + signalled). If this
+  // logs and the OS thread is still alive, the worker is
+  // stuck in the real ExitThread (host detach teardown).
+  {
+    char ml[128];
+    snprintf(ml, sizeof(ml),
+             "sync: THREAD-EXIT-MARKED tid=%u code=%u",
+             current_tid(), code);
+    trt_core_log(ml);
   }
   ExitThread(code);
 #else
@@ -2059,6 +2123,15 @@ u32 TRT_STDCALL trt_ExitThread(u32 code) {
         break;
       }
     }
+  }
+  // .232 DIAG: exit-path localization, POSIX branch --
+  // see the Win32 MARKED probe above.
+  {
+    char ml[128];
+    snprintf(ml, sizeof(ml),
+             "sync: THREAD-EXIT-MARKED tid=%u code=%u",
+             current_tid(), code);
+    trt_core_log(ml);
   }
   pthread_exit((void*)(uintptr_t)code);
 #endif
@@ -2126,10 +2199,59 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable, void* guest_ret)
       }
     }
     if (win_thread_h) {
-      const DWORD r = ::WaitForSingleObject(win_thread_h, ms);
-      if (r == WAIT_OBJECT_0) return 0;
-      if (r == WAIT_ABANDONED) return 0x80u;
-      return 0x102u;
+      // .232 FIX: a bridge-dead thread whose OS thread
+      // never terminated (.231: Sekiro worker called
+      // ExitThread, the bridge marked it dead +
+      // signalled, but the OS thread is stuck in exit
+      // teardown, so the host handle never signals and
+      // a plain host wait hangs forever). The bridge
+      // object is the guest source of truth: marking
+      // happens only on the exit paths, after which the
+      // guest thread never runs guest code again, so
+      // the wait is satisfied here. Slice-poll the host
+      // handle (50ms) and re-check the bridge object
+      // each slice, so a wait entered BEFORE the worker
+      // marks dead is released too. Thread waits are
+      // rare (not the event spin), so the poll costs
+      // nothing measurable. No TerminateThread: the
+      // stuck OS thread is left alone; only main's wait
+      // is released.
+      const bool infinite = (ms == 0xFFFFFFFFu);
+      const auto deadline =
+          infinite ? std::chrono::steady_clock::time_point::max()
+                   : std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(ms);
+      for (;;) {
+        {
+          std::lock_guard<std::mutex> lk(g_obj_mu);
+          sync_object* o2 = object_for_locked(handle);
+          if (o2 && o2->kind == OBJ_THREAD &&
+              !o2->alive.load(std::memory_order_acquire)) {
+            char dl[192];
+            snprintf(dl, sizeof(dl),
+                     "sync: WAIT-THREAD-DEAD handle=%llx tid=%u exit=%u",
+                     (unsigned long long)handle, o2->tid,
+                     o2->exit_code);
+            trt_core_log(dl);
+            return 0;
+          }
+        }
+        DWORD slice_ms = 50;
+        if (!infinite) {
+          const long long rem =
+              (long long)std::chrono::duration_cast<
+                  std::chrono::milliseconds>(
+                  deadline - std::chrono::steady_clock::now())
+                  .count();
+          if (rem <= 0) return 0x102u;
+          slice_ms = (DWORD)(rem < 50 ? rem : 50);
+        }
+        const DWORD r =
+            ::WaitForSingleObject(win_thread_h, slice_ms);
+        if (r == WAIT_OBJECT_0) return 0;
+        if (r == WAIT_ABANDONED) return 0x80u;
+        if (r != WAIT_TIMEOUT) return 0x102u;
+      }
     }
   }
 #endif
