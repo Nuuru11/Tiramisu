@@ -1562,6 +1562,18 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
 // reports partial=1, never kills the watchdog thread.
 // All locals are POD (no C2712: __try + destructibles
 // does not compile). Out-params are MB (>> 20).
+// HeapWalk is desktop-only and NOT declared in the
+// UWP-partition windows.h this TU sees (VirtualQuery /
+// GetProcessHeaps / GetTickCount64 resolve, HeapWalk does
+// not), although kernel32.dll exports it and the link
+// already resolves other kernel32 imports
+// (GetThreadContext, RtlCaptureContext). Declare it
+// locally with its true signature instead of pulling in
+// a desktop header. PROCESS_HEAP_ENTRY itself IS
+// declared (the .240 build failed only on the function
+// name, at the call site).
+extern "C" BOOL WINAPI HeapWalk(HANDLE hHeap,
+                                 LPPROCESS_HEAP_ENTRY lpEntry);
 static inline void trt_mem_split240(unsigned long long* heap_mb,
                                      unsigned* heap_part,
                                      unsigned long long* priv_mb,
