@@ -1214,10 +1214,45 @@ static u32 wait_single_impl(u64 handle, u32 ms, bool alertable) {
 #endif
   if (is_object_ready_locked(o, my_tid)) {
     consume_object_wait_locked(o, my_tid);
+    // .222 DIAG: immediate-return wait -- the Sekiro main
+    // thread (tid=872) spins on its own auto-reset event
+    // here and never reaches the .207 log or the WAIT-PARK
+    // log below, so the spin handle was only ever inferred.
+    // Sample the handle + return value (first 32 + every
+    // 100000th: a tight spin fires millions of waits/s, so
+    // the sample must be sparse).
+    {
+      static unsigned long long s_fast_n = 0;
+      ++s_fast_n;
+      if (s_fast_n <= 32 || (s_fast_n % 100000) == 0) {
+        char fl[256];
+        snprintf(fl, sizeof(fl),
+                 "sync: WAIT-FAST handle=%llx kind=%u tid=%u ret=0 lastset=%u sets=%llu n=%llu",
+                 (unsigned long long)handle, (unsigned)o->kind, my_tid,
+                 o->last_set_tid, (unsigned long long)o->set_count,
+                 s_fast_n);
+        trt_core_log(fl);
+      }
+    }
     return 0;
   }
   if (alertable && drain_apcs_locked(lk, my_tid)) return 0xC0u;
-  if (ms == 0) return 0x102u;
+  if (ms == 0) {
+    // .222 DIAG: zero-timeout poll -- same sparse sample as
+    // WAIT-FAST, so a poll-spin (ret 0x102) is
+    // distinguishable from a signalled-event spin (ret 0).
+    static unsigned long long s_poll_n = 0;
+    ++s_poll_n;
+    if (s_poll_n <= 32 || (s_poll_n % 100000) == 0) {
+      char pl[192];
+      snprintf(pl, sizeof(pl),
+               "sync: WAIT-POLL handle=%llx kind=%u tid=%u ret=0x102 n=%llu",
+               (unsigned long long)handle, (unsigned)o->kind, my_tid,
+               s_poll_n);
+      trt_core_log(pl);
+    }
+    return 0x102u;
+  }
 
   const auto deadline =
       (ms == 0xFFFFFFFFu)

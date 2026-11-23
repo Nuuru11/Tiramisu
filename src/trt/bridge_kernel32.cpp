@@ -5867,9 +5867,8 @@ struct syscall_trap_target {
   u8 orig;
   bool armed;
   bool fired;
-  // .220 DIAG: guest-fire count -- a target re-arms until it has
-  // fired 3 times, so a startup/init burn does not kill the trap
-  // before the death-phase wait; after 3 fires it stays dead.
+  // .220 DIAG: guest-fire count (diagnostic only since .222 --
+  // the cap is per-caller now, the target always re-arms).
   int fires;
 };
 static syscall_trap_target g_syscall_trap_targets[10];
@@ -5994,12 +5993,13 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
     }
     // .220 DIAG: syscall trap -- same INT3+VEH mechanism on the
     // ntdll/kernel32 wait functions (see trt_syscall_trap_install).
-    // Guest caller: log + count the fire. The target re-arms (via
-    // the watchdog tick) until it has fired 3 times, so a
-    // startup/init burn does not kill the trap before the
-    // death-phase wait; after 3 fires it stays dead. Host caller:
-    // restore the byte so the host proceeds, count the trip,
-    // re-arm on the next watchdog tick.
+    // Guest caller: log + count the fire. The target always
+    // re-arms (via the watchdog tick); the cap is per-caller
+    // (3 fires each, .221 budgets, made per-caller-only in
+    // .222), so a startup/init burn cannot kill the trap
+    // before the death-phase wait. Host caller: restore the
+    // byte so the host proceeds, count the trip, re-arm on
+    // the next watchdog tick.
     for (int i = 0; i < 10; ++i) {
       if (g_syscall_trap_targets[i].addr &&
           g_syscall_trap_targets[i].addr == addr) {
@@ -6043,12 +6043,14 @@ static LONG CALLBACK trt_win32_os_veh(PEXCEPTION_POINTERS ep) {
                      (unsigned long long)caller,
                      was_armed ? "" : " RACE");
             trt_core_log(line);
-            const int fires = ++g_syscall_trap_targets[i].fires;
-            if (fires < 3) {
-              g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
-            } else {
-              g_syscall_trap_targets[i].fired = true;
-            }
+            // .222 DIAG: the cap is per-caller-only now --
+            // budgets are per-caller (trap_caller_note_fire,
+            // 3 fires each), so the target-level 3-fire cap
+            // that killed the trap in .220 is gone. The
+            // target always re-arms; fires is kept as a
+            // diagnostic count only.
+            ++g_syscall_trap_targets[i].fires;
+            g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
           } else {
             g_syscall_trap_rearm.store(true, std::memory_order_relaxed);
           }
@@ -7015,11 +7017,14 @@ void gap_trace_dump_if_changed(void) {
     char bl[512];
     snprintf(bl, sizeof(bl), "gap: commit-at-death %s", budget);
     trt_core_log(bl);
-    // .221 DIAG: parked-wait report -- who is parked on what at
-    // death (names the ping-pong partner / the event nothing
-    // sets). trt_sync_parked_log lives in bridge_thread.cpp.
-    trt_sync_parked_log();
   }
+  // .222 DIAG: PARKED report on EVERY dump, not only the final
+  // one -- the final dump never fires on Sekiro (the process
+  // exits <2s after the last bridged call, before the 2s-quiet
+  // branch runs), so the periodic dump is the only one that
+  // fires at death. trt_sync_parked_log lives in
+  // bridge_thread.cpp.
+  trt_sync_parked_log();
 #endif
 }
 

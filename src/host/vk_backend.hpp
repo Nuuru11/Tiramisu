@@ -308,6 +308,30 @@ static u64 g_d3d_buf_created_n = 0;
 static u64 g_d3d_top_bytes = 0;
 static u32 g_d3d_top_w = 0, g_d3d_top_h = 0, g_d3d_top_d = 0;
 static u32 g_d3d_top_fmt = 0;
+// .222 DIAG: remaining video consumers -- the main
+// depth-stencil texture (ds_tex, created in bind()) and the
+// DXGI swapchain backbuffers (created by the swapchain,
+// never through CreateTexture2D, so the .221 ledger never
+// saw them). Plus the last VIDEO-SAMPLE local usage, so
+// d3d_sizes_log can print the unaccounted residual (video
+// usage minus every consumer the bridge logs).
+static u64 g_d3d_ds_bytes = 0;
+static u64 g_d3d_swap_bytes = 0;
+static u32 g_d3d_swap_buffers = 0;
+static u32 g_d3d_swap_w = 0, g_d3d_swap_h = 0, g_d3d_swap_fmt = 0;
+static u64 g_video_last_local_mb = 0;
+static bool g_video_sample_seen = false;
+static inline u32 dxgi_bpp(DXGI_FORMAT fmt) {
+  switch (fmt) {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R32_FLOAT:
+      return 8;
+    case DXGI_FORMAT_R16_FLOAT:
+      return 2;
+    default:
+      return 4;
+  }
+}
 static inline u64 d3d_tex_est_bytes(u32 vk_fmt, UINT w, UINT h, UINT d,
                                     UINT mips, UINT layers) {
   u64 total = 0;
@@ -324,9 +348,21 @@ static inline u64 d3d_tex_est_bytes(u32 vk_fmt, UINT w, UINT h, UINT d,
 static inline void d3d_sizes_log(const char* why) {
   u64 buf_live = 0;
   for (const auto& kv : g_vkrt.bufs) buf_live += kv.second.bytes;
-  char sb[384];
+  // .222 DIAG: unaccounted residual -- video usage from the
+  // last VIDEO-SAMPLE minus every consumer the bridge logs.
+  // If resid stays ~3.6GB, the consumer is a driver/segment
+  // reservation the bridge cannot see (check VIDEO-SAMPLE
+  // resv=); if resid is ~0, the ledger accounts for it.
+  long long resid_mb = -1;
+  if (g_video_sample_seen) {
+    const u64 accounted = g_d3d_tex_live_bytes + buf_live +
+        g_d3d_ds_bytes + g_d3d_swap_bytes;
+    resid_mb = (long long)g_video_last_local_mb -
+        (long long)(accounted >> 20);
+  }
+  char sb[512];
   snprintf(sb, sizeof(sb),
-           "D3D11-SIZES %s tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB buf_created=%lluMB buf_n=%llu top=%ux%ux%u fmt=%u %lluMB",
+           "D3D11-SIZES %s tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB buf_created=%lluMB buf_n=%llu top=%ux%ux%u fmt=%u %lluMB ds=%lluMB swap=%lluMB bufs=%u resid=%lldMB",
            why,
            (unsigned long long)(g_d3d_tex_live_bytes >> 20),
            (unsigned long long)(g_d3d_tex_created_bytes >> 20),
@@ -335,7 +371,10 @@ static inline void d3d_sizes_log(const char* why) {
            (unsigned long long)(g_d3d_buf_created_bytes >> 20),
            (unsigned long long)g_d3d_buf_created_n,
            g_d3d_top_w, g_d3d_top_h, g_d3d_top_d, g_d3d_top_fmt,
-           (unsigned long long)(g_d3d_top_bytes >> 20));
+           (unsigned long long)(g_d3d_top_bytes >> 20),
+           (unsigned long long)(g_d3d_ds_bytes >> 20),
+           (unsigned long long)(g_d3d_swap_bytes >> 20),
+           g_d3d_swap_buffers, resid_mb);
   trt_core_log(sb);
 }
 // Records one texture creation; returns its estimated bytes so
@@ -1356,6 +1395,10 @@ inline void shutdown() {
   }
   if (g_vkrt.main_dsv) { g_vkrt.main_dsv->Release(); g_vkrt.main_dsv = nullptr; }
   if (g_vkrt.ds_tex) { g_vkrt.ds_tex->Release(); g_vkrt.ds_tex = nullptr; }
+  // .222 DIAG: ds/swap counters die with the textures.
+  g_d3d_ds_bytes = 0;
+  g_d3d_swap_bytes = 0;
+  g_d3d_swap_buffers = 0;
   g_vkrt.initialized = false;
 }
 
@@ -1380,6 +1423,39 @@ inline void bind(ID3D11Device1* dev, ID3D11DeviceContext1* ctx,
     dd.BindFlags = D3D11_BIND_DEPTH_STENCIL;
     if (SUCCEEDED(dev->CreateTexture2D(&dd, nullptr, &g_vkrt.ds_tex))) {
       dev->CreateDepthStencilView(g_vkrt.ds_tex, nullptr, &g_vkrt.main_dsv);
+      // .222 DIAG: main depth-stencil texture -- D24+S8 is
+      // 4 bytes/px. One buffer at bind size (1920x1080 is
+      // ~8MB: small, but it is a logged consumer now).
+      g_d3d_ds_bytes = (u64)g_vkrt.width * (u64)g_vkrt.height * 4ull;
+    } else {
+      g_d3d_ds_bytes = 0;
+    }
+  }
+  // .222 DIAG: swapchain backbuffers -- DXGI-owned, never
+  // through CreateTexture2D, so the .221 ledger never saw
+  // them. Size from the real swapchain desc (BufferCount x
+  // W x H x bpp). The D3D11 path uses 2 x B8G8R8A8 (4 B/px),
+  // so 1920x1080 is ~16MB; a 3.7GB consumer cannot hide here,
+  // but the line proves it instead of assuming it.
+  g_d3d_swap_bytes = 0;
+  g_d3d_swap_buffers = 0;
+  if (swap) {
+    DXGI_SWAP_CHAIN_DESC sd{};
+    if (SUCCEEDED(swap->GetDesc(&sd))) {
+      g_d3d_swap_buffers = sd.BufferCount;
+      g_d3d_swap_w = sd.BufferDesc.Width;
+      g_d3d_swap_h = sd.BufferDesc.Height;
+      g_d3d_swap_fmt = (u32)sd.BufferDesc.Format;
+      g_d3d_swap_bytes = (u64)sd.BufferCount *
+          (u64)sd.BufferDesc.Width * (u64)sd.BufferDesc.Height *
+          (u64)dxgi_bpp(sd.BufferDesc.Format);
+      char swb[256];
+      snprintf(swb, sizeof(swb),
+               "D3D11-SIZES SWAPCHAIN buffers=%u %ux%u fmt=%u %lluMB",
+               g_d3d_swap_buffers, g_d3d_swap_w, g_d3d_swap_h,
+               g_d3d_swap_fmt,
+               (unsigned long long)(g_d3d_swap_bytes >> 20));
+      trt_core_log(swb);
     }
   }
   g_vkrt.initialized = (dev && ctx && rtv);
@@ -1425,14 +1501,54 @@ extern "C" void trt_video_sample_log() {
                                            (void**)&adapter3)) &&
         adapter3) {
       DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
-      if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(
-              0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi))) {
-        char vb[256];
+      DXGI_QUERY_VIDEO_MEMORY_INFO vmi_nl{};
+      const bool ok_local = SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+          0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi));
+      const bool ok_nl = SUCCEEDED(adapter3->QueryVideoMemoryInfo(
+          0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vmi_nl));
+      if (ok_local) {
+        // .222 DIAG: (a) BOTH segments + driver reservation
+        // (CurrentReservation) -- which segment holds the
+        // ~3.7GB, and is it a reservation the bridge cannot
+        // allocate? (b) jump vs the previous sample ALONGSIDE
+        // the D3D11 creation totals at this moment (one line,
+        // so a video jump is correlated with creation bursts
+        // IN TIME -- a jump with flat tex_created is
+        // independent of creation; a jump tracking tex_created
+        // names the burst. buf_live is the bufs-map sum, as
+        // in d3d_sizes_log.
+        static unsigned s_sample_n = 0;
+        static unsigned long long s_prev_local_mb = 0;
+        ++s_sample_n;
+        const unsigned long long cur_local_mb =
+            (unsigned long long)(vmi.CurrentUsage >> 20);
+        const long long jump_mb = (s_sample_n == 1)
+            ? 0
+            : (long long)cur_local_mb - (long long)s_prev_local_mb;
+        s_prev_local_mb = cur_local_mb;
+        vk_rt::g_video_last_local_mb = cur_local_mb;
+        vk_rt::g_video_sample_seen = true;
+        u64 buf_live = 0;
+        for (const auto& kv : vk_rt::g_vkrt.bufs) buf_live += kv.second.bytes;
+        char vb[640];
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE budget=%lluMB usage=%lluMB avail=%lluMB",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB",
+                 s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
-                 (unsigned long long)(vmi.CurrentUsage >> 20),
-                 (unsigned long long)(vmi.AvailableForReservation >> 20));
+                 cur_local_mb,
+                 (unsigned long long)(vmi.AvailableForReservation >> 20),
+                 (unsigned long long)(vmi.CurrentReservation >> 20),
+                 ok_nl ? (long long)(vmi_nl.Budget >> 20) : -1ll,
+                 ok_nl ? (long long)(vmi_nl.CurrentUsage >> 20) : -1ll,
+                 ok_nl ? (long long)(vmi_nl.AvailableForReservation >> 20) : -1ll,
+                 ok_nl ? (long long)(vmi_nl.CurrentReservation >> 20) : -1ll,
+                 jump_mb,
+                 (unsigned long long)(vk_rt::g_d3d_tex_live_bytes >> 20),
+                 (unsigned long long)(vk_rt::g_d3d_tex_created_bytes >> 20),
+                 (unsigned long long)vk_rt::g_d3d_tex_created_n,
+                 (unsigned long long)(buf_live >> 20),
+                 (unsigned long long)(vk_rt::g_d3d_ds_bytes >> 20),
+                 (unsigned long long)(vk_rt::g_d3d_swap_bytes >> 20));
         trt_core_log(vb);
       }
       adapter3->Release();

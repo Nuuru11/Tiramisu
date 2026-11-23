@@ -425,11 +425,22 @@ swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w)
           DXGI_QUERY_VIDEO_MEMORY_INFO vmi{};
           HRESULT hr_vmi = adapter30->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &vmi);
           if (SUCCEEDED(hr_vmi)) {
-            char vb[256];
+            // .222 DIAG: BOTH segments + driver reservation at
+            // boot, matching VIDEO-SAMPLE -- is the ~3.7GB a
+            // reservation present from boot, and in which
+            // segment?
+            DXGI_QUERY_VIDEO_MEMORY_INFO vmi_nl{};
+            const bool ok_nl = SUCCEEDED(adapter30->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &vmi_nl));
+            char vb[512];
             snprintf(vb, sizeof(vb),
-                     "[swapchain] VIDEO-BASELINE budget=%lluMB usage=%lluMB avail=%lluMB",
+                     "[swapchain] VIDEO-BASELINE local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB",
                      (unsigned long long)(vmi.Budget >> 20), (unsigned long long)(vmi.CurrentUsage >> 20),
-                     (unsigned long long)(vmi.AvailableForReservation >> 20));
+                     (unsigned long long)(vmi.AvailableForReservation >> 20),
+                     (unsigned long long)(vmi.CurrentReservation >> 20),
+                     ok_nl ? (long long)(vmi_nl.Budget >> 20) : -1ll,
+                     ok_nl ? (long long)(vmi_nl.CurrentUsage >> 20) : -1ll,
+                     ok_nl ? (long long)(vmi_nl.AvailableForReservation >> 20) : -1ll,
+                     ok_nl ? (long long)(vmi_nl.CurrentReservation >> 20) : -1ll);
             trt_core_log(vb);
           } else {
             char vb[128];
