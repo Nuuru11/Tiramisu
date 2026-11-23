@@ -1121,7 +1121,17 @@ struct spin_ip_sample {
   u64 rip_off = 0;
   u64 stkret = 0;
   u64 stkfn = 0;
-  u64 stk[9] = {};
+  // .234 DIAG: 9 -> 24 qwords -- the guest caller of Sleep
+  // (Sekiro) / WaitForSingleObjectEx (Ultrapool) sits deeper
+  // than q8 (the .233 window showed only ntdll/kernel32).
+  u64 stk[24] = {};
+  // .234 DIAG: first guest-image address in stk[] (the guest
+  // caller) + the qword at rdx (Sleep DelayInterval / wait
+  // timeout, read while the target is suspended).
+  u64 stkguest = 0;
+  u64 stkguest_off = 0;
+  u64 rdx_qword = 0;
+  int rdx_qword_ok = 0;
   unsigned stk_n = 0;
   unsigned long sus = 0;
   int ok = 0;
@@ -1157,7 +1167,22 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     s->rdx = (u64)ctx.Rdx;
     s->r8 = (u64)ctx.R8;
     s->r9 = (u64)ctx.R9;
-    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 9) : 0;
+    // .234 DIAG: 9 -> 24 qwords (see struct) + read the qword
+    // at rdx (Sleep DelayInterval / wait timeout) while the
+    // target is still suspended. Direct deref under __try
+    // (the spin_read_stack_qwords pattern): ReadProcessMemory
+    // is desktop-only, undeclared in the UWP SDK partition.
+    s->stk_n = s->rsp ? spin_read_stack_qwords(s->rsp, s->stk, 24) : 0;
+    s->rdx_qword = 0;
+    s->rdx_qword_ok = 0;
+    if (ctx.Rdx) {
+      __try {
+        s->rdx_qword = *(const u64*)(uintptr_t)ctx.Rdx;
+        s->rdx_qword_ok = 1;
+      } __except (EXCEPTION_EXECUTE_HANDLER) {
+        s->rdx_qword_ok = 0;
+      }
+    }
     s->stkret = (s->stk_n > 0) ? s->stk[0] : 0;
   }
   ::ResumeThread(h);
@@ -1176,6 +1201,21 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
     if (s->stk_n > 0) {
       u64 stk_len = 0;
       spin_fn_range(s->stk[0], &s->stkfn, &stk_len);
+    }
+    // .234 DIAG: first guest-image address in the (widened)
+    // stack -- the guest caller of the host function main is
+    // parked in (Sleep / WaitForSingleObjectEx). Same main
+    // image range rip_off uses above.
+    if (img && img->base && img->size_of_image) {
+      const u64 b = (u64)(uintptr_t)img->base;
+      const u64 e = b + img->size_of_image;
+      for (unsigned i = 0; i < s->stk_n; ++i) {
+        if (s->stk[i] >= b && s->stk[i] < e) {
+          s->stkguest = s->stk[i];
+          s->stkguest_off = s->stk[i] - b;
+          break;
+        }
+      }
     }
   }
   return 1;
@@ -2703,9 +2743,9 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
   const unsigned n =
       g_gap_samples_done.fetch_add(1, std::memory_order_relaxed) + 1;
   g_gap_last_sample_ms.store(spin_now_ms(), std::memory_order_relaxed);
-  char sl[512];
+  char sl[640];
   snprintf(sl, sizeof(sl),
-           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx",
+           "sync: GAP-IP-SAMPLE n=%u tid=%u final=%d rip=0x%llx rip_off=0x%llx fn_off=0x%llx fn_len=0x%llx rsp=0x%llx sus=%lu ok=%d ntfn=%s ntoff=0x%llx rcx=0x%llx rdx=0x%llx r8=0x%llx r9=0x%llx stkret=0x%llx stkfn=0x%llx stkguest=0x%llx stkguest_off=0x%llx rdxqw_ok=%d rdxqw=0x%llx",
            n, tid, is_final ? 1 : 0,
            (unsigned long long)s.rip,
            (unsigned long long)s.rip_off,
@@ -2716,19 +2756,73 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
            (unsigned long long)s.rcx, (unsigned long long)s.rdx,
            (unsigned long long)s.r8, (unsigned long long)s.r9,
            (unsigned long long)s.stkret,
-           (unsigned long long)s.stkfn);
+           (unsigned long long)s.stkfn,
+           (unsigned long long)s.stkguest,
+           (unsigned long long)s.stkguest_off,
+           s.rdx_qword_ok,
+           (unsigned long long)s.rdx_qword);
   trt_core_log(sl);
   {
-    char kl[640];
+    // .234 DIAG: 9 -> 24 qwords (see struct).
+    // .234 DIAG: 9 -> 24 qwords (see struct).
+    char kl[1024];
     snprintf(kl, sizeof(kl),
-             "sync: GAP-IP-STACK n=%u rsp=0x%llx n=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx q5=0x%llx q6=0x%llx q7=0x%llx q8=0x%llx",
+             "sync: GAP-IP-STACK n=%u rsp=0x%llx n=%u q0=0x%llx q1=0x%llx q2=0x%llx q3=0x%llx q4=0x%llx q5=0x%llx q6=0x%llx q7=0x%llx q8=0x%llx q9=0x%llx q10=0x%llx q11=0x%llx q12=0x%llx q13=0x%llx q14=0x%llx q15=0x%llx q16=0x%llx q17=0x%llx q18=0x%llx q19=0x%llx q20=0x%llx q21=0x%llx q22=0x%llx q23=0x%llx",
              n, (unsigned long long)s.rsp, s.stk_n,
              (unsigned long long)s.stk[0], (unsigned long long)s.stk[1],
              (unsigned long long)s.stk[2], (unsigned long long)s.stk[3],
              (unsigned long long)s.stk[4], (unsigned long long)s.stk[5],
              (unsigned long long)s.stk[6], (unsigned long long)s.stk[7],
-             (unsigned long long)s.stk[8]);
+             (unsigned long long)s.stk[8], (unsigned long long)s.stk[9],
+             (unsigned long long)s.stk[10], (unsigned long long)s.stk[11],
+             (unsigned long long)s.stk[12], (unsigned long long)s.stk[13],
+             (unsigned long long)s.stk[14], (unsigned long long)s.stk[15],
+             (unsigned long long)s.stk[16], (unsigned long long)s.stk[17],
+             (unsigned long long)s.stk[18], (unsigned long long)s.stk[19],
+             (unsigned long long)s.stk[20], (unsigned long long)s.stk[21],
+             (unsigned long long)s.stk[22], (unsigned long long)s.stk[23]);
     trt_core_log(kl);
+  }
+  // .234 DIAG: name main's Sleep when it is in NtDelayExecution
+  // (Sekiro's second death): the DelayInterval is *rdx
+  // (relative 100ns units, negative) or NULL (rdx==0) for an
+  // infinite sleep. One sample cannot tell a poll loop from
+  // one long sleep, but the up-to-6 gap samples (>=5s apart)
+  // can: repeated finite Sleep samples = a poll loop; a
+  // single INFINITE = main waits on something that never
+  // fires. Diagnostic only: no wake, no fix.
+  if (std::string(s.ntfn) == "ntdll!NtDelayExecution") {
+    char dl[256];
+    if (!s.rdx) {
+      snprintf(dl, sizeof(dl),
+               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0 iv=INFINITE",
+               n, (unsigned long long)s.rcx);
+    } else if (s.rdx_qword_ok) {
+      const long long iv = (long long)s.rdx_qword;
+      if (iv < 0) {
+        snprintf(dl, sizeof(dl),
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=%lld",
+                 n, (unsigned long long)s.rcx,
+                 (unsigned long long)s.rdx, (long long)(-iv / 10000));
+      } else if (iv == 0) {
+        snprintf(dl, sizeof(dl),
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ms=0",
+                 n, (unsigned long long)s.rcx,
+                 (unsigned long long)s.rdx);
+      } else {
+        snprintf(dl, sizeof(dl),
+                 "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_abs=0x%llx",
+                 n, (unsigned long long)s.rcx,
+                 (unsigned long long)s.rdx,
+                 (unsigned long long)s.rdx_qword);
+      }
+    } else {
+      snprintf(dl, sizeof(dl),
+               "sync: GAP-SLEEP n=%u alertable=%llu rdx=0x%llx iv_ok=0",
+               n, (unsigned long long)s.rcx,
+               (unsigned long long)s.rdx);
+    }
+    trt_core_log(dl);
   }
   // Name the waited-on handle when main is in
   // NtWaitForSingleObject (same naming as the loop sampler's
@@ -2775,6 +2869,67 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
                (wtid && wtid == tid) ? 1 : 0,
                (wtid && wexittid && wtid == wexittid) ? 1 : 0);
       trt_core_log(tl);
+    }
+    // .234 DIAG: reverse-map the NT-level host handle to the
+    // bridge object table. Bridge events are emulated (no host
+    // HANDLE), so a host Event is expected to MISS here -- the
+    // miss itself is the finding (the guest got the handle
+    // outside the bridge, via an unbridged CreateEventW).
+    // A hit names the guest handle + creator + set history.
+    // Also scans win_handle (only OBJ_THREAD has one) and the
+    // parked-wait table. try_lock: the gap dump must never
+    // block on g_obj_mu. Diagnostic only: no wake, no fix.
+    {
+      std::unique_lock<std::mutex> lk(g_obj_mu, std::try_to_lock);
+      char rl[512];
+      if (!lk.owns_lock()) {
+        snprintf(rl, sizeof(rl),
+                 "sync: GAP-HANDLE-REV n=%u host=0x%llx bridge=busy",
+                 n, (unsigned long long)s.rcx);
+        trt_core_log(rl);
+      } else {
+        auto* ro = object_for_locked(s.rcx);
+        u64 rguest = 0;
+        u32 rkind = 0;
+        u32 rcreator = 0;
+        u32 rlastset = 0;
+        u64 rsets = 0;
+        int rsig = 0;
+        int rmanual = 0;
+        if (ro) {
+          rguest = s.rcx;
+          rkind = (u32)ro->kind;
+          rcreator = ro->creator_tid;
+          rlastset = ro->last_set_tid;
+          rsets = ro->set_count;
+          rsig = ro->signalled ? 1 : 0;
+          rmanual = ro->manual_reset ? 1 : 0;
+        }
+        u64 rwinguest = 0;
+        for (size_t i = 0; i < g_objects.size(); ++i) {
+          auto& wo = g_objects[i];
+          if (wo.win_handle == (HANDLE)(uintptr_t)s.rcx) {
+            rwinguest = ((u64)wo.generation << 32) |
+                        (0x5B000000u | (u32)i);
+            break;
+          }
+        }
+        int rparked = 0;
+        for (int i = 0; i < 32; ++i) {
+          if (g_parked_waits[i].tid &&
+              g_parked_waits[i].handle == s.rcx) {
+            rparked = 1;
+            break;
+          }
+        }
+        snprintf(rl, sizeof(rl),
+                 "sync: GAP-HANDLE-REV n=%u host=0x%llx bridge=%d guest=%llx kind=%u creator=%u lastset=%u sets=%llu sig=%d manual=%d winhit=%d winguest=%llx parked=%d",
+                 n, (unsigned long long)s.rcx, ro ? 1 : 0,
+                 (unsigned long long)rguest, rkind, rcreator, rlastset,
+                 (unsigned long long)rsets, rsig, rmanual,
+                 rwinguest ? 1 : 0, (unsigned long long)rwinguest, rparked);
+        trt_core_log(rl);
+      }
     }
   }
 #else
