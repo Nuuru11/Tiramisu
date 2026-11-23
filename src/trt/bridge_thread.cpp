@@ -542,6 +542,9 @@ static std::atomic<unsigned long long> g_spin_last_fast_ms{0};
 static std::atomic<bool> g_spin_sampler_started{false};
 static std::atomic<bool> g_spin_worker_exit_seen{false};
 static std::atomic<unsigned> g_spin_samples_done{0};
+// .230 FIX: the WAKE-MAIN SetEvent fires at most once per
+// process run (see the sampler).
+static std::atomic<bool> g_spin_wake_done{false};
 static void spin_main_ip_sampler();
 // .229 DIAG: helpers for the richer MAIN-IP sample (defined
 // after the sampler, before thread_alive_locked).
@@ -549,6 +552,12 @@ static bool spin_host_nearest_export(u64 rip, char* name_buf,
                                      size_t name_cap, u64* off_out);
 static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
                                        unsigned n);
+// .230 FIX-DESIGN: NtQueryObject type (+ name) for the
+// waited-on handle (defined after the sampler, next to
+// the other .229 helpers).
+static bool spin_query_handle_info(HANDLE h, char* type_buf,
+                                   size_t type_cap, char* name_buf,
+                                   size_t name_cap);
 static unsigned long long spin_now_ms() {
   return (unsigned long long)std::chrono::duration_cast<
       std::chrono::milliseconds>(
@@ -628,6 +637,16 @@ static void woke_record(u32 tid, u64 handle) {
 // fn_off 0 for host code). The stack return address [RSP] is
 // resolved through the guest .pdata as well (stkfn=) -- it is
 // where main returns when the host wait ends.
+// .230 FIX: when the sample names ntdll!NtWaitForSingle-
+// Object, the sampler names the waited-on handle (NtQuery-
+// Object type + name) and the stack return address through
+// the host-export enumeration (stkhost= -- .229 left it as
+// the guest .pdata lookup, which reports 0 for host code).
+// When the handle is an Event, the sampler signals it once
+// (WAKE-MAIN) -- the worker that was supposed to signal it
+// has already exited (the sampler only runs after a worker
+// ExitThread), so without the wake main is parked in the
+// wait forever.
 static void spin_main_ip_sampler() {
 #if defined(_WIN32)
   for (int iter = 0; iter < 6000; ++iter) {  // up to ~10 min
@@ -721,6 +740,49 @@ static void spin_main_ip_sampler() {
              (unsigned long long)(stk_n > 0 ? stk[0] : 0),
              (unsigned long long)stk_fn_off);
     trt_core_log(sl);
+    // .230 FIX-DESIGN: name the waited-on handle + the
+    // wrapper, and wake main when the design allows it.
+    // The sampler only runs after a worker ExitThread has
+    // been seen (see the gate above), so by the time this
+    // fires the thread that was supposed to signal the
+    // event is gone -- main is parked forever unless the
+    // bridge signals it. The wake is gated on the handle
+    // type being exactly "Event" (NtQueryObject) and fires
+    // once per process run; any other type is named and
+    // left alone.
+    if (std::string(ntfn) == "ntdll!NtWaitForSingleObject") {
+      char stkhost[160];
+      snprintf(stkhost, sizeof(stkhost), "none");
+      u64 stkoff = 0;
+      if (stk_n > 0)
+        spin_host_nearest_export(stk[0], stkhost, sizeof(stkhost),
+                                 &stkoff);
+      char htype[64];
+      char hname[128];
+      snprintf(htype, sizeof(htype), "unknown");
+      snprintf(hname, sizeof(hname), "none");
+      const bool hok = spin_query_handle_info(
+          (HANDLE)(uintptr_t)rcx, htype, sizeof(htype), hname,
+          sizeof(hname));
+      char hl[384];
+      snprintf(hl, sizeof(hl),
+               "sync: MAIN-HANDLE n=%u handle=0x%llx ok=%d type=%s name=%s stkhost=%s stkoff=0x%llx",
+               n, (unsigned long long)rcx, hok ? 1 : 0, htype,
+               hname, stkhost, (unsigned long long)stkoff);
+      trt_core_log(hl);
+      if (hok && std::string(htype) == "Event" &&
+          !g_spin_wake_done.exchange(true,
+                                     std::memory_order_relaxed)) {
+        const BOOL set_ok = ::SetEvent((HANDLE)(uintptr_t)rcx);
+        const DWORD set_err = set_ok ? 0 : ::GetLastError();
+        char wl[320];
+        snprintf(wl, sizeof(wl),
+                 "sync: WAKE-MAIN n=%u handle=0x%llx type=Event name=%s setevent=%d err=%lu",
+                 n, (unsigned long long)rcx, hname,
+                 set_ok ? 1 : 0, (unsigned long)set_err);
+        trt_core_log(wl);
+      }
+    }
     {
       char kl[640];
       snprintf(kl, sizeof(kl),
@@ -826,6 +888,66 @@ static unsigned spin_read_stack_qwords(u64 rsp, u64* out,
 #else
   (void)rsp; (void)out; (void)n;
   return 0;
+#endif
+}
+
+// .230 FIX-DESIGN: query a handle's type (+ name) via
+// ntdll!NtQueryObject (ObjectTypeInformation = 2,
+// ObjectNameInformation = 1). Same-process query: the guest
+// runs in-process, so the sampler thread can ask about the
+// handle main is waiting on. Returns false when the type
+// cannot be read (bad handle, unknown type); the name is
+// best-effort ("none" when unnamed or unreadable).
+static bool spin_query_handle_info(HANDLE h, char* type_buf,
+                                   size_t type_cap, char* name_buf,
+                                   size_t name_cap) {
+#if defined(_WIN32)
+  typedef long(NTAPI* NtQueryObject_fn)(HANDLE, unsigned long,
+                                        void*, unsigned long,
+                                        unsigned long*);
+  static NtQueryObject_fn fn = nullptr;
+  static bool tried = false;
+  if (!tried) {
+    tried = true;
+    HMODULE ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    if (ntdll)
+      fn = (NtQueryObject_fn)::GetProcAddress(ntdll, "NtQueryObject");
+  }
+  if (!fn || !h) return false;
+  struct uni_str {
+    unsigned short len;
+    unsigned short max;
+    const wchar_t* ptr;
+  };
+  unsigned char buf[512];
+  unsigned long ret_len = 0;
+  if (fn(h, 2, buf, sizeof(buf), &ret_len) != 0) return false;
+  const uni_str* tn = (const uni_str*)buf;
+  if (!tn->ptr || tn->len == 0 || tn->len > 120) return false;
+  unsigned n = 0;
+  for (unsigned i = 0; i < tn->len / 2 && n + 1 < type_cap; ++i) {
+    const wchar_t c = tn->ptr[i];
+    type_buf[n++] = (c < 0x20 || c > 0x7e) ? '?' : (char)c;
+  }
+  type_buf[n] = 0;
+  snprintf(name_buf, name_cap, "none");
+  unsigned char nbuf[256];
+  if (fn(h, 1, nbuf, sizeof(nbuf), &ret_len) == 0) {
+    const uni_str* nm = (const uni_str*)nbuf;
+    if (nm->ptr && nm->len > 0 && nm->len <= 240) {
+      unsigned m = 0;
+      for (unsigned i = 0; i < nm->len / 2 && m + 1 < name_cap; ++i) {
+        const wchar_t c = nm->ptr[i];
+        name_buf[m++] = (c < 0x20 || c > 0x7e) ? '?' : (char)c;
+      }
+      name_buf[m] = 0;
+    }
+  }
+  return true;
+#else
+  (void)h; (void)type_buf; (void)type_cap; (void)name_buf;
+  (void)name_cap;
+  return false;
 #endif
 }
 
