@@ -25,6 +25,9 @@
 // Guest memory-budget ledger (bridge_membudget.cpp); declared extern "C"
 // here as in main.cpp:1034 / bridge_kernel32.cpp:75.
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+// .239 DIAG: bridge memory-budget ledger committed bytes
+// (bridge_membudget.cpp) -- VIDEO-SAMPLE ledger=.
+extern "C" u64 trt_mem_budget_committed(void);
 // .223 DIAG: cross-TU diagnostic accessors (defined in
 // bridge_vulkan.cpp / bridge_kernel32.cpp; declared here,
 // not in trt.h, so trt.h stays untouched). All are
@@ -36,6 +39,7 @@ extern "C" u64 trt_vk_imgs_live_n(void);
 extern "C" u64 trt_vk_imgs_est_bytes(void);
 extern "C" u64 trt_vk_presents(void);
 extern "C" u64 trt_vk_biggest_alloc_bytes(void);
+extern "C" u64 trt_vk_hostvec_live_bytes(void);
 extern "C" u64 trt_video_app_mem_mb(void);
 extern "C" u64 gap_trace_seq(void);
 
@@ -344,11 +348,22 @@ static bool g_video_sample_seen = false;
 // bufs mutation + inside d3d_sizes_log); the watchdog
 // reads ONLY this cached value, never the map. Same
 // pattern as the gap CPU feed.
+// .239 DIAG: cached buffer-shadow total -- the CPU copies
+// hk_sync_image/buffer keep per buffer (buf_rec::shadow),
+// summed alongside buf_live in the same render-thread walk
+// (VIDEO-SAMPLE shadow=). Same atomic pattern as buf_live:
+// the watchdog reads ONLY the cache, never the map.
+static std::atomic<u64> g_d3d_shadow_live_cached{0};
 static std::atomic<u64> g_d3d_buf_live_cached{0};
 static inline void d3d_buf_live_refresh() {
   u64 total = 0;
-  for (const auto& kv : g_vkrt.bufs) total += kv.second.bytes;
+  u64 shadow_total = 0;
+  for (const auto& kv : g_vkrt.bufs) {
+    total += kv.second.bytes;
+    shadow_total += kv.second.shadow.size();
+  }
   g_d3d_buf_live_cached.store(total, std::memory_order_relaxed);
+  g_d3d_shadow_live_cached.store(shadow_total, std::memory_order_relaxed);
 }
 static inline u32 dxgi_bpp(DXGI_FORMAT fmt) {
   switch (fmt) {
@@ -1603,6 +1618,27 @@ extern "C" void trt_video_sample_log() {
             (unsigned long long)gap_trace_seq();
         const unsigned long long appmem_mb =
             (unsigned long long)trt_video_app_mem_mb();
+        // .239 DIAG: CPU-side bridge totals + the app-memory
+        // residual. appresid = AppMemoryUsage minus every
+        // CPU byte the bridge accounts for (host vectors +
+        // buffer shadows): what is left is the guest heap +
+        // driver CPU memory + untracked bridge CPU -- the
+        // ~4.6GB consumer, named by size on every sample.
+        // (Video-side residual is the existing D3D11-SIZES
+        // resid=.) ledger = the bridge memory-budget
+        // committed bytes (266MB at the first .238 texfail
+        // while video was already 3809MB).
+        const unsigned long long hostvec_mb =
+            (unsigned long long)(trt_vk_hostvec_live_bytes() >> 20);
+        const unsigned long long shadow_mb =
+            (unsigned long long)(vk_rt::g_d3d_shadow_live_cached.load(
+                                     std::memory_order_relaxed) >>
+                                 20);
+        const unsigned long long ledger_mb =
+            (unsigned long long)(trt_mem_budget_committed() >> 20);
+        const long long appresid_mb =
+            (long long)appmem_mb - (long long)hostvec_mb -
+            (long long)shadow_mb;
         const bool first_sample = (s_sample_n == 1);
         const long long dtex_n = first_sample
             ? 0 : (long long)tex_n - (long long)s_prev_tex_n;
@@ -1627,7 +1663,7 @@ extern "C" void trt_video_sample_log() {
         s_prev_appmem_mb = appmem_mb;
         char vb[1024];
         snprintf(vb, sizeof(vb),
-                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld",
+                 "[vk_backend] VIDEO-SAMPLE #%u local budget=%lluMB usage=%lluMB avail=%lluMB resv=%lluMB nonlocal budget=%lldMB usage=%lldMB avail=%lldMB resv=%lldMB jump=%+lldMB tex_live=%lluMB tex_created=%lluMB tex_n=%llu buf_live=%lluMB ds=%lluMB swap=%lluMB appmem=%lluMB dappmem=%+lldMB vkalloc=%lluMB vkalloc_n=%llu vkimg_n=%llu vkimg_est=%lluMB presents=%llu calls=%llu dtex_n=%+lld dtex=%+lldMB dvkalloc=%+lldMB dvkimg=%+lld dpres=%+lld dcalls=%+lld hostvec=%lluMB shadow=%lluMB ledger=%lluMB appresid=%+lldMB",
                  s_sample_n,
                  (unsigned long long)(vmi.Budget >> 20),
                  cur_local_mb,
@@ -1647,7 +1683,8 @@ extern "C" void trt_video_sample_log() {
                  appmem_mb, dappmem_mb,
                  vkalloc_mb, vkalloc_n, vkimg_n, vkimg_est_mb,
                  presents, calls,
-                 dtex_n, dtex_mb, dvkalloc_mb, dvkimg, dpres, dcalls);
+                 dtex_n, dtex_mb, dvkalloc_mb, dvkimg, dpres, dcalls,
+                 hostvec_mb, shadow_mb, ledger_mb, appresid_mb);
         trt_core_log(vb);
         // .223 DIAG: VIDEO-BIGJUMP -- on jumps >= 500MB name
         // the largest single allocations alive: if the top
@@ -1659,14 +1696,15 @@ extern "C" void trt_video_sample_log() {
         if (jump_mb >= 500) {
           char bj[1024];
           snprintf(bj, sizeof(bj),
-                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB",
+                   "[vk_backend] VIDEO-BIGJUMP #%u jump=%+lldMB appmem=%lluMB dappmem=%+lldMB tex_n=%llu dtex_n=%+lld tex_created=%lluMB dtex=%+lldMB vkalloc=%lluMB dvkalloc=%+lldMB vkimg_n=%llu dvkimg=%+lld presents=%llu toptex=%lluMB %ux%ux%u fmt=%u biggestvk=%lluMB hostvec=%lluMB appresid=%+lldMB",
                    s_sample_n, jump_mb, appmem_mb, dappmem_mb,
                    tex_n, dtex_n, tex_created_mb, dtex_mb,
                    vkalloc_mb, dvkalloc_mb, vkimg_n, dvkimg, presents,
                    (unsigned long long)(vk_rt::g_d3d_top_bytes >> 20),
                    vk_rt::g_d3d_top_w, vk_rt::g_d3d_top_h, vk_rt::g_d3d_top_d,
                    vk_rt::g_d3d_top_fmt,
-                   (unsigned long long)(trt_vk_biggest_alloc_bytes() >> 20));
+                   (unsigned long long)(trt_vk_biggest_alloc_bytes() >> 20),
+                   hostvec_mb, appresid_mb);
           trt_core_log(bj);
         }
       }

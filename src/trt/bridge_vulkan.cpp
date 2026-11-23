@@ -58,6 +58,12 @@ extern "C" void trt_video_sample_log(void) {}
 static std::atomic<u64> g_vk_alloc_live_bytes{0};
 static std::atomic<u64> g_vk_alloc_live_n{0};
 static std::atomic<u64> g_vk_biggest_alloc_bytes{0};
+// .239 DIAG: CPU host-vector live total -- the sum of the
+// m.data vectors behind host-visible Vulkan memory
+// (VIDEO-SAMPLE hostvec=). Updated under g_vk_mu at every
+// resize/free, so the watchdog reads an exact total, not a
+// recomputed walk. Signed: frees subtract.
+static std::atomic<long long> g_vk_hostvec_live_bytes{0};
 static std::atomic<u64> g_vk_imgs_live_n{0};
 static std::atomic<u64> g_vk_imgs_est_bytes{0};
 static std::atomic<u64> g_vk_presents{0};
@@ -78,6 +84,10 @@ extern "C" u64 trt_vk_presents(void) {
 }
 extern "C" u64 trt_vk_biggest_alloc_bytes(void) {
   return g_vk_biggest_alloc_bytes.load(std::memory_order_relaxed);
+}
+extern "C" u64 trt_vk_hostvec_live_bytes(void) {
+  const long long v = g_vk_hostvec_live_bytes.load(std::memory_order_relaxed);
+  return v > 0 ? (u64)v : 0;
 }
 
 // ---- shader compile cache (settings knob: shader_cache) -------------------
@@ -1863,6 +1873,10 @@ i32 TRT_GUEST_ABI trt_vkAllocateMemory(void* dev_v, const vk_mem_alloc_info* ai,
       m.data.clear();
     }
   }
+  // .239 DIAG: host-vector live total (fresh entry, so the
+  // whole vector is new).
+  g_vk_hostvec_live_bytes.fetch_add((long long)m.data.size(),
+                                    std::memory_order_relaxed);
   char buf[128];
   snprintf(buf, sizeof(buf), "[vulkan] vkAllocateMemory id=%llu size=%llu type=%u host_vec=%zu",
            (unsigned long long)id, (unsigned long long)ai->allocationSize, ai->memoryTypeIndex, m.data.size());
@@ -1905,6 +1919,9 @@ void TRT_GUEST_ABI trt_vkFreeMemory(void* dev_v, u64 mem, const void*) {
     auto it = d->mems.find(mem);
     if (it != d->mems.end()) {
       const u64 freed = it->second.size;
+      // .239 DIAG: drop the freed host vector from hostvec=.
+      g_vk_hostvec_live_bytes.fetch_add(
+          -(long long)it->second.data.size(), std::memory_order_relaxed);
       g_vk_alloc_live_bytes.fetch_sub(freed, std::memory_order_relaxed);
       g_vk_alloc_live_n.fetch_sub(1, std::memory_order_relaxed);
       if (freed >= g_vk_biggest_alloc_bytes.load(std::memory_order_relaxed)) {
@@ -1931,11 +1948,16 @@ i32 TRT_GUEST_ABI trt_vkMapMemory(void* dev_v, u64 mem, u64 offset, u64 size, u3
   u64 need = (size == ~0ULL) ? m.size : offset + size;
   if (need > m.size) need = m.size;
   if (m.data.size() < need && need > 0) {
+    // .239 DIAG: host-vector live total, delta on grow.
+    const u64 hv_old = m.data.size();
     try {
       m.data.resize((size_t)std::max<u64>(need, 16u));
     } catch (...) {
       return VK_ERROR_OUT_OF_HOST_MEMORY_V;
     }
+    g_vk_hostvec_live_bytes.fetch_add(
+        (long long)m.data.size() - (long long)hv_old,
+        std::memory_order_relaxed);
   }
   if (offset >= m.data.size()) return VK_ERROR_OUT_OF_DEVICE_MEMORY_V;
   m.mapped = true;

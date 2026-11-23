@@ -103,6 +103,7 @@ static bool webxfer_throttle(std::atomic<long long>& last_ms,
 static std::atomic<long long> s_http_accept_last_ms{0};
 static std::atomic<long long> s_http_worker_last_ms{0};
 static std::atomic<long long> s_http_status_last_ms{0};
+static std::atomic<long long> s_http_respond_last_ms{0};
 
 // In-flight upload guard (item 8): concurrent upload streams to DIFFERENT
 // files are the whole point of parallelism, but two streams writing the
@@ -1037,12 +1038,40 @@ void send_all(sock_t s, const char* data, size_t len) {
 
 void respond(sock_t s, const char* code, const char* ctype,
              const std::string& body) {
+  // .239 DIAG: bracket send_all -- the .238 Sekiro anomaly
+  // (GAP-HTTP-STATUS fired but the t+45s poll timed out,
+  // handler ran, wait_ms=0) points at/after respond() /
+  // send_all(). BEFORE without AFTER names a block inside
+  // send_all; AFTER with ms~=30000 names the SO_SNDTIMEO
+  // expiry. Throttled to one pair per 30s so /api/logs and
+  // polling dashboards do not spam the log. Does NOT change
+  // /api/stop behavior; does NOT touch g_mu.
+  const auto resp_t0 = std::chrono::steady_clock::now();
+  const bool resp_log = webxfer_throttle(s_http_respond_last_ms, 30000);
+  if (resp_log) {
+    char rb[192];
+    snprintf(rb, sizeof(rb),
+             "webxfer: GAP-HTTP-RESPOND-BEFORE code=%s bytes=%zu",
+             code, body.size());
+    log_line(rb);
+  }
   char hdr[256];
   int hl = snprintf(hdr, sizeof(hdr),
                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
                     "Connection: close\r\n\r\n", code, ctype, body.size());
   if (hl > 0) send_all(s, hdr, (size_t)hl);
   if (!body.empty()) send_all(s, body.data(), body.size());
+  if (resp_log) {
+    const long long resp_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - resp_t0)
+            .count();
+    char ra[192];
+    snprintf(ra, sizeof(ra),
+             "webxfer: GAP-HTTP-RESPOND-AFTER ms=%lld code=%s",
+             resp_ms, code);
+    log_line(ra);
+  }
 }
 
 // Send one HTTP/1.1 chunked-transfer chunk (hex length, data, CRLF).
