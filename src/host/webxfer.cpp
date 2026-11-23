@@ -81,6 +81,29 @@ namespace {
 std::mutex g_mu;
 webxfer_state g;
 
+// .238 DIAG: throttle for the HTTP instrumentation lines -- at
+// most one line per interval per call site, so a polling
+// dashboard does not spam tiramisu.log. Returns true when the
+// line may be logged (and records the timestamp).
+static bool webxfer_throttle(std::atomic<long long>& last_ms,
+                             long long interval_ms) {
+  const long long now =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  long long prev = last_ms.load(std::memory_order_relaxed);
+  if (now - prev < interval_ms) return false;
+  // NOTE: prev must be non-const -- compare_exchange_strong
+  // takes the expected value by reference and updates it on
+  // failure (a const here fails to compile -- caught by the
+  // .238 build).
+  return last_ms.compare_exchange_strong(prev, now,
+                                         std::memory_order_relaxed);
+}
+static std::atomic<long long> s_http_accept_last_ms{0};
+static std::atomic<long long> s_http_worker_last_ms{0};
+static std::atomic<long long> s_http_status_last_ms{0};
+
 // In-flight upload guard (item 8): concurrent upload streams to DIFFERENT
 // files are the whole point of parallelism, but two streams writing the
 // SAME file would interleave bytes and fail verification. The registry
@@ -1227,7 +1250,64 @@ void handle_client(sock_t s) {
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
-    std::lock_guard<std::mutex> lk(g_mu);
+    // .238 FIX: serve /api/status WITHOUT holding g_mu across
+    // the response -- the .237 priority fix did NOT cure the
+    // :9127 deafness during guest runs, and the status handler
+    // was the prime g_mu suspect (it held the lock across the
+    // whole snprintf+respond). Snapshot the fields under a
+    // brief scoped lock, release it, then format + respond
+    // lock-free. Also measures the g_mu wait: if acquiring
+    // the lock ever takes >20ms, that names g_mu contention
+    // as the deafness cause (GAP-STATUS-GMUWAIT). Does NOT
+    // change /api/stop behavior.
+    const auto t0 = std::chrono::steady_clock::now();
+    bool running = false;
+    std::string running_game, url, last_upload, last_error, launch_name,
+        last_launch_result, last_launch_name, ap_game, ap_result;
+    bool launch_requested = false;
+    int ap_attempt = 0;
+    unsigned long long upload_done = 0, upload_total = 0;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      running = g.running;
+      running_game = g.running_game;
+      url = g.url;
+      last_upload = g.last_upload;
+      last_error = g.last_error;
+      launch_requested = g.launch_requested;
+      launch_name = g.launch_name;
+      last_launch_result = g.last_launch_result;
+      last_launch_name = g.last_launch_name;
+      ap_game = g_ap.game;
+      ap_attempt = g_ap.attempt;
+      ap_result = g_ap.result;
+      upload_done = g_upload_done.load();
+      upload_total = g_upload_total.load();
+    }
+    const long long wait_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0)
+            .count();
+    if (wait_ms > 20) {
+      char wl[128];
+      snprintf(wl, sizeof(wl),
+               "webxfer: GAP-STATUS-GMUWAIT ms=%lld guest=%s", wait_ms,
+               running_game.empty() ? "0" : "1");
+      log_line(wl);
+    }
+    // .238 DIAG: prove the worker REACHED the handler during a
+    // guest run (throttled) -- ACCEPT without WORKERSTART means
+    // thread spawn/start is blocked; WORKERSTART without this
+    // line means recv/parse is blocked; this line without a
+    // response means respond/send is blocked.
+    if (!running_game.empty() &&
+        webxfer_throttle(s_http_status_last_ms, 30000)) {
+      char hl[160];
+      snprintf(hl, sizeof(hl),
+               "webxfer: GAP-HTTP-STATUS guest=1 game=%s wait_ms=%lld",
+               running_game.c_str(), wait_ms);
+      log_line(hl);
+    }
     char buf[1024];
     snprintf(buf, sizeof(buf),
              "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
@@ -1237,22 +1317,19 @@ void handle_client(sock_t s) {
              "\"autopilot_game\":\"%s\",\"autopilot_attempt\":%d,"
              "\"autopilot_result\":\"%s\","
              "\"upload_done\":%llu,\"upload_total\":%llu}",
-             g.running ? "true" : "false",
+             running ? "true" : "false",
              // running = the server is listening; guest_running = a guest is
              // actually launched (running_game is set on launch, cleared on exit)
-             !g.running_game.empty() ? "true" : "false",
-             json_escape(g.running_game).c_str(),
-             json_escape(g.url).c_str(),
-             json_escape(g.last_upload).c_str(),
-             json_escape(g.last_error).c_str(),
-             g.launch_requested ? "true" : "false",
-             json_escape(g.launch_name).c_str(),
-             json_escape(g.last_launch_result).c_str(),
-             json_escape(g.last_launch_name).c_str(),
-             json_escape(g_ap.game).c_str(), g_ap.attempt,
-             g_ap.result.c_str(),
-             (unsigned long long)g_upload_done.load(),
-             (unsigned long long)g_upload_total.load());
+             !running_game.empty() ? "true" : "false",
+             json_escape(running_game).c_str(), json_escape(url).c_str(),
+             json_escape(last_upload).c_str(),
+             json_escape(last_error).c_str(),
+             launch_requested ? "true" : "false",
+             json_escape(launch_name).c_str(),
+             json_escape(last_launch_result).c_str(),
+             json_escape(last_launch_name).c_str(),
+             json_escape(ap_game).c_str(), ap_attempt, ap_result.c_str(),
+             upload_done, upload_total);
     respond(s, "200 OK", "application/json", buf);
     return;
   }
@@ -1685,6 +1762,16 @@ void listener_thread() {
   ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   while (!g_stop) {
     sock_t c = accept(g_listener, nullptr, nullptr);
+    // .238 DIAG: prove the listener ACCEPTED during a guest run
+    // (throttled) -- accept without a later WORKERSTART means
+    // the worker thread never started; no ACCEPT at all means
+    // the listener itself is stuck.
+    if (c != kBadSock && webxfer_throttle(s_http_accept_last_ms, 10000)) {
+      char al[96];
+      snprintf(al, sizeof(al), "webxfer: GAP-HTTP-ACCEPT workers=%d",
+               (int)g_workers.load());
+      log_line(al);
+    }
     if (c == kBadSock) {
       if (g_stop) break;
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -1714,6 +1801,13 @@ void listener_thread() {
         // refuses new connections. One notch up.
         ::SetThreadPriority(::GetCurrentThread(),
                             THREAD_PRIORITY_ABOVE_NORMAL);
+        // .238 DIAG: prove the worker thread STARTED during a
+        // guest run (throttled) -- ACCEPT without this line
+        // means thread creation/startup is blocked (loader
+        // lock / heap / scheduler).
+        if (webxfer_throttle(s_http_worker_last_ms, 10000)) {
+          log_line("webxfer: GAP-HTTP-WORKERSTART");
+        }
         handle_client(c);  // sock_guard closes c
         g_workers.fetch_sub(1);
       }).detach();
