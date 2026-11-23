@@ -70,6 +70,46 @@ static int vfs_mkdir_one(const char* p) { return mkdir(p, 0755); }
 static int vfs_rmdir_one(const char* p) { return rmdir(p); }
 #endif
 
+// .235 FIX: long-path fopen retry -- the .234 mkdir fix proved
+// the host Win32 layer fails 248-252-char paths with
+// ERROR_FILENAME_EXCED_RANGE (206) and the long-path retry
+// succeeds. The shader-cache FILE paths are ~10-20 chars
+// longer than the dir paths, so they fail the same way -- but
+// the opens never reach CreateFileW (0 witness hits in .234),
+// they go through the CRT fopen funnel (open_vfs_file) and
+// trt_CreateFileW, both of which end in host fopen. Retry the
+// same way here, once, only on failure, only for
+// drive-absolute paths (the prefix names the same file, it
+// does not change the target). g_vfs_fopen_retry_used records
+// which step served the open (0 plain / 1 retry / -1 both
+// failed) for the snapshot-only witnesses to read; the value
+// is per-call (a race between threads can only misattribute
+// a diagnostic, never the open itself). Outside the anonymous
+// namespace + extern "C" (cross-TU, .233 link lesson).
+extern "C" int g_vfs_fopen_retry_used = 0;
+extern "C" FILE* trt_vfs_fopen_retry(const char* host, const char* mode) {
+  g_vfs_fopen_retry_used = 0;
+  if (!host || !mode) { g_vfs_fopen_retry_used = -1; return nullptr; }
+  FILE* f = fopen(host, mode);
+  if (f) return f;
+#if defined(_WIN32)
+  if (host[0] && host[1] == ':' &&
+      (host[2] == (char)92 || host[2] == (char)47)) {
+    size_t n = 0;
+    while (host[n]) ++n;
+    if (n + 4 < 1024) {
+      char lp[1028];
+      lp[0] = (char)92; lp[1] = (char)92; lp[2] = (char)63; lp[3] = (char)92;
+      for (size_t i = 0; i <= n; ++i) lp[4 + i] = host[i];
+      f = fopen(lp, mode);
+      if (f) { g_vfs_fopen_retry_used = 1; return f; }
+    }
+  }
+#endif
+  g_vfs_fopen_retry_used = -1;
+  return nullptr;
+}
+
 namespace {
 
 char lower_of(char c) { return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c; }

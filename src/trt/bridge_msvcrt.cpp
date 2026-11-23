@@ -1069,6 +1069,11 @@ void* TRT_GUEST_ABI crt_signal(i32 sig, void* fn) {
   return prev;
 }
 
+// .235 FIX: long-path fopen retry (vfs.cpp) -- the shader-cache file
+// opens land here (CRT funnel), not in CreateFileW (0 witness hits
+// in .234). Declared here, not in trt.h (breadth-agent-owned).
+extern "C" FILE* trt_vfs_fopen_retry(const char* host, const char* mode);
+
 // ---------- FILE* / VFS I/O -----------------------------------------------
 msvcrt_FILE* open_vfs_file(const char* p8, const u16* p16, const char* m) {
   if ((!p8 && !p16) || !m) { set_errno_from_host(EINVAL); return nullptr; }
@@ -1097,7 +1102,7 @@ msvcrt_FILE* open_vfs_file(const char* p8, const u16* p16, const char* m) {
       }
     }
   }
-  FILE* osf = fopen(host, m);
+  FILE* osf = trt_vfs_fopen_retry(host, m);
   if (!osf) {
     set_errno_from_host(errno);
     return nullptr;
