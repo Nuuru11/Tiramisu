@@ -100,7 +100,15 @@ extern "C" FILE* trt_vfs_fopen_retry(const char* host, const char* mode) {
     if (n + 4 < 1024) {
       char lp[1028];
       lp[0] = (char)92; lp[1] = (char)92; lp[2] = (char)63; lp[3] = (char)92;
-      for (size_t i = 0; i <= n; ++i) lp[4 + i] = host[i];
+      // .236 FIX: host paths use '/' separators (join_norm), but the
+      // \\?\ prefix disables slash normalization -- a \\?\ path
+      // with '/' fails, so the .235 retry failed every long open
+      // with via=-1 errno=2 even though the parent dirs exist.
+      // (The .234 mkdir retry works precisely because
+      // vfs_mkdir_one converts '/' -> '\\' first.) Copy with
+      // '/' -> '\\' so the retry names the same file.
+      for (size_t i = 0; i <= n; ++i)
+        lp[4 + i] = (host[i] == (char)47) ? (char)92 : host[i];
       f = fopen(lp, mode);
       if (f) { g_vfs_fopen_retry_used = 1; return f; }
     }
