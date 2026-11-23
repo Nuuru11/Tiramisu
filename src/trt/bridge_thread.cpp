@@ -1147,6 +1147,24 @@ struct spin_ip_sample {
 // stack return address. No logging inside: callers log after the
 // target resumes. Returns 1 on success, 0 when the thread could
 // not be opened, -1 when it could not be suspended.
+// .237 DIAG: one-line stage marker for spin_capture_ip --
+// brackets the fault (see the .236 guard comment inside the
+// function). Called after each step of the capture; the last
+// marker seen before a HOST UNHANDLED names the step that
+// faulted. The .236 fault fires after the 2nd GAP-CAPTURE-TRY
+// with no GAP-IP-SAMPLE / GAP-CAPTURE-FAULT / capture-fail
+// between TRY and fault, so it is NOT in the __try-guarded
+// regions (the guard would return -2 and log FAULT) -- it is
+// in an unguarded call (OpenThread / SuspendThread /
+// ResumeThread / CloseHandle) or in the sampler's post-capture
+// logging. Diagnostic only.
+static void spin_capture_stage(u32 tid, const char* stage) {
+  char sl[96];
+  snprintf(sl, sizeof(sl), "sync: GAP-CAPTURE-STAGE tid=%u stage=%s",
+           tid, stage);
+  trt_core_log(sl);
+}
+
 static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
 #if defined(_WIN32)
   if (!tid || !s) return 0;
@@ -1154,11 +1172,13 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
                               THREAD_QUERY_INFORMATION,
                           FALSE, tid);
   if (!h) return 0;
+  spin_capture_stage(tid, "open");
   const DWORD sus = ::SuspendThread(h);
   if (sus == (DWORD)-1) {
     ::CloseHandle(h);
     return -1;
   }
+  spin_capture_stage(tid, "suspend");
   // .236 FIX: guard the capture -- both .235 Ultrapool runs crashed
   // on the watchdog thread immediately after a GAP-HOOK dump with
   // stid!=0, with no GAP-IP-SAMPLE line between the dump and the
@@ -1201,8 +1221,11 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     cap_rc = -2;
   }
+  spin_capture_stage(tid, "context");
   ::ResumeThread(h);
+  spin_capture_stage(tid, "resume");
   ::CloseHandle(h);
+  spin_capture_stage(tid, "close");
   if (cap_rc == -2) return -2;
   // Fn lookup AFTER resume (see the header comment).
   __try {
@@ -1239,6 +1262,7 @@ static int spin_capture_ip(u32 tid, spin_ip_sample* s) {
   } __except (EXCEPTION_EXECUTE_HANDLER) {
     return -2;
   }
+  spin_capture_stage(tid, "fnlookup");
   return 1;
 #else
   (void)tid;
@@ -2759,6 +2783,30 @@ extern "C" void spin_sample_main_ip_gap(u32 tid, int is_final) {
              g_gap_samples_done.load(std::memory_order_relaxed));
     trt_core_log(tl);
   }
+  // .237 DIAG: HOST SYMS, once -- the RVAs of the capture-path
+  // functions, so a faulting fn RVA from trt_host_fn_range
+  // (HOST FN line, snapshot-only main delta) can be matched to
+  // a name offline with no symbols and no game-file inspection.
+  // Logged before the first capture, so it survives even if
+  // the first capture faults. RVAs (addr - exe base), so they
+  // match the HOST FN RVA across runs of the same build.
+  {
+    static std::atomic<unsigned> s_syms_logged{0};
+    if (s_syms_logged.exchange(1, std::memory_order_relaxed) == 0) {
+      const unsigned long long eb =
+          (unsigned long long)(uintptr_t)::GetModuleHandleW(nullptr);
+      char yl[512];
+      snprintf(yl, sizeof(yl),
+               "sync: HOST SYMS capture_ip=0x%llx sample_gap=0x%llx "
+               "read_stack=0x%llx fn_range=0x%llx nearest_export=0x%llx",
+               (unsigned long long)((uintptr_t)&spin_capture_ip - eb),
+               (unsigned long long)((uintptr_t)&spin_sample_main_ip_gap - eb),
+               (unsigned long long)((uintptr_t)&spin_read_stack_qwords - eb),
+               (unsigned long long)((uintptr_t)&spin_fn_range - eb),
+               (unsigned long long)((uintptr_t)&spin_host_nearest_export - eb));
+      trt_core_log(yl);
+    }
+  }
   if (tid == g_gap_capture_fault_tid.load(std::memory_order_relaxed)) {
     char fl[128];
     snprintf(fl, sizeof(fl), "sync: GAP-CAPTURE-SKIP tid=%u faulted",
@@ -3060,6 +3108,106 @@ extern "C" void trt_host_crash_addr(u64 addr, char* buf, size_t cap) {
     return;
   }
   snprintf(buf, cap, "none");
+}
+
+// .237 DIAG: resolve a HOST address to its containing function
+// in the exe's own .pdata (RUNTIME_FUNCTION table) -- the
+// faulting function's exact RVA + length, where the
+// nearest-export attribution (trt_host_crash_addr) is weak
+// (the exe exports few functions, so the nearest export can
+// be ~800KB away, as in .236: F3DAudioCheckInitParams+
+// 0xc146c). The HOST UNHANDLED filter (snapshot-only main
+// delta) logs the RVA+len; the .237 run names the faulting
+// function by matching the RVA against the HOST SYMS line
+// (logged on the first GAP-CAPTURE-TRY). Same PE-header walk
+// as spin_host_nearest_export (no new UWP-partition APIs);
+// __try-guarded reads (a torn PE header must not fault the
+// filter). Outside the anonymous namespace + extern "C"
+// (cross-TU, .233 link lesson). Returns 1 on success
+// (rip_rva/fn_rva/fn_len set), 0 otherwise.
+extern "C" int trt_host_fn_range(unsigned long long addr,
+                                 unsigned long long* rip_rva,
+                                 unsigned long long* fn_rva,
+                                 unsigned long long* fn_len) {
+  if (rip_rva) *rip_rva = 0;
+  if (fn_rva) *fn_rva = 0;
+  if (fn_len) *fn_len = 0;
+  if (!addr) return 0;
+#if defined(_WIN32)
+  int rc = 0;
+  __try {
+    HMODULE exe = ::GetModuleHandleW(nullptr);
+    if (!exe) return 0;
+    const unsigned char* base = (const unsigned char*)exe;
+    if (*(const unsigned short*)base != 0x5A4D) return 0;
+    const unsigned long pe_off = *(const unsigned long*)(base + 0x3C);
+    if (pe_off > 4096) return 0;
+    const IMAGE_NT_HEADERS64* nt =
+        (const IMAGE_NT_HEADERS64*)(base + pe_off);
+    if (nt->Signature != 0x4550) return 0;
+    if (nt->OptionalHeader.Magic != 0x20B) return 0;
+    const IMAGE_DATA_DIRECTORY& dd =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (!dd.VirtualAddress || !dd.Size) return 0;
+    const unsigned long count = dd.Size / 12;
+    if (count == 0 || count > 1000000) return 0;
+    const unsigned long long b = (unsigned long long)(uintptr_t)exe;
+    if (addr < b) return 0;
+    const unsigned long rva = (unsigned long)(addr - b);
+    if (rip_rva) *rip_rva = (unsigned long long)rva;
+    const unsigned char* pdata = base + dd.VirtualAddress;
+    unsigned long lo = 0, hi = count;
+    while (lo < hi) {
+      const unsigned long mid = lo + (hi - lo) / 2;
+      const unsigned long begin =
+          *(const unsigned long*)(pdata + mid * 12);
+      const unsigned long end =
+          *(const unsigned long*)(pdata + mid * 12 + 4);
+      if (rva < begin) {
+        hi = mid;
+      } else if (rva >= end) {
+        lo = mid + 1;
+      } else {
+        if (fn_rva) *fn_rva = (unsigned long long)begin;
+        if (fn_len) *fn_len = (unsigned long long)(end - begin);
+        rc = 1;
+        break;
+      }
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    rc = 0;
+  }
+  return rc;
+#else
+  (void)addr;
+  return 0;
+#endif
+}
+
+// .237 DIAG: query a handle's type (+ name) for the GAP-WAIT-HOST
+// line in the snapshot-only kernel32 delta2 (the
+// NtWaitForSingleObject trap path). Wraps spin_query_handle_info
+// (same NtQueryObject call the .235 GAP-HANDLE line used).
+// Outside the anonymous namespace + extern "C" (cross-TU, .233
+// link lesson). Returns 1 when the type was read.
+extern "C" int trt_host_handle_type(void* h, char* type_buf,
+                                    size_t type_cap, char* name_buf,
+                                    size_t name_cap) {
+  if (!type_buf || type_cap == 0) return 0;
+  type_buf[0] = 0;
+  if (name_buf && name_cap > 0) name_buf[0] = 0;
+  if (!h) return 0;
+#if defined(_WIN32)
+  return spin_query_handle_info(h, type_buf, type_cap, name_buf,
+                                name_cap)
+             ? 1
+             : 0;
+#else
+  (void)h;
+  (void)name_buf;
+  (void)name_cap;
+  return 0;
+#endif
 }
 
 extern "C" void trt_sync_parked_log(void) {
