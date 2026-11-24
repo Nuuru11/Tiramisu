@@ -616,6 +616,40 @@ No Linux or coding tools required to install a release on your Xbox.
 5. Under **My games & apps → Add**, upload the `.msix` you chose. When prompted for the signing certificate (or under Dev Home certificate management), import the matching `.cer` into **TrustedPeople**.
    *(From a Linux dev PC you can also deploy with `DP_HOST=<console-ip> DP_PASS=<portal-pass> tools/deploy.sh install out/Tiramisu.msix out/dev.cer`.)*
 
+#### The `.cer` file — what it is and how to add it
+
+The `.cer` is the **signing certificate**, not a dependency or an app. It tells
+Xbox to trust the signature on the `.msix`. Never put it in the Dependencies
+list; upload **only the `.msix`** as the app.
+
+1. Find the console IP in **Dev Home → Network** (or the Device Portal URL shown
+   there). It looks like `10.0.0.23`, so the portal is `https://10.0.0.23:11443`.
+2. On a PC or phone on the same network, open that URL in Edge or Chrome. The
+   browser will warn about a self-signed certificate — choose **Advanced →
+   Continue** (this is normal for a Dev Mode console).
+3. Sign in with the Dev Home account if prompted.
+4. Trust the matching certificate:
+   - **My games & apps → Add** often shows a certificate field during the
+     install — select `dev.cer` there (or `edge-dev.cer` for the KBM build).
+   - Alternatively, use Dev Home / Device Portal's **certificate management**
+     screen and install it into **TrustedPeople**. The exact menu name varies
+     slightly between Xbox OS builds; look for "Certificate", "Trusted
+     certificates" or "Manage certificates".
+5. Still under **My games & apps → Add**, choose **only** `Tiramisu.msix` (or
+   `Tiramisu-EdgeSpoof.msix`). Wait for the status to show success, then launch
+   the app from Dev Home / My games & apps.
+
+Correct pairs:
+
+| Package | Certificate |
+|---|---|
+| `Tiramisu.msix` | `dev.cer` |
+| `Tiramisu-EdgeSpoof.msix` | `edge-dev.cer` |
+
+If you mix them, install fails with `0x8007000B` (publisher/signature mismatch).
+If the app installs but closes instantly, check that "Treat UWP apps as games by
+default" is ON and pull `LocalState\tiramisu.log` through Device Portal.
+
 ### 2. Transfer games & play
 
 - **Over Wi-Fi / LAN:** Launch **Tiramisu** on Xbox, scan the **QR code** (or open `http://<xbox-ip>:9127` on PC/phone):
