@@ -98,7 +98,11 @@ DEFAULT_TWEAK = {
 
 def detect_generation(os_info):
     """Return e.g. 'series_s' or None. Never guesses from nothing."""
-    model = (os_info.get("Platform", {}).get("Model")
+    if not isinstance(os_info, dict):
+        return None, ""
+    platform = os_info.get("Platform")
+    platform_model = platform.get("Model") if isinstance(platform, dict) else platform
+    model = (platform_model
              or os_info.get("ConsoleType")
              or os_info.get("ProductId")
              or os_info.get("ConsoleModel")
