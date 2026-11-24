@@ -348,9 +348,11 @@ int main() {
   // 8b. Pre-launch PE compat badges + save backup/restore + debug bundle endpoints
   {
     const std::string cgame = root + "/games/Compat32";
-    std::string mk = "mkdir -p '" + cgame + "' '" + root + "/drive_c/users/SaveDir' '" + root + "/profiles'";
+    const std::string agame = root + "/games/CompatArm64";
+    std::string mk = "mkdir -p '" + cgame + "' '" + agame + "' '" +
+                     root + "/drive_c/users/SaveDir' '" + root + "/profiles'";
     (void)system(mk.c_str());
-    // Minimal 32-bit x86 PE header (Machine = 0x014C)
+    // Minimal 32-bit x86 PE header (Machine = 0x014C) -> supported via x86 JIT
     uint8_t pe32[256] = {};
     pe32[0] = 'M'; pe32[1] = 'Z';
     pe32[0x3C] = 0x80;
@@ -360,11 +362,18 @@ int main() {
     pe32[0x98] = 0x0B; pe32[0x99] = 0x01; // PE32 magic
     FILE* pf = fopen((cgame + "/Compat32.exe").c_str(), "wb");
     if (pf) { fwrite(pe32, 1, sizeof(pe32), pf); fclose(pf); }
+    // Minimal ARM64 PE header (Machine = 0xAA64) -> flagged unsupported
+    uint8_t arm64[256] = {};
+    memcpy(arm64, pe32, sizeof(pe32));
+    arm64[0x84] = 0x64; arm64[0x85] = 0xAA;
+    FILE* af = fopen((agame + "/CompatArm64.exe").c_str(), "wb");
+    if (af) { fwrite(arm64, 1, sizeof(arm64), af); fclose(af); }
     std::string gl_compat = http_req(port, "GET", "/games", "");
     CHECK(gl_compat.find("Compat32") != std::string::npos &&
-              gl_compat.find("32-bit x86 (Unsupported)") != std::string::npos &&
+              gl_compat.find("x86 32-bit (JIT)") != std::string::npos &&
+              gl_compat.find("ARM64 (Unsupported)") != std::string::npos &&
               gl_compat.find("\"compat_ok\":false") != std::string::npos,
-          "/games flags 32-bit x86 executables as unsupported pre-launch");
+          "/games tags 32-bit x86 as JIT and flags ARM64 as unsupported");
 
     // An Xbox GDK / GameOS console payload is x64 but not a Win32 target.
     // The dashboard must say so instead of showing a misleading D3D11 badge.

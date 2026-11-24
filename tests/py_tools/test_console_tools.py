@@ -64,15 +64,25 @@ class TestGameStage(unittest.TestCase):
         self.assertEqual(record["exe"], "bin\\x64\\game.exe")
         self.assertEqual(len(record["exe_sha256"]), 64)
 
-    def test_refuses_pe32(self):
+    def test_stages_pe32_via_jit(self):
         write_pe(os.path.join(self.game, "bin", "x64", "game.exe"), 0x014C)
         result = self.stage("--exe", "bin/x64/game.exe")
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        with open(os.path.join(self.tmp, "out", "staging.json"), encoding="utf-8") as f:
+            record = json.load(f)
+        self.assertEqual(record["machine"], "0x014c")
+
+    def test_refuses_arm64(self):
+        write_pe(os.path.join(self.game, "bin", "x64", "game.exe"), 0xAA64)
+        result = self.stage("--exe", "bin/x64/game.exe")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("PE32", result.stderr + result.stdout)
+        self.assertIn("ARM64", result.stderr + result.stdout)
         self.assertFalse(os.path.exists(os.path.join(self.tmp, "out")))
 
     def test_force_32bit_stages_with_warning(self):
-        write_pe(os.path.join(self.game, "bin", "x64", "game.exe"), 0x014C)
+        # Keep the flag wired for scripts; PE32 is now the default, so force
+        # applies to the remaining unsupported arch (ARM64).
+        write_pe(os.path.join(self.game, "bin", "x64", "game.exe"), 0xAA64)
         result = self.stage("--exe", "bin/x64/game.exe", "--force-32bit")
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("WARNING", result.stdout)

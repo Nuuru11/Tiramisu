@@ -735,7 +735,7 @@ void scan_compat_stream(std::istream& f, char* out, unsigned cap) {
   const u16 opt_magic = (u16)(hdr[e_lfanew + 24] | (hdr[e_lfanew + 25] << 8));
   const char* arch;
   if (machine == 0x8664 && opt_magic == 0x20B) arch = "x64";
-  else if (machine == 0x014C) arch = "x86 32-bit (unsupported)";
+  else if (machine == 0x014C) arch = "x86 32-bit (JIT)";
   else if (machine == 0xAA64) arch = "ARM64 (unsupported)";
   else arch = "unknown arch";
 
@@ -1047,7 +1047,7 @@ void refresh_storage_stats() {
 std::wstring infer_engine_label(const game_entry& ge) {
   const std::string c = lower_ascii(ge.compat);
   if (c.find("anti-cheat") != std::string::npos) return L"Anti-Cheat (Blocked)";
-  if (c.find("32-bit") != std::string::npos) return L"32-bit x86 (Unsupported)";
+  if (c.find("32-bit") != std::string::npos) return L"x86 32-bit (JIT)";
   if (c.find("arm64") != std::string::npos) return L"ARM64 (Unsupported)";
   if (c.find("d3d12") != std::string::npos) return L"Direct3D 12";
   if (c.find("vulkan") != std::string::npos) return L"Vulkan -> D3D11";

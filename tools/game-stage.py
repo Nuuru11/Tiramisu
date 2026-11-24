@@ -7,9 +7,9 @@ What it does, and why each part exists:
 
   * copies the game tree unchanged into `staging/<Name>/` (no game file is
     modified; nothing is downloaded or bundled);
-  * finds the launch exe, and refuses by default when it is PE32 (x86-32):
-    Tiramisu runs only PE32+ guest code today, so uploading 1.5 GB of a 32-bit
-    title to find that out on the TV is a waste of an evening;
+  * finds the launch exe; PE32 (x86-32) is staged and marked for the JIT
+    (the host runs it through the x86 interpreter/JIT), and ARM64 is the
+    remaining unsupported guest arch;
   * writes `tiramisu_args.txt` next to the exe - the host reads it on launch
     and feeds the lines to the guest's command line (this is how a game that
     needs `--load-game save.zip` gets its arguments);
@@ -33,11 +33,11 @@ import sys
 import time
 
 MACHINES = {
-    0x014C: ("PE32 (x86-32)", False),
+    0x014C: ("PE32 (x86-32, JIT)", True),
     0x8664: ("PE32+ (x64)", True),
-    0xAA64: ("PE32+ (ARM64)", True),
-    0xA641: ("PE32+ (ARM64EC)", True),
-    0x0200: ("PE32+ (IA64)", True),
+    0xAA64: ("PE32+ (ARM64)", False),
+    0xA641: ("PE32+ (ARM64EC)", False),
+    0x0200: ("PE32+ (IA64)", False),
 }
 
 SKIP_DIRS = {".git", "__pycache__", ".svn", "node_modules"}
@@ -122,7 +122,7 @@ def main(argv=None):
     parser.add_argument("--exclude", action="append", default=[],
                         help="substring of paths to skip (repeatable)")
     parser.add_argument("--force-32bit", action="store_true",
-                        help="stage anyway when the exe is PE32 (it will not run)")
+                        help="stage anyway when the exe is ARM64 or another unsupported arch")
     parser.add_argument("--set", action="append", default=[],
                         metavar="KEY=VALUE",
                         help="per-game host setting, e.g. fsb_decode=1 "
@@ -163,8 +163,9 @@ def main(argv=None):
     print(f"machine:  {label}  (0x{machine:04x})")
     if not supported:
         message = (f"ERROR: {label} guest code cannot run yet - Tiramisu "
-                   f"executes PE32+ images only (see docs/04-support-roadmap.md, "
-                   f"wall W1). Nothing is staged.")
+                   f"executes PE32+ images and PE32(x86-32) via the x86-32 "
+                   f"JIT (see docs/console-type.md / docs/04-support-roadmap.md). "
+                   f"Nothing is staged.")
         if not args.force_32bit:
             sys.exit(message)
         print("WARNING: " + message.split("ERROR: ", 1)[1])

@@ -27,6 +27,7 @@ Wine's job, targeting UWP instead of POSIX.
 > - **64-bit (`x64` PE32+) Windows games only.** 32-bit `x86` games, kernel anti-cheat (EasyAntiCheat/BattlEye), Xbox GDK/GameOS packages (for example a `MicrosoftGame.Config` + `gameos.xvd` console build), and heavy desktop productivity suites (After Effects, DaVinci Resolve) are **not** supported yet.
 > - **APIs today:** D3D11, D3D9/D3D8, Vulkan (via SPIR-V→HLSL→D3D11), and OpenGL. **D3D12 execution, Bink video cutscenes, and Wwise audio** are still incomplete/experimental.
 > - **Celeste v1.4.0.0 is playable but silent.** FSB5 Vorbis decode is disabled on console after it heap-corrupted on a Series S; `fsb_decode=1` is test-only. See [known issues](docs/known-issues.md).
+> - **Things not supported on Xbox One S|X** (in principle possible to sideload, but untested): see [docs/known-issues.md — “Xbox One S/X”](docs/known-issues.md#xbox-one-sx).
 > - **Set Dev Home to Game mode (5 GB RAM)** and **back up your saves** via the LAN dashboard (`Saves & Support → Backup Saves (.zip)`) before uninstalling or updating Tiramisu — Xbox Dev Mode wipes `LocalState` on uninstall.
 
 ---
@@ -563,10 +564,11 @@ AAA in-house D3D11, Godot 4.x (Vulkan),
 PyInstaller/Python, static-recomp ports, Win32 launchers, GDI+ UI apps,
 FMOD-audio games, DirectStorage/Bink/Oodle-shipping titles (honest fallbacks).
 
-**Not yet:** 32-bit x86 (PE32) games — needs the M7 x86 engine; D3D12 AAA
-titles verified on hardware (the console path exists, hardware-verification
-pending); Wwise/Miles-audio games; save/profile round-trips. See
-[GAP-MAP.md](GAP-MAP.md).
+**Not yet:** ARM64 and other non-x86 guests; D3D12 AAA titles verified on
+hardware (the console path exists, hardware-verification pending); Wwise/Miles-audio
+games; save/profile round-trips. See [GAP-MAP.md](GAP-MAP.md). PE32 (x86-32)
+titles are staged and run via the host x86-32 JIT (`tools/game-stage.py`,
+`src/host/main.cpp`); treat them as experimental and validate on hardware.
 
 ## 🖥️ Dashboard (TV) & phone/web dashboard
 
@@ -597,6 +599,9 @@ adds a Connect card, the game manager (**upload folder/zip → extract → pick
 exe**, per-game args/appid/input, launch/stop/delete), the live log, and the
 **same settings editor** (`GET/POST /api/settings`) — all offline-gated in
 `tests/test_webxfer.cpp`.
+
+Autodetect the console family (`series_x`, `series_s`, `one_x`, `one_s`) with
+`tools/console_type.py detect --console <ip>`; see [docs/console-type.md](docs/console-type.md).
 
 ## 🚀 Quick start (Xbox Dev Mode)
 
@@ -629,10 +634,11 @@ python3 tools/console.py upload --game staging/<Title> --console <console-ip>
 python3 tools/console.py proof  --game staging/<Title> --console <console-ip>
 ```
 
-`game-stage.py` refuses a 32-bit exe (Tiramisu runs PE32+ only) instead of
-uploading gigabytes that cannot start. `--set key=value` stages a per-game
-`tiramisu.profile.ini` (e.g. `--set fsb_decode=1` to try FSB5 audio decode on
-one title); it is the only settings channel a packaged app can read. Proven titles live in
+`game-stage.py` runs PE32 (x86-32) titles via the host x86-32 JIT and blocks
+the remaining unsupported archs (ARM64 today) instead of uploading gigabytes
+that cannot start. `--set key=value` stages a per-game `tiramisu.profile.ini`
+(e.g. `--set fsb_decode=1` to try FSB5 audio decode on one title); it is the
+only settings channel a packaged app can read. Proven titles live in
 [docs/title-matrix.md](docs/title-matrix.md), which is generated from
 `docs/proof/titles.json` + `proof.json` — `python3 tools/title-matrix.py
 --check` fails if a row cites an artifact that is not on disk.
@@ -699,7 +705,7 @@ failure is a red gate, never a skipped test.
 | Crash bundles + watchdog | **BUILT** — bounded one-file post-mortems, 1 Hz memory-ledger trail, last-resort guest-thread kill |
 | Input (keyboard/mouse/gamepad, DInput8, XInput, Raw Input) | **PASS (RACCOIN)** — CoreWindow events → guest getters + pump; pad-as-mouse |
 | Console run | **PASS (2026-11-21)** — RACCOIN playable; God of War renders the forest; **Celeste playable (title, menu, Chapter 1)** |
-| 32-bit x86 (PE32) | **not supported** — needs an x86 engine; see GAP-MAP W5 |
+| ARM64 or other non-x86 guests | **not supported** — see GAP-MAP; PE32 (x86-32) is staged via the x86-32 JIT |
 
 <details>
 <summary><b>Full layer-by-layer table (70+ rows)</b> — click to expand</summary>
@@ -783,7 +789,7 @@ failure is a red gate, never a skipped test.
 | [docs/04-support-roadmap.md](docs/04-support-roadmap.md) | the walls between "a few titles boot" and "any PC game runs", ranked by library share |
 | [docs/support-matrix.md](docs/support-matrix.md) | auto-generated, measured per-title `real / recorded / named-silent` import coverage |
 | [docs/gap-worklist.md](docs/gap-worklist.md) | auto-generated gap list (currently empty) — the next thing to implement if it is not |
-| [docs/title-matrix.md](docs/title-matrix.md) | evidence-backed title matrix, checked against on-disk artifacts |
+| [docs/console-type.md](docs/console-type.md) | `tools/console_type.py` console-generation autodetect (Series X/S, Xbox One X/S) |
 | [docs/promo-reel.md](docs/promo-reel.md) | 60-second setup/promo shot list and capture recipe |
 | [docs/known-issues.md](docs/known-issues.md) · [docs/troubleshooting.md](docs/troubleshooting.md) | measured limitations, and how to get unstuck |
 | [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |

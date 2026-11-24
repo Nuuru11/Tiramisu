@@ -820,7 +820,7 @@ No console claim without a TV screenshot + the log pull.
 | 5 | Memory ceiling (5 GB game budget) | partly in flight (streaming maps) | any real game OOM |
 | 6 | Perf: pump/present pacing, guest-on-render-thread | session-2 Wave-1 plan | first-frame stutter |
 | 7 | D3D12 | not started | an engine that refuses D3D11 (RACCOIN negotiated D3D11 fine — UE-class is the trigger) |
-| 8 | x86-32 (G8) | **license decision pending** | a real 32-bit target chosen |
+| 8 | x86-32 (G8) | **in-tree JIT, hardware proof pending** | a real PE32 title runs through the x86-32 JIT; ARM64 stays open |
 | 9 | Steam depot downloader | `tools/steam_depot.py` exists (auth-only) | sideloading real GB-sized games |
 
 ## NOT needed yet (scope discipline — cut from any plan)
@@ -863,10 +863,11 @@ No console claim without a TV screenshot + the log pull.
   proof: `tests/test_fsb5_sanity.cpp` (`build-test.sh` §43c), no game banks or
   console required. Console proof is still pending; do not write "Celeste has
   audio" until a `proof.json` run says so.
-- **x86-32 (W1/G8).** Unchanged and still the largest gate: PE32 execution
-  needs an interpreter or JIT, and the license decision for Boxedwine's core
-  comes first. `tools/game-stage.py` refuses to stage a PE32 title rather than
-  upload gigabytes that cannot run. Nothing in this session made the catalogue
-  wider here, and nothing should claim it did.
+- **x86-32 (W1/G8).** PE32 execution is in-tree: `src/host/main.cpp` runs
+  `img->is_pe32` through `x86_run_pe32()` and `tools/game_stage.py` stages PE32
+  (`MACHINES[0x014C] = ("PE32 (x86-32, JIT)", True)`). This is still unproven
+  on hardware; the Boxedwine license-decision note is obsolete unless an
+  engine needs more than the tree's JIT. `tools/game_stage.py` still refuses
+  ARM64. If you drop the JIT, don't claim it here.
   The probe sequence in W3 converts all of them from speculation to measurement
   in one deploy session.

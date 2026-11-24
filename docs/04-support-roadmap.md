@@ -29,10 +29,11 @@ SUMMARY: 53 PEs | 3 PE32 / 50 PE32+ | 6 with delay imports (56 delay symbols)
   of failing the load. Measured: 6 of 53 corpus PEs carry delay descriptors
   (56 symbols) — `UnityPlayer.dll` delay-loads `d3d12.dll`, `binkw32.dll`
   delay-loads Miles (`mss32.dll`).
-- **PE32 is mapped and bound, but not executed.** 3 of 53 corpus PEs are
-  32-bit (`SDL2.dll`, `binkw32.dll`, `discord_game_sdk.dll`): they map, seal,
-  bind and their DllMains are collected, but `images.cpp` skips 32-bit code
-  (`M7 Phase 1: no 32-bit code runs natively`).
+- **PE32 is mapped, bound and run through the x86-32 JIT/interpreter path.**
+  The 3 PE32 corpus files map and bind; the host now executes them via
+  `src/host/main.cpp` + `src/trt/x86_exec.cpp` (`x86_run_pe32`). Expect
+  unresolved native quirks to be names, not crashes; no completion artifact
+  has been produced yet for these titles.
 - 56 bridge translation units, 56 offline suites, 49 gate stages.
 
 What that means: the classic emulator-project failure mode ("it dies at load")
@@ -48,10 +49,11 @@ proceed. Ordered by how many shipped PC titles each one covers.
 
 ### W1 — native x86-32 execution (largest wall by far)
 
-Every 32-bit native game — most of the pre-2015 PC library, and most 32-bit
-indies including D3D9-era titles — maps and binds but cannot run a single
-32-bit instruction. Mono games already work (Celeste, via the embedded Mono
-interpreter, no native x86 needed); native C/C++ 32-bit does not.
+Every 32-bit native game that Tiramisu does not execute natively (ARM64 today)
+or every 32-bit title where the in-tree JIT path is unsuitable maps and binds
+but cannot run a single 32-bit instruction. Mono games already work (Celeste,
+via the embedded Mono interpreter, no native x86 needed); native C/C++ 32-bit
+via the x86-32 JIT is partially in the tree (see `src/host/main.cpp`).
 
 - **Measured**: `images.cpp` defers PE32 entry/TLS/DllMain to "the M7
   emulator"; console evidence in `docs/01-roadmap.md` M7 (WoW64 probes all

@@ -812,10 +812,11 @@ static pe_compat_info inspect_pe_compat(const std::string& gdir,
   if (machine == 0x8664 && opt_magic == 0x20B) {
     out.arch = "x64";
   } else if (machine == 0x014C) {
-    fclose(f);
+    // Tiramisu routes PE32 binaries through the x86-32 interpreter/JIT (x86_run_pe32).
     out.arch = "x86";
-    out.badge = "32-bit x86 (Unsupported)";
-    out.ok = false;
+    out.badge = "x86 32-bit (JIT)";
+    out.ok = true;
+    fclose(f);
     return out;
   } else if (machine == 0xAA64) {
     fclose(f);
