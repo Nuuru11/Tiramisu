@@ -50,21 +50,42 @@ Keep them together in the same folder.
    Tap **Advanced** → **Continue** (or **Proceed anyway**).
 4. Sign in with the same account you used in Dev Home, if it asks.
 
-## Step 6 — Add the certificate and the app
+## Step 6 — Add the app
 
 1. On the website, go to **My games & apps** → **Add**.
-2. You will see separate file boxes:
-   - **App package** (or "Package") — choose **`Tiramisu.msix`**.
-   - **Dependencies** — leave this **empty**.
-   - **Certificate** — choose **`dev.cer`**.
-3. Click **Add** and wait until the page says the install finished.
+2. In the **App package** box, choose **`Tiramisu.msix`**.
+3. Leave **Dependencies** empty.
+4. Click **Add** and wait until the page says the install finished.
 
-If your Xbox does not show a Certificate box, install `dev.cer` first from
-**Dev Home → My games & apps → Certificates** (or the Device Portal's
-certificate page), then come back and add only `Tiramisu.msix`.
+**You will not see a Certificate box — that is normal.** Current Xbox Device
+Portal builds do not show one. Do not put `dev.cer` in Dependencies.
 
-**Remember:** `dev.cer` goes in the **Certificate** box. It is not a dependency
-and it is not the app.
+### Why is there a `dev.cer` file at all?
+
+Apps for Xbox Dev Mode must be **signed**. We do not have a Microsoft Store
+signing key, so the release is signed with our own self-signed certificate.
+`dev.cer` is that certificate. It tells the Xbox "trust the signature on this
+app". It is **not** a game, **not** a dependency and **not** an app you install
+by itself.
+
+The command-line installer passes the `.cer` to the Xbox automatically. The web
+page does not have a field for it, so if the web install fails with a signature
+error, use the installer below.
+
+### If the web install fails — the reliable method
+
+On a Windows PC with Git Bash or WSL (or any Linux/Mac terminal):
+
+```sh
+git clone https://github.com/xanstomper/Tiramisu.git
+cd Tiramisu
+export DP_HOST=10.0.0.23          # your Xbox IP from Step 2
+export DP_USER=your_portal_user   # from Dev Home → Settings → Device Portal
+export DP_PASS=your_portal_pass
+bash tools/deploy.sh install /path/to/Tiramisu.msix /path/to/dev.cer
+```
+
+The command sends both files to the Xbox in one request and waits for success.
 
 ## Step 7 — Launch Tiramisu
 
