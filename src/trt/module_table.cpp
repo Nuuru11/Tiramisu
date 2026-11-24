@@ -13,6 +13,7 @@
 #include "thunk.h"
 #include "images.h"
 #include "pe_exports.h"
+#include "dynamic_api.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -249,7 +250,7 @@ void* resolve_through_table(void* user, const char* module,
       char sym[128];
       if (symbol) snprintf(sym, sizeof(sym), "%s", symbol);
       else snprintf(sym, sizeof(sym), "#%u", (unsigned)ordinal);
-      return trt_thunk_make(trt_core_backend(), "STUB", target, sym);
+      return trt_dynamic_synthesize_api(target, sym, ordinal);
     }
     case TRT_ROUTE_BUILTIN:
       if (symbol) {
@@ -329,9 +330,28 @@ struct impl_override {
 const impl_override k_impl_classes[] = {
     // D3D12 has a real command-list RECORDING surface; draws are not executed.
     {"d3d12.dll", nullptr, TRT_IMPL_RECORDED},
+    // ...except root-signature serialization, which is REAL: the bridge parses
+    // the guest's desc, validates it, emits a DXBC container that actually
+    // carries the layout, and the two deserializers hand that layout back at
+    // 1.0/1.1/1.2. These four were the top entries of the measured gap list.
+    {"d3d12.dll", "D3D12SerializeRootSignature", TRT_IMPL_REAL},
+    {"d3d12.dll", "D3D12SerializeVersionedRootSignature", TRT_IMPL_REAL},
+    {"d3d12.dll", "D3D12CreateRootSignatureDeserializer", TRT_IMPL_REAL},
+    {"d3d12.dll", "D3D12CreateVersionedRootSignatureDeserializer", TRT_IMPL_REAL},
     // Media Foundation hands out metadata + a clean EOS; no frames decode.
     {"mfplat.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"mfreadwrite.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    // ...but the four object-creation entry points are REAL: each returns a COM
+    // object with a live IMFAttributes / IMFMediaBuffer / IMFSample vtable that
+    // stores what the title sets and returns it unchanged (GUIDs, UINT32/64,
+    // strings, blobs, buffer bytes and length, sample buffers and timestamps).
+    // MFStartup is the real refcounted platform init those objects need.
+    // MFSourceReader stays named-silent: it reports honest stream metadata and
+    // a clean end-of-stream, but no frame is ever decoded.
+    {"mfplat.dll", "MFStartup", TRT_IMPL_REAL},
+    {"mfplat.dll", "MFCreateMediaType", TRT_IMPL_REAL},
+    {"mfplat.dll", "MFCreateMemoryBuffer", TRT_IMPL_REAL},
+    {"mfplat.dll", "MFCreateSample", TRT_IMPL_REAL},
     // .NET Framework and the Steam auth layer are honest surfaces only.
     // mscoree: CorExitProcess is REAL (clean guest quit); entry points stay
     // named-silent because there is no CLR on the console.
@@ -340,24 +360,62 @@ const impl_override k_impl_classes[] = {
     {"mscoree.dll", "CorBindToRuntimeEx", TRT_IMPL_NAMED_SILENT},
     {"steam_api64.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"steam_api.dll", nullptr, TRT_IMPL_NAMED_SILENT},
-    // Honest empty answers, not real functionality.
-    {"shell32.dll", "ExtractIconExW", TRT_IMPL_NAMED_SILENT},
-    {"shell32.dll", "ExtractIconExA", TRT_IMPL_NAMED_SILENT},
-    {"shell32.dll", "ExtractIconW", TRT_IMPL_NAMED_SILENT},
-    {"shell32.dll", "ExtractIconA", TRT_IMPL_NAMED_SILENT},
-    {"winmm.dll", "waveOutGetNumDevs", TRT_IMPL_NAMED_SILENT},
+    // The lifecycle/callback entry points and the interface accessors that back
+    // dedicated stateful vtables are REAL: SteamAPI_Init/Shutdown track the live state,
+    // RunCallbacks dispatches to the registered CCallbackBase objects through
+    // their own vtable slot 0, SteamApps/SteamUser/SteamFriends/SteamUtils/
+    // SteamClient/SteamUserStats/SteamMatchmaking/SteamNetworking all operate
+    // on live stateful subsystems (imported library, signed-in id, persona, stats &
+    // achievements, lobby tables, P2P loopback sessions).
+    {"steam_api64.dll", "SteamAPI_Init", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_Shutdown", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_RunCallbacks", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_RegisterCallback", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_UnregisterCallback", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_RegisterCallResult", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_UnregisterCallResult", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamAPI_RestartAppIfNecessary", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamApps", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamClient", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamFriends", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamMatchmaking", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamNetworking", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamUser", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamUserStats", TRT_IMPL_REAL},
+    {"steam_api64.dll", "SteamUtils", TRT_IMPL_REAL},
+    // Shell icon extraction (ExtractIconExW/A, ExtractIconW/A) parses PE .rsrc
+    // RT_GROUP_ICON directories into live user32 icon handles -> REAL.
+    // waveOut is REAL: one output device backed by the host sink. waveIn is
+    // REAL too now: one capture device that delivers real WAVEHDR completions
+    // (silent unless the host installs a capture source), because
+    // waveInGetNumDevs()==0 made titles disable voice capture outright.
+    // midiOut is REAL: one virtual MIDI synthesizer device.
+    // MIDI input still enumerates zero devices.
     {"winmm.dll", "midiInGetNumDevs", TRT_IMPL_NAMED_SILENT},
-    {"winmm.dll", "waveInGetNumDevs", TRT_IMPL_NAMED_SILENT},
-    {"winmm.dll", "midiOutGetNumDevs", TRT_IMPL_NAMED_SILENT},
-    {"winmm.dll", "waveOutGetDevCapsW", TRT_IMPL_NAMED_SILENT},
-    {"winmm.dll", "waveOutGetDevCapsA", TRT_IMPL_NAMED_SILENT},
-    // Whole honest-empty surfaces (source-confirmed: no codecs, no printers).
-    {"msacm32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
+    // msacm32 is REAL: acm_codec.cpp decodes MS/IMA ADPCM, u-law and A-law and
+    // performs PCM format conversion. Only tags it cannot decode fail visibly.
+    // Whole honest-empty surfaces (source-confirmed: no video codecs, no
+    // printers).
     {"msvfw32.dll", nullptr, TRT_IMPL_NAMED_SILENT},
     {"winspool.drv", nullptr, TRT_IMPL_NAMED_SILENT},
 };
 
 bool g_impl_applied = false;
+
+// Explicit symbol-level entries (always module + symbol, never a default).
+// Unlike the marks apply_impl_classes() writes into each function record, these
+// are consulted directly, so they can say REAL about one symbol inside a module
+// that is otherwise recording only.
+trt_impl_class symbol_override_class(const char* module, const char* symbol, bool* found) {
+  for (const impl_override& o : k_impl_classes) {
+    if (o.symbol && name_eq(o.module, module) && strcmp(o.symbol, symbol) == 0) {
+      if (found) *found = true;
+      return o.cls;
+    }
+  }
+  if (found) *found = false;
+  return TRT_IMPL_REAL;
+}
 
 trt_impl_class module_default_class(const builtin_mod& m) {
   for (const impl_override& o : k_impl_classes) {
@@ -457,6 +515,35 @@ void trt_module_register(const char* name, trt_route route,
              name, copied, fn_count);
     trt_core_log(line);
   }
+}
+
+// ---- introspection (conformance suite) ------------------------------------
+// The registry is the only complete list of what Tiramisu claims to implement.
+// Enumerating it is what turns "we support a lot" into "here is every symbol we
+// claim, and here is the one whose call would corrupt the stack".
+int trt_module_export_count(void) {
+  int n = 0;
+  for (int i = 0; i < g_module_count; ++i) n += g_modules[i].fn_count;
+  return n;
+}
+
+int trt_module_export_at(int index, char* module, int module_cap, char* symbol,
+                         int symbol_cap, int* impl_class, int* route) {
+  if (index < 0) return 0;
+  int seen = 0;
+  for (int i = 0; i < g_module_count; ++i) {
+    const builtin_mod& m = g_modules[i];
+    for (int j = 0; j < m.fn_count; ++j) {
+      if (seen++ != index) continue;
+      if (module && module_cap > 0) snprintf(module, (size_t)module_cap, "%s", m.name);
+      if (symbol && symbol_cap > 0)
+        snprintf(symbol, (size_t)symbol_cap, "%s", m.fns[j].name);
+      if (impl_class) *impl_class = (int)m.fns[j].impl_class;
+      if (route) *route = (int)m.route;
+      return 1;
+    }
+  }
+  return 0;
 }
 
 trt_route trt_module_route(const char* name) {
@@ -571,6 +658,11 @@ int trt_symbol_class(const char* module, const char* symbol, int* cls_out) {
       }
     }
   }
+  // An explicit symbol-level entry is a stronger statement than the module
+  // default, and the only way to call one symbol REAL while its module records.
+  bool named = false;
+  const trt_impl_class named_cls = symbol_override_class(target, symbol, &named);
+  if (named) cls = named_cls;
   if (cls_out) *cls_out = cls;
   return 1;
 }

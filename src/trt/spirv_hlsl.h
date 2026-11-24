@@ -72,4 +72,25 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
                                    const spirv_spec_entry* spec_entries = nullptr,
                                    u32 spec_count = 0);
 
+// ---- shader census -------------------------------------------------------
+// What the corpus actually asks for, counted instead of guessed. A title that
+// reaches the menu and goes black is usually one unsupported feature; without
+// a census every such report is a fresh investigation. Every successful
+// translation records its stage and the features it had to lower, so the
+// worklist is a sorted list of counters rather than an anecdote.
+struct spirv_census {
+  u32 compiles = 0;
+  u32 per_stage[6] = {0, 0, 0, 0, 0, 0};  // SPV_STAGE_* order
+  u32 derivatives = 0;    // ddx/ddy/fwidth lowered from GLSL.std.450
+  u32 atomics = 0;        // Interlocked* -> SM5 intrinsics
+  u32 storage_images = 0; // RWTexture* (image load/store)
+  u32 groupshared = 0;    // compute shared memory
+  u32 tessellation = 0;   // tess control/eval path emitted
+};
+void spirv_census_reset();
+spirv_census spirv_census_snapshot();
+std::string spirv_census_json();
+// Write the census as JSON so a corpus run can be diffed between builds.
+bool spirv_census_write(const char* path);
+
 #endif

@@ -24,8 +24,13 @@
 #define SUPPORT_PROFILE_D3D 1
 #define SUPPORT_PROFILE_HLSL 1
 #define SUPPORT_PROFILE_BYTECODE 0
+#ifndef _WIN32
+#define SUPPORT_PROFILE_GLSL 1
+#define SUPPORT_PROFILE_GLSL120 1
+#else
 #define SUPPORT_PROFILE_GLSL 0
 #define SUPPORT_PROFILE_GLSL120 0
+#endif
 #define SUPPORT_PROFILE_GLSLES 0
 #define SUPPORT_PROFILE_GLSLES3 0
 #define SUPPORT_PROFILE_ARB1 0
@@ -67,6 +72,9 @@
 #include "../../third_party/mojoshader/profiles/mojoshader_profile_common.c"
 #include "../../third_party/mojoshader/profiles/mojoshader_profile_d3d.c"
 #include "../../third_party/mojoshader/profiles/mojoshader_profile_hlsl.c"
+#ifndef _WIN32
+#include "../../third_party/mojoshader/profiles/mojoshader_profile_glsl.c"
+#endif
 #include "../../third_party/mojoshader/mojoshader.c"
 #include "../../third_party/mojoshader/mojoshader_effects.c"
 #ifdef _WIN32

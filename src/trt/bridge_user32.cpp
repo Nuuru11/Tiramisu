@@ -527,7 +527,22 @@ int TRT_STDCALL trt_GetSystemMetrics(int idx) {
     case 0: return w;   // SM_CXSCREEN
     case 1: return h;   // SM_CYSCREEN
     case 2: return 1;   // SM_CXVSCROLL
-    case 15: return 0;  // SM_SECURE
+    case 3: return 10;  // SM_CYHSCROLL
+    case 13: return 32; // SM_CXCURSOR
+    case 14: return 32; // SM_CYCURSOR
+    case 15: return 0;  // SM_CYMENU (no menu bar on the console)
+    // The pointer is always present on the console: pad-as-mouse and remote
+    // input both feed it, and several engines decline to create a mouse
+    // device at all when this reports 0.
+    case 19: return 1;  // SM_MOUSEPRESENT
+    case 23: return 0;  // SM_SWAPBUTTON
+    case 36: return 4;  // SM_CXDOUBLECLK
+    case 37: return 4;  // SM_CYDOUBLECLK
+    case 43: return 5;  // SM_CMOUSEBUTTONS
+    case 68: return 4;  // SM_CXDRAG
+    case 69: return 4;  // SM_CYDRAG
+    case 75: return 1;  // SM_MOUSEWHEELPRESENT
+    case 80: return 1;  // SM_CMONITORS
     default: return 0;
   }
 }
@@ -969,7 +984,52 @@ int TRT_STDCALL trt_ReleaseDC(void* hwnd, void* hdc) {
 // DLGTEMPLATE), rect math is real, icons are record handles.
 namespace {
 struct rect16 { i32 l, t, r, b; };
+
+constexpr u32 k_icon_tag = 0x49430000u;
+struct icon_rec {
+  bool used;
+  int w, h;
+};
+constexpr int k_max_icons = 128;
+icon_rec g_icons[k_max_icons];
+std::mutex g_icon_mu;
 } // namespace
+
+void* trt_user32_icon_alloc(int w, int h) {
+  std::lock_guard<std::mutex> lk(g_icon_mu);
+  for (int i = 0; i < k_max_icons; ++i) {
+    if (!g_icons[i].used) {
+      g_icons[i].used = true;
+      g_icons[i].w = w > 0 ? w : 32;
+      g_icons[i].h = h > 0 ? h : 32;
+      return (void*)(uintptr_t)(k_icon_tag | (u32)(i + 1));
+    }
+  }
+  return nullptr;
+}
+
+int trt_user32_icon_free(void* hicon) {
+  const u32 h = (u32)(uintptr_t)hicon;
+  if ((h & 0xFFFF0000u) != k_icon_tag) return 0;
+  const u32 idx = (h & 0xFFFFu);
+  if (idx == 0 || idx > k_max_icons) return 0;
+  std::lock_guard<std::mutex> lk(g_icon_mu);
+  if (!g_icons[idx - 1].used) return 0;
+  g_icons[idx - 1].used = false;
+  return 1;
+}
+
+int trt_user32_icon_size(void* hicon, int* w_out, int* h_out) {
+  const u32 h = (u32)(uintptr_t)hicon;
+  if ((h & 0xFFFF0000u) != k_icon_tag) return 0;
+  const u32 idx = (h & 0xFFFFu);
+  if (idx == 0 || idx > k_max_icons) return 0;
+  std::lock_guard<std::mutex> lk(g_icon_mu);
+  if (!g_icons[idx - 1].used) return 0;
+  if (w_out) *w_out = g_icons[idx - 1].w;
+  if (h_out) *h_out = g_icons[idx - 1].h;
+  return 1;
+}
 
 void* TRT_STDCALL trt_AdjustWindowRect(void* rect, u32 style, int menu) {
   (void)style; (void)menu;
@@ -1055,16 +1115,58 @@ int TRT_STDCALL trt_UnionRect(void* out, const void* a, const void* b) {
 }
 
 void* TRT_STDCALL trt_GetIconInfo(void* icon, void* info) {
-  (void)icon;
-  log_line("user32: GetIconInfo -> FALSE (icon records carry no bitmap)");
-  return (void*)(uintptr_t)0;
+  int w = 0, h = 0;
+  if (!icon || !info) return (void*)(uintptr_t)0;
+  // Treat built-in LoadIconW handle (0x00030001) or table icon handles as valid.
+  if ((uintptr_t)icon == 0x00030001ull) {
+    w = 32; h = 32;
+  } else if (!trt_user32_icon_size(icon, &w, &h)) {
+    log_line("user32: GetIconInfo -> FALSE (invalid HICON)");
+    return (void*)(uintptr_t)0;
+  }
+  struct win64_iconinfo {
+    i32 fIcon;
+    u32 xHotspot;
+    u32 yHotspot;
+    u32 _pad;
+    void* hbmMask;
+    void* hbmColor;
+  };
+  static_assert(sizeof(win64_iconinfo) == 32, "Win64 ICONINFO size");
+  win64_iconinfo* ii = (win64_iconinfo*)info;
+  ii->fIcon = 1;
+  ii->xHotspot = (u32)(w / 2);
+  ii->yHotspot = (u32)(h / 2);
+  ii->_pad = 0;
+  ii->hbmMask = (void*)(uintptr_t)0x80000015ull;  // stock placeholder HBITMAP tag
+  ii->hbmColor = (void*)(uintptr_t)0x80000016ull;
+  return (void*)(uintptr_t)1;
 }
 
 void* TRT_STDCALL trt_CreateIconFromResourceEx(const u8* bits, u32 len, int icon,
                                                u32 ver, int w, int h, u32 flags) {
-  (void)bits; (void)len; (void)icon; (void)ver; (void)w; (void)h; (void)flags;
-  log_line("user32: CreateIconFromResourceEx -> NULL (no GDI icon decode)");
-  return nullptr;
+  (void)icon; (void)ver; (void)flags;
+  if (!bits || len < 16) {
+    log_line("user32: CreateIconFromResourceEx -> NULL (empty resource bits)");
+    return nullptr;
+  }
+  i32 rw = w > 0 ? w : 32;
+  i32 rh = h > 0 ? h : 32;
+  if (len >= 40) {
+    u32 hdr_sz = 0;
+    memcpy(&hdr_sz, bits, 4);
+    if (hdr_sz >= 40) {
+      i32 bw = 0, bh = 0;
+      memcpy(&bw, bits + 4, 4);
+      memcpy(&bh, bits + 8, 4);
+      if (bw > 0 && bw <= 1024) rw = bw;
+      if (bh != 0) {
+        i32 ah = bh < 0 ? -bh : bh / 2;
+        if (ah > 0 && ah <= 1024) rh = ah;
+      }
+    }
+  }
+  return trt_user32_icon_alloc(rw, rh);
 }
 
 void* TRT_STDCALL trt_LoadImageA(void* inst, const char* name, u32 type, int cx,

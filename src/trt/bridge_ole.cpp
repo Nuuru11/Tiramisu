@@ -16,6 +16,13 @@
 #include <mutex>
 #include <vector>
 
+#ifdef _WIN32
+// GetCurrentThreadId arrives with the Windows surface trt.h pulls in.
+#else
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 // unique name, file scope, OUTSIDE extern "C" (the log_line collision rule)
 namespace olelog {
 static void line(const char* s) { trt_core_log(s); }
@@ -46,8 +53,23 @@ constexpr int CO_E_CLASSSTRING_ = (int)0x800401F3;
 // COINIT_MULTITHREADED (0x0); either is fine single-threaded
 constexpr u32 COINIT_APARTMENTTHREADED = 0x2;
 
-int g_init_count = 0;     // CoInitialize nesting
-int g_last_init_mta = 0;  // model of the active CoInitializeEx (0=STA 1=MTA)
+// Apartment state is PER THREAD. CoInitializeEx initializes the calling
+// thread and CoGetApartmentType reports that thread's model, so one global
+// was a lie the moment a game touched COM from a worker: a worker's STA init
+// rewrote what the main thread reported (and its nesting count blocked the
+// main thread's own S_FALSE). Every guest thread now carries its own.
+thread_local int t_init_count = 0;  // CoInitialize nesting on this thread
+thread_local int t_init_mta = 0;    // this thread's model (0=STA 1=MTA)
+
+// Thread id for the apartment log lines, so a guest's two apartments are
+// distinguishable in the log instead of looking like one thread re-initing.
+uintptr_t ole_thread_id() {
+#ifdef _WIN32
+  return (uintptr_t)GetCurrentThreadId();
+#else
+  return (uintptr_t)syscall(SYS_gettid);
+#endif
+}
 
 // ---- CLSID personality registry (uncapped, thread-safe) ----
 struct com_class {
@@ -123,20 +145,22 @@ void trt_ole_register_class(const void* clsid, trt_com_factory factory,
 int TRT_GUEST_ABI ole_CoInitializeEx(void* reserved, u32 model) {
   gap_trace_record("CoInitializeEx");
   (void)reserved;
-  ++g_init_count;
-  g_last_init_mta = (model & COINIT_APARTMENTTHREADED) ? 0 : 1;
-  char line[96];
-  snprintf(line, sizeof(line), "ole: CoInitializeEx(model=%s) count=%d",
-           (model & COINIT_APARTMENTTHREADED) ? "STA" : "MTA", g_init_count);
+  ++t_init_count;
+  t_init_mta = (model & COINIT_APARTMENTTHREADED) ? 0 : 1;
+  char line[128];
+  snprintf(line, sizeof(line),
+           "ole: CoInitializeEx(model=%s) count=%d tid=%llu",
+           (model & COINIT_APARTMENTTHREADED) ? "STA" : "MTA", t_init_count,
+           (unsigned long long)ole_thread_id());
   log_line(line);
-  // S_FALSE (1) when already initialized — games accept both
-  return g_init_count > 1 ? S_FALSE_ : S_OK_;
+  // S_FALSE (1) when this thread was already initialized — games accept both
+  return t_init_count > 1 ? S_FALSE_ : S_OK_;
 }
 int TRT_GUEST_ABI ole_CoInitialize(void* reserved) {
   return ole_CoInitializeEx(reserved, COINIT_APARTMENTTHREADED);
 }
 void TRT_GUEST_ABI ole_CoUninitialize(void) {
-  if (g_init_count) --g_init_count;
+  if (t_init_count) --t_init_count;
 }
 void TRT_GUEST_ABI ole_CoFreeUnusedLibraries(void) {}
 void TRT_GUEST_ABI ole_CoFreeUnusedLibrariesEx(u32 delay, u32 reserved) {
@@ -280,6 +304,101 @@ void TRT_GUEST_ABI ole_VariantCopy(void* dst, const void* src) {
   if (dst && src) memcpy(dst, src, 24);
 }
 
+// ---- OLEAUT: VariantChangeType (oleaut32 ordinal 12) ----
+// The ordinal table used to point 12 at VariantInit, so a title converting a
+// value got its destination zeroed and no conversion. This implements the
+// conversions automation actually performs: VT_EMPTY, VT_I2/I4/I8, VT_R4/R8,
+// VT_BOOL and VT_BSTR in either direction. An unsupported pair returns
+// DISP_E_TYPEMISMATCH instead of quietly producing garbage.
+#define OLE_DISP_E_TYPEMISMATCH_ ((i32)0x80020005u)
+
+static void ole_wide_from_chars(const char* s, u16* out, u32 cap) {
+  u32 i = 0;
+  for (; s && s[i] && i + 1 < cap; ++i) out[i] = (u16)(u8)s[i];
+  out[i] = 0;
+}
+
+// Narrow text of a VARIANT that holds a BSTR (no conversion, byte-for-byte),
+// or the empty string when the variant is VT_EMPTY.
+i32 TRT_GUEST_ABI ole_VariantChangeType(void* dst, const void* src, u16 flags,
+                                        u16 vt) {
+  (void)flags;
+  if (!dst || !src) return E_INVALIDARG_;
+  const u16 svt = *(const u16*)src;
+  const u8* sdata = (const u8*)src + 8;
+  u8* ddata = (u8*)dst + 8;
+  if (svt == vt) {
+    ole_VariantCopy(dst, src);
+    return S_OK_;
+  }
+
+  // A textual view of the source, used by every numeric target.
+  char text[64];
+  text[0] = 0;
+  if (svt == 8 /* VT_BSTR */) {
+    const u16* b = *(const u16* const*)sdata;
+    if (!b) return OLE_DISP_E_TYPEMISMATCH_;
+    u32 i = 0;
+    for (; b[i] && i + 1 < sizeof(text); ++i) text[i] = (char)(b[i] & 0x7f);
+    text[i] = 0;
+  }
+
+  if (vt == 8 /* VT_BSTR */) {
+    if (svt == 8) {
+      ole_VariantCopy(dst, src);
+      return S_OK_;
+    }
+    if (svt == 3) snprintf(text, sizeof(text), "%d", *(const i32*)sdata);
+    else if (svt == 2) snprintf(text, sizeof(text), "%d", (int)*(const i16*)sdata);
+    else if (svt == 5) snprintf(text, sizeof(text), "%g", *(const double*)sdata);
+    else if (svt == 4) snprintf(text, sizeof(text), "%g", (double)*(const float*)sdata);
+    else if (svt == 20) snprintf(text, sizeof(text), "%lld", (long long)*(const i64*)sdata);
+    else if (svt == 11) snprintf(text, sizeof(text), "%d", *(const i16*)sdata ? -1 : 0);
+    else if (svt == 0) text[0] = 0;  // VT_EMPTY -> empty BSTR
+    else return OLE_DISP_E_TYPEMISMATCH_;
+    u16 wide[64];
+    ole_wide_from_chars(text, wide, 64);
+    u16* b = ole_SysAllocString(wide);
+    if (!b) return (i32)0x8007000Eu;  // E_OUTOFMEMORY
+    ole_VariantClear(dst);
+    *(u16*)dst = 8;
+    *(void**)((u8*)dst + 8) = b;
+    return S_OK_;
+  }
+
+  if (vt == 3 || vt == 2 || vt == 20 || vt == 5 || vt == 4) {
+    double num = 0.0;
+    if (svt == 8) {
+      char* end = nullptr;
+      num = strtod(text, &end);
+      if (end == text) return OLE_DISP_E_TYPEMISMATCH_;  // not a number
+    } else if (svt == 3) {
+      num = (double)*(const i32*)sdata;
+    } else if (svt == 2) {
+      num = (double)*(const i16*)sdata;
+    } else if (svt == 20) {
+      num = (double)*(const i64*)sdata;
+    } else if (svt == 5) {
+      num = *(const double*)sdata;
+    } else if (svt == 4) {
+      num = (double)*(const float*)sdata;
+    } else if (svt == 11) {
+      num = *(const i16*)sdata ? -1.0 : 0.0;
+    } else if (svt != 0) {
+      return OLE_DISP_E_TYPEMISMATCH_;
+    }
+    ole_VariantClear(dst);
+    *(u16*)dst = vt;
+    if (vt == 3) *(i32*)ddata = (i32)num;
+    else if (vt == 2) *(i16*)ddata = (i16)num;
+    else if (vt == 20) *(i64*)ddata = (i64)num;
+    else if (vt == 5) *(double*)ddata = num;
+    else *(float*)ddata = (float)num;
+    return S_OK_;
+  }
+  return OLE_DISP_E_TYPEMISMATCH_;
+}
+
 // ---- OLEAUT: safe arrays (minimal: 1D, no lock tracking) ----
 struct safearray {
   u32 dims;
@@ -317,6 +436,21 @@ u16* TRT_GUEST_ABI ole_SafeArrayCreateVector(u32 vt, u32 lower, u32 elements) {
   sa->data = elements ? calloc(elements, eb) : nullptr;
   return (u16*)sa;
 }
+// SafeArrayCreate (oleaut32 ordinal 15): the descriptor form of the call.
+// SAFEARRAYBOUND is { ULONG cElements; LONG lLbound; }. This bridge models one
+// dimension, so a multi-dimensional request fails visibly (NULL) exactly as the
+// real API does when it cannot satisfy the descriptor.
+u16* TRT_GUEST_ABI ole_SafeArrayCreate(u32 vt, u32 dims, const void* bounds) {
+  if (dims != 1 || !bounds) {
+    if (dims > 1)
+      trt_core_log("oleaut32: SafeArrayCreate(dims>1) -> NULL (1-D only)");
+    return nullptr;
+  }
+  const u32 elements = *(const u32*)bounds;
+  const i32 lower = *(const i32*)((const u8*)bounds + 4);
+  return ole_SafeArrayCreateVector(vt, (u32)lower, elements);
+}
+
 void TRT_GUEST_ABI ole_SafeArrayDestroy(u16* h) {
   safearray* sa = (safearray*)h;
   if (!sa) return;
@@ -548,15 +682,17 @@ int TRT_GUEST_ABI ole_CoGetApartmentType(u32* apt_type, u32* qualifier) {
   if (!apt_type || !qualifier) return E_INVALIDARG_;
   *apt_type = 0;
   *qualifier = 0;
-  if (g_init_count <= 0) {
-    log_line("ole: CoGetApartmentType -> CO_E_NOTINITIALIZED (no CoInitialize)");
+  // The caller's own thread, not whichever thread initialized last.
+  if (t_init_count <= 0) {
+    log_line("ole: CoGetApartmentType -> CO_E_NOTINITIALIZED "
+             "(this thread never called CoInitialize)");
     return (int)0x800401F0;  // CO_E_NOTINITIALIZED
   }
-  *apt_type = g_last_init_mta ? 1u /*APT_MTA*/ : 2u /*APT_STA*/;
+  *apt_type = t_init_mta ? 1u /*APT_MTA*/ : 2u /*APT_STA*/;
   *qualifier = 0u /*APTQUALIFIER_CURRENT*/;
-  char line[96];
-  snprintf(line, sizeof(line), "ole: CoGetApartmentType -> %s",
-           g_last_init_mta ? "MTA" : "STA");
+  char line[128];
+  snprintf(line, sizeof(line), "ole: CoGetApartmentType -> %s tid=%llu",
+           t_init_mta ? "MTA" : "STA", (unsigned long long)ole_thread_id());
   log_line(line);
   return S_OK_;
 }
@@ -755,8 +891,12 @@ int trt_bridge_register_ole(void) {
       {"#8", (void*)&ole_VariantInit},
       {"#9", (void*)&ole_VariantClear},
       {"#10", (void*)&ole_VariantCopy},
-      {"#12", (void*)&ole_VariantInit},
-      {"#15", (void*)&ole_SafeArrayCreateVector},
+      // Ordinal 12 is VariantChangeType and ordinal 15 is SafeArrayCreate (the
+      // descriptor form). Both were mapped onto the wrong function: 12 cleared
+      // the caller's destination instead of converting, and 15 read three
+      // scalars where the caller passed one bounds pointer.
+      {"#12", (void*)&ole_VariantChangeType},
+      {"#15", (void*)&ole_SafeArrayCreate},
       {"#16", (void*)&ole_SafeArrayDestroy},
       {"#17", (void*)&ole_SafeArrayGetDim},
       {"#19", (void*)&ole_SafeArrayGetUBound},

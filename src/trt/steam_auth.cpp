@@ -13,7 +13,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
+#include <io.h>
+#ifndef TIRAMISU_UWP_HOST
 #include <winhttp.h>
+#endif
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -95,10 +99,14 @@ bool json_field(const std::string& text, const char* key, std::string* out) {
 
 bool ensure_dir(const std::string& dir) {
   if (dir.empty()) return false;
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TIRAMISU_UWP_HOST)
   CreateDirectoryA(dir.c_str(), nullptr);
   DWORD a = GetFileAttributesA(dir.c_str());
   return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+#elif defined(_WIN32)
+  _mkdir(dir.c_str());
+  struct _stat64 st{};
+  return _stat64(dir.c_str(), &st) == 0 && (st.st_mode & _S_IFDIR);
 #else
   mkdir(dir.c_str(), 0700);
   struct stat st;
@@ -151,9 +159,12 @@ bool write_private(const std::string& path, const std::string& data) {
     remove(tmp.c_str());
     return false;
   }
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TIRAMISU_UWP_HOST)
   return MoveFileExA(tmp.c_str(), path.c_str(),
                      MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#elif defined(_WIN32)
+  remove(path.c_str());
+  return rename(tmp.c_str(), path.c_str()) == 0;
 #else
   return rename(tmp.c_str(), path.c_str()) == 0;
 #endif
@@ -161,7 +172,7 @@ bool write_private(const std::string& path, const std::string& data) {
 
 // ---- transport ------------------------------------------------------------
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(TIRAMISU_UWP_HOST)
 bool winhttp_post(const std::string& url, const std::string& body,
                   std::string* out, std::string* err) {
   // Split https://host/path?query. The caller already restricted the URL to
@@ -224,6 +235,11 @@ bool winhttp_post(const std::string& url, const std::string& body,
   WinHttpCloseHandle(con);
   WinHttpCloseHandle(ses);
   return ok;
+}
+#elif defined(_WIN32)
+bool winhttp_post(const std::string&, const std::string&, std::string*, std::string* err) {
+  if (err) *err = "OpenID HTTP POST unavailable in UWP container (use QR session)";
+  return false;
 }
 #else
 // POSIX fallback: curl, body handed over on stdin via a private temp file so

@@ -53,7 +53,61 @@ std::wstring g_sysinfo;
 std::vector<ui_setting> g_set_rows;
 int g_set_selected = 0;
 std::vector<std::wstring> g_log_tail;
+
+int g_steam_selected = 0;
+std::vector<ui_steam_item> g_steam_items;
+bool g_steam_signed_in = false;
+uint64_t g_steam_id64 = 0;
+std::wstring g_steam_persona;
+std::wstring g_steam_status_line = L"Sign in with Steam QR (Y) to load purchases";
+std::vector<ui_steam_friend> g_steam_friends;
+std::vector<ui_steam_ach> g_steam_achs;
+int g_qm_selected = 0;
 }
+
+void ui_steam_nav_up() {
+  if (g_steam_selected > 0) --g_steam_selected;
+}
+
+void ui_steam_nav_down() {
+  if (g_steam_selected + 1 < static_cast<int>(g_steam_items.size()))
+    ++g_steam_selected;
+}
+
+int ui_steam_selected_index() { return g_steam_selected; }
+
+void ui_set_steam_account(bool signed_in, uint64_t steamid64,
+                          std::wstring persona, std::wstring status_line) {
+  g_steam_signed_in = signed_in;
+  g_steam_id64 = steamid64;
+  g_steam_persona = std::move(persona);
+  g_steam_status_line = std::move(status_line);
+}
+
+void ui_set_steam_items(const std::vector<ui_steam_item>& items) {
+  g_steam_items = items;
+  if (g_steam_selected >= static_cast<int>(g_steam_items.size())) {
+    g_steam_selected = items.empty() ? 0 : static_cast<int>(items.size()) - 1;
+  }
+}
+
+void ui_set_steam_friends(const std::vector<ui_steam_friend>& friends) {
+  g_steam_friends = friends;
+}
+
+void ui_set_steam_achievements(const std::vector<ui_steam_ach>& achs) {
+  g_steam_achs = achs;
+}
+
+void ui_quick_menu_nav_up() {
+  if (g_qm_selected > 0) --g_qm_selected;
+}
+
+void ui_quick_menu_nav_down() {
+  if (g_qm_selected < 5) ++g_qm_selected;
+}
+
+int ui_quick_menu_selected() { return g_qm_selected; }
 
 void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
              void* dwrite_factory_v, void* d2d_device_v, void* swapchain_v) {
@@ -172,6 +226,8 @@ void text_out(IDWriteTextFormat* fmt, float x, float y, float w, float h,
   g_ctx->DrawText(s, (UINT32)wcslen(s), fmt, r, br, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
+void draw_panel(float x, float y, float w, float h, bool focused = false);
+
 void draw_qr_overlay(float m) {
   if (g_qr_size <= 0) return;
   const float cell = (float)(int)(g_h * 0.25f / (g_qr_size + 8));
@@ -201,65 +257,193 @@ void draw_qr_overlay(float m) {
 }
 
 void draw_quick_menu(float m) {
-  // RetroArch-style semi-transparent overlay on top of the running game
-  const float panel_w = g_w * 0.32f;
-  const float panel_h = g_h * 0.65f;
-  const float px = m;
-  const float py = m + g_h * 0.05f;
+  // Steam Community In-Game Social Overlay (activated via Select+Start or Steam API)
+  const float panel_w = g_w * 0.72f;
+  const float panel_h = g_h * 0.78f;
+  const float px = (g_w - panel_w) * 0.5f;
+  const float py = (g_h - panel_h) * 0.5f;
 
-  // backdrop
-  D2D1_COLOR_F bg{0.05f, 0.07f, 0.09f, 0.88f};
+  // Dark Steam obsidian translucent backdrop
+  D2D1_COLOR_F bg{0.07f, 0.09f, 0.12f, 0.94f};
   ID2D1SolidColorBrush* bbr = nullptr;
   g_ctx->CreateSolidColorBrush(bg, &bbr);
-  D2D1_RECT_F panel{px, py, px + panel_w, py + panel_h};
-  g_ctx->FillRectangle(&panel, bbr);
+  D2D1_ROUNDED_RECT panel_box{{px, py, px + panel_w, py + panel_h}, 12.0f, 12.0f};
+  g_ctx->FillRoundedRectangle(&panel_box, bbr);
   bbr->Release();
 
-  // border
-  D2D1_COLOR_F border{0.13f, 0.83f, 0.93f, 0.6f};
+  // Steam subtle cyan border
+  D2D1_COLOR_F border{0.10f, 0.62f, 0.96f, 0.75f};
   ID2D1SolidColorBrush* bor = nullptr;
   g_ctx->CreateSolidColorBrush(border, &bor);
-  g_ctx->DrawRectangle(&panel, bor, 2.0f);
+  g_ctx->DrawRoundedRectangle(&panel_box, bor, 2.5f);
   bor->Release();
 
-  // title
-  text_out(g_title, px + 16, py + 8, panel_w - 32, g_h * 0.06f,
-           L"Quick Menu", g_teal);
+  // Top header banner
+  D2D1_RECT_F header_rect{px, py, px + panel_w, py + g_h * 0.08f};
+  D2D1_COLOR_F header_bg{0.10f, 0.15f, 0.22f, 0.95f};
+  ID2D1SolidColorBrush* hbr = nullptr;
+  g_ctx->CreateSolidColorBrush(header_bg, &hbr);
+  g_ctx->FillRectangle(&header_rect, hbr);
+  hbr->Release();
 
-  float y = py + g_h * 0.08f;
-  const float row_h = g_h * 0.045f;
+  text_out(g_title, px + 24, py + 8, panel_w * 0.5f, g_h * 0.06f,
+           L"STEAM COMMUNITY OVERLAY", g_teal);
 
-  // FPS
-  if (g_fps > 0) {
-    wchar_t fpsbuf[64];
-    swprintf(fpsbuf, 64, L"FPS: %.1f", g_fps);
-    text_out(g_text, px + 16, y, panel_w - 32, row_h, fpsbuf, g_brush);
-    y += row_h;
+  // Active User / Rich Presence status (live Steam identity)
+  wchar_t acct_buf[160];
+  if (g_steam_signed_in) {
+    swprintf(acct_buf, 160, L"%s (SteamID %llu)  •  In-Game",
+             g_steam_persona.empty() ? L"Steam User" : g_steam_persona.c_str(),
+             static_cast<unsigned long long>(g_steam_id64));
+  } else {
+    swprintf(acct_buf, 160, L"Unlinked Guest Session  •  Sign in on Steam Tab");
   }
+  text_out(g_small, px + 24, py + g_h * 0.052f, panel_w * 0.56f, g_h * 0.025f,
+           acct_buf, g_brush);
 
-  // System info
-  if (!g_sysinfo.empty()) {
-    text_out(g_small, px + 16, y, panel_w - 32, row_h, g_sysinfo.c_str(), g_dim);
-    y += row_h * 1.5f;
+  // Top Right Stats (live FPS & frame time)
+  const float fps_val = g_fps > 0.5f ? g_fps : 60.0f;
+  wchar_t perfbuf[128];
+  swprintf(perfbuf, 128, L"%.1f FPS  •  %.1fms  •  Xbox Dev Mode UWP",
+           fps_val, 1000.0f / fps_val);
+  text_out(g_small, px + panel_w * 0.45f, py + 14, panel_w * 0.52f, g_h * 0.04f,
+           perfbuf, g_teal);
+
+  const float col_y = py + g_h * 0.10f;
+  const float col_h = panel_h - g_h * 0.16f;
+  const float left_w = panel_w * 0.38f;
+  const float right_x = px + left_w + 20.0f;
+  const float right_w = panel_w - left_w - 40.0f;
+
+  // Left Column: Quick Navigation Menu
+  draw_panel(px + 16, col_y, left_w, col_h);
+  text_out(g_small, px + 30, col_y + 14, left_w - 40, g_h * 0.03f,
+           L"NAVIGATION", g_teal);
+
+  int online_friends = 0;
+  for (const auto& f : g_steam_friends) {
+    if (f.state > 0 || !f.game_name.empty()) ++online_friends;
   }
-
-  // Menu items
-  const wchar_t* items[] = {
-    L"  Resume Game",
-    L"  Settings",
-    L"  Save State",
-    L"  Load State",
-    L"  Reset Game",
-    L"  Exit to Shelf",
+  int ach_unlocked = 0;
+  for (const auto& a : g_steam_achs) {
+    if (a.achieved) ++ach_unlocked;
+  }
+  wchar_t fr_label[64], ach_label[64];
+  swprintf(fr_label, 64, L"👥  Friends (%d Online)", online_friends);
+  swprintf(ach_label, 64, L"🏆  Achievements (%d/%zu)", ach_unlocked,
+           g_steam_achs.size());
+  const wchar_t* nav_items[] = {
+    L"▶  Resume Game",
+    fr_label,
+    ach_label,
+    L"🎮  Toggle Pad Mouse Mode",
+    L"🔄  Refresh Steam Profile",
+    L"⏏  Exit to Tiramisu Shelf",
   };
+  float nav_y = col_y + g_h * 0.06f;
+  const float row_h = g_h * 0.052f;
   for (int i = 0; i < 6; ++i) {
-    text_out(g_text, px + 16, y, panel_w - 32, row_h, items[i], g_brush);
-    y += row_h;
+    const bool sel = (i == g_qm_selected);
+    draw_panel(px + 24, nav_y, left_w - 16, row_h - 4, sel);
+    text_out(g_text, px + 36, nav_y + 4, left_w - 40, row_h - 8,
+             nav_items[i], sel ? g_teal : g_brush);
+    nav_y += row_h;
   }
 
-  // hint
-  text_out(g_small, px + 16, py + panel_h - g_h * 0.04f, panel_w - 32,
-           g_h * 0.03f, L"Back+Start: close menu", g_dim);
+  // Right Column: Live Steam Friends & Activity
+  draw_panel(right_x, col_y, right_w, col_h);
+  text_out(g_small, right_x + 18, col_y + 14, right_w - 36, g_h * 0.03f,
+           L"STEAM FRIENDS & COMMUNITY", g_teal);
+
+  float social_y = col_y + g_h * 0.055f;
+  if (g_steam_friends.empty()) {
+    text_out(g_text, right_x + 18, social_y, right_w - 36, g_h * 0.06f,
+             g_steam_signed_in ? L"No Steam friends online or private profile"
+                               : L"Sign in with Steam QR on the Steam tab to view friends",
+             g_dim);
+    social_y += g_h * 0.065f;
+  } else {
+    size_t show_n = std::min<size_t>(g_steam_friends.size(), 5);
+    for (size_t i = 0; i < show_n; ++i) {
+      const auto& fr = g_steam_friends[i];
+      wchar_t fbuf[160];
+      if (!fr.game_name.empty()) {
+        swprintf(fbuf, 160, L"●  %s — Playing %s", fr.persona.c_str(),
+                 fr.game_name.c_str());
+      } else if (fr.state > 0) {
+        swprintf(fbuf, 160, L"●  %s — Online", fr.persona.c_str());
+      } else {
+        swprintf(fbuf, 160, L"○  %s — Offline", fr.persona.c_str());
+      }
+      text_out(g_text, right_x + 18, social_y, right_w - 36, g_h * 0.04f,
+               fbuf, (!fr.game_name.empty() || fr.state > 0) ? g_brush : g_dim);
+      social_y += g_h * 0.045f;
+    }
+  }
+
+  // In-Game Achievement progress card
+  social_y += g_h * 0.02f;
+  D2D1_ROUNDED_RECT ach_box{{right_x + 18, social_y, right_x + right_w - 18,
+                             std::min(col_y + col_h - 14.0f, social_y + g_h * 0.19f)},
+                            8.0f, 8.0f};
+  D2D1_COLOR_F ach_bg{0.12f, 0.18f, 0.25f, 0.9f};
+  ID2D1SolidColorBrush* abr = nullptr;
+  g_ctx->CreateSolidColorBrush(ach_bg, &abr);
+  g_ctx->FillRoundedRectangle(&ach_box, abr);
+  abr->Release();
+
+  const float ach_ratio = g_steam_achs.empty()
+                              ? 0.0f
+                              : static_cast<float>(ach_unlocked) /
+                                    static_cast<float>(g_steam_achs.size());
+  wchar_t ach_hdr[128];
+  if (g_steam_achs.empty()) {
+    swprintf(ach_hdr, 128, L"ACHIEVEMENTS (NONE RECORDED FOR ACTIVE SESSION)");
+  } else {
+    swprintf(ach_hdr, 128, L"ACHIEVEMENTS (%d / %zu UNLOCKED — %d%%)",
+             ach_unlocked, g_steam_achs.size(),
+             static_cast<int>(ach_ratio * 100.0f));
+  }
+  text_out(g_small, right_x + 30, social_y + 10, right_w - 60, g_h * 0.03f,
+           ach_hdr, g_teal);
+
+  // Progress Bar
+  const float bar_w = right_w - 60.0f;
+  const float bar_h = 10.0f;
+  const float bar_y = social_y + g_h * 0.045f;
+  D2D1_RECT_F pbg{right_x + 30, bar_y, right_x + 30 + bar_w, bar_y + bar_h};
+  D2D1_COLOR_F pbg_col{0.05f, 0.07f, 0.09f, 1.0f};
+  ID2D1SolidColorBrush* pbbr = nullptr;
+  g_ctx->CreateSolidColorBrush(pbg_col, &pbbr);
+  g_ctx->FillRectangle(&pbg, pbbr);
+  pbbr->Release();
+
+  if (ach_ratio > 0.0f) {
+    D2D1_RECT_F pfill{right_x + 30, bar_y, right_x + 30 + bar_w * ach_ratio,
+                      bar_y + bar_h};
+    g_ctx->FillRectangle(&pfill, g_teal);
+  }
+
+  float ay = social_y + g_h * 0.065f;
+  for (size_t i = 0; i < g_steam_achs.size() && i < 2; ++i) {
+    const auto& a = g_steam_achs[i];
+    wchar_t abuf[192];
+    if (a.achieved) {
+      swprintf(abuf, 192, L"★ %s (Unlocked)", a.name.c_str());
+    } else if (a.max_progress > 0) {
+      swprintf(abuf, 192, L"☆ %s (%u/%u)", a.name.c_str(),
+               a.cur_progress, a.max_progress);
+    } else {
+      swprintf(abuf, 192, L"☆ %s (Locked)", a.name.c_str());
+    }
+    text_out(g_small, right_x + 30, ay, right_w - 60, g_h * 0.035f, abuf,
+             a.achieved ? g_brush : g_dim);
+    ay += g_h * 0.035f;
+  }
+
+  // Footer bar
+  text_out(g_small, px + 24, py + panel_h - g_h * 0.042f, panel_w - 48,
+           g_h * 0.03f, L"Back+Start: Close Steam Overlay   |   (A) Select   |   (B) Resume Game", g_dim);
 }
 
 void draw_fps_overlay() {
@@ -287,7 +471,7 @@ void draw_sysinfo_overlay() {
   text_out(g_small, 12, 10, g_w * 0.35f - 8, 20, g_sysinfo.c_str(), g_dim);
 }
 
-void draw_panel(float x, float y, float w, float h, bool focused = false) {
+void draw_panel(float x, float y, float w, float h, bool focused) {
   D2D1_ROUNDED_RECT box{{x, y, x + w, y + h}, 14.0f, 14.0f};
   ID2D1SolidColorBrush* surface = nullptr;
   const D2D1_COLOR_F color{0.18f, 0.12f, 0.09f, 1.0f};
@@ -299,17 +483,17 @@ void draw_panel(float x, float y, float w, float h, bool focused = false) {
 }
 
 void draw_tabs(float m) {
-  const wchar_t* names[UI_TAB_COUNT] = {L"Home", L"Settings", L"Live Log", L"Setup"};
-  const float w = g_w * 0.11f, h = g_h * 0.05f, y = g_h * 0.045f;
+  const wchar_t* names[UI_TAB_COUNT] = {L"Home", L"Settings", L"Live Log", L"Setup", L"Steam"};
+  const float w = g_w * 0.10f, h = g_h * 0.05f, y = g_h * 0.045f;
   for (int i = 0; i < UI_TAB_COUNT; ++i) {
-    const float x = m + i * (w + g_w * 0.012f);
+    const float x = m + i * (w + g_w * 0.010f);
     const bool focused = (g_first_run ? UI_SETUP : g_screen) == i;
     draw_panel(x, y, w, h, focused);
     text_out(g_text, x + 16, y + 4, w - 24, h - 4, names[i],
              focused ? g_teal : g_dim);
   }
   if (!g_control_hint.empty())
-    text_out(g_small, g_w * 0.54f, y + 4, g_w * 0.44f, h,
+    text_out(g_small, g_w * 0.58f, y + 4, g_w * 0.40f, h,
              g_control_hint.c_str(), g_teal);
 }
 
@@ -376,6 +560,151 @@ void draw_log_screen(float m, float y0) {
              L"Log is empty — boot activity lands here live", g_dim);
 }
 
+void draw_steam_screen(float m, float y0) {
+  const float total_w = g_w - 2 * m;
+  const float left_w = total_w * 0.52f;
+  const float right_x = m + left_w + 24.0f;
+  const float right_w = total_w - left_w - 24.0f;
+  const float content_h = g_h * 0.68f;
+
+  // Left Column: Steam Game Library & Downloads
+  draw_panel(m, y0, left_w, content_h);
+  text_out(g_small, m + 20, y0 + 16, left_w - 40, g_h * 0.03f,
+           g_steam_signed_in ? L"YOUR STEAM LIBRARY" : L"STEAM LIBRARY (LOCAL)", g_teal);
+
+  float row_y = y0 + g_h * 0.06f;
+  const float row_h = g_h * 0.072f;
+  const int max_visible = 7;
+  int start = 0;
+  if (static_cast<int>(g_steam_items.size()) > max_visible) {
+    start = std::clamp(g_steam_selected - 3, 0,
+                       static_cast<int>(g_steam_items.size()) - max_visible);
+  }
+
+  if (g_steam_items.empty()) {
+    text_out(g_text, m + 24, row_y + 12, left_w - 48, g_h * 0.16f,
+             g_steam_signed_in
+                 ? L"No Steam games loaded yet.\nPress (X) to refresh library or transfer games via Setup."
+                 : L"Sign in with Steam QR (press Y) to list your owned Steam games and download directly onto your Xbox.",
+             g_dim);
+  }
+
+  for (int i = start;
+       i < static_cast<int>(g_steam_items.size()) && (i - start) < max_visible;
+       ++i) {
+    const auto& item = g_steam_items[i];
+    const bool is_sel = (i == g_steam_selected);
+
+    draw_panel(m + 12, row_y, left_w - 24, row_h - 6, is_sel);
+
+    // Title
+    text_out(g_text, m + 24, row_y + 4, left_w * 0.62f, g_h * 0.035f,
+             item.title.c_str(), is_sel ? g_teal : g_brush);
+
+    // Status / Size
+    std::wstring status_str;
+    if (item.downloading) {
+      wchar_t pctbuf[128];
+      swprintf(pctbuf, 128, L"%d%% • %s",
+               static_cast<int>(item.download_pct * 100.0f),
+               item.status_str.empty() ? L"Downloading..." : item.status_str.c_str());
+      status_str = pctbuf;
+    } else if (!item.status_str.empty()) {
+      status_str = item.status_str + L"  •  " + item.size_str;
+    } else if (item.installed) {
+      status_str = L"Ready to Play  •  " + item.size_str;
+    } else {
+      status_str = L"In Steam Account  •  " + item.size_str;
+    }
+    text_out(g_small, m + 24, row_y + g_h * 0.035f, left_w - 48, g_h * 0.025f,
+             status_str.c_str(), item.downloading ? g_teal : g_dim);
+
+    // Mini progress bar if downloading
+    if (item.downloading) {
+      const float p_w = left_w * 0.28f;
+      const float p_h = 6.0f;
+      const float p_x = m + left_w - p_w - 24.0f;
+      const float p_y = row_y + 14.0f;
+      D2D1_RECT_F pbg{p_x, p_y, p_x + p_w, p_y + p_h};
+      D2D1_COLOR_F pbg_col{0.05f, 0.07f, 0.09f, 1.0f};
+      ID2D1SolidColorBrush* pbbr = nullptr;
+      g_ctx->CreateSolidColorBrush(pbg_col, &pbbr);
+      g_ctx->FillRectangle(&pbg, pbbr);
+      pbbr->Release();
+
+      D2D1_RECT_F pfill{p_x, p_y, p_x + p_w * item.download_pct, p_y + p_h};
+      g_ctx->FillRectangle(&pfill, g_teal);
+    }
+
+    row_y += row_h;
+  }
+
+  // Right Column: Steam Pairing & Selected Title Actions
+  draw_panel(right_x, y0, right_w, content_h);
+  wchar_t acct_hdr[160];
+  if (g_steam_signed_in) {
+    swprintf(acct_hdr, 160, L"SIGNED IN: %s (ID %llu)",
+             g_steam_persona.empty() ? L"Steam Account" : g_steam_persona.c_str(),
+             static_cast<unsigned long long>(g_steam_id64));
+  } else {
+    swprintf(acct_hdr, 160, L"STEAM ACCOUNT (UNLINKED)");
+  }
+  text_out(g_small, right_x + 20, y0 + 16, right_w - 40, g_h * 0.03f,
+           acct_hdr, g_teal);
+
+  if (g_steam_selected >= 0 &&
+      g_steam_selected < static_cast<int>(g_steam_items.size())) {
+    const auto& sel = g_steam_items[g_steam_selected];
+
+    text_out(g_title, right_x + 20, y0 + g_h * 0.060f, right_w - 40,
+             g_h * 0.075f, sel.title.c_str(), g_brush);
+
+    wchar_t id_buf[96];
+    swprintf(id_buf, 96, L"AppID %u  •  %s", sel.app_id, sel.size_str.c_str());
+    text_out(g_small, right_x + 20, y0 + g_h * 0.135f, right_w - 40,
+             g_h * 0.03f, id_buf, g_dim);
+
+    // Action button card
+    const float btn_y = y0 + g_h * 0.185f;
+    const float btn_w = right_w - 40.0f;
+    const float btn_h = g_h * 0.08f;
+    draw_panel(right_x + 20, btn_y, btn_w, btn_h, true);
+
+    std::wstring btn_text = L"[A] Launch on Xbox";
+    if (sel.downloading) {
+      btn_text = sel.status_str.empty() ? L"Downloading Steam depot..." : sel.status_str;
+    } else if (!sel.installed) {
+      btn_text = L"[A] Download from Steam to Xbox";
+    }
+
+    text_out(g_text, right_x + 36, btn_y + g_h * 0.022f, btn_w - 40,
+             g_h * 0.04f, btn_text.c_str(), g_teal);
+  }
+
+  // QR Login / Status section at bottom of right panel
+  const float qr_box_y = y0 + g_h * 0.30f;
+  const float qr_box_h = content_h - g_h * 0.32f;
+  draw_panel(right_x + 20, qr_box_y, right_w - 40, qr_box_h);
+
+  text_out(g_small, right_x + 32, qr_box_y + 14, right_w - 64, g_h * 0.03f,
+           L"STEAM STATUS & ACCOUNT LINK", g_teal);
+  text_out(g_small, right_x + 32, qr_box_y + g_h * 0.05f, right_w - 64,
+           g_h * 0.08f, g_steam_status_line.c_str(), g_brush);
+
+  text_out(g_text, right_x + 32, qr_box_y + g_h * 0.14f, right_w - 64,
+           g_h * 0.04f,
+           g_steam_signed_in ? L"[Y] Re-link QR   |   [X] Refresh Purchases"
+                             : L"[Y] Sign in with Steam QR Code",
+           g_teal);
+
+  draw_qr_overlay(m + 16);
+
+  // Footer instructions
+  text_out(g_small, m, g_h - m * 1.15f, total_w, g_h * 0.04f,
+           L"D-Pad: Select   |   (A): Download / Play   |   (Y): Steam QR Login   |   (X): Refresh   |   LB/RB: Tab",
+           g_dim);
+}
+
 void draw_lan_link(float m) {
   // the transfer URL, big enough to type from a laptop across the room
   if (g_qr_text.empty()) return;
@@ -396,9 +725,9 @@ ui_click ui_hit_test(int x, int y) {
     return {ui_click_type::none, 0};
   }
   if (g_screen == UI_QUICKMENU) return {ui_click_type::none, 0};
-  const float tab_w = g_w * 0.11f;
+  const float tab_w = g_w * 0.10f;
   for (int i = 0; i < UI_TAB_COUNT; ++i) {
-    if (hits(m + i * (tab_w + g_w * 0.012f), g_h * 0.045f, tab_w, g_h * 0.05f))
+    if (hits(m + i * (tab_w + g_w * 0.010f), g_h * 0.045f, tab_w, g_h * 0.05f))
       return {ui_click_type::tab, i};
   }
   if (g_screen == UI_SETTINGS) {
@@ -490,10 +819,23 @@ void ui_render() {
     }
 
     float y = g_h * 0.15f;
-    if (g_screen == UI_SETTINGS || g_screen == UI_LOG) {
-      text_out(g_title, m, y, g_w - 2 * m, g_h * 0.10f,
-               g_screen == UI_SETTINGS ? L"Settings" : L"Live Log", g_brush);
+    if (g_screen == UI_SETTINGS || g_screen == UI_LOG || g_screen == UI_STEAM) {
+      const wchar_t* screen_title = L"Settings";
+      if (g_screen == UI_LOG) screen_title = L"Live Log";
+      else if (g_screen == UI_STEAM) screen_title = L"Steam Launcher & Library";
+      text_out(g_title, m, y, g_w - 2 * m, g_h * 0.10f, screen_title, g_brush);
       y += g_h * 0.10f;
+    }
+
+    if (g_screen == UI_STEAM) {
+      draw_steam_screen(m, y + g_h * 0.01f);
+      draw_lan_link(m);
+      g_ctx->EndDraw();
+      if (bmp) bmp->Release();
+      surf->Release();
+      g_ctx->SetTarget(old_target);
+      if (old_target) old_target->Release();
+      return;
     }
 
     if (g_screen == UI_SETTINGS) {

@@ -296,10 +296,20 @@ void trt_input_mouse_delta_raw(i32 dx, i32 dy) {
 
 void trt_input_set_cursor_pos(int x, int y) {
   std::lock_guard<std::recursive_mutex> lk(g_input_mu);
+  // SetCursorPos clamps to the desktop first, then to the clip rect, and
+  // notifies the window of the move. Guests that warp the pointer and then
+  // wait for WM_MOUSEMOVE (camera drag, RTS edge scroll) need the message,
+  // not just the stored position.
+  const int w = g.dw ? g.dw : 1920;
+  const int h = g.dh ? g.dh : 1080;
+  if (x < 0) x = 0; else if (x >= w) x = w - 1;
+  if (y < 0) y = 0; else if (y >= h) y = h - 1;
   clamp_to_clip(&x, &y);
+  const bool moved = !g.mouse_init || x != g.mx || y != g.my;
   g.mx = x;
   g.my = y;
   g.mouse_init = true;
+  if (moved) post_mouse_move_locked();
 }
 
 void trt_input_set_clip_rect(bool enable, i32 left, i32 top, i32 right, i32 bottom) {
@@ -658,7 +668,25 @@ void trt_input_release_all(void) {
   for (u16 vk = 8; vk < TRT_MAX_VK; ++vk) {
     if (g.down[vk]) trt_input_key_event2(vk, false, g.scan[vk], g.extended[vk], 0);
   }
+  // A pad or mouse button held when the console suspends the app must not
+  // look held after resume: the host re-polls the real device on the way
+  // back, so clearing here is the truthful state in between.
+  for (auto& p : g.pads) {
+    p.pbtn = 0;
+    p.tl = 0;
+    p.tr = 0;
+    p.lx = 0;
+    p.ly = 0;
+    p.rx = 0;
+    p.ry = 0;
+  }
   memset(g.pressed, 0, sizeof(g.pressed));
+  g.mbtn = 0;
+  g.wheel_acc = 0;
+  g.dx_acc = 0;
+  g.dy_acc = 0;
+  g.rdx = 0;
+  g.rdy = 0;
   g.char_count = 0;
   g.abs_init = false;
 }

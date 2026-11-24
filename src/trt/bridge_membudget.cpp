@@ -13,6 +13,8 @@
 //                                           the SLAB reservation is charged,
 //                                           not per-block carving)
 //   MapViewOfFile / UnmapViewOfFile / LRU eviction (bridge_mem.cpp)
+//   MapViewOfFile read-only FILES: VA only, never commit — the pages are the
+//   file's clean page cache, reclaimable on demand (the SSD/RAM overlap)
 //   PE image SizeOfImage at map / unmap    (pe_loader.cpp)
 //   CRT malloc/calloc/realloc/free family  (bridge_msvcrt.cpp)
 //   Anonymous mapping backing buffers      (bridge_mem.cpp)
@@ -40,9 +42,9 @@
 #include <atomic>
 
 extern "C" void trt_crt_forget_all(void);  // .251 FIX: bridge_msvcrt.cpp
+extern "C" void trt_va_forget_all(void);  // .252 FIX: bridge_kernel32.cpp
 #include <cstdio>
 #include <cstdlib>
-extern "C" void trt_va_forget_all(void);  // .252 FIX: bridge_kernel32.cpp
 #include <cstring>
 
 extern "C" void TRT_STDCALL trt_SetLastError(u32 err);
@@ -51,6 +53,7 @@ namespace {
 
 std::atomic<u64> g_committed{0};   // VirtualAlloc commit + heap + mapped views
 std::atomic<u64> g_mapped{0};      // the mapped-view subclass of g_committed
+std::atomic<u64> g_file_view{0};   // file-backed read-only views (VA only)
 std::atomic<u64> g_peak{0};
 std::atomic<u64> g_refusals{0};
 
@@ -238,6 +241,26 @@ void trt_mem_budget_discharge_commit(u64 bytes) {
   }
 }
 
+// A file-backed read-only view charges VA only: its pages ARE the file's
+// clean page cache, the kernel drops them under pressure for free and re-faults
+// them from the SSD. Counting them as commit would charge a streaming game for
+// RAM the platform can reclaim whenever it wants.
+int trt_mem_budget_charge_file_view(u64 bytes) {
+  if (!bytes) return 0;
+  if (va_charge_common("MapViewOfFile(file) VA", bytes) != 0) return -1;
+  g_file_view.fetch_add(bytes);
+  return 0;
+}
+
+void trt_mem_budget_discharge_file_view(u64 bytes) {
+  if (!bytes) return;
+  const u64 before = g_file_view.load();
+  g_file_view.store(before > bytes ? before - bytes : 0);
+  discharge(g_va_reserved, bytes, "file view VA");
+}
+
+u64 trt_mem_budget_file_mapped(void) { return g_file_view.load(); }
+
 int trt_mem_budget_charge_map(u64 bytes) {
   if (!bytes) return 0;
   // a mapped view reserves VA for exactly its lifetime, so the map charge
@@ -304,6 +327,7 @@ u64 trt_mem_budget_va_refusals(void) { return g_va_refusals.load(); }
 void trt_mem_budget_reset(void) {
   const u64 committed = g_committed.exchange(0);
   const u64 mapped = g_mapped.exchange(0);
+  g_file_view.store(0);
   const u64 va = g_va_reserved.exchange(0);
   g_soft80.store(false);
   g_soft90.store(false);
@@ -318,6 +342,7 @@ void trt_mem_budget_reset(void) {
   // .252 FIX: the VA-extent registry DID trip on .251 (1 MB VA
   // over-discharge after /api/stop) -- forget it too, same treatment.
   trt_crt_forget_all();
+  trt_va_forget_all();
   char line[256];
   snprintf(line, sizeof(line),
            "[trt] mem: BUDGET RESET after guest force-kill: ledger zeroed "
@@ -335,11 +360,12 @@ void trt_mem_budget_report(char* line, unsigned cap) {
   const u64 committed = g_committed.load();
   snprintf(line, cap,
            "memory budget: %llu/%llu MB committed (%llu MB mapped views, "
-           "peak %llu MB, %llu refusals; VA %llu/%llu MB reserved, "
-           "peak %llu MB, %llu refusals)",
+           "%llu MB file-backed page cache, peak %llu MB, %llu refusals; "
+           "VA %llu/%llu MB reserved, peak %llu MB, %llu refusals)",
            (unsigned long long)(committed / (1024ULL * 1024ULL)),
            (unsigned long long)(budget / (1024ULL * 1024ULL)),
            (unsigned long long)(g_mapped.load() / (1024ULL * 1024ULL)),
+           (unsigned long long)(g_file_view.load() / (1024ULL * 1024ULL)),
            (unsigned long long)(g_peak.load() / (1024ULL * 1024ULL)),
            (unsigned long long)g_refusals.load(),
            (unsigned long long)(g_va_reserved.load() / (1024ULL * 1024ULL)),

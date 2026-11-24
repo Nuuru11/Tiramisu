@@ -43,10 +43,12 @@
 #include "../src/trt/images.h"
 #include "../src/trt/pe.h"
 #include "../src/trt/pe_exports.h"
+#include "../src/trt/engine_synthesizer.h"
 #include "../src/trt/input.h"
 #include "../src/trt/thunk.h"
 #include "../src/trt/bridge_reg.h"
 #include "../src/trt/bridge_ws2.h"
+#include "../src/trt/x86_cpu.h"
 
 // bridge_sys.cpp: Win8+ temp-path (shared answer with GetTempPathW).
 // Declared inside extern "C" so the guest-ABI symbol name matches.
@@ -237,6 +239,37 @@ static void print_x86_skip(const char* path, u16 machine) {
   const char* name = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
   printf("SKIP %s: unsupported machine 0x%04x (neither PE64 nor PE32)\n",
          name, machine);
+}
+
+// --run32: set by the parent before fork, so every child inherits it.
+static int g_run32 = 0;
+
+// M7 Phase 2: run a PE32 image on the clean-room x86 engine.
+// Load-only was the Phase 1 verdict. With --run32 the mapped 32-bit image is
+// executed on the 4GB guest reservation, so the boot ladder reports what the
+// guest code itself does instead of stopping at the seal. TRT_X86_HOTLOOP
+// names a spin ("HOT LOOP 0x..."), and the engine's return value, instruction
+// count and final EIP are printed as the verdict -- never a bare "returned".
+static int run_pe32_image(trt_image* img, const char* name) {
+  x86_context ctx = {};
+  x86_cpu_init(&ctx);
+  ctx.log = [](const char* s) {
+    printf("  [x86] %s\n", s);
+    trt_log_ring(s);
+  };
+  printf("  run32: executing PE32 entry at image+0x%llx (guest base 0x%08X)\n",
+         (unsigned long long)img->entry_rva, (unsigned)img->guest_base);
+  fflush(stdout);
+  const int rc = x86_run_pe32(&ctx, img->base, img->size_of_image,
+                              img->guest_base, img->entry_rva, 0x00100000,
+                              0x00100000);
+  printf("  run32: engine rc=%d after %llu instructions (eip=0x%08X "
+         "eax=0x%08X esp=0x%08X ebp=0x%08X)\n",
+         rc, (unsigned long long)ctx.insn_count, ctx.regs.eip, ctx.regs.eax,
+         ctx.regs.esp, ctx.regs.ebp);
+  fflush(stdout);
+  x86_mem_free(&ctx);
+  return rc;
 }
 
 static void print_pe32_load_only(const char* path, const char* what) {
@@ -958,6 +991,13 @@ int child_run(const char* path) {
         fflush(stdout);
         return 44;
       }
+      if (g_run32 && img32->entry_rva) {
+        const int rc32 = run_pe32_image(img32, name);
+        printf("RUN OK %s: PE32 entry executed on the x86 engine (rc=%d)\n",
+               name, rc32);
+        fflush(stdout);
+        return 0;
+      }
       print_pe32_load_only(path, "RUN");
       fflush(stdout);
       return 46;
@@ -999,10 +1039,38 @@ int child_run(const char* path) {
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc < 2) {
-    printf("usage: test_corpus_run [--exe] <pe> [<pe> ...]\n");
+    printf("usage: test_corpus_run [--exe] [--run32] <pe> [<pe> ...]\n");
     printf("  (default)   run DllMain(PROCESS_ATTACH) on each DLL\n");
     printf("  --exe       boot each EXE: CRT startup -> WinMain -> engine\n");
+    printf("  --run32     execute a PE32 EXE on the x86 engine (not load-only)\n");
+    printf("  --synth     classify each argument as a game DIRECTORY\n");
     return 2;
+  }
+
+  // Synthesizer phase: real-directory classification, no guest code executed.
+  if (strcmp(argv[1], "--synth") == 0) {
+    int bad = 0;
+    for (int a = 2; a < argc; ++a) {
+      trt_engine_profile p;
+      printf("\n==== SYNTH %s ====\n", argv[a]);
+      if (!trt_synthesize_engine(argv[a], nullptr, &p)) {
+        printf("SYNTH FAILED %s: no candidate executable in directory\n", argv[a]);
+        ++bad;
+        continue;
+      }
+      printf("SYNTH %s:\n  engine=%s\n  arch=%s\n  exe=%s\n  gfx=%s\n  audio=%s\n"
+             "  steam=%s appid=%u\n  imports=%zu\n",
+             p.game_name.c_str(), trt_engine_type_name(p.engine_type),
+             p.is_managed ? "Managed (.NET)" : (p.is_pe32 ? "PE32" : "PE64"),
+             p.main_exe_rel.c_str(), trt_graphics_api_name(p.preferred_gfx),
+             trt_audio_middleware_name(p.preferred_audio),
+             p.has_steam ? "yes" : "no", p.steam_appid, p.imported_modules.size());
+      for (const auto& m : p.imported_modules) printf("    import %s\n", m.c_str());
+      for (const auto& s : p.synthetic_shims) printf("    shim   %s\n", s.c_str());
+      for (const auto& c : p.cmdline_args) printf("    arg    %s\n", c.c_str());
+    }
+    printf("\nSYNTH SUMMARY: %d classified, %d failed\n", (argc - 2) - bad, bad);
+    return bad ? 1 : 0;
   }
 
   g_ring = (trt_ring*)mmap(nullptr, sizeof(trt_ring), PROT_READ | PROT_WRITE,
@@ -1014,13 +1082,16 @@ int main(int argc, char** argv) {
   int first = 1;
   int exe_mode = 0;
   while (first < argc && (strcmp(argv[first], "--exe") == 0 ||
-                          strcmp(argv[first], "--mock-d3d11") == 0)) {
+                          strcmp(argv[first], "--mock-d3d11") == 0 ||
+                          strcmp(argv[first], "--run32") == 0)) {
     if (strcmp(argv[first], "--exe") == 0) exe_mode = 1;
-    else g_mock_d3d11 = 1;
+    else if (strcmp(argv[first], "--mock-d3d11") == 0) g_mock_d3d11 = 1;
+    else { g_run32 = 1; exe_mode = 1; }  // --run32 implies the EXE boot phase
     ++first;
   }
   if (argc <= first) {
-    printf("usage: test_corpus_run [--exe] [--mock-d3d11] <pe> ...\n");
+    printf("usage: test_corpus_run [--exe] [--mock-d3d11] [--run32] <pe> ...\n");
+    printf("       test_corpus_run --synth <game-dir> ...\n");
     return 2;
   }
 
@@ -1633,6 +1704,13 @@ int child_boot(const char* path) {
              name);
       fflush(stdout);
       return 44;
+    }
+    if (g_run32 && img32->entry_rva) {
+      const int rc32 = run_pe32_image(img32, name);
+      printf("BOOT OK %s: PE32 entry executed on the x86 engine (rc=%d)\n",
+             name, rc32);
+      fflush(stdout);
+      return 0;
     }
     print_pe32_load_only(path, "BOOT");
     fflush(stdout);

@@ -47,6 +47,7 @@ struct thunk_entry {
   std::string mod;
   std::string sym;
   void* code = nullptr;
+  u64 ret_val = 0;
 };
 
 std::mutex g_thunk_mu;
@@ -127,9 +128,10 @@ void trt_core_log(const char* line) {
   else fprintf(stderr, "  [trt] %s\n", tagged);
 }
 
-// the target of every stub: names the symbol, returns 0
+// the target of every stub: names the symbol, returns ret_val
 extern "C" u64 trt_thunk_dispatch(u64 index) {
   std::string kind, mod, sym;
+  u64 ret = 0;
   bool found = false;
   {
     std::lock_guard<std::mutex> lk(g_thunk_mu);
@@ -138,22 +140,32 @@ extern "C" u64 trt_thunk_dispatch(u64 index) {
       kind = e.kind;
       mod = e.mod;
       sym = e.sym;
+      ret = e.ret_val;
       found = true;
     }
   }
   if (found) {
-    char line[512];
-    snprintf(line, sizeof(line), "trt: %s %s!%s called (unimplemented)",
-             kind.c_str(), mod.c_str(), sym.c_str());
-    trt_core_log(line);
+    static std::unordered_map<u64, int> s_call_counts;
+    static std::mutex s_log_mu;
+    bool should_log = false;
+    {
+      std::lock_guard<std::mutex> lk(s_log_mu);
+      if (++s_call_counts[index] <= 6) should_log = true;
+    }
+    if (should_log) {
+      char line[512];
+      snprintf(line, sizeof(line), "trt: %s %s!%s called (unimplemented) -> ret=0x%llx",
+               kind.c_str(), mod.c_str(), sym.c_str(), (unsigned long long)ret);
+      trt_core_log(line);
+    }
   } else {
     trt_core_log("trt: thunk called with a bad index");
   }
-  return 0;
+  return ret;
 }
 
-void* trt_thunk_make(const trt_backend* be, const char* kind, const char* mod,
-                     const char* sym) {
+void* trt_thunk_make_ext(const trt_backend* be, const char* kind, const char* mod,
+                         const char* sym, u64 ret_val) {
   if (!kind) kind = "STUB";
   if (!mod) mod = "?";
   if (!sym) sym = "?";
@@ -169,7 +181,10 @@ void* trt_thunk_make(const trt_backend* be, const char* kind, const char* mod,
   {
     std::lock_guard<std::mutex> lk(g_thunk_mu);
     auto it = g_thunk_map.find(key);
-    if (it != g_thunk_map.end()) return g_thunks[it->second].code;
+    if (it != g_thunk_map.end()) {
+      g_thunks[it->second].ret_val = ret_val;
+      return g_thunks[it->second].code;
+    }
 
     if (!backend || !backend->alloc || !backend->protect) return nullptr;
 
@@ -196,15 +211,21 @@ void* trt_thunk_make(const trt_backend* be, const char* kind, const char* mod,
     e.mod = mod;
     e.sym = sym;
     e.code = created_code;
+    e.ret_val = ret_val;
     g_thunks.push_back(std::move(e));
     g_thunk_map.emplace(std::move(key), index);
   }
 
   char line[512];
-  snprintf(line, sizeof(line), "trt: %s %s!%s -> fail-visible thunk",
-           kind, mod, sym);
+  snprintf(line, sizeof(line), "trt: %s %s!%s -> fail-visible thunk (default ret=0x%llx)",
+           kind, mod, sym, (unsigned long long)ret_val);
   trt_core_log(line);
   return created_code;
+}
+
+void* trt_thunk_make(const trt_backend* be, const char* kind, const char* mod,
+                     const char* sym) {
+  return trt_thunk_make_ext(be, kind, mod, sym, 0);
 }
 
 } // extern "C"

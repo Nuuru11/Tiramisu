@@ -1,6 +1,11 @@
 # Longan runtime internals
 out/
 tests/out/
+# local working data: console logs, scratch host builds, agent state
+logs/
+out_verify/
+out253/
+.codebuff/
 *.obj
 *.msix
 *.pfx

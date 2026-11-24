@@ -36,6 +36,11 @@ u32 TRT_STDCALL trt_GetCurrentThreadId(void);
 void* trt_thunk_make(const trt_backend* be, const char* kind,
                      const char* mod, const char* sym);
 
+// Build (or reuse) a callable that logs "kind mod!sym called" and returns
+// ret_val. `be` may be NULL to use the remembered backend.
+void* trt_thunk_make_ext(const trt_backend* be, const char* kind,
+                         const char* mod, const char* sym, u64 ret_val);
+
 #ifdef __cplusplus
 }
 #endif

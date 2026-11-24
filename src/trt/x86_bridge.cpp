@@ -10,6 +10,7 @@
 #include "trt.h"
 #include "images.h"
 #include "pe_exports.h"
+#include "dynamic_api.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -136,6 +137,12 @@ uint32_t x86_call_bridge(x86_context* ctx, const char* module, const char* symbo
 // ---- Argument count database for common Windows APIs ----
 // Maps "module!symbol" -> number of arguments (for __stdcall)
 static int lookup_arg_count(const char* module, const char* symbol) {
+    // winmmbase.dll is the api-set that backs winmm. Same functions, same
+    // calling conventions, so every arity answer must apply to both names -
+    // otherwise a PE32 title importing winmmbase gets the 4-argument guess.
+    if (module && (strcasecmp(module, "winmmbase") == 0 ||
+                   strcasecmp(module, "winmmbase.dll") == 0))
+        module = "winmm";
 
     // ---- General table (module, symbol, stdcall arg count) ----
     struct arg_ent { const char* mod; const char* sym; int n; };
@@ -179,6 +186,13 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         {"kernel32","GetACP",0},{"kernel32","GetOEMCP",0},
         {"kernel32","IsValidCodePage",1},{"kernel32","GetCPInfo",2},
         {"kernel32","GetLocaleInfoA",4},{"kernel32","GetLocaleInfoW",4},
+        // Localization api-set entry points OpenTTD resolves by hand. A wrong
+        // arity here is fatal, not cosmetic: the 4-arg default popped 12 bytes
+        // too many off IsValidLocaleName's stack and the CRT returned into
+        // stack data (EIP=0x001FFF3A, executed as 0xEA).
+        {"kernel32","GetLocaleInfoEx",4},{"kernel32","IsValidLocale",2},
+        {"kernel32","IsValidLocaleName",1},{"kernel32","LocaleNameToLCID",2},
+        {"kernel32","LCIDToLocaleName",4},
         {"kernel32","TlsAlloc",0},{"kernel32","TlsFree",1},
         {"kernel32","TlsGetValue",1},{"kernel32","TlsSetValue",2},
         // Fiber-local storage has the same shape as TLS. Without these the
@@ -389,8 +403,218 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         // steam
         {"steam_api","SteamAPI_Init",0},{"steam_api","SteamAPI_Shutdown",0},
         {"steam_api","SteamAPI_RunCallbacks",0},
+        {"steam_api","SteamAPI_ISteamUserStats_RequestCurrentStats",1},
         {"steam_api64","SteamAPI_Init",0},{"steam_api64","SteamAPI_Shutdown",0},
         {"steam_api64","SteamAPI_RunCallbacks",0},
+        {"steam_api64","SteamAPI_ISteamUserStats_RequestCurrentStats",1},
+        {"ws2_32","WSAIoctl",9},
+        {"ws2_32","getnameinfo",7},
+        {"ws2_32","freeaddrinfo",1},
+        {"ws2_32","getaddrinfo",4},
+        {"winmm","midiOutShortMsg",2},
+        {"winmm","timeKillEvent",1},
+        {"winmm","midiOutGetNumDevs",0},
+        {"winmm","midiOutGetDevCapsW",3},
+        {"winmm","midiOutGetDevCapsA",3},
+        {"winmm","midiOutGetVolume",2},
+        {"winmm","midiOutSetVolume",2},
+        {"winmm","midiOutOpen",5},
+        {"winmm","waveOutReset",1},
+        {"winmm","waveOutWrite",3},
+        {"winmm","waveOutUnprepareHeader",3},
+        {"winmm","waveOutPrepareHeader",3},
+        {"winmm","waveOutClose",1},
+        {"winmm","waveOutOpen",6},
+        {"winmm","timeGetDevCaps",2},
+        {"winmm","midiOutReset",1},
+        {"winmm","midiOutLongMsg",3},
+        {"winmm","midiOutClose",1},
+        {"winmm","midiOutUnprepareHeader",3},
+        {"winmm","midiOutPrepareHeader",3},
+        {"winmm","timeSetEvent",5},
+        // winmm capture/output surface: waveIn and waveOut are REAL devices now,
+        // so a PE32 caller needs the true arity. A guessed count pops the wrong
+        // number of stack slots and corrupts the return address.
+        {"winmm","waveInGetNumDevs",0},{"winmm","waveInGetDevCapsW",3},
+        {"winmm","waveInGetDevCapsA",3},{"winmm","waveInOpen",6},
+        {"winmm","waveInClose",1},{"winmm","waveInPrepareHeader",3},
+        {"winmm","waveInUnprepareHeader",3},{"winmm","waveInAddBuffer",3},
+        {"winmm","waveInStart",1},{"winmm","waveInStop",1},
+        {"winmm","waveInReset",1},{"winmm","waveInMessage",4},
+        {"winmm","waveInGetErrorTextW",3},{"winmm","waveInGetErrorTextA",3},
+        {"winmm","waveOutGetNumDevs",0},{"winmm","waveOutGetDevCapsW",3},
+        {"winmm","waveOutGetDevCapsA",3},{"winmm","waveOutGetPosition",3},
+        {"winmm","waveOutSetVolume",2},{"winmm","waveOutGetVolume",2},
+        {"winmm","waveOutPause",1},{"winmm","waveOutRestart",1},
+        {"winmm","waveOutBreakLoop",1},{"winmm","waveOutMessage",4},
+        {"winmm","waveOutGetErrorTextW",3},{"winmm","waveOutGetErrorTextA",3},
+        // msacm32 decodes for real now, so the 32-bit dispatcher must know
+        // every one of its arities instead of guessing four arguments.
+        {"msacm32","acmGetVersion",0},{"msacm32","acmStreamOpen",8},
+        {"msacm32","acmStreamPrepareHeader",3},
+        {"msacm32","acmStreamUnprepareHeader",3},
+        {"msacm32","acmStreamConvert",3},{"msacm32","acmStreamSize",4},
+        {"msacm32","acmStreamReset",2},{"msacm32","acmStreamClose",2},
+        {"msacm32","acmFormatSuggest",5},{"msacm32","acmFormatTagEnumW",4},
+        {"msacm32","acmFormatTagEnumA",4},{"msacm32","acmFormatEnumW",5},
+        {"msacm32","acmFormatEnumA",5},{"msacm32","acmGetDriverHandle",2},
+        {"msacm32","acmDriverEnum",3},{"msacm32","acmDriverID",3},
+        {"imm32","ImmSetCompositionWindow",2},
+        {"imm32","ImmNotifyIME",4},
+        {"imm32","ImmGetCompositionStringW",4},
+        {"imm32","ImmReleaseContext",2},
+        {"imm32","ImmGetContext",1},
+        {"imm32","ImmGetProperty",2},
+        {"imm32","ImmSetCandidateWindow",2},
+        {"usp10","ScriptGetLogicalWidths",6},
+        {"usp10","ScriptFreeCache",1},
+        {"usp10","ScriptItemize",7},
+        {"usp10","ScriptLayout",4},
+        {"usp10","ScriptShape",10},
+        {"usp10","ScriptPlace",9},
+        {"usp10","ScriptBreak",4},
+        {"winhttp","WinHttpOpen",5},
+        {"winhttp","WinHttpCloseHandle",1},
+        {"winhttp","WinHttpConnect",4},
+        {"winhttp","WinHttpOpenRequest",7},
+        {"winhttp","WinHttpSendRequest",7},
+        {"winhttp","WinHttpReceiveResponse",2},
+        {"winhttp","WinHttpQueryDataAvailable",2},
+        {"winhttp","WinHttpReadData",4},
+        {"winhttp","WinHttpQueryHeaders",6},
+        {"winhttp","WinHttpCrackUrl",4},
+        {"winhttp","WinHttpSetStatusCallback",4},
+        {"winhttp","WinHttpSetTimeouts",5},
+        {"bcrypt","BCryptGenRandom",4},
+        {"kernel32","SetConsoleCtrlHandler",2},
+        {"kernel32","GetModuleHandleExW",3},
+        {"kernel32","FreeLibraryAndExitThread",2},
+        {"kernel32","CreatePipe",4},
+        {"kernel32","IsThreadAFiber",0},
+        {"kernel32","GetDateFormatW",6},
+        {"kernel32","GetTimeFormatW",6},
+        {"kernel32","LCMapStringW",6},
+        {"kernel32","GetConsoleOutputCP",0},
+        {"kernel32","InterlockedFlushSList",1},
+        {"kernel32","InterlockedPushEntrySList",2},
+        {"kernel32","RtlUnwind",4},
+        {"kernel32","GetStringTypeW",4},
+        {"kernel32","CompareStringEx",9},
+        {"kernel32","LCMapStringEx",9},
+        {"kernel32","CloseThreadpoolWait",1},
+        {"kernel32","SetThreadpoolWait",3},
+        {"kernel32","CreateThreadpoolWait",3},
+        {"kernel32","CloseThreadpoolTimer",1},
+        {"kernel32","WaitForThreadpoolTimerCallbacks",2},
+        {"kernel32","SetThreadpoolTimer",4},
+        {"kernel32","CreateThreadpoolTimer",3},
+        {"kernel32","FreeLibraryWhenCallbackReturns",2},
+        {"kernel32","FormatMessageW",7},
+        {"kernel32","FormatMessageA",7},
+        {"kernel32","ExpandEnvironmentStringsW",3},
+        {"kernel32","AddVectoredExceptionHandler",2},
+        {"kernel32","GetLocaleInfoEx",4},
+        {"kernel32","GetCurrentDirectoryW",2},
+        {"kernel32","GetUserDefaultLCID",0},
+        {"kernel32","GetLogicalDriveStringsW",2},
+        {"kernel32","SetErrorMode",1},
+        {"kernel32","CompareStringW",6},
+        {"kernel32","GetUserDefaultUILanguage",0},
+        {"kernel32","AllocConsole",0},
+        {"kernel32","FreeConsole",0},
+        {"kernel32","GetConsoleScreenBufferInfo",2},
+        {"kernel32","SetConsoleScreenBufferSize",2},
+        {"kernel32","SignalObjectAndWait",4},
+        {"kernel32","VerSetConditionMask",4},
+        {"kernel32","VerifyVersionInfoW",4},
+        {"kernel32","SetConsoleTitleW",1},
+        {"kernel32","SetConsoleOutputCP",1},
+        {"kernel32","ReleaseSemaphore",3},
+        {"kernel32","CreateSemaphoreW",4},
+        {"kernel32","CreateSemaphoreExW",6},
+        {"kernel32","OpenThread",3},
+        {"kernel32","GetProcessId",1},
+        {"kernel32","GetThreadContext",2},
+        {"kernel32","VirtualQueryEx",4},
+        {"kernel32","SetNamedPipeHandleState",4},
+        {"kernel32","TransactNamedPipe",7},
+        {"kernel32","WaitNamedPipeW",2},
+        {"kernel32","EnumSystemLocalesW",2},
+        {"kernel32","FlushProcessWriteBuffers",0},
+        {"kernel32","CreateEventExW",4},
+        {"kernel32","InitOnceExecuteOnce",4},
+        {"kernel32","CreateSymbolicLinkW",3},
+        {"kernel32","CreateHardLinkW",3},
+        {"kernel32","MoveFileExW",3},
+        {"kernel32","CopyFileW",3},
+        {"kernel32","CreateDirectoryExW",3},
+        {"kernel32","DeviceIoControl",8},
+        {"kernel32","AreFileApisANSI",0},
+        {"kernel32","SetFileTime",4},
+        {"kernel32","SetFileInformationByHandle",4},
+        {"kernel32","SetFileAttributesW",2},
+        {"kernel32","GetFinalPathNameByHandleW",4},
+        {"kernel32","GetFileInformationByHandle",2},
+        {"kernel32","GetFileAttributesExW",3},
+        {"kernel32","FindFirstFileExW",6},
+        {"kernel32","SetCurrentDirectoryW",1},
+        {"kernel32","TryAcquireSRWLockShared",1},
+        {"kernel32","AcquireSRWLockShared",1},
+        {"kernel32","ReleaseSRWLockShared",1},
+        {"kernel32","SleepConditionVariableSRW",4},
+        {"kernel32","WakeAllConditionVariable",1},
+        {"kernel32","WakeConditionVariable",1},
+        {"kernel32","TryAcquireSRWLockExclusive",1},
+        {"kernel32","AcquireSRWLockExclusive",1},
+        {"kernel32","ReleaseSRWLockExclusive",1},
+        {"kernel32","GetNativeSystemInfo",1},
+        {"kernel32","SwitchToThread",0},
+        {"kernel32","WaitForSingleObjectEx",3},
+        {"kernel32","GetEnvironmentStringsW",0},
+        {"kernel32","FreeEnvironmentStringsW",1},
+        {"kernel32","IsValidLocale",2},
+        {"kernel32","GetDiskFreeSpaceExW",4},
+        {"user32","IsClipboardFormatAvailable",1},
+        {"user32","SetWindowPos",7},
+        {"user32","EnumDisplayMonitors",4},
+        {"user32","GetMonitorInfoW",2},
+        {"user32","MonitorFromWindow",2},
+        {"user32","EnumDisplaySettingsW",3},
+        {"user32","ChangeDisplaySettingsW",2},
+        {"user32","SetRectEmpty",1},
+        {"user32","SetRect",5},
+        {"user32","ClientToScreen",2},
+        {"user32","ValidateRect",2},
+        {"user32","GetUpdateRect",3},
+        {"user32","GetWindowDC",1},
+        {"user32","TrackMouseEvent",1},
+        {"user32","GetKeyboardLayout",1},
+        {"user32","GetClipboardData",1},
+        {"user32","CloseClipboard",0},
+        {"user32","OpenClipboard",1},
+        {"user32","GetActiveWindow",0},
+        {"user32","SendDlgItemMessageW",5},
+        {"user32","SetDlgItemTextW",3},
+        {"user32","GetDlgItem",2},
+        {"user32","DialogBoxParamW",5},
+        {"gdi32","SetDIBColorTable",4},
+        {"gdi32","GetDIBColorTable",4},
+        {"gdi32","CreateDIBSection",6},
+        {"gdi32","SetPixelFormat",3},
+        {"gdi32","SelectPalette",3},
+        {"gdi32","GetPaletteEntries",4},
+        {"gdi32","SetPaletteEntries",4},
+        {"gdi32","SetMapMode",2},
+        {"gdi32","AddFontResourceExW",4},
+        {"gdi32","SwapBuffers",1},
+        {"gdi32","GetOutlineTextMetricsW",3},
+        {"gdi32","GetGlyphOutlineW",7},
+        {"gdi32","EnumFontFamiliesExW",5},
+        {"gdi32","CreateFontIndirectW",1},
+        {"gdi32","GetGlyphIndicesW",5},
+        {"gdi32","CreatePalette",1},
+        {"gdi32","RealizePalette",1},
+        {"gdi32","ChoosePixelFormat",2},
     };
     for (size_t i = 0; i < sizeof(k_args) / sizeof(k_args[0]); i++) {
         if (mod_eq(module, k_args[i].mod) && sym_eq(symbol, k_args[i].sym))
@@ -569,6 +793,25 @@ static int lookup_arg_count(const char* module, const char* symbol) {
     #undef ARGENTRY
 }
 
+// Conformance API: the argument count this bridge will pop for module!symbol,
+// or -1 when no ABI entry exists. -1 is not harmless - the trap dispatcher then
+// falls back to a 4-argument guess, which is exactly how a 1-arg stdcall once
+// ate OpenTTD's return address and jumped to 0x0000B5E3. The conformance suite
+// requires every registered BUILTIN symbol to answer without guessing.
+int trt_abi_arg_count(const char* module, const char* symbol) {
+    if (!module || !symbol) return -1;
+    int n = lookup_arg_count(module, symbol);
+    if (n >= 0) return n;
+    // The table stores module names without the extension; retry stripped.
+    char bare[32];
+    size_t len = strcspn(module, ".");
+    if (len == 0 || len >= sizeof(bare)) return -1;
+    memcpy(bare, module, len);
+    bare[len] = 0;
+    if (strcmp(bare, module) == 0) return -1;
+    return lookup_arg_count(bare, symbol);
+}
+
 // ---- Calling-convention helpers ----
 static int ieq_n(const char* a, const char* b, size_t n) {
     for (size_t i = 0; i < n; i++) {
@@ -616,7 +859,7 @@ static uint32_t lookup_ptr_mask(x86_context* ctx, const char* module,
         if (sym_eq(symbol, "SetEnvironmentVariableA") || sym_eq(symbol, "SetEnvironmentVariableW")) P(0x3);
         if (sym_eq(symbol, "MultiByteToWideChar") || sym_eq(symbol, "WideCharToMultiByte")) P(0x14);
         if (sym_eq(symbol, "OutputDebugStringA") || sym_eq(symbol, "OutputDebugStringW")) P(0x1);
-        if (sym_eq(symbol, "GetSystemInfo") || sym_eq(symbol, "GetVersionExA") ||
+        if (sym_eq(symbol, "GetSystemInfo") || sym_eq(symbol, "GetNativeSystemInfo") || sym_eq(symbol, "GetVersionExA") ||
             sym_eq(symbol, "GetVersionExW")) P(0x1);
         if (sym_eq(symbol, "RtlMoveMemory")) P(0x3);
         // Symbols the CRT resolves at runtime (api-set -> kernel32) take guest
@@ -1009,6 +1252,25 @@ static int x86_pe32_runtime(x86_context* ctx, const char* module,
         }
         return 1;
     }
+    if (sym_eq(symbol, "GetSystemInfo") || sym_eq(symbol, "GetNativeSystemInfo")) {
+        const uint32_t si = args[0];
+        if (!si) { *out = 0; return 1; }
+        // 32-bit SYSTEM_INFO is 36 bytes.
+        for (int i = 0; i < 36; i++) x86_mem_write8(ctx, si + i, 0);
+        x86_mem_write16(ctx, si + 0, 0);        // wProcessorArchitecture (0 = x86)
+        x86_mem_write16(ctx, si + 2, 0);        // wReserved
+        x86_mem_write32(ctx, si + 4, 4096);     // dwPageSize
+        x86_mem_write32(ctx, si + 8, 0x10000);  // lpMinimumApplicationAddress
+        x86_mem_write32(ctx, si + 12, 0x7FFEFFFF); // lpMaximumApplicationAddress
+        x86_mem_write32(ctx, si + 16, 0xFF);     // dwActiveProcessorMask
+        x86_mem_write32(ctx, si + 20, 8);       // dwNumberOfProcessors
+        x86_mem_write32(ctx, si + 24, 586);      // dwProcessorType (PROCESSOR_INTEL_PENTIUM)
+        x86_mem_write32(ctx, si + 28, 0x10000); // dwAllocationGranularity
+        x86_mem_write16(ctx, si + 32, 6);       // wProcessorLevel
+        x86_mem_write16(ctx, si + 34, 0);       // wProcessorRevision
+        *out = 0;
+        return 1;
+    }
     if (mod_eq(module, "msvcrt") || mod_eq(module, "ucrtbase")) {
         if (sym_eq(symbol, "malloc")) { *out = x86_guest_alloc(ctx, args[0], 0); return 1; }
         if (sym_eq(symbol, "calloc")) {
@@ -1107,15 +1369,11 @@ extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
     int cdecl_call = lookup_cdecl(module, symbol);
     int nargs = lookup_arg_count(module, symbol);
     if (nargs < 0) {
-        // No ABI entry: fall back to the historical 4-arg guess, but say so
-        // once per symbol. A wrong count silently shifts the guest stack by
-        // 4 bytes per missing argument, which surfaces much later as a jump to
-        // a garbage EIP. Naming it here keeps that failure attributable.
-        nargs = 4;
+        nargs = trt_dynamic_deduce_arg_count(module, symbol);
         char buf[256];
         snprintf(buf, sizeof(buf),
-                 "x86_bridge: NAMED GAP %s!%s has no stdcall arg-count entry; "
-                 "assuming 4 (stack may drift)", module, symbol ? symbol : "?");
+                 "x86_bridge: [AUTONOMOUS SYNTHESIS] %s!%s deduced stdcall nargs=%d",
+                 module, symbol ? symbol : "?", nargs);
         if (ctx->log) ctx->log(buf);
     }
 
@@ -1129,12 +1387,14 @@ extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
     void* fn = (trap_index >= 0) ? trt_pe32_trap_host_fn(trap_index) : nullptr;
     if (!fn && symbol && symbol[0]) fn = trt_resolve_symbol(module, symbol);
     if (!fn) {
+        uint32_t syn_val = (uint32_t)trt_dynamic_deduce_return_val(module, symbol);
         char buf[256];
-        snprintf(buf, sizeof(buf), "x86_bridge: unresolved %s!%s -> returning 0", module, symbol);
+        snprintf(buf, sizeof(buf), "x86_bridge: unresolved %s!%s -> dynamic synth return 0x%x",
+                 module, symbol ? symbol : "?", syn_val);
         if (ctx->log) ctx->log(buf);
         *out_nargs = nargs;
         *out_cdecl = cdecl_call;
-        return 0;
+        return syn_val;
     }
     result = x86_call_fn(ctx, fn, module, symbol, args, nargs);
     *out_nargs = nargs;

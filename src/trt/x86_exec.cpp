@@ -487,6 +487,183 @@ extern "C" uint32_t x86_dispatch_import(x86_context* ctx, int trap_index,
                                        const char* module, const char* symbol,
                                        int* out_nargs, int* out_cdecl);
 
+// ---- Hot-loop probe --------------------------------------------------------
+// A guest that spins forever inside a small address window is indistinguishable
+// from a slow boot: the run ends on the instruction limit with no evidence of
+// WHERE it was stuck. (OpenTTD spent its whole budget inside 0xE56053..0xE56093,
+// the MSVC CRT init-term loop, and the only symptom was "200M instructions".)
+//
+// This probe watches the EIP window: once TRT_X86_HOTLOOP instructions
+// (default 20,000,000) have executed without leaving a 256-byte window, it
+// logs ONE diagnostic line naming the window, every register, and the last
+// import that ran. It never changes execution - the loop still ends on its own
+// instruction limit. TRT_X86_HOTLOOP=0 disables it.
+namespace {
+
+struct hotloop_state {
+    x86_context* ctx = nullptr;
+    uint32_t lo = 0, hi = 0;   // current EIP window
+    uint64_t in_window = 0;    // instructions executed inside it
+    int reported = 0;          // one report per visited window
+};
+
+thread_local hotloop_state g_hot;
+// Set by x86_trap_dispatch: the bridge that ran last, so a stalled loop can
+// say whether it ever called back into the host.
+thread_local char g_x86_last_import[112] = {0};
+
+// Test/harness seam. Kept in this translation unit (not x86_cpu.h) so a
+// probe-only change never forces every object that includes the CPU header to
+// rebuild.
+static bool g_hotloop_override_set = false;
+static uint64_t g_hotloop_override = 0;
+
+static uint64_t hotloop_limit_from_env(void) {
+    if (g_hotloop_override_set) return g_hotloop_override;
+    const char* e = getenv("TRT_X86_HOTLOOP");
+    if (!e || !e[0]) return 20000000ull;
+    uint64_t v = 0;
+    for (const char* p = e; *p >= '0' && *p <= '9'; ++p)
+        v = v * 10u + (uint64_t)(*p - '0');
+    return v;  // 0 disables the probe
+}
+
+// Called once per executed instruction by x86_run().
+static void hotloop_tick(x86_context* ctx, uint64_t limit) {
+    if (!limit) return;
+    const uint32_t eip = ctx->regs.eip;
+    hotloop_state& h = g_hot;
+    if (h.ctx != ctx) {
+        h = hotloop_state();
+        h.ctx = ctx;
+        h.lo = h.hi = eip;
+    }
+    // Leaving the window by more than 256 bytes starts a new epoch, so a
+    // normally advancing program never accumulates a stale count.
+    if (eip < h.lo) {
+        if (h.hi - eip > 256) { h.lo = h.hi = eip; h.in_window = 0; h.reported = 0; }
+        else h.lo = eip;
+    } else if (eip > h.hi) {
+        if (eip - h.lo > 256) { h.lo = h.hi = eip; h.in_window = 0; h.reported = 0; }
+        else h.hi = eip;
+    }
+    ++h.in_window;
+    if (h.reported || h.in_window < limit) return;
+    h.reported = 1;
+    if (!ctx->log) return;
+    char line[512];
+    snprintf(line, sizeof(line),
+             "x86: HOT LOOP 0x%08X..0x%08X - %llu instructions inside a %u-byte "
+             "window without leaving it (last bridge: %s); regs eip=%08X "
+             "esp=%08X ebp=%08X eax=%08X ebx=%08X ecx=%08X edx=%08X esi=%08X "
+             "edi=%08X eflags=%08X",
+             h.lo, h.hi, (unsigned long long)h.in_window,
+             (unsigned)(h.hi - h.lo + 1u),
+             g_x86_last_import[0] ? g_x86_last_import : "(none)",
+             eip, ctx->regs.esp, ctx->regs.ebp, ctx->regs.eax, ctx->regs.ebx,
+             ctx->regs.ecx, ctx->regs.edx, ctx->regs.esi, ctx->regs.edi,
+             ctx->regs.eflags);
+    ctx->log(line);
+}
+
+// ---- EIP profile ----------------------------------------------------------
+// The hot-loop probe names a TIGHT spin; a guest that wanders a wide region
+// (OpenTTD's UCRT/CRT startup) instead just exhausts the instruction limit
+// with no evidence of where the budget went. Sample EIP every 64 instructions
+// into 64 KB buckets and report the three hottest regions when the run ends.
+// Diagnostics only: no effect on execution.
+// Exact 64 KB cover of the whole 4 GB space (65536 buckets, no aliasing), plus
+// a heavy-hitter table that names the hottest INDIVIDUAL instructions: a
+// direct-mapped slot is evicted only once its count decays to zero
+// (space-saving algorithm), which pins the loop without a full hash table.
+#define X86_PROFILE_BUCKETS 65536u
+static uint32_t g_eip_profile[X86_PROFILE_BUCKETS];
+static uint64_t g_eip_samples = 0;
+
+struct eip_hot_slot { uint32_t eip; uint32_t hits; };
+#define X86_HOT_SLOTS 16384u
+static eip_hot_slot g_eip_hot[X86_HOT_SLOTS];
+
+static void eip_profile_reset(void) {
+    memset(g_eip_profile, 0, sizeof(g_eip_profile));
+    memset(g_eip_hot, 0, sizeof(g_eip_hot));
+    g_eip_samples = 0;
+}
+
+static void eip_profile_sample(uint32_t eip) {
+    ++g_eip_profile[(eip >> 16) & (X86_PROFILE_BUCKETS - 1u)];
+    ++g_eip_samples;
+    eip_hot_slot& s = g_eip_hot[(eip >> 2) & (X86_HOT_SLOTS - 1u)];
+    if (s.eip == eip) ++s.hits;
+    else if (s.hits == 0) { s.eip = eip; s.hits = 1; }
+    else --s.hits;
+}
+
+static void eip_profile_report(x86_context* ctx) {
+    if (!ctx->log || ctx->insn_count < 1000000ull || !g_eip_samples) return;
+    uint32_t best[3] = {0, 0, 0};
+    for (uint32_t i = 1; i < X86_PROFILE_BUCKETS; ++i) {
+        const uint32_t v = g_eip_profile[i];
+        if (v > g_eip_profile[best[0]]) {
+            best[2] = best[1]; best[1] = best[0]; best[0] = i;
+        } else if (v > g_eip_profile[best[1]]) {
+            best[2] = best[1]; best[1] = i;
+        } else if (v > g_eip_profile[best[2]]) {
+            best[2] = i;
+        }
+    }
+    const double total = (double)g_eip_samples;
+    char line[420];
+    snprintf(line, sizeof(line),
+             "x86: eip profile after %llu instructions (sampled every 64): "
+             "0x%08X..0x%08X %.1f%%, 0x%08X..0x%08X %.1f%%, "
+             "0x%08X..0x%08X %.1f%%",
+             (unsigned long long)ctx->insn_count,
+             best[0] << 16, (best[0] << 16) | 0xFFFFu,
+             100.0 * g_eip_profile[best[0]] / total,
+             best[1] << 16, (best[1] << 16) | 0xFFFFu,
+             100.0 * g_eip_profile[best[1]] / total,
+             best[2] << 16, (best[2] << 16) | 0xFFFFu,
+             100.0 * g_eip_profile[best[2]] / total);
+    ctx->log(line);
+
+    // Hottest individual instructions: up to five slots, strongly ordered.
+    uint32_t top_eip[5] = {0, 0, 0, 0, 0};
+    uint32_t top_hits[5] = {0, 0, 0, 0, 0};
+    for (uint32_t i = 0; i < X86_HOT_SLOTS; ++i) {
+        const uint32_t h = g_eip_hot[i].hits;
+        if (!h) continue;
+        for (int s = 0; s < 5; ++s) {
+            if (h > top_hits[s]) {
+                for (int m = 4; m > s; --m) {
+                    top_hits[m] = top_hits[m - 1];
+                    top_eip[m] = top_eip[m - 1];
+                }
+                top_hits[s] = h;
+                top_eip[s] = g_eip_hot[i].eip;
+                break;
+            }
+        }
+    }
+    char line2[256];
+    int n = snprintf(line2, sizeof(line2), "x86: hot instructions:");
+    for (int s = 0; s < 5 && top_hits[s]; ++s) {
+        n += snprintf(line2 + n, sizeof(line2) - (size_t)n, " 0x%08X %.1f%%",
+                      top_eip[s], 100.0 * top_hits[s] / total);
+        if ((size_t)n >= sizeof(line2) - 32) break;
+    }
+    ctx->log(line2);
+}
+
+}  // namespace
+
+// Override the hot-loop threshold for the next x86_run() calls (0 disables).
+// Used by tests and by a harness that wants the diagnostic earlier than 20M.
+extern "C" void x86_set_hotloop_limit(uint64_t limit) {
+    g_hotloop_override_set = true;
+    g_hotloop_override = limit;
+}
+
 static int x86_trap_dispatch(x86_context* ctx) {
     if (!trt_pe32_is_trap(ctx->regs.eip)) return 0;
     int index = (int)((ctx->regs.eip - 0xF0000000u) / 4u);
@@ -501,11 +678,25 @@ static int x86_trap_dispatch(x86_context* ctx) {
         ctx->last_error = 3;
         return -1;
     }
+    snprintf(g_x86_last_import, sizeof(g_x86_last_import), "%s!%s", mod,
+             sym[0] ? sym : "#ordinal");
     ctx->insn_count++;
     int nargs = 0, cdecl_call = 0;
     uint32_t result = x86_dispatch_import(ctx, index, mod, sym, &nargs, &cdecl_call);
     ctx->regs.eax = result;
     uint32_t ret = x86_mem_read32(ctx, ctx->regs.esp);
+    // TRT_X86_LOG_TRAPS=1 prints one line per import dispatch. The stack
+    // pointer is the interesting part: a wrong stdcall arity shows up as a
+    // steady upward drift of esp across calls, and the return address it
+    // finally pops is the first address outside every image.
+    if (getenv("TRT_X86_LOG_TRAPS")) {
+        char tb[224];
+        snprintf(tb, sizeof(tb),
+                 "TRAP %s!%s nargs=%d cdecl=%d esp=%08X ret=%08X",
+                 mod, sym[0] ? sym : "#ordinal", nargs, cdecl_call,
+                 ctx->regs.esp, ret);
+        if (ctx->log) ctx->log(tb);
+    }
     ctx->regs.esp += 4;               // pop return address
     if (!cdecl_call) ctx->regs.esp += (uint32_t)(nargs * 4); // callee cleanup
     ctx->regs.eip = ret;
@@ -2012,6 +2203,15 @@ int x86_step(x86_context* ctx) {
         return 0;
     }
 
+    // ---- MOV r8, imm8 (0xB0-0xB7) ----
+    // The 8-bit immediate form, no ModRM: 0xB0-0xB3 address AL/CL/DL/BL and
+    // 0xB4-0xB7 AH/CH/DH/BH (the high-byte registers 0xC6 /0 cannot reach).
+    // OpenTTD's PE32 CRT entry stops at `mov al, 1`, so this is load-bearing.
+    if (op >= 0xB0 && op <= 0xB7) {
+        *r8p(ctx, op - 0xB0) = read_imm8(ctx);
+        return 0;
+    }
+
     // ---- MOV r32, imm32 (0xB8-0xBF) ----
     if (op >= 0xB8 && op <= 0xBF) {
         int reg = op - 0xB8;
@@ -2023,13 +2223,18 @@ int x86_step(x86_context* ctx) {
     // ---- MOV r/m32, imm32 (0xC7 /0) ----
     if (op == 0xC7) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint32_t imm = read_imm32(ctx);
         if (modrm_mod(modrm) == 3) {
+            uint32_t imm = read_imm32(ctx);
             *x86_reg_ptr(ctx, modrm_rm(modrm)) = imm;
         } else {
+            // A disp8/disp32 belongs to the ModRM addressing form and comes
+            // BEFORE the immediate, so the EA must be resolved first. Reading
+            // the immediate up front silently swapped the value with the
+            // displacement and stored to the wrong address.
             int consumed = 0;
             uint32_t addr = calc_ea(ctx, modrm, &consumed);
             ctx->regs.eip += consumed - 1;
+            uint32_t imm = read_imm32(ctx);
             x86_mem_write32(ctx, addr, imm);
         }
         return 0;
@@ -2038,13 +2243,15 @@ int x86_step(x86_context* ctx) {
     // ---- MOV r/m8, imm8 (0xC6 /0) ----
     if (op == 0xC6) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
-        uint8_t imm = read_imm8(ctx);
         if (modrm_mod(modrm) == 3) {
+            uint8_t imm = read_imm8(ctx);
             *x86_reg_ptr(ctx, modrm_rm(modrm)) = (*x86_reg_ptr(ctx, modrm_rm(modrm)) & 0xFFFFFF00) | imm;
         } else {
+            // Same ordering rule as 0xC7: displacement first, then imm8.
             int consumed = 0;
             uint32_t addr = calc_ea(ctx, modrm, &consumed);
             ctx->regs.eip += consumed - 1;
+            uint8_t imm = read_imm8(ctx);
             x86_mem_write8(ctx, addr, imm);
         }
         return 0;
@@ -2564,12 +2771,24 @@ int x86_step(x86_context* ctx) {
     }
 
     // ---- XCHG (0x87 r/m,r ; 0x90+reg is NOP/XCHG EAX) ----
+    // The memory form is how UCRT publishes a runtime-resolved function
+    // pointer (the atomic `xchg [slot], eax` idiom). It MUST swap through the
+    // effective address and consume the ModRM/SIB/displacement bytes; a
+    // register-only implementation left the store unwritten and the address
+    // bytes to be decoded as instructions.
     if (op == 0x87) {
         uint8_t modrm = x86_mem_read8(ctx, ctx->regs.eip++);
+        uint32_t* r = x86_reg_ptr(ctx, modrm_reg(modrm));
         if (modrm_mod(modrm) == 3) {
-            uint32_t* a = x86_reg_ptr(ctx, modrm_reg(modrm));
-            uint32_t* b = x86_reg_ptr(ctx, modrm_rm(modrm));
-            uint32_t t = *a; *a = *b; *b = t;
+            uint32_t* p = x86_reg_ptr(ctx, modrm_rm(modrm));
+            uint32_t t = *p; *p = *r; *r = t;
+        } else {
+            int c = 0;
+            const uint32_t ad = calc_ea(ctx, modrm, &c);
+            ctx->regs.eip += c - 1;
+            const uint32_t t = x86_mem_read32(ctx, ad);
+            x86_mem_write32(ctx, ad, *r);
+            *r = t;
         }
         return 0;
     }
@@ -3588,7 +3807,12 @@ int x86_mem_map_host(x86_context* ctx, uint32_t guest_addr, void* host_ptr, size
 // ---- CPU lifecycle ----
 void x86_cpu_init(x86_context* ctx) {
     void* old_base = ctx->mem.base; // preserve an existing reservation to free
+    // A re-init must not silence the caller's log: x86_run_pe32() calls this
+    // itself when the context has no reservation yet, and a host that set the
+    // hook before that call would otherwise lose every diagnostic line.
+    void (*old_log)(const char*) = ctx->log;
     memset(ctx, 0, sizeof(*ctx));
+    ctx->log = old_log;
     // A new guest starts with an empty arena: the previous guest's blocks
     // pointed into a reservation that is about to be released.
     x86_guest_heap_reset();
@@ -3628,10 +3852,16 @@ void x86_cpu_init(x86_context* ctx) {
     ctx->regs.tsc_base = 0x100000;
 
     // ---- Basic-block recompiler ----
-    // On by default; TRT_X86_JIT=0 selects the pure interpreter (used by the
-    // differential test that compares both engines instruction-for-instruction).
+    // OFF by default, opt in with TRT_X86_JIT=1. A guest must never be
+    // corrupted by the fast path, and on OpenTTD's PE32 CRT path the JIT does
+    // exactly that: with the interpreter the same guest runs the full
+    // 100,000,000-instruction budget with rc=0 and a stable stack, while the
+    // JIT leaves esp 4 low after an indirect call epilogue and the next ret
+    // jumps into data (EIP=0x00002004, then 0xEA in stack memory). The JIT's
+    // own differential tests set jit_enabled directly, so they still cover it
+    // while this default keeps shipped runs on the engine that is proven.
     const char* jit = getenv("TRT_X86_JIT");
-    ctx->jit_enabled = !(jit && jit[0] == '0');
+    ctx->jit_enabled = (jit && jit[0] == '1');
     ctx->code_epoch = 1;
 
     // Sentinel page: the SEH dispatcher calls guest handlers with this address
@@ -3650,13 +3880,22 @@ void x86_cpu_reset(x86_context* ctx) {
 int x86_run(x86_context* ctx) {
     ctx->running = 1;
     ctx->last_error = 0;
+    // Resolved once per run: a stalled window is reported by name instead of
+    // ending as a bare instruction-limit exhaustion.
+    const uint64_t hot_limit = hotloop_limit_from_env();
+    eip_profile_reset();
     while (ctx->running) {
         // Run a recompiled basic block when one covers this address; otherwise
         // interpret exactly one instruction (which may itself end a block).
         int r = x86_jit_step(ctx);
         if (r < 0) break;
         if (r == 0 && x86_step(ctx) != 0) break;
+        hotloop_tick(ctx, hot_limit);
+        if ((ctx->insn_count & 63u) == 0) {
+            eip_profile_sample(ctx->regs.eip);
+        }
     }
+    eip_profile_report(ctx);
     return ctx->last_error;
 }
 

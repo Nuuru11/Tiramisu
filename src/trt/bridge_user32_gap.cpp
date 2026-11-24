@@ -1659,7 +1659,11 @@ int TRT_STDCALL trt_MessageBoxIndirectA(const void* lpmbp) {
   return 1;
 }
 
-int TRT_STDCALL trt_DestroyIcon(void* icon) { (void)icon; return 1; }
+extern "C" int trt_user32_icon_free(void* hicon);
+int TRT_STDCALL trt_DestroyIcon(void* icon) {
+  if (!icon) return 0;
+  return trt_user32_icon_free(icon) ? 1 : 1;  // stock icons remain valid no-op, dynamic icons freed
+}
 
 int TRT_STDCALL trt_DrawTextW(void* hdc, u16* text, int count, void* rect,
                               u32 format) {

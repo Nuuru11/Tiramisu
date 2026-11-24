@@ -18,6 +18,7 @@
 //
 // Everything is fail-visible: an unimplemented callback names itself.
 #include "bridge_steam.h"
+#include <atomic>
 #include "input.h"
 #include "steam_auth.h"
 #include "steam_library.h"
@@ -54,12 +55,26 @@ std::vector<u32> g_owned_apps;
 std::mutex g_owned_mu;
 
 // ---- callback / callresult registration (the overlay + achievements use it) ----
+// A real registration table: the entries persist until the game unregisters
+// them, and unregistering really removes one. A register that only appended and
+// an unregister that did nothing would leave RunCallbacks calling a callback the
+// game already deleted.
 struct callback_entry {
   void* callback;
-  int (*run)(void* self, void* param);
+  // A guest callback runs under the guest ABI (Windows x64), not the host's:
+  // a plain `int (*)(void*, void*)` cast here passed `self` in the wrong
+  // register and faulted inside the game's own Run().
+  int(TRT_GUEST_ABI* run)(void* self, void* param);
 };
-callback_entry g_callbacks[32];
-int g_callback_count = 0;
+std::vector<callback_entry> g_callbacks;
+std::mutex g_callbacks_mu;
+
+struct callresult_entry {
+  void* callback;
+  u64 call_id;
+};
+std::vector<callresult_entry> g_callresults;
+std::mutex g_callresults_mu;
 
 } // namespace
 
@@ -153,30 +168,25 @@ int trt_steam_is_owned(u32 app_id) {
 }
 
 u64 trt_steam_current_id(void) { return g_signed_in ? g_steamid64 : 0; }
+const char* trt_steam_current_persona(void) {
+  return (g_signed_in && !g_persona.empty()) ? g_persona.c_str() : "TiramisuPlayer";
+}
 
 // Load the persisted identity and the local Steam library in one call. Returns
 // the number of AppIDs the account's installation reports (0 = no library
 // found, which is a named, visible state rather than a fake success).
 int trt_steam_load_account(const char* state_dir) {
-#ifndef TIRAMISU_UWP_HOST
   trt_steam_identity id;
   if (state_dir && trt_steam_auth_load(state_dir, &id)) {
     trt_steam_set_identity(id.steamid64.c_str(), id.persona.c_str());
   } else {
     trt_steam_clear_identity();
   }
-#else
-  // UWP (Xbox): no Steam client or persisted identity on the console.
-  // The Steam bridge is auth-only here; clear any identity.
-  (void)state_dir;
-  trt_steam_clear_identity();
-#endif
 
   trt_steam_library lib;
 #ifndef TIRAMISU_UWP_HOST
   trt_steam_library_scan(&lib);
-#endif  // UWP: no Steam library on the console; lib stays empty
-        // (0 apps = a named, visible state, not a fake success).
+#endif
   std::vector<u32> owned;
   int installed = 0;
   for (const auto& app : lib.apps) {
@@ -225,10 +235,36 @@ u64 TRT_GUEST_ABI trt_SteamAPI_GetSteamID(void) {
   return 0x0110000100000001ull;  // anonymous local user, valid ID format
 }
 
-// ---- friends / overlay / utils: harmless successes ----
+// ---- friends / overlay / utils ----
+static std::atomic<int> g_steam_overlay_flag{0};
+
+int trt_steam_overlay_check_and_reset(void) {
+  return g_steam_overlay_flag.exchange(0);
+}
+
+void trt_steam_trigger_overlay(void) {
+  g_steam_overlay_flag.store(1);
+}
+
 int TRT_GUEST_ABI trt_SteamAPI_ActivateGameOverlay(const char* url) {
   (void)url;
-  return 1;  // the overlay is a no-op on the console
+  trt_steam_trigger_overlay();
+  return 1;
+}
+
+static void TRT_GUEST_ABI st_friends_ActivateGameOverlay(void* self, const char* dialog) {
+  (void)self; (void)dialog;
+  trt_steam_trigger_overlay();
+}
+
+static void TRT_GUEST_ABI st_friends_ActivateGameOverlayToUser(void* self, const char* dialog, u64 steamid) {
+  (void)self; (void)dialog; (void)steamid;
+  trt_steam_trigger_overlay();
+}
+
+static void TRT_GUEST_ABI st_friends_ActivateGameOverlayInviteDialog(void* self, u64 lobby) {
+  (void)self; (void)lobby;
+  trt_steam_trigger_overlay();
 }
 int TRT_GUEST_ABI trt_SteamAPI_SetRichPresence(const char* key,
                                                const char* value) {
@@ -236,21 +272,29 @@ int TRT_GUEST_ABI trt_SteamAPI_SetRichPresence(const char* key,
   return 1;
 }
 void TRT_GUEST_ABI trt_SteamAPI_RunCallbacks(void) {
-  // the registered callbacks run through the real callback dispatch; a game
+  // The registered callbacks run through the real callback dispatch; a game
   // that waits for an achievement callback gets it when it earns one.
   // RegisterCallback stores .run = nullptr (the game fills the vtable), so
-  // dispatch reads the CCallbackBase vtable directly: the first field of
-  // the callback object is the vtable pointer, slot 0 is Run.
-  for (int i = 0; i < g_callback_count; ++i) {
-    void* cb = g_callbacks[i].callback;
+  // dispatch reads the CCallbackBase vtable directly: the first field of the
+  // callback object is the vtable pointer, slot 0 is Run.
+  //
+  // The list is copied first, so a callback that registers or unregisters
+  // another callback from inside Run() cannot invalidate the iteration.
+  std::vector<callback_entry> snapshot;
+  {
+    std::lock_guard<std::mutex> lk(g_callbacks_mu);
+    snapshot = g_callbacks;
+  }
+  for (const callback_entry& e : snapshot) {
+    void* cb = e.callback;
     if (!cb) continue;
-    if (g_callbacks[i].run) {
-      g_callbacks[i].run(cb, nullptr);
+    if (e.run) {
+      e.run(cb, nullptr);
       continue;
     }
     void** vtable = *reinterpret_cast<void***>(cb);
     if (!vtable || !vtable[0]) continue;
-    auto run = reinterpret_cast<int (*)(void*, void*)>(vtable[0]);
+    auto run = reinterpret_cast<int(TRT_GUEST_ABI*)(void*, void*)>(vtable[0]);
     run(cb, nullptr);
   }
 }
@@ -258,14 +302,23 @@ void TRT_GUEST_ABI trt_SteamAPI_RunCallbacks(void) {
 // SteamAPI_RegisterCallback(callback, id) / UnregisterCallback
 void TRT_GUEST_ABI trt_SteamAPI_RegisterCallback(void* callback, int id) {
   (void)id;
-  if (callback && g_callback_count < 32) {
-    g_callbacks[g_callback_count].callback = callback;
-    g_callbacks[g_callback_count].run = nullptr;  // the game fills the vtable
-    ++g_callback_count;
+  if (!callback) return;
+  std::lock_guard<std::mutex> lk(g_callbacks_mu);
+  for (const callback_entry& e : g_callbacks) {
+    if (e.callback == callback) return;  // already registered: one entry
   }
+  // The game fills the vtable, so dispatch reads it directly.
+  g_callbacks.push_back({callback, nullptr});
 }
 void TRT_GUEST_ABI trt_SteamAPI_UnregisterCallback(void* callback) {
-  (void)callback;
+  if (!callback) return;
+  std::lock_guard<std::mutex> lk(g_callbacks_mu);
+  for (size_t i = 0; i < g_callbacks.size(); ++i) {
+    if (g_callbacks[i].callback == callback) {
+      g_callbacks.erase(g_callbacks.begin() + (ptrdiff_t)i);
+      return;
+    }
+  }
 }
 
 // ---- steam apps: the OWNERSHIP question. Fail-visible on purpose ----
@@ -310,11 +363,38 @@ const char* TRT_GUEST_ABI trt_SteamAPI_GetCurrentGameLanguage(void) {
 int TRT_GUEST_ABI trt_SteamAPI_GetHSteamUser(void) { return g_initialized ? 1 : 0; }
 int TRT_GUEST_ABI trt_SteamAPI_GetHSteamPipe(void) { return g_initialized ? 1 : 0; }
 
+// Call results are a real table too: an async API call (a leaderboard upload, a
+// workshop query) registers its CCallResult here, and the entry survives until
+// the game unregisters it or the matching call completes. Nothing in this
+// bridge completes an async call, so the table is the whole observable contract
+// and it is honest about holding entries rather than pretending to have none.
 void TRT_GUEST_ABI trt_SteamAPI_RegisterCallResult(void* cb, u64 call_id) {
-  (void)cb; (void)call_id;
+  if (!cb) return;
+  std::lock_guard<std::mutex> lk(g_callresults_mu);
+  for (const callresult_entry& e : g_callresults) {
+    if (e.callback == cb && e.call_id == call_id) return;
+  }
+  g_callresults.push_back({cb, call_id});
 }
 void TRT_GUEST_ABI trt_SteamAPI_UnregisterCallResult(void* cb, u64 call_id) {
-  (void)cb; (void)call_id;
+  std::lock_guard<std::mutex> lk(g_callresults_mu);
+  for (size_t i = 0; i < g_callresults.size(); ++i) {
+    if (g_callresults[i].callback == cb && g_callresults[i].call_id == call_id) {
+      g_callresults.erase(g_callresults.begin() + (ptrdiff_t)i);
+      return;
+    }
+  }
+}
+
+// Host-side observability: how many call results are outstanding. Used by the
+// gate test to prove Register/Unregister really mutate the table.
+int trt_steam_callresult_count(void) {
+  std::lock_guard<std::mutex> lk(g_callresults_mu);
+  return (int)g_callresults.size();
+}
+int trt_steam_callback_count(void) {
+  std::lock_guard<std::mutex> lk(g_callbacks_mu);
+  return (int)g_callbacks.size();
 }
 
 void TRT_GUEST_ABI trt_SteamAPI_ManualDispatch_Init(void) {}
@@ -506,22 +586,76 @@ const void* g_steam_utils_vtbl[64] = {
 };
 fake_steam_iface g_steam_utils_obj = {g_steam_utils_vtbl};
 
-// ---- ISteamFriends ----
-const char* TRT_GUEST_ABI st_friends_GetPersonaName(void*) {
-  { const char* st_v = "TiramisuPlayer"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamFriends.GetPersonaName -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
-  return "TiramisuPlayer";
+// ---- ISteamFriends (real signed-in persona + host-fed friend roster) -----
+static std::mutex g_friends_mu;
+static std::vector<trt_steam_friend_info> g_friends_list;
+
+extern "C" {
+void trt_steam_set_friends(const trt_steam_friend_info* list, int count) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  g_friends_list.clear();
+  if (list && count > 0) {
+    for (int i = 0; i < count && i < 256; ++i) g_friends_list.push_back(list[i]);
+  }
 }
-int TRT_GUEST_ABI st_friends_GetPersonaState(void*) { return 0; }
-// ISteamFriends slot 7: const char* GetFriendPersonaName(CSteamID).
-// Previously steam_noop_zero (NULL) - any caller passing the result to a
-// string function would fault on a null read.
-const char* TRT_GUEST_ABI st_friends_GetFriendPersonaName(void* self, u64 steam_id) {
-  char line[160];
-  snprintf(line, sizeof(line), "trt: ISteamFriends.GetFriendPersonaName(self=%p friend=%016llx) -> TiramisuPlayer",
-           self, (unsigned long long)steam_id);
-  trt_core_log(line);
-  { const char* st_v = "TiramisuPlayer"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: ISteamFriends.GetFriendPersonaName -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); }
-  return "TiramisuPlayer";
+int trt_steam_get_friend_count(void) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  return (int)g_friends_list.size();
+}
+int trt_steam_get_friend_at(int idx, trt_steam_friend_info* out) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  if (!out || idx < 0 || idx >= (int)g_friends_list.size()) return 0;
+  *out = g_friends_list[(size_t)idx];
+  return 1;
+}
+}
+
+const char* TRT_GUEST_ABI st_friends_GetPersonaName(void*) {
+  return trt_steam_current_persona();
+}
+int TRT_GUEST_ABI st_friends_GetPersonaState(void*) {
+  return g_initialized ? 1 : 0;  // k_EPersonaStateOnline when running
+}
+int TRT_GUEST_ABI st_friends_GetFriendCount(void*, int flags) {
+  (void)flags;
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  return (int)g_friends_list.size();
+}
+u64 TRT_GUEST_ABI st_friends_GetFriendByIndex(void*, int idx, int flags, u64* hidden_sret) {
+  (void)flags;
+  u64 id = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_friends_mu);
+    if (idx >= 0 && idx < (int)g_friends_list.size())
+      id = g_friends_list[(size_t)idx].steam_id;
+  }
+  if (hidden_sret) *hidden_sret = id;
+  return id;
+}
+int TRT_GUEST_ABI st_friends_GetFriendRelationship(void*, u64 steam_id) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  for (const auto& f : g_friends_list) {
+    if (f.steam_id == steam_id) return 3;  // k_EFriendRelationshipFriend
+  }
+  return 0;
+}
+int TRT_GUEST_ABI st_friends_GetFriendPersonaState(void*, u64 steam_id) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  for (const auto& f : g_friends_list) {
+    if (f.steam_id == steam_id) return f.state;
+  }
+  return 0;
+}
+const char* TRT_GUEST_ABI st_friends_GetFriendPersonaName(void*, u64 steam_id) {
+  std::lock_guard<std::mutex> lk(g_friends_mu);
+  static char s_fname[64];
+  for (const auto& f : g_friends_list) {
+    if (f.steam_id == steam_id) {
+      snprintf(s_fname, sizeof(s_fname), "%s", f.persona);
+      return s_fname;
+    }
+  }
+  return trt_steam_current_persona();
 }
 // ---- ISteamFriends string slots that were steam_noop_zero (NULL) ----
 // Per-slot traced wrappers returning "" (steam_empty_str value). Layout is
@@ -574,10 +708,10 @@ const void* g_steam_friends_vtbl[64] = {
     (const void*)&st_friends_GetPersonaName,  // 0 GetPersonaName
     (const void*)&steam_noop_zero,            // 1 SetPersonaName
     (const void*)&st_friends_GetPersonaState, // 2 GetPersonaState
-    (const void*)&steam_noop_zero,            // 3 GetFriendCount
-    (const void*)&steam_noop_zero,            // 4 GetFriendByIndex
-    (const void*)&steam_noop_zero,            // 5 GetFriendRelationship
-    (const void*)&steam_noop_zero,            // 6 GetFriendPersonaState
+    (const void*)&st_friends_GetFriendCount,  // 3 GetFriendCount
+    (const void*)&st_friends_GetFriendByIndex,// 4 GetFriendByIndex
+    (const void*)&st_friends_GetFriendRelationship, // 5 GetFriendRelationship
+    (const void*)&st_friends_GetFriendPersonaState, // 6 GetFriendPersonaState
     (const void*)&st_friends_GetFriendPersonaName, // 7 GetFriendPersonaName
     (const void*)&steam_noop_zero,            // 8 GetFriendGamePlayed
     (const void*)&st_friends_GetFriendPersonaNameHistory, // 9 GetFriendPersonaNameHistory
@@ -599,12 +733,12 @@ const void* g_steam_friends_vtbl[64] = {
     (const void*)&steam_noop_zero,            // 25 GetFriendFromSourceByIndex
     (const void*)&steam_noop_zero,            // 26 IsUserInSource
     (const void*)&steam_noop_zero,            // 27 SetInGameVoiceSpeaking
-    (const void*)&steam_noop_zero,            // 28 ActivateGameOverlay
-    (const void*)&steam_noop_zero,            // 29 ActivateGameOverlayToUser
+    (const void*)&st_friends_ActivateGameOverlay,            // 28 ActivateGameOverlay
+    (const void*)&st_friends_ActivateGameOverlayToUser,      // 29 ActivateGameOverlayToUser
     (const void*)&steam_noop_zero,            // 30 ActivateGameOverlayToWebPage
     (const void*)&steam_noop_zero,            // 31 ActivateGameOverlayToStore
     (const void*)&steam_noop_zero,            // 32 SetPlayedWith
-    (const void*)&steam_noop_zero,            // 33 ActivateGameOverlayInviteDialog
+    (const void*)&st_friends_ActivateGameOverlayInviteDialog, // 33 ActivateGameOverlayInviteDialog
     (const void*)&steam_noop_zero,            // 34 GetSmallFriendAvatar
     (const void*)&steam_noop_zero,            // 35 GetMediumFriendAvatar
     (const void*)&steam_noop_zero,            // 36 GetLargeFriendAvatar
@@ -623,39 +757,712 @@ const void* g_steam_friends_vtbl[64] = {
 };
 fake_steam_iface g_steam_friends_obj = {g_steam_friends_vtbl};
 
-// ---- ISteamUserStats (dedicated vtable; was the all-noop safe vtbl) ----
-// String slots 12/15/20 returned NULL via steam_noop_zero; they now return
-// "" (steam_empty_str value) with a per-slot trace. Other slots stay noop.
-const char* TRT_GUEST_ABI st_userstats_GetAchievementDisplayAttribute(void* self, const char* name, const char* key) {
-  char line[256];
-  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetAchievementDisplayAttribute(self=%p name=\"%.64s\" key=\"%.64s\") -> \"\"", self, name ? name : "(null)", key ? key : "(null)");
-  trt_core_log(line);
+// ---- ISteamUserStats (persistent stats, achievements & leaderboards) ----
+struct steam_stat_entry {
+  char name[128];
+  bool is_float;
+  i32 i_val;
+  float f_val;
+};
+struct steam_ach_entry {
+  char name[128];
+  bool achieved;
+  u32 unlock_time;
+  u32 cur_progress;
+  u32 max_progress;
+};
+struct steam_lb_entry {
+  u64 handle;
+  char name[128];
+  int sort_method;
+  int display_type;
+};
+static std::mutex g_stats_mu;
+static u32 g_stats_loaded_appid = 0xFFFFFFFFu;
+static std::vector<steam_stat_entry> g_stats_list;
+static std::vector<steam_ach_entry> g_ach_list;
+static std::vector<steam_lb_entry> g_lb_list;
+static u64 g_next_lb_handle = 0x534C420000000100ULL;
+
+static int stats_file_path(char* host_out, size_t cap, int for_write) {
+  char guest[512];
+  snprintf(guest, sizeof(guest),
+           "C:\\users\\player\\AppData\\Local\\Tiramisu\\SteamStats\\%u.cfg",
+           (unsigned)g_app_id);
+  u16 wg[512];
+  size_t k = 0;
+  for (; guest[k] && k + 1 < 512; ++k) wg[k] = (unsigned char)guest[k];
+  wg[k] = 0;
+  if (trt_vfs_resolve_utf16_rw(wg, for_write, host_out, cap) != 0) return -1;
+  if (for_write) trt_vfs_ensure_parents(host_out);
+  return 0;
+}
+
+static void stats_load_locked(void) {
+  if (g_stats_loaded_appid == g_app_id) return;
+  g_stats_loaded_appid = g_app_id;
+  g_stats_list.clear();
+  g_ach_list.clear();
+  char host[512];
+  if (stats_file_path(host, sizeof(host), 0) != 0) return;
+  FILE* f = fopen(host, "rb");
+  if (!f) return;
+  char line[512];
+  while (fgets(line, sizeof(line), f)) {
+    size_t n = strlen(line);
+    while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+    if (strncmp(line, "I:", 2) == 0) {
+      char nm[128] = {}; i32 v = 0;
+      if (sscanf(line + 2, "%127[^=]=%d", nm, &v) == 2) {
+        steam_stat_entry e{};
+        snprintf(e.name, sizeof(e.name), "%s", nm);
+        e.is_float = false; e.i_val = v;
+        g_stats_list.push_back(e);
+      }
+    } else if (strncmp(line, "F:", 2) == 0) {
+      char nm[128] = {}; float v = 0.0f;
+      if (sscanf(line + 2, "%127[^=]=%f", nm, &v) == 2) {
+        steam_stat_entry e{};
+        snprintf(e.name, sizeof(e.name), "%s", nm);
+        e.is_float = true; e.f_val = v;
+        g_stats_list.push_back(e);
+      }
+    } else if (strncmp(line, "A:", 2) == 0) {
+      char nm[128] = {}; int ach = 0; unsigned ut = 0, cp = 0, mp = 0;
+      if (sscanf(line + 2, "%127[^=]=%d,%u,%u,%u", nm, &ach, &ut, &cp, &mp) >= 2) {
+        steam_ach_entry e{};
+        snprintf(e.name, sizeof(e.name), "%s", nm);
+        e.achieved = (ach != 0); e.unlock_time = ut; e.cur_progress = cp; e.max_progress = mp;
+        g_ach_list.push_back(e);
+      }
+    }
+  }
+  fclose(f);
+}
+
+static void stats_save_locked(void) {
+  char host[512];
+  if (stats_file_path(host, sizeof(host), 1) != 0) return;
+  FILE* f = fopen(host, "wb");
+  if (!f) return;
+  for (const auto& s : g_stats_list) {
+    if (s.is_float) fprintf(f, "F:%s=%f\n", s.name, s.f_val);
+    else fprintf(f, "I:%s=%d\n", s.name, s.i_val);
+  }
+  for (const auto& a : g_ach_list) {
+    fprintf(f, "A:%s=%d,%u,%u,%u\n", a.name, a.achieved ? 1 : 0,
+            a.unlock_time, a.cur_progress, a.max_progress);
+  }
+  fclose(f);
+}
+
+extern "C" {
+int trt_steam_get_achievement_count(void) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  return (int)g_ach_list.size();
+}
+int trt_steam_get_achievement_at(int idx, trt_steam_achievement_info* out) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  if (!out || idx < 0 || idx >= (int)g_ach_list.size()) return 0;
+  const auto& a = g_ach_list[(size_t)idx];
+  snprintf(out->name, sizeof(out->name), "%s", a.name);
+  out->achieved = a.achieved;
+  out->unlock_time = a.unlock_time;
+  out->cur_progress = a.cur_progress;
+  out->max_progress = a.max_progress;
+  return 1;
+}
+}
+
+int TRT_GUEST_ABI st_userstats_RequestCurrentStats(void*) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_GetStatInt32(void*, const char* name, i32* pData) {
+  if (!name || !pData) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (const auto& s : g_stats_list) {
+    if (strcmp(s.name, name) == 0) {
+      *pData = s.is_float ? (i32)s.f_val : s.i_val;
+      return 1;
+    }
+  }
+  *pData = 0;
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_GetStatFloat(void*, const char* name, float* pData) {
+  if (!name || !pData) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (const auto& s : g_stats_list) {
+    if (strcmp(s.name, name) == 0) {
+      *pData = s.is_float ? s.f_val : (float)s.i_val;
+      return 1;
+    }
+  }
+  *pData = 0.0f;
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_SetStatInt32(void*, const char* name, i32 data) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (auto& s : g_stats_list) {
+    if (strcmp(s.name, name) == 0) { s.is_float = false; s.i_val = data; return 1; }
+  }
+  steam_stat_entry e{};
+  snprintf(e.name, sizeof(e.name), "%s", name);
+  e.is_float = false; e.i_val = data;
+  g_stats_list.push_back(e);
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_SetStatFloat(void*, const char* name, float data) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (auto& s : g_stats_list) {
+    if (strcmp(s.name, name) == 0) { s.is_float = true; s.f_val = data; return 1; }
+  }
+  steam_stat_entry e{};
+  snprintf(e.name, sizeof(e.name), "%s", name);
+  e.is_float = true; e.f_val = data;
+  g_stats_list.push_back(e);
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_UpdateAvgRateStat(void* self, const char* name, float countThisSession, double dSessionLength) {
+  if (dSessionLength <= 0.0) return 0;
+  return st_userstats_SetStatFloat(self, name, (float)(countThisSession / dSessionLength));
+}
+static steam_ach_entry& ach_get_or_add_locked(const char* name) {
+  stats_load_locked();
+  for (auto& a : g_ach_list) {
+    if (strcmp(a.name, name) == 0) return a;
+  }
+  steam_ach_entry e{};
+  snprintf(e.name, sizeof(e.name), "%s", name);
+  g_ach_list.push_back(e);
+  return g_ach_list.back();
+}
+int TRT_GUEST_ABI st_userstats_GetAchievement(void*, const char* name, u8* pbAchieved) {
+  if (!name || !pbAchieved) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (const auto& a : g_ach_list) {
+    if (strcmp(a.name, name) == 0) { *pbAchieved = a.achieved ? 1 : 0; return 1; }
+  }
+  *pbAchieved = 0;
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_SetAchievement(void*, const char* name) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  auto& a = ach_get_or_add_locked(name);
+  if (!a.achieved) {
+    a.achieved = true;
+    a.unlock_time = (u32)time(nullptr);
+    char line[192];
+    snprintf(line, sizeof(line), "steam: achievement unlocked -> %s", name);
+    trt_core_log(line);
+  }
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_ClearAchievement(void*, const char* name) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  auto& a = ach_get_or_add_locked(name);
+  a.achieved = false;
+  a.unlock_time = 0;
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_GetAchievementAndUnlockTime(void*, const char* name, u8* pbAchieved, u32* punUnlockTime) {
+  if (!name) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  for (const auto& a : g_ach_list) {
+    if (strcmp(a.name, name) == 0) {
+      if (pbAchieved) *pbAchieved = a.achieved ? 1 : 0;
+      if (punUnlockTime) *punUnlockTime = a.unlock_time;
+      return 1;
+    }
+  }
+  if (pbAchieved) *pbAchieved = 0;
+  if (punUnlockTime) *punUnlockTime = 0;
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_StoreStats(void*) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_save_locked();
+  return 1;
+}
+int TRT_GUEST_ABI st_userstats_GetAchievementIcon(void*, const char*) { return 0; }
+const char* TRT_GUEST_ABI st_userstats_GetAchievementDisplayAttribute(void*, const char* name, const char* key) {
+  if (!name || !key) return steam_empty_str();
+  static char s_attr[128];
+  if (strcmp(key, "name") == 0) {
+    snprintf(s_attr, sizeof(s_attr), "%s", name);
+    return s_attr;
+  }
   return steam_empty_str();
 }
-const char* TRT_GUEST_ABI st_userstats_GetAchievementName(void* self, u32 index) {
-  char line[224];
-  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetAchievementName(self=%p index=%u) -> \"\"", self, index);
-  trt_core_log(line);
+int TRT_GUEST_ABI st_userstats_IndicateAchievementProgress(void*, const char* name, u32 nCur, u32 nMax) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  auto& a = ach_get_or_add_locked(name);
+  a.cur_progress = nCur;
+  a.max_progress = nMax;
+  if (nMax > 0 && nCur >= nMax) {
+    a.achieved = true;
+    if (!a.unlock_time) a.unlock_time = (u32)time(nullptr);
+  }
+  return 1;
+}
+u32 TRT_GUEST_ABI st_userstats_GetNumAchievements(void*) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  return (u32)g_ach_list.size();
+}
+const char* TRT_GUEST_ABI st_userstats_GetAchievementName(void*, u32 index) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  stats_load_locked();
+  static char s_ach_ret[128];
+  if (index >= g_ach_list.size()) return steam_empty_str();
+  snprintf(s_ach_ret, sizeof(s_ach_ret), "%s", g_ach_list[index].name);
+  return s_ach_ret;
+}
+u64 TRT_GUEST_ABI st_userstats_RequestUserStats(void*, u64) { return 1; }
+int TRT_GUEST_ABI st_userstats_GetUserStatInt32(void* self, u64, const char* name, i32* pData) {
+  return st_userstats_GetStatInt32(self, name, pData);
+}
+int TRT_GUEST_ABI st_userstats_GetUserStatFloat(void* self, u64, const char* name, float* pData) {
+  return st_userstats_GetStatFloat(self, name, pData);
+}
+int TRT_GUEST_ABI st_userstats_GetUserAchievement(void* self, u64, const char* name, u8* pbAchieved) {
+  return st_userstats_GetAchievement(self, name, pbAchieved);
+}
+const char* TRT_GUEST_ABI st_userstats_GetLeaderboardName(void*, u64 leaderboard) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  static char s_lb_ret[128];
+  for (const auto& lb : g_lb_list) {
+    if (lb.handle == leaderboard) {
+      snprintf(s_lb_ret, sizeof(s_lb_ret), "%s", lb.name);
+      return s_lb_ret;
+    }
+  }
   return steam_empty_str();
 }
-const char* TRT_GUEST_ABI st_userstats_GetLeaderboardName(void* self, u64 leaderboard) {
-  char line[224];
-  snprintf(line, sizeof(line), "strtrace: ISteamUserStats.GetLeaderboardName(self=%p leaderboard=%016llx) -> \"\"", self, (unsigned long long)leaderboard);
-  trt_core_log(line);
-  return steam_empty_str();
+int TRT_GUEST_ABI st_userstats_ResetAllStats(void*, int bAchievementsToo) {
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  g_stats_list.clear();
+  if (bAchievementsToo) g_ach_list.clear();
+  stats_save_locked();
+  return 1;
 }
+u64 TRT_GUEST_ABI st_userstats_FindOrCreateLeaderboard(void*, const char* name, int sort_method, int display_type) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  for (const auto& lb : g_lb_list) {
+    if (strcmp(lb.name, name) == 0) return lb.handle;
+  }
+  steam_lb_entry e{g_next_lb_handle++, {}, sort_method, display_type};
+  snprintf(e.name, sizeof(e.name), "%s", name);
+  g_lb_list.push_back(e);
+  return e.handle;
+}
+u64 TRT_GUEST_ABI st_userstats_FindLeaderboard(void*, const char* name) {
+  if (!name || !name[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_stats_mu);
+  for (const auto& lb : g_lb_list) {
+    if (strcmp(lb.name, name) == 0) return lb.handle;
+  }
+  return 0;
+}
+int TRT_GUEST_ABI st_userstats_GetLeaderboardEntryCount(void*, u64) { return 0; }
+
 static const void* g_steam_userstats_vtbl[64] = {
-    Z8, Z4,                                            // 0-11
-    (const void*)&st_userstats_GetAchievementDisplayAttribute, // 12 GetAchievementDisplayAttribute
-    (const void*)&steam_noop_zero, (const void*)&steam_noop_zero, // 13-14
-    (const void*)&st_userstats_GetAchievementName,     // 15 GetAchievementName
-    Z4,                                                // 16-19
-    (const void*)&st_userstats_GetLeaderboardName,     // 20 GetLeaderboardName
-    Z16, Z16, Z8,                                      // 21-60
-    (const void*)&steam_noop_zero, (const void*)&steam_noop_zero,
-    (const void*)&steam_noop_zero,                     // 61-63
+    (const void*)&st_userstats_RequestCurrentStats,          // 0
+    (const void*)&st_userstats_GetStatInt32,                 // 1
+    (const void*)&st_userstats_GetStatFloat,                 // 2
+    (const void*)&st_userstats_SetStatInt32,                 // 3
+    (const void*)&st_userstats_SetStatFloat,                 // 4
+    (const void*)&st_userstats_UpdateAvgRateStat,            // 5
+    (const void*)&st_userstats_GetAchievement,               // 6
+    (const void*)&st_userstats_SetAchievement,               // 7
+    (const void*)&st_userstats_ClearAchievement,             // 8
+    (const void*)&st_userstats_GetAchievementAndUnlockTime,  // 9
+    (const void*)&st_userstats_StoreStats,                   // 10
+    (const void*)&st_userstats_GetAchievementIcon,           // 11
+    (const void*)&st_userstats_GetAchievementDisplayAttribute, // 12
+    (const void*)&st_userstats_IndicateAchievementProgress,  // 13
+    (const void*)&st_userstats_GetNumAchievements,           // 14
+    (const void*)&st_userstats_GetAchievementName,           // 15
+    (const void*)&st_userstats_RequestUserStats,             // 16
+    (const void*)&st_userstats_GetUserStatInt32,             // 17
+    (const void*)&st_userstats_GetUserStatFloat,             // 18
+    (const void*)&st_userstats_GetUserAchievement,           // 19
+    (const void*)&st_userstats_GetLeaderboardName,           // 20
+    (const void*)&st_userstats_ResetAllStats,                // 21
+    (const void*)&st_userstats_FindOrCreateLeaderboard,      // 22
+    (const void*)&st_userstats_FindLeaderboard,              // 23
+    (const void*)&st_userstats_GetLeaderboardEntryCount,     // 24
+    (const void*)&steam_noop_zero,                           // 25
+    (const void*)&steam_noop_zero,                           // 26
+    (const void*)&steam_noop_zero,                           // 27
+    Z4, Z16, Z16,                                            // 28..63
 };
 fake_steam_iface g_steam_userstats_obj = {g_steam_userstats_vtbl};
+
+// ---- ISteamMatchmaking (real lobby registry) ----------------------------
+struct steam_kv { char k[64]; char v[128]; };
+struct steam_lobby_rec {
+  u64 id;
+  u64 owner;
+  int type;
+  int member_limit;
+  bool joinable;
+  std::vector<u64> members;
+  std::vector<steam_kv> data;
+  std::vector<std::string> chat;
+};
+static std::mutex g_mm_mu;
+static std::vector<steam_lobby_rec> g_lobbies;
+static u64 g_next_lobby_id = 0x1860000000000001ULL;
+
+static steam_lobby_rec* mm_find_locked(u64 id) {
+  for (auto& l : g_lobbies) if (l.id == id) return &l;
+  return nullptr;
+}
+int TRT_GUEST_ABI st_mm_GetFavoriteGameCount(void*) { return 0; }
+int TRT_GUEST_ABI st_mm_GetFavoriteGame(void*, int, u32*, u32*, u16*, u16*, u32*, u32*) { return 0; }
+int TRT_GUEST_ABI st_mm_AddFavoriteGame(void*, u32, u32, u16, u16, u32, u32) { return 0; }
+int TRT_GUEST_ABI st_mm_RemoveFavoriteGame(void*, u32, u32, u16, u16, u32) { return 0; }
+u64 TRT_GUEST_ABI st_mm_RequestLobbyList(void*) { return 1; }
+void TRT_GUEST_ABI st_mm_AddFilter5(void*, const char*, const char*, int) {}
+void TRT_GUEST_ABI st_mm_AddFilterNum(void*, const char*, int, int) {}
+void TRT_GUEST_ABI st_mm_AddFilterVal(void*, const char*, int) {}
+void TRT_GUEST_ABI st_mm_AddFilterOne(void*, int) {}
+u64 TRT_GUEST_ABI st_mm_GetLobbyByIndex(void*, int idx, u64* sret) {
+  u64 id = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_mm_mu);
+    if (idx >= 0 && idx < (int)g_lobbies.size()) id = g_lobbies[(size_t)idx].id;
+  }
+  if (sret) *sret = id;
+  return id;
+}
+u64 TRT_GUEST_ABI st_mm_CreateLobby(void*, int lobby_type, int max_members) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  steam_lobby_rec l{};
+  l.id = g_next_lobby_id++;
+  l.owner = trt_SteamAPI_GetSteamID();
+  l.type = lobby_type;
+  l.member_limit = max_members > 0 ? max_members : 8;
+  l.joinable = true;
+  l.members.push_back(l.owner);
+  g_lobbies.push_back(l);
+  return l.id;
+}
+u64 TRT_GUEST_ABI st_mm_JoinLobby(void*, u64 lobby_id) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l || !l->joinable) return 0;
+  u64 me = trt_SteamAPI_GetSteamID();
+  if (std::find(l->members.begin(), l->members.end(), me) == l->members.end())
+    l->members.push_back(me);
+  return 1;
+}
+void TRT_GUEST_ABI st_mm_LeaveLobby(void*, u64 lobby_id) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  u64 me = trt_SteamAPI_GetSteamID();
+  for (size_t i = 0; i < g_lobbies.size(); ++i) {
+    if (g_lobbies[i].id == lobby_id) {
+      auto& m = g_lobbies[i].members;
+      m.erase(std::remove(m.begin(), m.end(), me), m.end());
+      if (m.empty()) g_lobbies.erase(g_lobbies.begin() + (ptrdiff_t)i);
+      return;
+    }
+  }
+}
+int TRT_GUEST_ABI st_mm_InviteUserToLobby(void*, u64, u64) { return 1; }
+int TRT_GUEST_ABI st_mm_GetNumLobbyMembers(void*, u64 lobby_id) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  return l ? (int)l->members.size() : 0;
+}
+u64 TRT_GUEST_ABI st_mm_GetLobbyMemberByIndex(void*, u64 lobby_id, int idx, u64* sret) {
+  u64 id = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_mm_mu);
+    auto* l = mm_find_locked(lobby_id);
+    if (l && idx >= 0 && idx < (int)l->members.size()) id = l->members[(size_t)idx];
+  }
+  if (sret) *sret = id;
+  return id;
+}
+const char* TRT_GUEST_ABI st_mm_GetLobbyData(void*, u64 lobby_id, const char* key) {
+  if (!key) return steam_empty_str();
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  static char s_val[128];
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return steam_empty_str();
+  for (const auto& kv : l->data) {
+    if (strcmp(kv.k, key) == 0) {
+      snprintf(s_val, sizeof(s_val), "%s", kv.v);
+      return s_val;
+    }
+  }
+  return steam_empty_str();
+}
+int TRT_GUEST_ABI st_mm_SetLobbyData(void*, u64 lobby_id, const char* key, const char* val) {
+  if (!key || !key[0]) return 0;
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  for (auto& kv : l->data) {
+    if (strcmp(kv.k, key) == 0) {
+      snprintf(kv.v, sizeof(kv.v), "%s", val ? val : "");
+      return 1;
+    }
+  }
+  steam_kv kv{};
+  snprintf(kv.k, sizeof(kv.k), "%s", key);
+  snprintf(kv.v, sizeof(kv.v), "%s", val ? val : "");
+  l->data.push_back(kv);
+  return 1;
+}
+int TRT_GUEST_ABI st_mm_GetLobbyDataCount(void*, u64 lobby_id) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  return l ? (int)l->data.size() : 0;
+}
+int TRT_GUEST_ABI st_mm_GetLobbyDataByIndex(void*, u64 lobby_id, int idx, char* key, int key_cap, char* val, int val_cap) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l || idx < 0 || idx >= (int)l->data.size()) return 0;
+  const auto& kv = l->data[(size_t)idx];
+  if (key && key_cap > 0) snprintf(key, (size_t)key_cap, "%s", kv.k);
+  if (val && val_cap > 0) snprintf(val, (size_t)val_cap, "%s", kv.v);
+  return 1;
+}
+int TRT_GUEST_ABI st_mm_DeleteLobbyData(void*, u64 lobby_id, const char* key) {
+  if (!key) return 0;
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  for (size_t i = 0; i < l->data.size(); ++i) {
+    if (strcmp(l->data[i].k, key) == 0) {
+      l->data.erase(l->data.begin() + (ptrdiff_t)i);
+      return 1;
+    }
+  }
+  return 0;
+}
+const char* TRT_GUEST_ABI st_mm_GetLobbyMemberData(void*, u64, u64, const char*) { return steam_empty_str(); }
+void TRT_GUEST_ABI st_mm_SetLobbyMemberData(void*, u64, const char*, const char*) {}
+int TRT_GUEST_ABI st_mm_SendLobbyChatMsg(void*, u64 lobby_id, const void* msg, int len) {
+  if (!msg || len <= 0) return 0;
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  l->chat.emplace_back((const char*)msg, (size_t)len);
+  return 1;
+}
+int TRT_GUEST_ABI st_mm_GetLobbyChatEntry(void*, u64 lobby_id, int idx, u64* user, void* data, int cap, int* type) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l || idx < 0 || idx >= (int)l->chat.size()) return 0;
+  if (user) *user = l->owner;
+  if (type) *type = 1;  // k_EChatEntryTypeChatMsg
+  int cp = (int)l->chat[(size_t)idx].size();
+  if (data && cap > 0) {
+    if (cp > cap) cp = cap;
+    memcpy(data, l->chat[(size_t)idx].data(), (size_t)cp);
+  }
+  return cp;
+}
+int TRT_GUEST_ABI st_mm_RequestLobbyData(void*, u64) { return 1; }
+int TRT_GUEST_ABI st_mm_SetLobbyMemberLimit(void*, u64 lobby_id, int limit) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  l->member_limit = limit;
+  return 1;
+}
+int TRT_GUEST_ABI st_mm_GetLobbyMemberLimit(void*, u64 lobby_id) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  return l ? l->member_limit : 0;
+}
+int TRT_GUEST_ABI st_mm_SetLobbyType(void*, u64 lobby_id, int type) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  l->type = type;
+  return 1;
+}
+int TRT_GUEST_ABI st_mm_SetLobbyJoinable(void*, u64 lobby_id, int joinable) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  l->joinable = (joinable != 0);
+  return 1;
+}
+u64 TRT_GUEST_ABI st_mm_GetLobbyOwner(void*, u64 lobby_id, u64* sret) {
+  u64 ow = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_mm_mu);
+    auto* l = mm_find_locked(lobby_id);
+    if (l) ow = l->owner;
+  }
+  if (sret) *sret = ow;
+  return ow;
+}
+int TRT_GUEST_ABI st_mm_SetLobbyOwner(void*, u64 lobby_id, u64 new_owner) {
+  std::lock_guard<std::mutex> lk(g_mm_mu);
+  auto* l = mm_find_locked(lobby_id);
+  if (!l) return 0;
+  l->owner = new_owner;
+  return 1;
+}
+static const void* g_steam_matchmaking_vtbl[64] = {
+    (const void*)&st_mm_GetFavoriteGameCount,   // 0
+    (const void*)&st_mm_GetFavoriteGame,        // 1
+    (const void*)&st_mm_AddFavoriteGame,        // 2
+    (const void*)&st_mm_RemoveFavoriteGame,     // 3
+    (const void*)&st_mm_RequestLobbyList,       // 4
+    (const void*)&st_mm_AddFilter5,             // 5
+    (const void*)&st_mm_AddFilterNum,           // 6
+    (const void*)&st_mm_AddFilterVal,           // 7
+    (const void*)&st_mm_AddFilterOne,           // 8
+    (const void*)&st_mm_AddFilterOne,           // 9
+    (const void*)&st_mm_AddFilter5,             // 10
+    (const void*)&st_mm_GetLobbyByIndex,        // 11
+    (const void*)&st_mm_CreateLobby,            // 12
+    (const void*)&st_mm_JoinLobby,              // 13
+    (const void*)&st_mm_LeaveLobby,             // 14
+    (const void*)&st_mm_InviteUserToLobby,      // 15
+    (const void*)&st_mm_GetNumLobbyMembers,     // 16
+    (const void*)&st_mm_GetLobbyMemberByIndex,  // 17
+    (const void*)&st_mm_GetLobbyData,           // 18
+    (const void*)&st_mm_SetLobbyData,           // 19
+    (const void*)&st_mm_GetLobbyDataCount,      // 20
+    (const void*)&st_mm_GetLobbyDataByIndex,    // 21
+    (const void*)&st_mm_DeleteLobbyData,        // 22
+    (const void*)&st_mm_GetLobbyMemberData,     // 23
+    (const void*)&st_mm_SetLobbyMemberData,     // 24
+    (const void*)&st_mm_SendLobbyChatMsg,       // 25
+    (const void*)&st_mm_GetLobbyChatEntry,      // 26
+    (const void*)&st_mm_RequestLobbyData,       // 27
+    (const void*)&steam_noop_zero,              // 28 SetLobbyGameServer
+    (const void*)&steam_noop_zero,              // 29 GetLobbyGameServer
+    (const void*)&st_mm_SetLobbyMemberLimit,    // 30
+    (const void*)&st_mm_GetLobbyMemberLimit,    // 31
+    (const void*)&st_mm_SetLobbyType,           // 32
+    (const void*)&st_mm_SetLobbyJoinable,       // 33
+    (const void*)&st_mm_GetLobbyOwner,          // 34
+    (const void*)&st_mm_SetLobbyOwner,          // 35
+    (const void*)&steam_noop_zero,              // 36
+    (const void*)&steam_noop_zero, (const void*)&steam_noop_zero,
+    (const void*)&steam_noop_zero, Z8, Z16,
+};
+fake_steam_iface g_steam_matchmaking_obj = {g_steam_matchmaking_vtbl};
+
+// ---- ISteamNetworking (P2P loopback / session table) --------------------
+struct steam_p2p_pkt {
+  u64 remote_id;
+  int channel;
+  std::vector<u8> payload;
+};
+static std::mutex g_net_mu;
+static std::vector<steam_p2p_pkt> g_net_rx;
+static std::vector<u64> g_net_peers;
+static bool g_net_relay = true;
+
+int TRT_GUEST_ABI st_net_SendP2PPacket(void*, u64 remote_id, const void* data, u32 len, int send_type, int channel) {
+  (void)send_type;
+  if (!data || len == 0 || len > 1048576u) return 0;
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  const u64 self_id = trt_SteamAPI_GetSteamID();
+  bool accepted = (remote_id == self_id);
+  for (u64 p : g_net_peers) if (p == remote_id) accepted = true;
+  if (accepted) {
+    steam_p2p_pkt pkt{remote_id == self_id ? self_id : remote_id, channel, {}};
+    pkt.payload.assign((const u8*)data, (const u8*)data + len);
+    g_net_rx.push_back(std::move(pkt));
+  }
+  return 1;
+}
+int TRT_GUEST_ABI st_net_IsP2PPacketAvailable(void*, u32* msg_sz, int channel) {
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  for (const auto& pkt : g_net_rx) {
+    if (pkt.channel == channel) {
+      if (msg_sz) *msg_sz = (u32)pkt.payload.size();
+      return 1;
+    }
+  }
+  if (msg_sz) *msg_sz = 0;
+  return 0;
+}
+int TRT_GUEST_ABI st_net_ReadP2PPacket(void*, void* dest, u32 cap, u32* msg_sz, u64* remote_id, int channel) {
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  for (size_t i = 0; i < g_net_rx.size(); ++i) {
+    if (g_net_rx[i].channel == channel) {
+      const auto& pkt = g_net_rx[i];
+      u32 n = (u32)pkt.payload.size();
+      if (n > cap) n = cap;
+      if (dest && n > 0) memcpy(dest, pkt.payload.data(), n);
+      if (msg_sz) *msg_sz = n;
+      if (remote_id) *remote_id = pkt.remote_id;
+      g_net_rx.erase(g_net_rx.begin() + (ptrdiff_t)i);
+      return 1;
+    }
+  }
+  if (msg_sz) *msg_sz = 0;
+  return 0;
+}
+int TRT_GUEST_ABI st_net_AcceptP2PSessionWithUser(void*, u64 remote_id) {
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  if (std::find(g_net_peers.begin(), g_net_peers.end(), remote_id) == g_net_peers.end())
+    g_net_peers.push_back(remote_id);
+  return 1;
+}
+int TRT_GUEST_ABI st_net_CloseP2PSessionWithUser(void*, u64 remote_id) {
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  g_net_peers.erase(std::remove(g_net_peers.begin(), g_net_peers.end(), remote_id), g_net_peers.end());
+  return 1;
+}
+int TRT_GUEST_ABI st_net_CloseP2PChannelWithUser(void*, u64, int) { return 1; }
+int TRT_GUEST_ABI st_net_GetP2PSessionState(void*, u64 remote_id, void* out_state) {
+  std::lock_guard<std::mutex> lk(g_net_mu);
+  bool active = (remote_id == trt_SteamAPI_GetSteamID()) ||
+                (std::find(g_net_peers.begin(), g_net_peers.end(), remote_id) != g_net_peers.end());
+  if (out_state) {
+    // P2PSessionState_t layout: bConnectionActive(1), bConnecting(1), eP2PSessionError(1), bUsingRelay(1), nBytesQueuedForSend(4), nPacketsQueuedForSend(4), m_nRemoteIP(4), m_nRemotePort(2)
+    u8* s = (u8*)out_state;
+    memset(s, 0, 20);
+    s[0] = active ? 1 : 0;
+  }
+  return active ? 1 : 0;
+}
+int TRT_GUEST_ABI st_net_AllowP2PPacketRelay(void*, int allow) {
+  g_net_relay = (allow != 0);
+  return 1;
+}
+static const void* g_steam_networking_vtbl[64] = {
+    (const void*)&st_net_SendP2PPacket,             // 0
+    (const void*)&st_net_IsP2PPacketAvailable,      // 1
+    (const void*)&st_net_ReadP2PPacket,             // 2
+    (const void*)&st_net_AcceptP2PSessionWithUser,  // 3
+    (const void*)&st_net_CloseP2PSessionWithUser,   // 4
+    (const void*)&st_net_CloseP2PChannelWithUser,   // 5
+    (const void*)&st_net_GetP2PSessionState,        // 6
+    (const void*)&st_net_AllowP2PPacketRelay,       // 7
+    Z8, Z16, Z16, Z16,
+};
+fake_steam_iface g_steam_networking_obj = {g_steam_networking_vtbl};
 
 // ---- ISteamRemoteStorage (VFS-backed local cloud saves) ----
 constexpr int kSteamCloudMaxFiles = 256;
@@ -1078,7 +1885,7 @@ void* TRT_GUEST_ABI st_client_GetISteamUtils(void*, int, const char*) {
   return &g_steam_utils_obj;
 }
 void* TRT_GUEST_ABI st_client_GetISteamMatchmaking(void*, int, int, const char*) {
-  return steam_get_iface(1);
+  return &g_steam_matchmaking_obj;
 }
 void* TRT_GUEST_ABI st_client_GetISteamMatchmakingServers(void*, int, int, const char*) {
   return steam_get_iface(2);
@@ -1096,7 +1903,7 @@ void* TRT_GUEST_ABI st_client_GetISteamApps(void*, int, int, const char*) {
   return &g_steam_apps_obj;
 }
 void* TRT_GUEST_ABI st_client_GetISteamNetworking(void*, int, int, const char*) {
-  return steam_get_iface(6);
+  return &g_steam_networking_obj;
 }
 void* TRT_GUEST_ABI st_client_GetISteamRemoteStorage(void*, int, int, const char*) {
   return &g_steam_rs_obj;
@@ -1233,6 +2040,14 @@ void* TRT_GUEST_ABI trt_SteamInternal_CreateInterface(const char* version) {
   if (strncmp(version, "SteamFriends", 12) == 0 ||
       strncmp(version, "STEAMFRIENDS_INTERFACE_VERSION", 30) == 0)
     return &g_steam_friends_obj;
+  if ((strncmp(version, "SteamMatchmaking", 16) == 0 &&
+       strncmp(version, "SteamMatchmakingServers", 23) != 0) ||
+      (strncmp(version, "STEAMMATCHMAKING_INTERFACE_VERSION", 34) == 0 &&
+       strncmp(version, "STEAMMATCHMAKINGSERVERS_INTERFACE_VERSION", 41) != 0))
+    return &g_steam_matchmaking_obj;
+  if (strncmp(version, "SteamNetworking", 15) == 0 ||
+      strncmp(version, "STEAMNETWORKING_INTERFACE_VERSION", 33) == 0)
+    return &g_steam_networking_obj;
   if (strncmp(version, "SteamRemoteStorage", 18) == 0 ||
       strncmp(version, "STEAMREMOTESTORAGE_INTERFACE_VERSION", 36) == 0)
     return &g_steam_rs_obj;
@@ -1319,6 +2134,12 @@ static void* TRT_GUEST_ABI steam_utils_obj_ptr(void) {
 static void* TRT_GUEST_ABI steam_friends_obj_ptr(void) {
   return &g_steam_friends_obj;
 }
+static void* TRT_GUEST_ABI steam_matchmaking_obj_ptr(void) {
+  return &g_steam_matchmaking_obj;
+}
+static void* TRT_GUEST_ABI steam_networking_obj_ptr(void) {
+  return &g_steam_networking_obj;
+}
 static void* TRT_GUEST_ABI steam_rs_obj_ptr(void) {
   return &g_steam_rs_obj;
 }
@@ -1344,7 +2165,9 @@ static int TRT_GUEST_ABI steam_apps_is_timed_trial(void*, u32* allowed, u32* pla
   if (played) *played = 0;
   return 0;
 }
-static u64 TRT_GUEST_ABI steam_apps_get_app_owner(void*) { return 0; }
+static u64 TRT_GUEST_ABI steam_apps_get_app_owner(void*) {
+  return trt_steam_is_owned(g_app_id) ? trt_SteamAPI_GetSteamID() : 0;
+}
 static int TRT_GUEST_ABI steam_user_has_license(void*, u64 /*steam_id*/, u32 /*app_id*/) {
   // EUserHasLicenseForAppResult: 0=HasLicense, 1=DoesNotHaveLicense, 2=NoAuth
   return 2;
@@ -1353,12 +2176,14 @@ static int TRT_GUEST_ABI steam_user_b_logged_on(void*) {
   return g_initialized ? 1 : 0;
 }
 static u64 TRT_GUEST_ABI steam_user_get_steam_id(void*) {
-  return 0x0110000100000001ULL;
+  return trt_SteamAPI_GetSteamID();
 }
 static const char* TRT_GUEST_ABI steam_friends_get_persona_name(void*) {
-  return "TiramisuPlayer";
+  return trt_steam_current_persona();
 }
-static int TRT_GUEST_ABI steam_friends_get_persona_state(void*) { return 0; }
+static int TRT_GUEST_ABI steam_friends_get_persona_state(void*) {
+  return g_initialized ? 1 : 0;
+}
 static const char* TRT_GUEST_ABI steam_const_english(void*) { { const char* st_v = "english"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_GetSteamUILanguage/GetAvailableGameLanguages(flat) -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "english"; }
 static const char* TRT_GUEST_ABI steam_utils_get_ip_country(void*) { { const char* st_v = "US"; char st_line[192]; snprintf(st_line, sizeof(st_line), "strtrace: SteamAPI_ISteamUtils_GetIPCountry(flat) -> ptr=%p \"%.128s\"", (const void*)st_v, st_v); trt_core_log(st_line); } return "US"; }
 static unsigned char TRT_GUEST_ABI steam_utils_get_battery(void*) { return 255; }
@@ -1398,8 +2223,8 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamUtils", (void*)steam_utils_obj_ptr},
     {"SteamApps", (void*)steam_apps_obj_ptr},
     {"SteamUserStats", (void*)steam_userstats_obj_ptr},
-    {"SteamMatchmaking", (void*)steam_iface_1},
-    {"SteamNetworking", (void*)steam_iface_6},
+    {"SteamMatchmaking", (void*)steam_matchmaking_obj_ptr},
+    {"SteamNetworking", (void*)steam_networking_obj_ptr},
     {"SteamRemoteStorage", (void*)steam_rs_obj_ptr},
     {"SteamScreenshots", (void*)steam_iface_7},
     {"SteamHTTP", (void*)steam_iface_9},
@@ -1419,7 +2244,7 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamAPI_SteamFriends_v015", (void*)steam_friends_obj_ptr},
     {"SteamAPI_SteamFriends_v017", (void*)steam_friends_obj_ptr},
     {"SteamAPI_SteamFriends_v018", (void*)steam_friends_obj_ptr},
-    {"SteamAPI_SteamMatchmaking_v009", (void*)steam_iface_1},
+    {"SteamAPI_SteamMatchmaking_v009", (void*)steam_matchmaking_obj_ptr},
     {"SteamAPI_SteamMatchmakingServers_v002", (void*)steam_iface_2},
     {"SteamAPI_SteamParties_v002", (void*)steam_iface_3},
     {"SteamAPI_SteamRemoteStorage_v014", (void*)steam_rs_obj_ptr},
@@ -1427,7 +2252,71 @@ static const trt_named_fn k_steam_extra_fns[] = {
     {"SteamAPI_SteamUserStats_v011", (void*)steam_userstats_obj_ptr},
     {"SteamAPI_SteamUserStats_v012", (void*)steam_userstats_obj_ptr},
     {"SteamAPI_SteamUserStats_v013", (void*)steam_userstats_obj_ptr},
-    {"SteamAPI_SteamNetworking_v006", (void*)steam_iface_6},
+    {"SteamAPI_SteamNetworking_v006", (void*)steam_networking_obj_ptr},
+    {"SteamAPI_ISteamUserStats_RequestCurrentStats", (void*)st_userstats_RequestCurrentStats},
+    {"SteamAPI_ISteamUserStats_GetStatInt32", (void*)st_userstats_GetStatInt32},
+    {"SteamAPI_ISteamUserStats_GetStatFloat", (void*)st_userstats_GetStatFloat},
+    {"SteamAPI_ISteamUserStats_SetStatInt32", (void*)st_userstats_SetStatInt32},
+    {"SteamAPI_ISteamUserStats_SetStatFloat", (void*)st_userstats_SetStatFloat},
+    {"SteamAPI_ISteamUserStats_UpdateAvgRateStat", (void*)st_userstats_UpdateAvgRateStat},
+    {"SteamAPI_ISteamUserStats_GetAchievement", (void*)st_userstats_GetAchievement},
+    {"SteamAPI_ISteamUserStats_SetAchievement", (void*)st_userstats_SetAchievement},
+    {"SteamAPI_ISteamUserStats_ClearAchievement", (void*)st_userstats_ClearAchievement},
+    {"SteamAPI_ISteamUserStats_GetAchievementAndUnlockTime", (void*)st_userstats_GetAchievementAndUnlockTime},
+    {"SteamAPI_ISteamUserStats_StoreStats", (void*)st_userstats_StoreStats},
+    {"SteamAPI_ISteamUserStats_GetAchievementIcon", (void*)st_userstats_GetAchievementIcon},
+    {"SteamAPI_ISteamUserStats_GetAchievementDisplayAttribute", (void*)st_userstats_GetAchievementDisplayAttribute},
+    {"SteamAPI_ISteamUserStats_IndicateAchievementProgress", (void*)st_userstats_IndicateAchievementProgress},
+    {"SteamAPI_ISteamUserStats_GetNumAchievements", (void*)st_userstats_GetNumAchievements},
+    {"SteamAPI_ISteamUserStats_GetAchievementName", (void*)st_userstats_GetAchievementName},
+    {"SteamAPI_ISteamUserStats_RequestUserStats", (void*)st_userstats_RequestUserStats},
+    {"SteamAPI_ISteamUserStats_GetUserStatInt32", (void*)st_userstats_GetUserStatInt32},
+    {"SteamAPI_ISteamUserStats_GetUserStatFloat", (void*)st_userstats_GetUserStatFloat},
+    {"SteamAPI_ISteamUserStats_GetUserAchievement", (void*)st_userstats_GetUserAchievement},
+    {"SteamAPI_ISteamUserStats_GetLeaderboardName", (void*)st_userstats_GetLeaderboardName},
+    {"SteamAPI_ISteamUserStats_ResetAllStats", (void*)st_userstats_ResetAllStats},
+    {"SteamAPI_ISteamUserStats_FindOrCreateLeaderboard", (void*)st_userstats_FindOrCreateLeaderboard},
+    {"SteamAPI_ISteamUserStats_FindLeaderboard", (void*)st_userstats_FindLeaderboard},
+    {"SteamAPI_ISteamUserStats_GetLeaderboardEntryCount", (void*)st_userstats_GetLeaderboardEntryCount},
+    {"SteamAPI_ISteamMatchmaking_GetFavoriteGameCount", (void*)st_mm_GetFavoriteGameCount},
+    {"SteamAPI_ISteamMatchmaking_GetFavoriteGame", (void*)st_mm_GetFavoriteGame},
+    {"SteamAPI_ISteamMatchmaking_AddFavoriteGame", (void*)st_mm_AddFavoriteGame},
+    {"SteamAPI_ISteamMatchmaking_RemoveFavoriteGame", (void*)st_mm_RemoveFavoriteGame},
+    {"SteamAPI_ISteamMatchmaking_RequestLobbyList", (void*)st_mm_RequestLobbyList},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyByIndex", (void*)st_mm_GetLobbyByIndex},
+    {"SteamAPI_ISteamMatchmaking_CreateLobby", (void*)st_mm_CreateLobby},
+    {"SteamAPI_ISteamMatchmaking_JoinLobby", (void*)st_mm_JoinLobby},
+    {"SteamAPI_ISteamMatchmaking_LeaveLobby", (void*)st_mm_LeaveLobby},
+    {"SteamAPI_ISteamMatchmaking_InviteUserToLobby", (void*)st_mm_InviteUserToLobby},
+    {"SteamAPI_ISteamMatchmaking_GetNumLobbyMembers", (void*)st_mm_GetNumLobbyMembers},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex", (void*)st_mm_GetLobbyMemberByIndex},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyData", (void*)st_mm_GetLobbyData},
+    {"SteamAPI_ISteamMatchmaking_SetLobbyData", (void*)st_mm_SetLobbyData},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyDataCount", (void*)st_mm_GetLobbyDataCount},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyDataByIndex", (void*)st_mm_GetLobbyDataByIndex},
+    {"SteamAPI_ISteamMatchmaking_DeleteLobbyData", (void*)st_mm_DeleteLobbyData},
+    {"SteamAPI_ISteamMatchmaking_SendLobbyChatMsg", (void*)st_mm_SendLobbyChatMsg},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyChatEntry", (void*)st_mm_GetLobbyChatEntry},
+    {"SteamAPI_ISteamMatchmaking_RequestLobbyData", (void*)st_mm_RequestLobbyData},
+    {"SteamAPI_ISteamMatchmaking_SetLobbyMemberLimit", (void*)st_mm_SetLobbyMemberLimit},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyMemberLimit", (void*)st_mm_GetLobbyMemberLimit},
+    {"SteamAPI_ISteamMatchmaking_SetLobbyType", (void*)st_mm_SetLobbyType},
+    {"SteamAPI_ISteamMatchmaking_SetLobbyJoinable", (void*)st_mm_SetLobbyJoinable},
+    {"SteamAPI_ISteamMatchmaking_GetLobbyOwner", (void*)st_mm_GetLobbyOwner},
+    {"SteamAPI_ISteamMatchmaking_SetLobbyOwner", (void*)st_mm_SetLobbyOwner},
+    {"SteamAPI_ISteamNetworking_SendP2PPacket", (void*)st_net_SendP2PPacket},
+    {"SteamAPI_ISteamNetworking_IsP2PPacketAvailable", (void*)st_net_IsP2PPacketAvailable},
+    {"SteamAPI_ISteamNetworking_ReadP2PPacket", (void*)st_net_ReadP2PPacket},
+    {"SteamAPI_ISteamNetworking_AcceptP2PSessionWithUser", (void*)st_net_AcceptP2PSessionWithUser},
+    {"SteamAPI_ISteamNetworking_CloseP2PSessionWithUser", (void*)st_net_CloseP2PSessionWithUser},
+    {"SteamAPI_ISteamNetworking_CloseP2PChannelWithUser", (void*)st_net_CloseP2PChannelWithUser},
+    {"SteamAPI_ISteamNetworking_GetP2PSessionState", (void*)st_net_GetP2PSessionState},
+    {"SteamAPI_ISteamNetworking_AllowP2PPacketRelay", (void*)st_net_AllowP2PPacketRelay},
+    {"SteamAPI_ISteamFriends_GetFriendCount", (void*)st_friends_GetFriendCount},
+    {"SteamAPI_ISteamFriends_GetFriendByIndex", (void*)st_friends_GetFriendByIndex},
+    {"SteamAPI_ISteamFriends_GetFriendRelationship", (void*)st_friends_GetFriendRelationship},
+    {"SteamAPI_ISteamFriends_GetFriendPersonaState", (void*)st_friends_GetFriendPersonaState},
+    {"SteamAPI_ISteamFriends_GetFriendPersonaName", (void*)st_friends_GetFriendPersonaName},
     {"SteamAPI_SteamScreenshots_v003", (void*)steam_iface_7},
     {"SteamAPI_SteamMusic_v001", (void*)steam_iface_8},
     {"SteamAPI_SteamMusicRemote_v001", (void*)steam_iface_24},

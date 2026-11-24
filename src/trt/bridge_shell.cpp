@@ -17,12 +17,15 @@
 // Both wide and ANSI entry points fill a MAX_PATH (260) buffer; the VFS
 // mkdirs the folder when the SHF_FLAG_CREATE bit (0x8000) is set.
 #include "bridge_shell.h"
+#include "bridge_user32.h"
+#include "pe.h"
 #include "thunk.h"
 #include "trt.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 #ifdef _WIN32
 #include <direct.h>  // _mkdir
 #else
@@ -127,7 +130,7 @@ int TRT_GUEST_ABI shell_SHGetFolderPathW(void* hwnd, u32 csidl, void* token,
   if (!path_out) return E_INVALIDARG_;
   char p8[k_max_path];
   if (csidl_path(csidl, p8, sizeof(p8)) != 0) {
-    char line[96];
+    char line[128];
     snprintf(line, sizeof(line),
              "shell: SHGetFolderPathW csidl=0x%x -> E_FAIL (no mapping)", csidl);
     log_line(line);
@@ -146,7 +149,7 @@ int TRT_GUEST_ABI shell_SHGetFolderPathA(void* hwnd, u32 csidl, void* token,
                                          u32 flags, char* path_out) {
   if (!path_out) return E_INVALIDARG_;
   if (csidl_path(csidl, path_out, k_max_path) != 0) {
-    char line[96];
+    char line[128];
     snprintf(line, sizeof(line),
              "shell: SHGetFolderPathA csidl=0x%x -> E_FAIL (no mapping)", csidl);
     log_line(line);
@@ -212,7 +215,7 @@ int TRT_GUEST_ABI shell_SHGetKnownFolderPath(const u8* rfid, u32 flags,
   if (knownfolder_path(rfid, p8, sizeof(p8)) != 0) {
     char guid[40];
     // print the first field for the log
-    char line[96];
+    char line[128];
     guid8 id;
     memcpy(&id, rfid, sizeof(id));
     snprintf(guid, sizeof(guid), "{%08X-%04X-%04X-...}", id.a, id.b, id.c);
@@ -304,7 +307,7 @@ int TRT_GUEST_ABI shell_SHCreateDirectoryExW(void* hwnd, const u16* path,
   (void)hwnd; (void)attr;
   char host[1024];
   if (!path || trt_vfs_resolve_utf16(path, host, sizeof(host)) != 0) {
-    char line[96];
+    char line[128];
     snprintf(line, sizeof(line), "shell: SHCreateDirectoryExW -> path unresolvable");
     log_line(line);
     return (int)0x8007000B;  // E_INVALIDARG-shaped: named failure
@@ -358,7 +361,7 @@ u16** TRT_GUEST_ABI shell_CommandLineToArgvW(const u16* cmdline, i32* count) {
   tail[0] = nullptr;
   argv_buf[nargs] = nullptr;
   *count = (i32)nargs;
-  char line[96];
+  char line[128];
   snprintf(line, sizeof(line), "shell: CommandLineToArgvW -> %u args", nargs);
   log_line(line);
   return argv_buf;
@@ -383,7 +386,7 @@ void TRT_GUEST_ABI shell_DragFinish(void* hdrop) {
   // DragQueryFileW hands back synthetic records (no GlobalAlloc backing), so
   // there is nothing to GlobalFree — the real contract (release the HDROP)
   // is met vacuously. Logged so a future real-HDROP implementation revisits.
-  char line[96];
+  char line[128];
   snprintf(line, sizeof(line), "shell: DragFinish(%p) -> released (synthetic)",
            hdrop);
   log_line(line);
@@ -398,7 +401,7 @@ u32 TRT_GUEST_ABI shell_DragQueryFileW(void* hdrop, u32 idx, u16* buf, u32 cch) 
 void* TRT_GUEST_ABI shell_SHBrowseForFolderW(const void* browse_info) {
   // No shell folder browser on the console. NULL = the user cancelled the
   // dialog (real semantics); the caller falls back to typed path entry.
-  char line[96];
+  char line[128];
   snprintf(line, sizeof(line),
            "shell: SHBrowseForFolderW -> NULL (no folder picker on console; "
            "caller falls back to manual entry)");
@@ -446,62 +449,208 @@ int TRT_GUEST_ABI shell_Shell_NotifyIconW(u32 msg, void* nid) {
   return 0;  // FALSE: no system tray on console UWP
 }
 
-// ---- icon extraction ----
-// SDL2 imports ExtractIconExW at load time for its window-icon path, so an
-// absent export is a LOAD failure for every SDL2 game (measured: corpus
-// SDL2.dll). There is no shell image list and no PE icon extraction on the
-// console, so the honest answer is zero icons with the request named — the
-// caller falls back to its own icon or none.
+// ---- PE .rsrc icon extraction --------------------------------------------
+struct shell_pe_sec {
+  u32 va, vsize, raw_size, raw_ptr;
+};
+
+static u16 sh_rd16(const u8* p) { u16 v; memcpy(&v, p, 2); return v; }
+static u32 sh_rd32(const u8* p) { u32 v; memcpy(&v, p, 4); return v; }
+
+static size_t sh_rva_to_off(const std::vector<shell_pe_sec>& secs, u32 rva, size_t total) {
+  for (const auto& s : secs) {
+    const u32 span = s.vsize ? s.vsize : s.raw_size;
+    if (span && rva >= s.va && rva - s.va < span) {
+      const size_t off = (size_t)s.raw_ptr + (size_t)(rva - s.va);
+      if (off < total) return off;
+    }
+  }
+  return (size_t)-1;
+}
+
+static bool sh_resolve_open_path(const char* raw_path, char* out, size_t out_cap) {
+  if (!raw_path || !raw_path[0]) return false;
+  if (raw_path[1] == ':' && (raw_path[2] == '\\' || raw_path[2] == '/')) {
+    u16 w[512];
+    size_t i = 0;
+    for (; raw_path[i] && i + 1 < 512; ++i) w[i] = (u16)(u8)raw_path[i];
+    w[i] = 0;
+    if (trt_vfs_resolve_utf16(w, out, out_cap) == 0) return true;
+  }
+  snprintf(out, out_cap, "%s", raw_path);
+  return true;
+}
+
+struct pe_icon_dim { int w; int h; };
+
+static std::vector<pe_icon_dim> scan_pe_group_icons(const char* path) {
+  std::vector<pe_icon_dim> out;
+  char host[1024];
+  if (!sh_resolve_open_path(path, host, sizeof(host))) return out;
+  FILE* f = fopen(host, "rb");
+  if (!f) return out;
+  fseek(f, 0, SEEK_END);
+  long fsz = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (fsz <= 128 || fsz > 64 * 1024 * 1024) {
+    fclose(f);
+    return out;
+  }
+  std::vector<u8> buf((size_t)fsz);
+  size_t got = fread(buf.data(), 1, (size_t)fsz, f);
+  fclose(f);
+  const u8* d = buf.data();
+  const size_t total = got;
+  if (total < sizeof(trt_dos_header)) return out;
+  trt_dos_header dos{};
+  memcpy(&dos, d, sizeof(dos));
+  if (dos.e_magic != 0x5A4D) return out;
+  const size_t nt = dos.e_lfanew;
+  if (nt + 4 + sizeof(trt_file_header) + 2 > total) return out;
+  if (sh_rd32(d + nt) != 0x00004550u) return out;
+  trt_file_header fh{};
+  memcpy(&fh, d + nt + 4, sizeof(fh));
+  const size_t opt_off = nt + 4 + sizeof(fh);
+  const u16 magic = sh_rd16(d + opt_off);
+  const bool pe32 = (magic == TRT_PE_OPT32_MAGIC);
+  const bool pe64 = (magic == 0x020b);
+  if (!pe32 && !pe64) return out;
+  const size_t dirs_off = opt_off + (pe32 ? TRT_PE32_OPT_DIRS_OFF : TRT_PE64_OPT_DIRS_OFF);
+  if (dirs_off + sizeof(trt_data_directory) * TRT_PE_NUM_DIRECTORIES > total) return out;
+  trt_data_directory dirs[TRT_PE_NUM_DIRECTORIES];
+  memcpy(dirs, d + dirs_off, sizeof(dirs));
+  const u32 rsrc_rva = dirs[2 /*IMAGE_DIRECTORY_ENTRY_RESOURCE*/].virtual_address;
+  const u32 rsrc_sz = dirs[2].size;
+  if (!rsrc_rva || !rsrc_sz) return out;
+
+  std::vector<shell_pe_sec> secs;
+  const size_t sec_off = opt_off + fh.size_of_optional_header;
+  for (u16 i = 0; i < fh.number_of_sections; ++i) {
+    const size_t o = sec_off + (size_t)i * sizeof(trt_section_header);
+    if (o + sizeof(trt_section_header) > total) break;
+    trt_section_header sh{};
+    memcpy(&sh, d + o, sizeof(sh));
+    secs.push_back({sh.virtual_address, sh.virtual_size,
+                    sh.size_of_raw_data, sh.pointer_to_raw_data});
+  }
+  const size_t rsrc_base = sh_rva_to_off(secs, rsrc_rva, total);
+  if (rsrc_base == (size_t)-1 || rsrc_base + 16 > total) return out;
+
+  const u16 t_named = sh_rd16(d + rsrc_base + 12);
+  const u16 t_ided = sh_rd16(d + rsrc_base + 14);
+  const u32 t_cnt = (u32)(t_named + t_ided);
+  for (u32 ti = 0; ti < t_cnt; ++ti) {
+    const size_t eo = rsrc_base + 16 + (size_t)ti * 8;
+    if (eo + 8 > total) break;
+    const u32 id = sh_rd32(d + eo);
+    const u32 val = sh_rd32(d + eo + 4);
+    if ((id & 0x80000000u) == 0 && (id & 0xFFFFu) == 14u /*RT_GROUP_ICON*/ &&
+        (val & 0x80000000u) != 0) {
+      const size_t gdir = rsrc_base + (size_t)(val & 0x7FFFFFFFu);
+      if (gdir + 16 > total) break;
+      const u32 gcnt = (u32)sh_rd16(d + gdir + 12) + sh_rd16(d + gdir + 14);
+      for (u32 gi = 0; gi < gcnt; ++gi) {
+        const size_t geo = gdir + 16 + (size_t)gi * 8;
+        if (geo + 8 > total) break;
+        const u32 gval = sh_rd32(d + geo + 4);
+        int iw = 32, ih = 32;
+        if (gval & 0x80000000u) {
+          const size_t ldir = rsrc_base + (size_t)(gval & 0x7FFFFFFFu);
+          if (ldir + 24 <= total) {
+            const u32 lcnt = (u32)sh_rd16(d + ldir + 12) + sh_rd16(d + ldir + 14);
+            if (lcnt > 0) {
+              const u32 dval = sh_rd32(d + ldir + 16 + 4);
+              if ((dval & 0x80000000u) == 0) {
+                const size_t de = rsrc_base + (size_t)dval;
+                if (de + 16 <= total) {
+                  const u32 data_off = (u32)sh_rva_to_off(secs, sh_rd32(d + de), total);
+                  const u32 data_sz = sh_rd32(d + de + 4);
+                  if (data_off != (u32)-1 && (size_t)data_off + 20 <= total && data_sz >= 20) {
+                    const u16 grp_cnt = sh_rd16(d + data_off + 4);
+                    if (grp_cnt > 0) {
+                      const u8 w0 = d[data_off + 6];
+                      const u8 h0 = d[data_off + 7];
+                      iw = w0 ? (int)w0 : 256;
+                      ih = h0 ? (int)h0 : 256;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        out.push_back({iw, ih});
+      }
+      break;
+    }
+  }
+  return out;
+}
+
+u32 extract_icons_common(const char* path, int index, void** large,
+                         void** small, u32 count) {
+  if (large && count > 0) memset(large, 0, count * sizeof(void*));
+  if (small && count > 0) memset(small, 0, count * sizeof(void*));
+  const std::vector<pe_icon_dim> icons = scan_pe_group_icons(path);
+  if (index == -1) return (u32)icons.size();
+  if (index < 0 || (size_t)index >= icons.size() || count == 0 || (!large && !small))
+    return 0;
+  u32 extracted = 0;
+  for (u32 i = 0; i < count && (size_t)index + i < icons.size(); ++i) {
+    const auto& dim = icons[(size_t)index + i];
+    if (large) large[i] = trt_user32_icon_alloc(dim.w, dim.h);
+    if (small) small[i] = trt_user32_icon_alloc(16, 16);
+    ++extracted;
+  }
+  return extracted;
+}
+
 u32 TRT_GUEST_ABI shell_ExtractIconExW(const u16* file, int index, void** large,
                                        void** small, u32 count) {
-  if (large) *large = nullptr;
-  if (small) *small = nullptr;
-  char nm[96] = "";
+  char nm[512] = "";
   if (file && trt_utf16_to_utf8(file, nm, sizeof(nm)) != 0) nm[0] = 0;
-  char line[224];
+  const u32 got = extract_icons_common(nm, index, large, small, count);
+  char line[256];
   snprintf(line, sizeof(line),
-           "shell32: ExtractIconExW(\"%s\", index=%d, n=%u) -> 0 icons "
-           "(no icon extraction on console: fail-visible)",
-           nm, index, count);
+           "shell32: ExtractIconExW(\"%s\", index=%d, n=%u) -> %u icon(s)",
+           nm, index, count, got);
   log_line(line);
-  return 0;
+  return got;
 }
 
 u32 TRT_GUEST_ABI shell_ExtractIconExA(const char* file, int index, void** large,
                                        void** small, u32 count) {
-  if (large) *large = nullptr;
-  if (small) *small = nullptr;
-  char line[224];
+  const u32 got = extract_icons_common(file ? file : "", index, large, small, count);
+  char line[256];
   snprintf(line, sizeof(line),
-           "shell32: ExtractIconExA(\"%s\", index=%d, n=%u) -> 0 icons "
-           "(no icon extraction on console: fail-visible)",
-           file ? file : "", index, count);
+           "shell32: ExtractIconExA(\"%s\", index=%d, n=%u) -> %u icon(s)",
+           file ? file : "", index, count, got);
   log_line(line);
-  return 0;
+  return got;
 }
 
 void* TRT_GUEST_ABI shell_ExtractIconW(void* inst, const u16* file, u32 index) {
   (void)inst;
-  char nm[96] = "";
+  char nm[512] = "";
   if (file && trt_utf16_to_utf8(file, nm, sizeof(nm)) != 0) nm[0] = 0;
-  char line[192];
-  snprintf(line, sizeof(line),
-           "shell32: ExtractIconW(\"%s\", index=%u) -> NULL "
-           "(no icon extraction on console: fail-visible)",
-           nm, index);
-  log_line(line);
-  return nullptr;
+  if (index == 0xFFFFFFFFu) {
+    const u32 total = extract_icons_common(nm, -1, nullptr, nullptr, 0);
+    return (void*)(uintptr_t)total;
+  }
+  void* ico = nullptr;
+  extract_icons_common(nm, (int)index, &ico, nullptr, 1);
+  return ico;
 }
 
 void* TRT_GUEST_ABI shell_ExtractIconA(void* inst, const char* file, u32 index) {
   (void)inst;
-  char line[192];
-  snprintf(line, sizeof(line),
-           "shell32: ExtractIconA(\"%s\", index=%u) -> NULL "
-           "(no icon extraction on console: fail-visible)",
-           file ? file : "", index);
-  log_line(line);
-  return nullptr;
+  if (index == 0xFFFFFFFFu) {
+    const u32 total = extract_icons_common(file ? file : "", -1, nullptr, nullptr, 0);
+    return (void*)(uintptr_t)total;
+  }
+  void* ico = nullptr;
+  extract_icons_common(file ? file : "", (int)index, &ico, nullptr, 1);
+  return ico;
 }
 
 }  // namespace

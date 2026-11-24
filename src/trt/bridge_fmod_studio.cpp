@@ -67,6 +67,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -2102,6 +2103,8 @@ void feeder_submit_chunk(studio_system* sys, studio_voice* voice) {
   }
 }
 
+void update_instance(studio_system* sys, studio_instance* inst);
+
 void feeder_fn(studio_system* sys) {
   using namespace std::chrono;
   while (sys->feeder_run.load()) {
@@ -2112,6 +2115,7 @@ void feeder_fn(studio_system* sys) {
       for (auto* inst : sys->instances) {
         if (inst->state != TRT_STUDIO_PLAYBACK_PLAYING || inst->paused)
           continue;
+        update_instance(sys, inst);
         for (auto* voice : inst->voices) {
           if (!voice->playing || voice->paused || voice->done) continue;
           decoded_sample* s = voice->sample.get();

@@ -7,6 +7,17 @@ EXPORTS
     waveOutGetNumDevs
     waveOutGetDevCapsW
     midiOutGetNumDevs
+    midiOutGetDevCapsW
+    midiOutGetDevCapsA
+    midiOutOpen
+    midiOutClose
+    midiOutShortMsg
+    midiOutLongMsg
+    midiOutPrepareHeader
+    midiOutUnprepareHeader
+    midiOutReset
+    midiOutGetVolume
+    midiOutSetVolume
     joyGetNumDevs
     joyGetPosEx
     mciSendStringW

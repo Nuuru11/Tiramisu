@@ -74,6 +74,13 @@ int TRT_GUEST_ABI trt_D3D12SerializeRootSignature(const void* desc, u32 version,
 int TRT_GUEST_ABI trt_D3D12SerializeVersionedRootSignature(const void* desc,
                                                            void** out_blob,
                                                            void** out_err);
+int TRT_GUEST_ABI trt_D3D12CreateRootSignatureDeserializer(const void* src, u64 size,
+                                                           const void* riid,
+                                                           void** out_des);
+int TRT_GUEST_ABI trt_D3D12CreateVersionedRootSignatureDeserializer(const void* src,
+                                                                    u64 size,
+                                                                    const void* riid,
+                                                                    void** out_des);
 int TRT_GUEST_ABI trt_D3D12GetInterface(const void* rclsid, const void* riid,
                                         void** out_iface);
 
@@ -111,6 +118,13 @@ unsigned trt_d3d12_cmdlist_scissor_count(void* cmdlist);
 unsigned trt_d3d12_cmdlist_draws(void* cmdlist);
 unsigned trt_d3d12_cmdlist_queries(void* cmdlist);
 unsigned trt_d3d12_cmdlist_bundles(void* cmdlist);
+
+// Root-signature layout recovered from the blob CreateRootSignature accepted.
+// Non-zero only for a blob this bridge serialized (a hand-authored or
+// real-Windows blob binds but is not introspectable; -1 = bad pointer).
+unsigned trt_d3d12_rootsig_param_count(void* rootsig);
+unsigned trt_d3d12_rootsig_static_sampler_count(void* rootsig);
+int trt_d3d12_rootsig_flags(void* rootsig);
 
 #ifdef __cplusplus
 }

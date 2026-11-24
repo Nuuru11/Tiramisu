@@ -77,7 +77,9 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   -I third_party/faudio-src/src \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
+  src/host/crash_report.cpp src/host/steam_client.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
+  src/trt/dynamic_api.cpp src/trt/engine_synthesizer.cpp \
   src/trt/bridge_res.cpp \
   src/trt/apiset.cpp src/trt/thunk.cpp src/trt/images.cpp \
   src/trt/x86_32.cpp src/trt/x86_image.cpp \
@@ -86,15 +88,15 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_dinput.cpp src/trt/bridge_audio.cpp \
   src/trt/bridge_steam.cpp src/trt/bridge_winmm.cpp src/trt/bridge_d3d9.cpp \
   src/trt/bridge_dsound.cpp src/trt/bridge_ddraw.cpp src/trt/bridge_d3dx9.cpp \
-  src/trt/bridge_mmedia.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
+  src/trt/bridge_mmedia.cpp src/trt/acm_codec.cpp src/trt/bridge_img.cpp src/trt/bridge_d3dx.cpp src/trt/bridge_d3d8.cpp src/trt/bridge_openal.cpp src/trt/bridge_ole.cpp src/trt/bridge_shell.cpp src/trt/bridge_shlwapi.cpp src/trt/bridge_comctl.cpp src/trt/bridge_gdi.cpp \
   src/trt/bridge_wininet.cpp src/trt/bridge_psapi.cpp src/trt/bridge_iphlpapi.cpp src/trt/bridge_imm32.cpp src/trt/bridge_crypt32.cpp src/trt/bridge_dbghelp.cpp \
   src/trt/bridge_ntdll.cpp src/trt/bridge_opengl32.cpp src/trt/glsl_hlsl.cpp \
-  src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/spirv_cache.cpp src/trt/bridge_hid.cpp \
+  src/trt/bridge_vulkan.cpp src/trt/spirv_hlsl.cpp src/trt/pc2xb_translator.cpp src/trt/spirv_cache.cpp src/trt/steam_auth.cpp src/trt/steam_library.cpp src/trt/universal_guest.cpp src/trt/bridge_hid.cpp \
   src/trt/bridge_xinput.cpp src/trt/bridge_wasapi.cpp src/trt/bridge_winrt.cpp src/trt/bridge_ws2.cpp src/trt/bridge_msvcrt.cpp src/trt/bridge_console_pack.cpp \
   src/trt/bridge_sys_extras.cpp src/trt/bridge_mf.cpp src/trt/bridge_gameinput.cpp \
   src/trt/bridge_dstorage.cpp src/trt/bridge_bink.cpp src/trt/bridge_oodle.cpp src/trt/bridge_wwise.cpp \
   src/trt/bridge_criware.cpp src/trt/bridge_miles.cpp \
-  src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
+  src/trt/bridge_heap.cpp src/trt/bridge_kernel32.cpp src/trt/bridge_kernel32_gap.cpp src/trt/bridge_user32.cpp src/trt/bridge_user32_gap.cpp src/trt/input.cpp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
   src/trt/bridge_fmod_studio.cpp \

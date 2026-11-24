@@ -104,226 +104,14 @@ extern "C" int trt_sync_parked_count(void);
 #  include <sys/stat.h>
 #  include <errno.h>
 
+#include "bridge_heap.h"
+
 // Host-settings hook (weak: absent when trt runs without the host layer —
 // offline tests). File-scope near the top: clang rejects attributed
 // block-scope extern declarations.
 extern "C" bool trt_settings_write_watch() __attribute__((weak));
 
 namespace {
-
-// ---- heap allocation registry: HeapSize/HeapReAlloc need the byte size of
-// every block HeapAlloc handed out, plus which backend owns it (pool slab
-// vs direct backend alloc). Uncapped thread-safe map. The high bit of the
-// recorded size marks a DIRECT block (backend alloc, charged per-alloc);
-// a clear high bit marks a POOL block (carved from a charged slab).
-// The _locked helpers assume g_heap_mu is held; the plain wrappers lock.
-constexpr size_t k_heap_direct_flag = (size_t)1 << (sizeof(size_t) * 8 - 1);
-std::mutex g_heap_mu;
-std::unordered_map<void*, size_t> g_heap_rec;
-
-bool heap_rec_find_locked(void* p, size_t* size_out, bool* direct_out) {
-  if (!p) return false;
-  auto it = g_heap_rec.find(p);
-  if (it == g_heap_rec.end()) return false;
-  if (size_out) *size_out = it->second & ~k_heap_direct_flag;
-  if (direct_out) *direct_out = (it->second & k_heap_direct_flag) != 0;
-  return true;
-}
-void heap_rec_add_locked(void* p, size_t n, bool direct) {
-  if (!p) return;
-  g_heap_rec[p] = (n & ~k_heap_direct_flag) | (direct ? k_heap_direct_flag : 0);
-}
-void heap_rec_del_locked(void* p) {
-  if (!p) return;
-  g_heap_rec.erase(p);
-}
-bool heap_rec_find(void* p, size_t* size_out) {
-  if (!p) return false;
-  std::lock_guard<std::mutex> lk(g_heap_mu);
-  return heap_rec_find_locked(p, size_out, nullptr);
-}
-void heap_rec_add(void* p, size_t n, bool direct) {
-  if (!p) return;
-  std::lock_guard<std::mutex> lk(g_heap_mu);
-  heap_rec_add_locked(p, n, direct);
-}
-
-// forward: the backend singleton is defined below (after the handle
-// table); the slab pool reserves through it
-extern trt_backend g_be;
-
-// ---- heap slab pool ----
-// HeapAlloc used to cost one backend VirtualAlloc/mmap per guest alloc
-// (one syscall + one page commit per block, even for 16 bytes). The pool
-// carves small blocks out of 1 MB slabs reserved from the backend, so a
-// game doing thousands of small allocs pays one syscall per slab instead
-// of one per block. Budget accounting charges the SLAB reservation (1 MB
-// commit + 1 MB VA at slab creation, discharged when the slab is
-// released) — never per-block carving, so the ledger always equals real
-// committed memory. Blocks over 64 KB bypass the pool and go straight to
-// the backend, charged per-alloc exactly as before (the small-budget
-// probe's exact 10 MB ledger assertions depend on it).
-// Layout: a slab is 1 MB, page-aligned from the backend. Blocks start at
-// offset 256; each block is a 16-byte header (slab pointer + magic) plus
-// a class-sized payload, so every returned pointer is 16-aligned. The
-// free list links through the user area's first 8 bytes (dead while the
-// block is free). All pool state is guarded by g_heap_mu — the same mutex
-// as the registry, so there is no lock ordering to get wrong.
-constexpr size_t k_heap_slab_bytes = 1024 * 1024;  // 1 MB per slab
-constexpr size_t k_heap_slab_hdr = 256;            // slab header reservation
-constexpr size_t k_heap_pool_max = 65536;          // largest pooled class
-constexpr u64 k_heap_block_magic = 0x484541504F4F4C21ULL;  // "HEAPOOL!"
-constexpr u64 k_heap_slab_magic = 0x48454150534C4142ULL;   // "HEAPSLAB"
-constexpr size_t k_heap_classes[] = {16,   32,   64,   128,  256,  512, 1024,
-                                     2048, 4096, 8192, 16384, 32768, 65536};
-constexpr size_t k_heap_nclasses =
-    sizeof(k_heap_classes) / sizeof(k_heap_classes[0]);
-
-struct heap_slab {
-  u64 magic;          // k_heap_slab_magic
-  u32 class_idx;
-  u32 block_stride;   // 16 (header) + class size
-  u32 live;           // blocks currently handed out
-  u32 capacity;       // blocks the slab holds
-  u32 next_off;       // bump offset for carving (bytes from slab base)
-  void* free_list;    // singly-linked free blocks (link in user area)
-  heap_slab* next;    // next slab in this class
-};
-
-struct heap_block_hdr {
-  heap_slab* slab;
-  u64 magic;  // k_heap_block_magic
-};
-
-heap_slab* g_heap_slabs[k_heap_nclasses] = {};
-
-int heap_class_for(size_t n) {
-  for (size_t i = 0; i < k_heap_nclasses; ++i)
-    if (n <= k_heap_classes[i]) return (int)i;
-  return -1;
-}
-
-// Carve or reuse a block from the class's slabs; creates a slab (charged)
-// when every slab is full. Returns nullptr (with 1455/8 set) when the
-// budget refuses the slab reservation. g_heap_mu must be held.
-void* heap_pool_alloc_locked(size_t n) {
-  const int ci = heap_class_for(n);
-  if (ci < 0) return nullptr;
-  const size_t stride = 16 + k_heap_classes[ci];
-  for (heap_slab* s = g_heap_slabs[ci]; s; s = s->next) {
-    if (s->free_list) {
-      u8* blk = (u8*)s->free_list;
-      s->free_list = *(void**)(blk + 16);  // link lives in the user area
-      ++s->live;
-      return blk + 16;
-    }
-    if (s->next_off + stride <= k_heap_slab_bytes) {
-      u8* blk = (u8*)s + s->next_off;
-      s->next_off += (u32)stride;
-      heap_block_hdr* h = (heap_block_hdr*)blk;
-      h->slab = s;
-      h->magic = k_heap_block_magic;
-      ++s->live;
-      return blk + 16;
-    }
-  }
-  // no room anywhere in this class: reserve a fresh slab (charged 1 MB
-  // commit + 1 MB VA — the ledger charges the reservation, never the
-  // carving)
-  if (trt_mem_budget_charge_va((u64)k_heap_slab_bytes) != 0) return nullptr;
-  if (trt_mem_budget_charge_commit((u64)k_heap_slab_bytes) != 0) {
-    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
-    return nullptr;
-  }
-  u8* mem = (u8*)g_be.alloc(k_heap_slab_bytes, 0);
-  if (!mem) {
-    trt_mem_budget_discharge_commit((u64)k_heap_slab_bytes);
-    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
-    return nullptr;
-  }
-  heap_slab* ns = (heap_slab*)mem;
-  ns->magic = k_heap_slab_magic;
-  ns->class_idx = (u32)ci;
-  ns->block_stride = (u32)stride;
-  ns->live = 1;
-  ns->capacity = (u32)((k_heap_slab_bytes - k_heap_slab_hdr) / stride);
-  ns->next_off = (u32)(k_heap_slab_hdr + stride);
-  ns->free_list = nullptr;
-  ns->next = g_heap_slabs[ci];
-  g_heap_slabs[ci] = ns;
-  u8* blk = mem + k_heap_slab_hdr;
-  heap_block_hdr* h = (heap_block_hdr*)blk;
-  h->slab = ns;
-  h->magic = k_heap_block_magic;
-  return blk + 16;
-}
-
-// Return a pool block to its slab; releases the slab (and discharges its
-// reservation) when the last block goes. Returns 1 on a clean free, 0
-// when the block header is corrupt (fail-visible: the block leaks rather
-// than trusting a forged slab pointer). The owning slab is found by
-// range containment over the class's live slabs — the header's slab
-// pointer is never dereferenced untrusted. g_heap_mu must be held.
-int heap_pool_free_locked(void* p, size_t n) {
-  u8* blk = (u8*)p - 16;
-  heap_block_hdr* h = (heap_block_hdr*)blk;
-  if (h->magic != k_heap_block_magic) {
-    char line[192];
-    snprintf(line, sizeof(line),
-             "kernel32: HeapFree corruption: block %p header magic mismatch "
-             "(not a pool block or heap overwritten) — leaked, not freed", p);
-    trt_core_log(line);
-    return 0;
-  }
-  const int ci = heap_class_for(n);
-  heap_slab* s = nullptr;
-  if (ci >= 0) {
-    for (heap_slab* c = g_heap_slabs[ci]; c; c = c->next) {
-      const uintptr_t lo = (uintptr_t)c;
-      const uintptr_t hi = lo + k_heap_slab_bytes;
-      if ((uintptr_t)blk >= lo && (uintptr_t)blk < hi) { s = c; break; }
-    }
-  }
-  if (!s || s->magic != k_heap_slab_magic) {
-    trt_core_log("kernel32: HeapFree corruption: pool block names no live "
-                 "slab — leaked, not freed");
-    return 0;
-  }
-  if (h->slab != s) {
-    trt_core_log("kernel32: HeapFree corruption: block header slab disagrees "
-                 "with the live slab list (proceeding with the live slab)");
-// .252 FIX: forget the VA-extent registry on budget reset
-// (mirror of trt_crt_forget_all, .251). After a guest
-// force-kill, trt_mem_budget_reset() zeroes the ledgers, but
-// the dead guest's VA regions stay in g_va; when teardown
-// frees them, VirtualFree finds the extent and discharges
-// against the zeroed ledger, tripping the over-discharge
-// tripwire (the .251 1 MB VA discharge). Clearing the
-// registry makes those frees land as foreign (no discharge,
-// memory still released), matching the reset's fresh-start
-// fiction. Called only from trt_mem_budget_reset(), after
-// the guest thread is joined.
-extern "C" void trt_va_forget_all(void) {
-  std::lock_guard<std::mutex> lk(g_va_mu);
-  g_va.clear();
-  g_extra_pending_rx.clear();
-}
-
-  }
-  *(void**)p = s->free_list;  // link into the free list via the user area
-  s->free_list = blk;
-  if (--s->live == 0) {
-    // last live block: release the slab and discharge its reservation
-    const u32 sci = s->class_idx;
-    heap_slab** pp = &g_heap_slabs[sci];
-    while (*pp && *pp != s) pp = &(*pp)->next;
-    if (*pp) *pp = s->next;
-    g_be.release(s, k_heap_slab_bytes);
-    trt_mem_budget_discharge_commit((u64)k_heap_slab_bytes);
-    trt_mem_budget_discharge_va((u64)k_heap_slab_bytes);
-  }
-  return 1;
-}
 
 // ---- FLS (fiber-local storage; uncapped metadata + per-thread values) ----
 struct fls_meta { void* cb; bool used; };
@@ -405,12 +193,10 @@ void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
   // backend alloc = RW memory; flags HEAP_ZERO_MEMORY = 0x8
   const size_t n = (size_t)(bytes ? bytes : 1);
   void* p = nullptr;
-  if (n <= k_heap_pool_max) {
-    // small block: carve from a slab (the slab reservation is already
-    // charged; carving charges nothing)
-    std::lock_guard<std::mutex> lk(g_heap_mu);
-    p = heap_pool_alloc_locked(n);
-    if (p) heap_rec_add_locked(p, n, false);
+  if (n <= TRT_HEAP_POOL_MAX) {
+    // small block: carve from a slab and record it (the slab reservation is
+    // already charged; carving charges nothing). The pool owns its mutex.
+    p = trt_heap_pool_alloc(n);
   } else {
     // large block: bypass the pool — one backend alloc, charged exactly
     // (commit + VA), as before
@@ -425,7 +211,7 @@ void* TRT_STDCALL trt_HeapAlloc(void* heap, u32 flags, u64 bytes) {
       trt_mem_budget_discharge_va((u64)n);
       return nullptr;
     }
-    heap_rec_add(p, n, true);
+    trt_heap_rec_add(p, n, 1);
   }
   if (!p) return nullptr;  // slab charge refused: 1455/8 already set
   if (flags & 0x8) memset(p, 0, n);
@@ -449,26 +235,18 @@ int TRT_STDCALL trt_HeapFree(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
   if (!p) return 1;
   size_t n = 0;
-  bool direct = false;
-  bool known = false;
-  {
-    std::lock_guard<std::mutex> lk(g_heap_mu);
-    known = heap_rec_find_locked(p, &n, &direct);
-    if (known) {
-      heap_rec_del_locked(p);  // drop the size record (HeapSize honesty)
-      if (!direct) {
-        // pool block: back to its slab (the slab is released + discharged
-        // inside when its last block goes)
-        if (!heap_pool_free_locked(p, n)) return 0;  // corrupt: logged
-        return 1;
-      }
-    }
+  int direct = 0;
+  const int r = trt_heap_release(p, &n, &direct);
+  if (r < 0) {
+    // foreign pointer HeapAlloc never recorded: the backend no-ops unknown
+    // addresses, exactly as the pre-split code relied on
+    g_be.release(p, 0);  // backend tracks size internally (mmap/UWP)
+    return 1;
   }
-  // direct block — or a foreign pointer HeapAlloc never recorded (the old
-  // code released those through the backend too, and the backend no-ops
-  // unknown addresses): release, then discharge what was charged
-  if (p) g_be.release(p, 0);  // backend tracks size internally (mmap/UWP)
-  if (known && direct) {
+  if (r == 0) return 0;  // pool corruption: logged, block deliberately leaked
+  if (direct) {
+    // a pool block rode on an already-charged slab; only a direct block
+    // moved the ledger
     trt_mem_budget_discharge_commit((u64)n);
     trt_mem_budget_discharge_va((u64)n);
   }
@@ -512,6 +290,23 @@ unsigned va_prot_bits(u32 wp) {
     case 0x80: return TRT_PROT_R | TRT_PROT_W | TRT_PROT_X;      // EXECUTE_WRITECOPY
     default:   return TRT_PROT_R | TRT_PROT_W;
   }
+}
+
+// .252 FIX: forget the VA-extent registry on budget reset
+// (mirror of trt_crt_forget_all, .251). After a guest
+// force-kill, trt_mem_budget_reset() zeroes the ledgers, but
+// the dead guest's VA regions stay in g_va; when teardown
+// frees them, VirtualFree finds the extent and discharges
+// against the zeroed ledger, tripping the over-discharge
+// tripwire (the .251 1 MB VA discharge). Clearing the
+// registry makes those frees land as foreign (no discharge,
+// memory still released), matching the reset's fresh-start
+// fiction. Called only from trt_mem_budget_reset(), after
+// the guest thread is joined.
+extern "C" void trt_va_forget_all(void) {
+  std::lock_guard<std::mutex> lk(g_va_mu);
+  g_va.clear();
+  g_extra_pending_rx.clear();
 }
 
 void va_split_and_set_locked(va_region& r, uintptr_t s, uintptr_t e,
@@ -1916,8 +1711,13 @@ int file_release_locked(u32 idx) {
   }
   // .252 FIX: directory handles hold a real host HANDLE
   // (mode 'd'), not a FILE* -- CloseHandle it instead of fclose.
+#ifdef _WIN32
   if (g_files[idx].mode == 'd') ::CloseHandle((HANDLE)g_files[idx].os);
   else fclose((FILE*)g_files[idx].os);
+#else
+  if (g_files[idx].mode == 'd') (void)0;
+  else fclose((FILE*)g_files[idx].os);
+#endif
   g_files[idx].os = nullptr;
   g_files[idx].refs = 0;
   g_files[idx].vpath[0] = 0;
@@ -1973,41 +1773,6 @@ void build_guest_vpath(const u16* name, char* out, size_t cap) {
 void* file_alloc(FILE* os, u8 mode, const char* vpath = nullptr) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   for (size_t i = 0; i < g_files.size(); ++i) {
-    // .252 FIX: directory open with FILE_FLAG_BACKUP_SEMANTICS --
-    // the .251 Sekiro run 2 proves the guest opens its game
-    // directory the correct Windows way (flags=0x02000080,
-    // is_dir=1) and the bridge drops it (fopen cannot open a
-    // directory, errno=EACCES). Open the directory with the
-    // REAL host CreateFileW and return a directory handle
-    // (mode 'd', host HANDLE in os). GetFileType reports
-    // FILE_TYPE_DISK; ReadFile/WriteFile/Seek fail with
-    // ERROR_ACCESS_DENIED / INVALID_HANDLE, as on real Windows.
-    if ((flags & 0x02000000u) && cf_is_dir) {
-      wchar_t wdir[1024];
-      if (::MultiByteToWideChar(CP_UTF8, 0, host, -1, wdir, 1024) > 0) {
-        HANDLE hdir = ::CreateFileW(wdir, 0x80000000u /*GENERIC_READ*/,
-                                    share ? share : 0x00000007u, nullptr,
-                                    3u /*OPEN_EXISTING*/,
-                                    0x02000000u /*FILE_FLAG_BACKUP_SEMANTICS*/,
-                                    nullptr);
-        if (hdir != INVALID_HANDLE_VALUE) {
-          char vpath[512];
-          build_guest_vpath(name, vpath, sizeof(vpath));
-          char dlog[1100];
-          snprintf(dlog, sizeof(dlog),
-                   "kernel32: CreateFileW directory open -> handle (path: %s flags=0x%08x)",
-                   host, flags);
-          trt_core_log(dlog);
-          return file_alloc((FILE*)hdir, 'd', vpath);
-        }
-      }
-      // Host open failed -- fall through to the .250 DIAG failure log.
-      char flog[1100];
-      snprintf(flog, sizeof(flog),
-               "kernel32: CreateFileW directory host-open failed (path: %s flags=0x%08x err=%u)",
-               host, flags, (unsigned)::GetLastError());
-      trt_core_log(flog);
-    }
     if (!g_files[i].os) {
       g_files[i].os = os;
       g_files[i].mode = mode;
@@ -2070,15 +1835,6 @@ void trt_bridge_set_cwd(const char* guest_dir) {
     g_cwd[sizeof(g_cwd) - 1] = 0;
     for (char* p = g_cwd; *p; ++p) {
       if (*p == '/') *p = '\\';
-  // .252 FIX: directory handles (mode 'd') are not FILE* --
-  // ReadFile/WriteFile on a directory fails with
-  // ERROR_ACCESS_DENIED on real Windows, so fail here instead
-  // of passing a HANDLE to stdio.
-  if (rec && rec->mode == 'd') {
-    trt_SetLastError(5);
-    if (n_out) *n_out = 0;
-    return 0;
-  }
     }
   }
 }
@@ -2268,6 +2024,15 @@ static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
                           void* overlapped, size_t* n_out, u32* io_err_out) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(h);
+  // .252 FIX: directory handles (mode 'd') are not FILE* --
+  // ReadFile/WriteFile on a directory fails with
+  // ERROR_ACCESS_DENIED on real Windows, so fail here instead
+  // of passing a HANDLE to stdio.
+  if (rec && rec->mode == 'd') {
+    trt_SetLastError(5);
+    if (n_out) *n_out = 0;
+    return 0;
+  }
   FILE* os = rec ? (FILE*)rec->os : nullptr;
   if (!os) {
     trt_SetLastError(6);
@@ -2289,10 +2054,6 @@ static int file_xfer_impl(void* h, void* buf, u32 bytes, int is_write,
       if (io_err_out) *io_err_out = (bytes > 0 && got == 0) ? 38u : 0u;
       return 1;
     }
-  // .252 FIX: directory handles are not FILE* -- GetFileSize
-  // on a directory returns failure here (real Windows:
-  // INVALID_FILE_SIZE).
-  if (rec->mode == 'd') return 0;
   }
   if (overlapped) {
     const u64 off = ((const u64*)overlapped)[2];
@@ -2378,9 +2139,6 @@ int TRT_STDCALL trt_ReadFileEx(void* h, void* buf, u32 bytes, void* overlapped,
     trt_SetLastError(87);
     return 0;
   }
-  // .252 FIX: directory handles are not FILE* -- pread on a
-  // directory fails (real Windows: ERROR_ACCESS_DENIED).
-  if (rec->mode == 'd') return 0;
   size_t n = 0;
   u32 io_err = 0;
   if (!file_xfer_impl(h, buf, bytes, 0, overlapped, &n, &io_err)) return 0;
@@ -2432,6 +2190,10 @@ int trt_file_stat_size(void* handle, u64* size_out) {
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(handle);
   if (!rec) return 0;
+  // .252 FIX: directory handles are not FILE* -- GetFileSize
+  // on a directory returns failure here (real Windows:
+  // INVALID_FILE_SIZE).
+  if (rec->mode == 'd') return 0;
   FILE* os = (FILE*)rec->os;
   fflush(os);
   const i64 cur = os_tell64(os);
@@ -2441,6 +2203,31 @@ int trt_file_stat_size(void* handle, u64* size_out) {
   if (end < 0) return 0;
   if (size_out) *size_out = (u64)end;
   return 1;
+}
+
+// Host descriptor + real size behind a guest file handle. bridge_mem.cpp uses
+// this to FILE-BACK read-only views: the view's pages become the file's clean
+// page cache (mapped, not copied), so an asset archive costs address space
+// instead of committed RAM and evicted pages re-fault from the SSD. -1 for
+// anything that is not a regular host file (pipes, devices, non-Linux hosts).
+int trt_file_host_fd(void* handle, u64* size_out) {
+  if (size_out) *size_out = 0;
+#ifdef __linux__
+  std::lock_guard<std::mutex> lk(g_files_mu);
+  file_rec* rec = file_at_locked(handle);
+  if (!rec || !rec->os) return -1;
+  FILE* os = (FILE*)rec->os;
+  fflush(os);  // pending guest writes must be visible to the mapped pages
+  const int fd = fileno(os);
+  if (fd < 0) return -1;
+  struct stat st{};
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+  if (size_out) *size_out = (u64)st.st_size;
+  return fd;
+#else
+  (void)handle;
+  return -1;
+#endif
 }
 
 // mmap fast path for LARGE positional reads (streaming engines' window
@@ -2462,12 +2249,6 @@ static bool file_pread_mmap_locked(FILE* os, u64 offset, void* dst,
   if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return false;
   const u64 fsize = (u64)st.st_size;
   if (offset >= fsize) {  // at/past EOF: a clean zero-byte read
-  // .252 FIX: directory handles are not FILE* -- SetFilePointer
-  // on a directory fails on real Windows (ERROR_INVALID_HANDLE).
-  if (rec->mode == 'd') {
-    err_ref_for_current_thread() = 6;
-    return 0xFFFFFFFFu;
-  }
     if (got_out) *got_out = 0;
     return true;
   }
@@ -2494,6 +2275,9 @@ int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(handle);
   if (!rec) return 0;
+  // .252 FIX: directory handles are not FILE* -- pread on a
+  // directory fails (real Windows: ERROR_ACCESS_DENIED).
+  if (rec->mode == 'd') return 0;
   FILE* os = (FILE*)rec->os;
   size_t got = 0;
   if (file_pread_mmap_locked(os, offset, dst, bytes, &got)) {
@@ -2569,6 +2353,12 @@ u32 TRT_STDCALL trt_SetFilePointer(void* h, i64 dist, i64* dist_hi, u32 method) 
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(h);
   if (!rec) {
+    err_ref_for_current_thread() = 6;
+    return 0xFFFFFFFFu;
+  }
+  // .252 FIX: directory handles are not FILE* -- SetFilePointer
+  // on a directory fails on real Windows (ERROR_INVALID_HANDLE).
+  if (rec->mode == 'd') {
     err_ref_for_current_thread() = 6;
     return 0xFFFFFFFFu;
   }
@@ -4079,7 +3869,7 @@ const u16* TRT_STDCALL trt_GetCommandLineW(void) {
 u64 TRT_STDCALL trt_HeapSize(void* heap, u32 flags, void* p) {
   (void)heap; (void)flags;
   size_t sz = 0;
-  if (heap_rec_find(p, &sz)) return (u64)sz;
+  if (trt_heap_rec_peek(p, &sz, nullptr)) return (u64)sz;
   // not ours: Windows would consult the heap; honest answer is 0 + named log
   boot_log("kernel32: HeapSize on a block HeapAlloc did not record -> 0");
   return 0;
@@ -4089,14 +3879,10 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   (void)heap;
   if (!p) return trt_HeapAlloc(heap, flags, bytes);
   size_t old = 0;
-  bool old_direct = false;
-  bool known = false;
-  {
-    std::lock_guard<std::mutex> lk(g_heap_mu);
-    known = heap_rec_find_locked(p, &old, &old_direct);
-  }
+  int old_direct = 0;
+  const bool known = trt_heap_rec_peek(p, &old, &old_direct) != 0;
   const size_t want = (size_t)(bytes ? bytes : 1);
-  const bool new_direct = want > k_heap_pool_max;
+  const bool new_direct = want > TRT_HEAP_POOL_MAX;
   // Ledger delta for the transition (pool blocks ride on already-charged
   // slabs, so only direct blocks move the ledger):
   //   direct->direct: charge max(0, want-old) now, discharge on shrink later
@@ -4121,12 +3907,10 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   }
   void* np = nullptr;
   if (!new_direct) {
-    std::lock_guard<std::mutex> lk(g_heap_mu);
-    np = heap_pool_alloc_locked(want);
-    if (np) heap_rec_add_locked(np, want, false);
+    np = trt_heap_pool_alloc(want);  // carves and records the pool block
   } else {
     np = g_be.alloc(want, 0);
-    if (np) heap_rec_add(np, want, true);
+    if (np) trt_heap_rec_add(np, want, 1);
   }
   if (!np) {
     if (charge_now) {
@@ -4143,23 +3927,23 @@ void* TRT_STDCALL trt_HeapReAlloc(void* heap, u32 flags, void* p, u64 bytes) {
   if ((flags & 0x8) && (size_t)bytes > copied) {
     memset((u8*)np + copied, 0, (size_t)bytes - copied);
   }
-  // free the old block (the discharge side of the transition)
-  const bool old_was_pool = known && !old_direct;
-  {
-    std::lock_guard<std::mutex> lk(g_heap_mu);
-    if (known) heap_rec_del_locked(p);
-    if (old_was_pool) heap_pool_free_locked(p, old);
-  }
-  if (!old_was_pool) g_be.release(p, 0);
-  if (known && old_direct) {
+  // Free the old block (the discharge side of the transition).
+  // trt_heap_release reports what it released but leaves the ledger to us:
+  // realloc's discharge rules differ from plain free's.
+  size_t released = 0;
+  int released_direct = 0;
+  const int fr = trt_heap_release(p, &released, &released_direct);
+  if (fr < 0) {
+    g_be.release(p, 0);  // foreign pointer: same backend release as before
+  } else if (fr > 0 && released_direct) {
     if (!new_direct) {
       // direct -> pool: the old backend block is gone
-      trt_mem_budget_discharge_commit((u64)old);
-      trt_mem_budget_discharge_va((u64)old);
-    } else if (old > want) {
+      trt_mem_budget_discharge_commit((u64)released);
+      trt_mem_budget_discharge_va((u64)released);
+    } else if (released > want) {
       // direct -> direct shrink
-      trt_mem_budget_discharge_commit((u64)(old - want));
-      trt_mem_budget_discharge_va((u64)(old - want));
+      trt_mem_budget_discharge_commit((u64)(released - want));
+      trt_mem_budget_discharge_va((u64)(released - want));
     }
   }
   return np;
@@ -4938,15 +4722,6 @@ const u8* safe_unwind_info(const u8* ui, const u8* image_end) {
   return ui;
 }
 }  // namespace
-
-// Fault attribution: a fault whose address lies in a loaded guest image is
-// the title's; anything else (host heap, wild pointer, low null page) is ours
-// and must not be blamed on the game. The host fault loggers use this to
-// label a crash, so "the title crashed" and "we crashed" stop looking alike
-// in a bug report.
-extern "C" int trt_fault_is_guest(const void* addr) {
-  return (addr && ptr_in_guest_image(addr)) ? 1 : 0;
-}
 
 u64 TRT_STDCALL trt_RtlVirtualUnwind(u32 handler_type, u64 image_base,
                                      u64 ctrl_pc, void* fn_entry, void* ctx_in,
@@ -7736,9 +7511,7 @@ int gap_trace_note_main_cv_wait(void* cv, void* ret) {
         // wait_for_group_task_completion (ret 0x2DC5F72). It is
         // pre-validated by guest_caller2_from_fp; the offset is
         // only computed when it lands in the first image, so
-        // the offline .pdata map can name the caller. It arrives
-        // via the thread_local s_gap_main_cv_ret2 (signature
-        // stays 2-arg per trt.h).
+        // the offline .pdata map can name the caller.
         void* ret2 = s_gap_main_cv_ret2;
         u64 c2_off = 0;
         unsigned c2_valid = 0;
@@ -7771,10 +7544,6 @@ static int cv_wait_locked(cv_slot* s, u32 ms, void* ret, void* ret2) {
   // guest return address (the wait-site) + sampled re-waits with the
   // tex-fail count. ret is the guest return address of the
   // SleepConditionVariable call, captured by the caller.
-  // .224 DIAG: ret2 rides a thread_local into
-  // gap_trace_note_main_cv_wait (its trt.h declaration is 2-arg
-  // and trt.h is breadth-agent-owned). Set + cleared around
-  // the call.
   s_gap_main_cv_ret2 = ret2;
   if (gap_trace_note_main_cv_wait(s ? s->key : nullptr, ret))
     g_gap_main_cv_waits.fetch_add(1, std::memory_order_relaxed);
@@ -7847,8 +7616,13 @@ int TRT_STDCALL trt_SleepConditionVariableSRW(void* cv, void* srw, u32 ms,
   // .224 DIAG: capture the level-1 return address (engine call
   // site of the group wait) before entering the wait; the
   // frame walk is bounds-checked + validated, 0 on failure.
-  const u64 caller2 =
-      guest_caller2_from_fp(__builtin_frame_address(0));
+  // Host-only diagnostic: guest_caller2_from_fp walks the frame chain with
+  // GetCurrentThreadStackLimits, which exists only in the Windows host build.
+  // On other hosts the level-1 caller is simply unknown (0), not a build error.
+  u64 caller2 = 0;
+#ifdef _WIN32
+  caller2 = guest_caller2_from_fp(__builtin_frame_address(0));
+#endif
   const int r =
       cv_wait_locked(s, ms, __builtin_return_address(0), (void*)caller2);
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
@@ -7896,8 +7670,13 @@ int TRT_STDCALL trt_SleepConditionVariableCS(void* cv, void* cs, u32 ms) {
   // .224 DIAG: capture the level-1 return address (engine call
   // site of the group wait) before entering the wait; the
   // frame walk is bounds-checked + validated, 0 on failure.
-  const u64 caller2 =
-      guest_caller2_from_fp(__builtin_frame_address(0));
+  // Host-only diagnostic: guest_caller2_from_fp walks the frame chain with
+  // GetCurrentThreadStackLimits, which exists only in the Windows host build.
+  // On other hosts the level-1 caller is simply unknown (0), not a build error.
+  u64 caller2 = 0;
+#ifdef _WIN32
+  caller2 = guest_caller2_from_fp(__builtin_frame_address(0));
+#endif
   const int r =
       cv_wait_locked(s, ms, __builtin_return_address(0), (void*)caller2);
   g_cv_wokes.fetch_add(1, std::memory_order_relaxed);
@@ -8010,9 +7789,6 @@ int TRT_STDCALL trt_FindNextFileW(void* handle, void* info) {
       }
       memcpy(info, &native_fd, sizeof(WIN32_FIND_DATAW));
       return 1;
-  // .252 FIX: directory handles are not FILE* -- fail (real
-  // Windows: SetFilePointerEx on a directory fails).
-  if (rec->mode == 'd') return 0;
     }
     if (c.os_dir) { FindClose((HANDLE)c.os_dir); c.os_dir = nullptr; }
     if (!c.is_z || c.opaque_ro || !c.host_path2[0]) {
@@ -8122,6 +7898,9 @@ int TRT_STDCALL trt_SetFilePointerEx(void* h, i64 dist, i64* new_pos, u32 method
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(h);
   if (!rec) return 0;
+  // .252 FIX: directory handles are not FILE* -- fail (real
+  // Windows: SetFilePointerEx on a directory fails).
+  if (rec->mode == 'd') return 0;
   FILE* os = (FILE*)rec->os;
   const int whence = method == 0 ? SEEK_SET : method == 1 ? SEEK_CUR : SEEK_END;
   if (!os_seek64(os, dist, whence)) return 0;

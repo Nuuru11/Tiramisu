@@ -198,7 +198,12 @@ typedef enum {
 typedef enum {
   TRT_IMPL_REAL = 0,        // real semantics, real result
   TRT_IMPL_RECORDED = 1,    // call accepted + logged, no real effect
-  TRT_IMPL_NAMED_SILENT = 2 // truthful empty answer / named failure
+  TRT_IMPL_NAMED_SILENT = 2,// truthful empty answer / named failure
+  // A module Tiramisu claims to implement (BUILTIN route) does not export the
+  // symbol. This is a genuine gap: the loader would fail. It used to fall
+  // through to REAL in the coverage report, which is how a row could read
+  // 100% while a title still could not bind.
+  TRT_IMPL_UNRESOLVED = 3
 } trt_impl_class;
 
 typedef struct trt_named_fn {
@@ -220,6 +225,18 @@ int trt_module_mark_impl(const char* module, const char* symbol,
 // fills *cls_out); 0 when it is not. SYSTEM routes and game-dir exports are
 // REAL; STUB routes are NAMED_SILENT. Used by the support-matrix report.
 int trt_symbol_class(const char* module, const char* symbol, int* cls_out);
+// Introspection over every registered module!symbol (conformance suite and
+// support reporting). trt_module_export_at returns 0 when index is past the
+// end. impl_class is the registered TRT_IMPL_* (0 = REAL), route the
+// TRT_ROUTE_* of the owning module.
+int trt_module_export_count(void);
+int trt_module_export_at(int index, char* module, int module_cap, char* symbol,
+                         int symbol_cap, int* impl_class, int* route);
+// How many arguments this bridge pops for module!symbol, or -1 when there is
+// no ABI entry. -1 is not harmless: the x86 trap dispatcher falls back to a
+// 4-arg guess, which is how a 1-arg stdcall once ate OpenTTD's return address.
+// The conformance suite requires every registered BUILTIN symbol to answer.
+int trt_abi_arg_count(const char* module, const char* symbol);
 // Offline bind-simulation (corpus dry-run): would this module!symbol bind?
 // BUILTIN -> iff the named fn is registered; STUB/SYSTEM -> always yes
 // (STUB binds fail-visible, SYSTEM binds via the console host). Unknown
@@ -298,6 +315,11 @@ void trt_fls_on_thread_exit(void);       // invoke non-null FLS callbacks on exi
 void trt_queue_io_apc(void* fn, u64 err, u64 bytes, void* overlapped);
 int trt_file_release(void* handle);
 int trt_file_stat_size(void* handle, u64* size_out);
+// Host descriptor + real size behind a guest file handle (bridge_kernel32.cpp).
+// -1 when the handle is not a regular host file. bridge_mem.cpp uses it to
+// file-back read-only views (map the SSD's page cache instead of copying it
+// into committed RAM).
+int trt_file_host_fd(void* handle, u64* size_out);
 int trt_file_pread(void* handle, u64 offset, void* dst, size_t bytes,
                    size_t* read_out);
 int trt_file_pwrite(void* handle, u64 offset, const void* src, size_t bytes,

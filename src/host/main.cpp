@@ -12,6 +12,7 @@
 #include "webxfer.h"
 #include "host_autopilot.h"
 #include "settings.h"
+#include "crash_report.h"
 #include "../trt/trt.h"
 #include "../trt/x86_cpu.h"
 #include "../trt/mono_host.h"
@@ -28,6 +29,13 @@
 #include "../trt/bridge_d3d.h"
 #include "../trt/bridge_openal.h"
 #include "../trt/bridge_reg.h"
+#include "../trt/engine_synthesizer.h"
+#include "../trt/pc2xb_translator.h"
+#include "../trt/dynamic_api.h"
+#include "../trt/bridge_fmod_studio.h"
+#include "../trt/bridge_steam.h"
+#include "steam_client.h"
+#include "../trt/spirv_hlsl.h"
 
 #include <winrt/base.h>
 #include <winrt/Windows.ApplicationModel.Core.h>
@@ -71,6 +79,8 @@ extern "C" int __stdcall TerminateThread(void* hThread,
 #include <chrono>
 #include <cctype>
 #include <csetjmp>
+#include <csignal>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -97,6 +107,7 @@ std::string g_guest_status = "idle";
 std::string g_steam_status = "press Y to link Steam (your own account)";
 std::string g_steam_qr;  // URL to render as QR (steam or transfer)
 std::atomic<bool> g_steam_busy{false};
+std::atomic<bool> g_steam_needs_rescan{false};
 std::atomic<bool> g_shutdown{false};
 std::atomic<bool> g_guest_running{false};
 DWORD g_ui_tid = 0;
@@ -1032,6 +1043,8 @@ extern "C" void trt_mem_budget_reset(void);
 
 
 extern "C" void trt_mem_budget_report(char* line, unsigned cap);
+// .223 DIAG (snapshot-only): appmem feed for VIDEO-SAMPLE.
+extern "C" void trt_video_set_app_mem_mb(u64 mb);
 
 // Brown-line diagnostics: report guest/app memory at boot stages.
 void log_guest_memory(const char* stage) {
@@ -1043,6 +1056,11 @@ void log_guest_memory(const char* stage) {
     using winrt::Windows::System::MemoryManager;
     const u64 usage = MemoryManager::AppMemoryUsage();
     const u64 limit = MemoryManager::AppMemoryUsageLimit();
+    // .223 DIAG (snapshot-only): publish the app working set
+    // for the VIDEO-SAMPLE appmem field (one WinRT call
+    // shared with this line, not a second ~1s call inside
+    // the sample).
+    trt_video_set_app_mem_mb(usage / mib);
     snprintf(line, sizeof(line), "guest memory (%s): app %llu/%llu MiB, %s",
              stage, (unsigned long long)(usage / mib),
              (unsigned long long)(limit / mib), budget);
@@ -1068,6 +1086,9 @@ std::atomic<u64> g_guest_stop_since{0};
 
 extern "C" {
 void trt_bridge_post_quit(int code);
+void trt_real_exit_hook_install(void);
+void trt_syscall_trap_install(void);
+void trt_video_sample_log(void);
 }
 
 void request_guest_stop() {
@@ -1178,6 +1199,16 @@ static int capture_fault_stack(const CONTEXT* initial, DWORD64* frames, int cap)
 }
 
 static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
+  // .213 DIAG: canary -- proves the filter was entered. If the filter itself
+  // faults before logging, this line never appears (double fault in the filter).
+  if (ep && ep->ExceptionRecord) {
+    char canary[128];
+    snprintf(canary, sizeof(canary), "guest_seh_filter entered code=0x%08lx",
+             (unsigned long)ep->ExceptionRecord->ExceptionCode);
+    longan::log_line(canary);
+  } else {
+    longan::log_line("guest_seh_filter entered (null record)");
+  }
   if (trt_dispatch_win32_exception(ep) == -1) return EXCEPTION_CONTINUE_EXECUTION;
   const EXCEPTION_RECORD& record = *ep->ExceptionRecord;
   char where[192];
@@ -1232,6 +1263,53 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
       longan::log_line(cb);
     }
   }
+  // Crash bundle. On the console there is no debugger to attach and the log
+  // tail is the only thing that survives a reboot, so the settings toggle
+  // writes one file containing everything a post-mortem needs: the fault, the
+  // registers, the settings that were in force, what shaders the title had
+  // translated, and the log tail. Runs before the unwind below, because
+  // capture_fault_stack mutates the context we want to record.
+  if (longan::trt_settings_crash_report()) {
+    longan::crash_report_input rep;
+    char why[352];
+    snprintf(why, sizeof(why), "guest fault: 0x%08lx at %s",
+             (unsigned long)record.ExceptionCode, where);
+    rep.reason = why;
+    if (ep->ContextRecord) {
+      const CONTEXT& c = *ep->ContextRecord;
+      char d[512];
+      snprintf(d, sizeof(d),
+               "rip=%llx rsp=%llx rbp=%llx rax=%llx\n"
+               "rbx=%llx rcx=%llx rdx=%llx rsi=%llx\n"
+               "rdi=%llx r8=%llx r9=%llx r10=%llx\n"
+               "r11=%llx r12=%llx r13=%llx r14=%llx r15=%llx",
+               (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+               (unsigned long long)c.Rbp, (unsigned long long)c.Rax,
+               (unsigned long long)c.Rbx, (unsigned long long)c.Rcx,
+               (unsigned long long)c.Rdx, (unsigned long long)c.Rsi,
+               (unsigned long long)c.Rdi, (unsigned long long)c.R8,
+               (unsigned long long)c.R9, (unsigned long long)c.R10,
+               (unsigned long long)c.R11, (unsigned long long)c.R12,
+               (unsigned long long)c.R13, (unsigned long long)c.R14,
+               (unsigned long long)c.R15);
+      rep.detail = d;
+    }
+    rep.settings_ini = longan::settings_get().to_ini();
+    rep.census_json = spirv_census_json();
+    char tail[8192];
+    tail[0] = 0;
+    longan::log_get_recent(tail, sizeof(tail));
+    rep.log_tail = tail;
+    const std::string rep_path =
+        longan::crash_report_write(g_local_state, rep);
+    if (!rep_path.empty()) {
+      char note[320];
+      snprintf(note, sizeof(note), "crash report: %s", rep_path.c_str());
+      longan::log_line(note);
+    } else {
+      longan::log_line("crash report: write failed (see LocalState\\crash)");
+    }
+  }
   DWORD64 frames[32];
   const int count = capture_fault_stack(ep->ContextRecord, frames, 32);
   for (int i = 1; i < count; ++i) {
@@ -1257,11 +1335,156 @@ int call_guest_seh(trt_image* img, u64* out_rc, DWORD* out_ex) {
 }
 
 void run_guest_trapped(trt_image* img, char* detail, size_t cap) {
+  // .216 DIAG (snapshot-only): arm the real-exit INT3 hook before any
+  // guest code runs, so a PEB-walked / direct real ExitProcess is caught.
+  trt_real_exit_hook_install();
+  // .220 DIAG (snapshot-only): arm the syscall trap AT LAUNCH, not
+  // from the gap final dump -- the .219 trap never armed because
+  // the final dump needs 2s of wall-time quiet and the guest dies
+  // first. The trap re-arms silently on the watchdog tick after
+  // host trips; guest fires re-arm up to 3 times per target.
+  trt_syscall_trap_install();
   g_exit_code = 0;
   g_raise_code = 0;
   g_guest_tid = GetCurrentThreadId();
   trt_boot_exit_trap = &host_exit_trap;
   trt_boot_raise_trap = nullptr;  // let caught C++ EH unwind via OS .pdata
+  // .212 DIAG: host watchdog -- log total app memory + guest ledger every 1s
+  // while a guest runs. If the platform kills the app (Game-package memory
+  // ceiling), the last watchdog lines show the trajectory right up to death
+  // (log_line flushes, so they survive). log_guest_memory reports both the
+  // platform AppMemoryUsage and the bridge ledger commit.
+  std::atomic<bool> wd_stop{false};
+  std::thread wd_thread([&wd_stop] {
+    try {
+      winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+    }
+    // .213 DIAG: watchdog starting -- proves the thread launched.
+    longan::log_line("watchdog starting");
+    // .220 DIAG (snapshot-only): watchdog-block instrumentation --
+    // the watchdog ticks at ~1Hz, not 10ms, while the process is
+    // idle (guest 843ms CPU total in .219), so something BLOCKS
+    // it. Time each step (mem query / CPU feed / gap dump) and
+    // the inter-tick gap; a step >50ms or a gap >100ms logs with
+    // the breakdown, naming the blocker (prime suspect: the
+    // MemoryManager::AppMemoryUsage() WinRT call inside
+    // log_guest_memory, ~1s per call).
+    auto wd_tick_prev = std::chrono::steady_clock::now();
+    int wd_tick_n = 0;
+    while (!wd_stop.load()) {
+      const auto wd_tick_start = std::chrono::steady_clock::now();
+      const long long wd_tick_gap_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              wd_tick_start - wd_tick_prev)
+              .count();
+      wd_tick_prev = wd_tick_start;
+      ++wd_tick_n;
+      try {
+        const auto wd_t0 = std::chrono::steady_clock::now();
+        log_guest_memory("watchdog");
+        const auto wd_t1 = std::chrono::steady_clock::now();
+        // .219 DIAG (snapshot-only): guest-CPU proof -- feed the guest
+        // main-thread CPU time + whole-process CPU time into the gap
+        // trace each tick; the dump prints them, so advancing CPU with
+        // zero new bridged calls proves the guest is SPINNING (vs
+        // dead/blocked). g_guest_thread is the guest main thread.
+        if (g_guest_thread.joinable()) {
+          FILETIME c, e, k, u;
+          if (::GetThreadTimes(g_guest_thread.native_handle(), &c, &e, &k,
+                               &u)) {
+            const u64 guest_ms =
+                ((((u64)k.dwHighDateTime << 32) | (u64)k.dwLowDateTime) +
+                 (((u64)u.dwHighDateTime << 32) | (u64)u.dwLowDateTime)) /
+                10000ull;
+            FILETIME pc, pe, pk, pu;
+            u64 proc_ms = 0;
+            if (::GetProcessTimes(::GetCurrentProcess(), &pc, &pe, &pk,
+                                  &pu)) {
+              proc_ms = ((((u64)pk.dwHighDateTime << 32) |
+                          (u64)pk.dwLowDateTime) +
+                         (((u64)pu.dwHighDateTime << 32) |
+                          (u64)pu.dwLowDateTime)) /
+                        10000ull;
+            }
+            gap_trace_set_guest_cpu_ms(guest_ms, proc_ms);
+          }
+        }
+        const auto wd_t2 = std::chrono::steady_clock::now();
+        // .218 DIAG (snapshot-only): dump the gap API-call trace when it
+        // changed (at most once per second wall-clock + a final dump
+        // 2s of wall time after the last call, so the final calls
+        // before a silent death are logged).
+        gap_trace_dump_if_changed();
+        const auto wd_t3 = std::chrono::steady_clock::now();
+        const long long wd_mem_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(wd_t1 -
+                                                                  wd_t0)
+                .count();
+        const long long wd_cpu_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(wd_t2 -
+                                                                  wd_t1)
+                .count();
+        const long long wd_gap_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(wd_t3 -
+                                                                  wd_t2)
+                .count();
+        // .220 DIAG (snapshot-only): the blocker verdict -- a slow
+        // step names the blocking call; a big gap with fast steps
+        // means the sleep/scheduler never woke the thread.
+        if (wd_mem_ms > 50 || wd_cpu_ms > 50 || wd_gap_ms > 50 ||
+            wd_tick_gap_ms > 100) {
+          char wl[256];
+          snprintf(wl, sizeof(wl),
+                   "watchdog: tick #%d gap=%llums steps mem=%llums cpu=%llums gapdump=%llums",
+                   wd_tick_n, wd_tick_gap_ms, wd_mem_ms, wd_cpu_ms, wd_gap_ms);
+          longan::log_line(wl);
+        }
+        // .221 DIAG (snapshot-only): periodic step-time sample
+        // -- the .220 verdict only logs SLOW ticks, so the
+        // steady ~100-150ms per-tick cost is invisible.
+        // Sample every 10th tick.
+        if ((wd_tick_n % 10) == 0) {
+          char sl[256];
+          snprintf(sl, sizeof(sl),
+                   "watchdog: step-sample tick #%d gap=%llums steps mem=%llums cpu=%llums gapdump=%llums",
+                   wd_tick_n, wd_tick_gap_ms, wd_mem_ms, wd_cpu_ms, wd_gap_ms);
+          longan::log_line(sl);
+        }
+        // .220 DIAG (snapshot-only): VIDEO-SAMPLE every ~5s wall
+        // time -- growth vs baseline for the 3809MB video usage.
+        static auto wd_last_video = std::chrono::steady_clock::now();
+        if (wd_tick_start - wd_last_video >= std::chrono::seconds(5)) {
+          wd_last_video = wd_tick_start;
+          trt_video_sample_log();
+        }
+      } catch (...) {
+        // .213 DIAG: tick exception -- watchdog survived a bad tick.
+        longan::log_line("watchdog: tick exception");
+      }
+      // .214 DIAG: 10ms cadence -- the .213 250ms cadence was slower than
+      // the final death phase, so a missing tick could not prove the
+      // watchdog died. At 10ms a missing tick during death is decisive.
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+  });
+  // .221 DIAG (snapshot-only): second-thread heartbeat -- a
+  // separate lightweight thread logging every second. If the
+  // heartbeat stops but the watchdog ticks, the watchdog is
+  // suspended; if both stop, the process is suspended/dying.
+  // This separates watchdog-suspension from process-suspension
+  // at death (the .220 blocker question).
+  std::thread hb_thread([&wd_stop] {
+    int hb_n = 0;
+    while (!wd_stop.load()) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (wd_stop.load()) break;
+      ++hb_n;
+      char hl[64];
+      snprintf(hl, sizeof(hl), "watchdog: heartbeat #%d", hb_n);
+      longan::log_line(hl);
+    }
+  });
   const int trapped = setjmp(g_exit_jmp);
   if (trapped == 0) {
     u64 rc = 0;
@@ -1280,6 +1503,19 @@ void run_guest_trapped(trt_image* img, char* detail, size_t cap) {
   trt_boot_exit_trap = nullptr;
   trt_boot_raise_trap = nullptr;
   g_guest_tid = 0;
+  wd_stop.store(true);
+  if (wd_thread.joinable()) wd_thread.join();
+  if (hb_thread.joinable()) hb_thread.join();
+}
+
+// Settings the bridge layers read once per launch. Pushed rather than pulled
+// so the runtime keeps its weak-symbol contract with offline test binaries.
+static void apply_bridge_launch_settings() {
+  // FSB5 console decode gate: off unless the user (or a per-title profile)
+  // opts in, because the unhardened decode corrupted the heap on a Series S.
+  // Before this call existed the gate documented "the host calls this with the
+  // fsb_decode setting" and nothing ever did.
+  trt_fsb5_set_console_decode(longan::trt_settings_fsb_decode() ? 1 : 0);
 }
 
 guest_run_result run_game(const std::string& name, const std::string& exe,
@@ -1341,15 +1577,41 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   }
   trt_vfs_mount("c:", drive_c.c_str());
   trt_vfs_mount("z:", game_dir.c_str());
-  // Per-game profile overrides (tiramisu.profile.ini next to the exe).
-  // Applied on top of global settings; missing file = no-op (returns 0).
+  // Per-title overrides, applied on top of global settings. The file beside
+  // the exe wins (a title can ship one); otherwise the writable per-title
+  // store under LocalState is used, so a game on a read-only folder or a
+  // mounted disc can still be tuned from the console. A first launch drops a
+  // commented starter there rather than guessing at values.
   {
-    const int prof = longan::settings_load_profile(game_dir);
-    char pline[128];
+    const std::string titles_dir = g_local_state + "\\profiles";
+    const int stub = longan::settings_write_profile_stub(titles_dir, name);
+    const int prof = longan::settings_load_profile(game_dir, titles_dir);
+    // A per-title profile may flip fsb_decode or the quality tier, so the
+    // bridge knobs are re-pushed after the profile lands.
+    apply_bridge_launch_settings();
+    char pline[600];
     snprintf(pline, sizeof(pline),
-             "profile: %d keys applied from %s\\tiramisu.profile.ini",
-             prof, game_dir.c_str());
+             "profile: %d keys applied for %s (starter %s)", prof,
+             name.c_str(),
+             stub == 1 ? "written to LocalState\\profiles"
+                       : (stub == 0 ? "already present" : "not writable"));
     longan::log_line(pline);
+    // A profile that names a service we cannot provide should say so here,
+    // not surface later as a game that mysteriously fails to initialise.
+    const std::string& need = longan::settings_get().required_services;
+    if (!need.empty()) {
+      std::string unknown;
+      const int bad = longan::settings_unknown_services(need, &unknown);
+      if (bad) {
+        snprintf(pline, sizeof(pline),
+                 "profile: %d unrecognised required service(s): %s", bad,
+                 unknown.c_str());
+      } else {
+        snprintf(pline, sizeof(pline), "profile: requires %s (all known)",
+                 need.c_str());
+      }
+      longan::log_line(pline);
+    }
   }
   // A game that ships on a disc image: mount it as D: (read-only, lazily
   // extracted) and run the exe out of the image, so every one of its path
@@ -1381,9 +1643,14 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
                                       : (guest_cwd_root + exe.substr(0, rel_sl));
     trt_bridge_set_cwd(guest_cwd.c_str());
   }
+  // A game-shipped tiramisu_args.txt, or launch_args from the per-title
+  // profile, both win over the synthesized arguments.
+  bool has_user_args = false;
+  bool app_id_read = false;     // a non-zero steam_appid.txt was found
   {
     std::ifstream af(game_dir + "\\tiramisu_args.txt");
     if (af) {
+      has_user_args = true;
       std::string args, ln;
       while (std::getline(af, ln)) {
         if (!ln.empty() && ln.back() == '\r') ln.pop_back();
@@ -1393,11 +1660,20 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
       }
       trt_bridge_set_cmd_args(args.c_str());
     } else {
-      trt_bridge_set_cmd_args("");
+      const std::string prof_args = longan::settings_get().launch_args;
+      if (!prof_args.empty()) {
+        trt_bridge_set_cmd_args(prof_args.c_str());
+        has_user_args = true;  // tuned for this title, keep the synthesizer out
+        longan::log_line(
+            ("host: args from per-title profile: " + prof_args).c_str());
+      } else {
+        trt_bridge_set_cmd_args("");
+      }
     }
     u32 app_id = 0;
     std::ifstream sf(game_dir + "\\steam_appid.txt");
     if (sf) sf >> app_id;
+    app_id_read = (app_id != 0);
     trt_steam_set_appid(app_id);
   }
   g_guest_stop_req.store(false);
@@ -1432,6 +1708,60 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
         exe_path = hexe;
     }
   }
+  trt_engine_profile synth_prof;
+  if (trt_synthesize_engine(game_dir.c_str(), exe.c_str(), &synth_prof)) {
+    char synth_msg[512];
+    snprintf(synth_msg, sizeof(synth_msg),
+             "host: [ENGINE SYNTHESIZER] %s engine=%s arch=%s gfx=%s audio=%s universal_flags=%u",
+             synth_prof.game_name.c_str(),
+             trt_engine_type_name(synth_prof.engine_type),
+             synth_prof.is_managed ? "Managed (.NET)" : (synth_prof.is_pe32 ? "PE32" : "PE64"),
+             trt_graphics_api_name(synth_prof.preferred_gfx),
+             trt_audio_middleware_name(synth_prof.preferred_audio),
+             synth_prof.universal_flags);
+    longan::log_line(synth_msg);
+    if (synth_prof.engine_type == TRT_ENGINE_UNIVERSAL) {
+      // Universal: use the universal guest runtime for this game (Phase 3+).
+      // For now, log + fall back to the native guest path — the guest boots
+      // and the dynamic API synthesizer fills unknowns at boot.
+      longan::log_line("host: universal engine -> clearing game onto Xbox via universal guest");
+    }
+    longan::log_line(synth_msg);
+    // A profile only counts if the launch uses it. The synthesized engine
+    // arguments reach the bridge before the guest runs (a game-shipped
+    // tiramisu_args.txt still wins), and a Steam title that had no
+    // steam_appid.txt gets the AppID the synthesizer just resolved instead of
+    // spending this launch at AppID 0.
+    if (!has_user_args && !synth_prof.cmdline_args.empty()) {
+      std::string synth_args;
+      for (const auto& a : synth_prof.cmdline_args) {
+        if (!synth_args.empty()) synth_args += ' ';
+        synth_args += a;
+      }
+      trt_bridge_set_cmd_args(synth_args.c_str());
+      longan::log_line(("host: [ENGINE SYNTHESIZER] applied args: " + synth_args).c_str());
+    }
+    if (!app_id_read && synth_prof.has_steam) {
+      trt_steam_set_appid(synth_prof.steam_appid);
+      char al[160];
+      snprintf(al, sizeof(al),
+               "host: [ENGINE SYNTHESIZER] steam appid %u applied",
+               synth_prof.steam_appid);
+      longan::log_line(al);
+    }
+    const std::string tdir = game_dir + "\\.tiramisu";
+    CreateDirectoryA(tdir.c_str(), nullptr);
+    const int xlated = trt_pc2xb_translate_file(exe_path.c_str(),
+                                                (tdir + "\\xb").c_str());
+    if (xlated >= 0) {
+      char xl_msg[192];
+      snprintf(xl_msg, sizeof(xl_msg),
+               "host: [PC->XBOX] translated %d import symbols -> %s\\xb_imports.json",
+               xlated, tdir.c_str());
+      longan::log_line(xl_msg);
+    }
+  }
+
   const size_t exe_sl = exe_path.rfind('\\');
   const std::string exe_dir =
       (exe_sl == std::string::npos) ? game_dir : exe_path.substr(0, exe_sl);
@@ -1570,93 +1900,61 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   return r;
 }
 
-// ---------------- Steam QR login (own account) ----------------
-std::wstring uri_escape(const std::wstring& s) {
-  try {
-    return std::wstring(
-        winrt::Windows::Foundation::Uri::EscapeComponent(s).c_str());
-  } catch (...) {
-    return s;
+// ---------------- Steam account sync & overlay bridge ----------------
+void rescan_games();
+
+void sync_steam_to_ui() {
+  const auto acct = longan::steam_client_account();
+  g_steam_status = acct.status_line;
+  g_steam_qr = acct.qr_url;
+  g_steam_busy = acct.busy;
+
+  longan::ui_set_steam_account(
+      acct.signed_in, acct.steamid64,
+      u82ws(acct.persona.empty() ? acct.account_name : acct.persona),
+      u82ws(acct.status_line));
+
+  const auto raw_items = longan::steam_client_items();
+  std::vector<longan::ui_steam_item> ui_items;
+  ui_items.reserve(raw_items.size());
+  for (const auto& r : raw_items) {
+    longan::ui_steam_item u;
+    u.title = u82ws(r.title);
+    u.app_id = r.app_id;
+    u.size_str = u82ws(r.size_str);
+    u.installed = r.installed;
+    u.downloading = r.downloading;
+    u.download_pct = r.download_pct;
+    u.status_str = u82ws(r.status_text);
+    u.install_dir = u82ws(r.install_dir);
+    ui_items.push_back(std::move(u));
   }
+  longan::ui_set_steam_items(ui_items);
+
+  std::vector<longan::ui_steam_friend> ui_friends;
+  const int nf = trt_steam_get_friend_count();
+  for (int i = 0; i < nf; ++i) {
+    trt_steam_friend_info fi{};
+    if (trt_steam_get_friend_at(i, &fi) == 0) {
+      ui_friends.push_back({u82ws(fi.persona), fi.state, u82ws(fi.game_name)});
+    }
+  }
+  longan::ui_set_steam_friends(ui_friends);
+
+  std::vector<longan::ui_steam_ach> ui_achs;
+  const int na = trt_steam_get_achievement_count();
+  for (int i = 0; i < na; ++i) {
+    trt_steam_achievement_info ai{};
+    if (trt_steam_get_achievement_at(i, &ai) == 0) {
+      ui_achs.push_back(
+          {u82ws(ai.name), ai.achieved, ai.cur_progress, ai.max_progress});
+    }
+  }
+  longan::ui_set_steam_achievements(ui_achs);
 }
 
 void steam_begin() {
-  if (g_steam_busy.exchange(true)) return;
-  g_steam_status = "steam: requesting QR…";
-  std::thread([] {
-    try {
-      winrt::init_apartment(winrt::apartment_type::multi_threaded);
-      using namespace winrt::Windows::Web::Http;
-      using namespace winrt::Windows::Data::Json;
-      HttpClient http;
-      // form body assembled by hand: input_protobuf_encoded=false + escaped
-      // input JSON (the WebAPI's JSON mode)
-      auto post_form = [&http](const wchar_t* endpoint,
-                               const std::wstring& input_json)
-          -> winrt::Windows::Foundation::IAsyncOperationWithProgress<
-              HttpResponseMessage, HttpProgress> {
-        const std::wstring body =
-            L"input_protobuf_encoded=false&input=" + uri_escape(input_json);
-        HttpStringContent content(body,
-                                  Windows::Storage::Streams::UnicodeEncoding::Utf8,
-                                  L"application/x-www-form-urlencoded");
-        return http.PostAsync(
-            winrt::Windows::Foundation::Uri(endpoint), content);
-      };
-      const std::wstring begin_json =
-          L"{\"client_id\":\"2654200164598180\",\"device_id\":"
-          L"\"tiramisu-xbox\",\"refresh_token\":\"\"}";
-      auto resp = post_form(
-          L"https://api.steampowered.com/IAuthenticationService/v1/"
-          L"BeginAuthSessionViaQR",
-          begin_json)
-                      .get();
-      const std::string text = ws2u8(resp.Content().ReadAsStringAsync().get());
-      auto j = JsonObject::Parse(winrt::to_hstring(text));
-      auto r2 = j.GetNamedObject(L"response");
-      g_steam_qr = str2u8(ws2u8(r2.GetNamedString(L"challenge_url")));
-      const std::string client_id =
-          str2u8(ws2u8(r2.GetNamedString(L"client_id")));
-      const std::string request_id =
-          str2u8(ws2u8(r2.GetNamedString(L"request_id")));
-      g_steam_status = "steam: scan the QR with the Steam app";
-      for (int i = 0; i < 36 && !g_shutdown; ++i) {
-        Sleep(5000);
-        auto pr =
-            post_form(L"https://api.steampowered.com/IAuthenticationService/"
-                      L"v1/PollAuthSessionStatus",
-                      L"{\"client_id\":\"" + u82ws(client_id) +
-                          L"\",\"request_id\":\"" + u82ws(request_id) +
-                          L"\"}")
-                .get();
-        const std::string pt = ws2u8(pr.Content().ReadAsStringAsync().get());
-        auto pj = JsonObject::Parse(winrt::to_hstring(pt));
-        auto pr2 = pj.GetNamedObject(L"response");
-        if (pr2.HasKey(L"refresh_token")) {
-          const std::string token =
-              str2u8(ws2u8(pr2.GetNamedString(L"refresh_token")));
-          FILE* tf = fopen((g_local_state + "\\steam.token").c_str(), "wb");
-          if (tf) {
-            fwrite(token.data(), 1, token.size(), tf);
-            fclose(tf);
-          }
-          g_steam_status =
-              "steam: LINKED — depot DL is M6; play via file transfer now";
-          g_steam_qr.clear();
-          break;
-        }
-      }
-      if (g_steam_qr.size()) {
-        g_steam_qr.clear();
-        g_steam_status = "steam: QR expired — press Y to retry";
-      }
-    } catch (hresult_error const& e) {
-      g_steam_status = "steam error: " + ws2u8(e.message());
-    } catch (...) {
-      g_steam_status = "steam error: network/parse (endpoint may need protobuf)";
-    }
-    g_steam_busy = false;
-  }).detach();
+  longan::steam_client_begin_qr([]() { g_steam_needs_rescan.store(true); });
 }
 
 // ---------------- dashboard: settings rows + screen nav ----------------
@@ -2188,6 +2486,7 @@ struct tiramisu_host
 
     // ---- persisted settings (dashboard-editable; consumed by bridges) ----
     const int applied = longan::settings_load(g_local_state);
+    apply_bridge_launch_settings();
     snprintf(line, sizeof(line), "settings: %d keys applied from settings.ini",
              applied);
     longan::log_line(line);
@@ -2290,6 +2589,8 @@ struct tiramisu_host
                  L"Audio ready", url_step},
                 L"Scanning for games…", false);
     rescan_games();
+    longan::steam_client_init(g_local_state, g_games_dir);
+    trt_steam_load_account(g_local_state.c_str());
     setup_steps({L"Storage ready", L"Direct3D 11 ready", L"Gamepads probed",
                  L"Audio ready", url_step, L"Game shelf scanned"},
                 L"Running the built-in self-test…", false);
@@ -2636,25 +2937,22 @@ struct tiramisu_host
               (u64)GetTickCount64() - g_guest_stop_since.load() > 10000ull) {
             force_kill_guest("stop ignored 10s");
           }
-          if (longan::trt_settings_quick_menu_enabled() && pad_vm) {
-            // RetroArch-style: Back+Start toggles the quick menu
-            static bool qm_was = false;
+          static bool qm_was = false;
+          if (longan::trt_settings_quick_menu_enabled() && (pad_vm || trt_steam_overlay_check_and_reset())) {
+            // RetroArch/Steam overlay: Back+Start or Steam API ActivateGameOverlay toggles overlay
             if (!qm_was) {
               qm_was = true;
               g_quick_menu_open = !g_quick_menu_open;
               longan::ui_set_quick_menu(g_quick_menu_open);
             }
           } else {
+            qm_was = false;
             // hold Back+Start for 45 ticks to force-stop (escape hatch)
             if (pad_vm) {
               if (++vm_hold_ticks == 45) request_guest_stop();
             } else {
               vm_hold_ticks = 0;
             }
-          }
-          if (!pad_vm) {
-            static bool qm_reset = true;
-            qm_reset = true;
           }
         } else {
           vm_hold_ticks = 0;
@@ -2757,6 +3055,64 @@ struct tiramisu_host
             a_btn = true;
             if (edit_setting_row(1)) apply_settings_rows();
           } else if (!want_go) a_btn = false;
+        } else if (!g_guest_running.load() && g_screen == longan::UI_STEAM) {
+          // on-console Steam screen: up/down select title, A download/play,
+          // X refresh library, Y QR login
+          if (want_up && !d_up) {
+            d_up = true;
+            longan::ui_steam_nav_up();
+          } else if (!want_up) d_up = false;
+          if (want_dn && !d_dn) {
+            d_dn = true;
+            longan::ui_steam_nav_down();
+          } else if (!want_dn) d_dn = false;
+          static bool x_btn = false;
+          const bool want_ref =
+              ((b & XINPUT_GAMEPAD_X) && !(b & XINPUT_GAMEPAD_BACK)) ||
+              (!km_lock && launcher_key('R'));
+          if (want_ref && !x_btn) {
+            x_btn = true;
+            longan::steam_client_refresh_remote(
+                []() { g_steam_needs_rescan.store(true); });
+          } else if (!want_ref) {
+            x_btn = false;
+          }
+          if (want_go && !a_btn) {
+            a_btn = true;
+            const auto items = longan::steam_client_items();
+            const int idx = longan::ui_steam_selected_index();
+            if (idx >= 0 && idx < static_cast<int>(items.size())) {
+              const auto& it = items[idx];
+              if (it.installed) {
+                std::string launch_name;
+                for (const auto& ge : g_games) {
+                  if (!it.install_dir.empty() &&
+                      _stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
+                    launch_name = ge.name;
+                    break;
+                  }
+                }
+                if (launch_name.empty() && !it.install_dir.empty()) {
+                  rescan_games();
+                  for (const auto& ge : g_games) {
+                    if (_stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
+                      launch_name = ge.name;
+                      break;
+                    }
+                  }
+                }
+                if (launch_name.empty()) launch_name = it.title;
+                g_pending_launch = launch_name;
+              } else if (!it.downloading) {
+                longan::steam_client_download_app(
+                    it.app_id, []() { g_steam_needs_rescan.store(true); });
+              }
+            }
+          } else if (!want_go) a_btn = false;
+          if (want_st && !y_btn) {
+            y_btn = true;
+            steam_begin();
+          } else if (!want_st) y_btn = false;
         } else {
           d_up = d_dn = d_lt = d_rt = a_btn = y_btn = false;
         }
@@ -2889,6 +3245,9 @@ struct tiramisu_host
               // A transfer just landed: arm the in-console autopilot for it.
               longan::host_ap_arm(game);
               longan::log_line(("host: autopilot armed for " + game).c_str());
+              trt_engine_profile sprof;
+              std::string gdir = g_local_state + "\\games\\" + game;
+              trt_synthesize_engine(gdir.c_str(), nullptr, &sprof);
               rescan_one_game(game);
             }
             // any rescan resets the periodic clock
@@ -3050,13 +3409,30 @@ struct tiramisu_host
         const bool want_go = (qm_b & XINPUT_GAMEPAD_A) != 0;
         const bool pad_vm =
             (qm_b & XINPUT_GAMEPAD_BACK) && (qm_b & XINPUT_GAMEPAD_START);
-        if (want_up && !qm_up) { qm_up = true; /* navigate up */ }
-        else if (!want_up) qm_up = false;
-        if (want_dn && !qm_dn) { qm_dn = true; /* navigate down */ }
-        else if (!want_dn) qm_dn = false;
+        if (want_up && !qm_up) {
+          qm_up = true;
+          longan::ui_quick_menu_nav_up();
+        } else if (!want_up) qm_up = false;
+        if (want_dn && !qm_dn) {
+          qm_dn = true;
+          longan::ui_quick_menu_nav_down();
+        } else if (!want_dn) qm_dn = false;
         if (want_go && !qm_go) {
           qm_go = true;
-          // A: activate selected item (placeholder)
+          const int qsel = longan::ui_quick_menu_selected();
+          if (qsel == 0) {
+            g_quick_menu_open = false;
+            longan::ui_set_quick_menu(false);
+          } else if (qsel == 1 || qsel == 4) {
+            longan::steam_client_refresh_remote(
+                []() { g_steam_needs_rescan.store(true); });
+          } else if (qsel == 3) {
+            g_mouse_mode = !g_mouse_mode;
+          } else if (qsel == 5) {
+            g_quick_menu_open = false;
+            longan::ui_set_quick_menu(false);
+            request_guest_stop();
+          }
         } else if (!want_go) qm_go = false;
         // B or Back+Start again: close menu
         if ((qm_b & XINPUT_GAMEPAD_B) && !qm_back) {
@@ -3074,7 +3450,8 @@ struct tiramisu_host
         } else {
           qm_toggle = false;
         }
-        // render quick menu overlay on top of the frozen game frame
+        // sync live Steam persona, friends & unlocked achievements + render overlay
+        sync_steam_to_ui();
         longan::swapchain_restore_d3d11();
         longan::ui_set_screen(longan::UI_QUICKMENU);
         longan::ui_render();
@@ -3084,6 +3461,12 @@ struct tiramisu_host
       }
       longan::swapchain_restore_d3d11();
       longan::swapchain_restore_launcher_format();
+
+      if (g_steam_needs_rescan.exchange(false)) {
+        rescan_games();
+        longan::steam_client_rescan_local();
+      }
+      sync_steam_to_ui();
 
       // ---- UI ----
       // FPS tracking for overlay
@@ -3170,8 +3553,87 @@ struct tiramisu_host
 
 } // namespace
 
+// .211 DIAG: host-side unhandled-exception filter. The guest faults
+// are caught by guest_seh_filter (call_guest_seh), so anything
+// reaching here is a HOST crash (host thread, D3D/GameInput callback,
+// COM) -- previously silent (process dies, no fault line, no dump).
+// log_line flushes, so the line survives the kill. Returns
+// CONTINUE_SEARCH so the OS terminates normally after logging.
+static LONG WINAPI host_unhandled_filter(EXCEPTION_POINTERS* ep) {
+  char line[256];
+  snprintf(line, sizeof(line), "HOST UNHANDLED: code=0x%08lx addr=%p",
+           (unsigned long)ep->ExceptionRecord->ExceptionCode,
+           ep->ExceptionRecord->ExceptionAddress);
+  longan::log_line(line);
+  if (ep->ContextRecord) {
+    const CONTEXT& c = *ep->ContextRecord;
+    char g[256];
+    snprintf(g, sizeof(g),
+             "  HOST GPRs: rip=%llx rsp=%llx rax=%llx rcx=%llx rdx=%llx",
+             (unsigned long long)c.Rip, (unsigned long long)c.Rsp,
+             (unsigned long long)c.Rax, (unsigned long long)c.Rcx,
+             (unsigned long long)c.Rdx);
+    longan::log_line(g);
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// .212 DIAG: host-side exit-path handlers. The guest real CRT (ucrtbase is
+// TRT_ROUTE_SYSTEM) shares the process CRT with the host, so a guest exit()
+// via the real CRT runs the host atexit list, a guest abort() raises the
+// process SIGABRT, and an unhandled C++ exception calls terminate(). These
+// log (flushed) so a silent death via any of those paths becomes visible.
+static void host_atexit_handler() {
+  longan::log_line("host: atexit (clean process exit via real CRT exit())");
+}
+static void host_terminate_handler() {
+  longan::log_line("host: terminate() called (unhandled C++ exception)");
+  std::abort();
+}
+static void host_sigabrt_handler(int) {
+  longan::log_line("host: SIGABRT (abort() called via real CRT)");
+  std::_Exit(3);
+}
+
 int __stdcall wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
+  SetUnhandledExceptionFilter(host_unhandled_filter);
+  std::atexit(host_atexit_handler);
+  std::set_terminate(host_terminate_handler);
+  std::signal(SIGABRT, host_sigabrt_handler);
   init_apartment(apartment_type::multi_threaded);
+
+  // Console lifetime: the app is suspended when the player leaves it and
+  // resumed when they come back. Release held inputs on both edges so a game
+  // never resumes with a phantom held button, and log each edge so a freeze
+  // after resume has a timestamp to line up with. CoreApplication raises
+  // these statically; Current() belongs to Application, not to it.
+  try {
+    winrt::Windows::ApplicationModel::Core::CoreApplication::Suspending(
+        [](const winrt::Windows::Foundation::IInspectable&,
+           const winrt::Windows::ApplicationModel::SuspendingEventArgs& e) {
+          auto deferral = e.SuspendingOperation().GetDeferral();
+          trt_input_release_all();
+          {
+            char lc[256];
+            snprintf(lc, sizeof(lc), "lifecycle: suspending - inputs released game=%s",
+                     g_running_game_name.empty() ? "(none)" : g_running_game_name.c_str());
+            longan::log_line(lc);
+          }
+          deferral.Complete();
+        });
+    winrt::Windows::ApplicationModel::Core::CoreApplication::Resuming(
+        [](auto&&, auto&&) {
+          trt_input_release_all();  // devices are re-polled on the way back
+          {
+            char lc[256];
+            snprintf(lc, sizeof(lc), "lifecycle: resumed - inputs re-polled game=%s",
+                     g_running_game_name.empty() ? "(none)" : g_running_game_name.c_str());
+            longan::log_line(lc);
+          }
+        });
+  } catch (...) {
+    longan::log_line("lifecycle: no CoreApplication suspend hook on this host");
+  }
   CoreApplication::Run(make<tiramisu_host>());
   return 0;
 }

@@ -30,6 +30,7 @@ constexpr u32 TRT_GDI_OBJ_BRUSH = 2;
 constexpr u32 TRT_GDI_OBJ_PEN = 3;
 constexpr u32 TRT_GDI_OBJ_REGION = 4;
 constexpr u32 TRT_GDI_OBJ_BITMAP = 5;
+constexpr u32 TRT_GDI_OBJ_PALETTE = 6;
 
 constexpr u32 LF_BYTES = 96;
 
@@ -42,6 +43,10 @@ struct gdi_obj {
   i32 bm_h;          // bitmap height
   u16 bm_bpp;        // bitmap bits per pixel
   void* bm_bits;     // allocated DIB/bitmap pixel buffer
+  u16 dib_color_count;
+  u32 dib_colors[256];
+  u16 pal_count;
+  u32 pal_entries[256];
   bool used;
 };
 constexpr int GDI_MAX_OBJECTS = 128;
@@ -978,6 +983,154 @@ u32 TRT_GUEST_ABI trt_GetKerningPairsW(void* hdc, u32 nPairs, void* lpkrnpair) {
   return 0;
 }
 
+// ---- real logical palettes & DIB color tables ----------------------------
+struct dc_pal_rec {
+  void* hdc;
+  void* hpal;
+};
+constexpr int GDI_MAX_DC_PALS = 64;
+dc_pal_rec g_dc_pals[GDI_MAX_DC_PALS];
+std::mutex g_pal_mu;
+
+void* TRT_GUEST_ABI trt_CreatePalette(const void* logpal) {
+  if (!logpal) return nullptr;
+  const u8* p = (const u8*)logpal;
+  u16 num_entries = 0;
+  memcpy(&num_entries, p + 2, 2);
+  if (num_entries > 256) num_entries = 256;
+  const int slot = obj_alloc(TRT_GDI_OBJ_PALETTE);
+  if (slot < 0) return nullptr;
+  g_objs[slot].pal_count = num_entries;
+  if (num_entries > 0) {
+    memcpy(g_objs[slot].pal_entries, p + 4, (size_t)num_entries * 4);
+  }
+  return make_handle(slot);
+}
+
+void* TRT_GUEST_ABI trt_SelectPalette(void* hdc, void* hpal, int force_bkgnd) {
+  (void)force_bkgnd;
+  if (!trt_user32_dc_is_valid(hdc)) return nullptr;
+  const u32 h = (u32)(uintptr_t)hpal;
+  const bool is_default = (h == 0x8000000Fu);
+  if (!is_default) {
+    gdi_obj* o = obj_by_handle(h);
+    if (!o || o->type != TRT_GDI_OBJ_PALETTE) return nullptr;
+  }
+  std::lock_guard<std::mutex> lk(g_pal_mu);
+  void* prev = (void*)(uintptr_t)0x8000000Fu;  // DEFAULT_PALETTE
+  for (int i = 0; i < GDI_MAX_DC_PALS; ++i) {
+    if (g_dc_pals[i].hdc == hdc) {
+      prev = g_dc_pals[i].hpal ? g_dc_pals[i].hpal : prev;
+      g_dc_pals[i].hpal = hpal;
+      return prev;
+    }
+  }
+  for (int i = 0; i < GDI_MAX_DC_PALS; ++i) {
+    if (!g_dc_pals[i].hdc) {
+      g_dc_pals[i].hdc = hdc;
+      g_dc_pals[i].hpal = hpal;
+      return prev;
+    }
+  }
+  return prev;
+}
+
+u32 TRT_GUEST_ABI trt_RealizePalette(void* hdc) {
+  if (!trt_user32_dc_is_valid(hdc)) return 0xFFFFFFFFu;  // GDI_ERROR
+  void* cur_pal = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_pal_mu);
+    for (int i = 0; i < GDI_MAX_DC_PALS; ++i) {
+      if (g_dc_pals[i].hdc == hdc) {
+        cur_pal = g_dc_pals[i].hpal;
+        break;
+      }
+    }
+  }
+  if (!cur_pal || (uintptr_t)cur_pal == 0x8000000Full) return 0;
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)cur_pal);
+  return (o && o->type == TRT_GDI_OBJ_PALETTE) ? (u32)o->pal_count : 0;
+}
+
+u32 TRT_GUEST_ABI trt_GetPaletteEntries(void* hpal, u32 start, u32 count,
+                                        void* entries) {
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)hpal);
+  if (!o || o->type != TRT_GDI_OBJ_PALETTE) return 0;
+  if (!entries) return o->pal_count;
+  if (start >= o->pal_count || count == 0) return 0;
+  u32 n = o->pal_count - start;
+  if (count < n) n = count;
+  memcpy(entries, o->pal_entries + start, (size_t)n * 4);
+  return n;
+}
+
+u32 TRT_GUEST_ABI trt_SetPaletteEntries(void* hpal, u32 start, u32 count,
+                                        const void* entries) {
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)hpal);
+  if (!o || o->type != TRT_GDI_OBJ_PALETTE || !entries) return 0;
+  if (start >= o->pal_count || count == 0) return 0;
+  u32 n = o->pal_count - start;
+  if (count < n) n = count;
+  memcpy(o->pal_entries + start, entries, (size_t)n * 4);
+  return n;
+}
+
+u32 TRT_GUEST_ABI trt_SetDIBColorTable(void* hdc, u32 start, u32 count,
+                                       const void* colors) {
+  if (!trt_user32_dc_is_valid(hdc) || !colors || count == 0 || start >= 256)
+    return 0;
+  void* sel = trt_user32_dc_selected(hdc);
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)sel);
+  if (!o || o->type != TRT_GDI_OBJ_BITMAP) return 0;
+  u32 avail = 256u - start;
+  u32 n = count < avail ? count : avail;
+  memcpy(o->dib_colors + start, colors, (size_t)n * 4);
+  if (start + n > o->dib_color_count)
+    o->dib_color_count = (u16)(start + n);
+  return n;
+}
+
+u32 TRT_GUEST_ABI trt_GetDIBColorTable(void* hdc, u32 start, u32 count,
+                                       void* colors) {
+  if (!trt_user32_dc_is_valid(hdc) || !colors || count == 0 || start >= 256)
+    return 0;
+  void* sel = trt_user32_dc_selected(hdc);
+  gdi_obj* o = obj_by_handle((u32)(uintptr_t)sel);
+  if (!o || o->type != TRT_GDI_OBJ_BITMAP || start >= o->dib_color_count)
+    return 0;
+  u32 avail = (u32)o->dib_color_count - start;
+  u32 n = count < avail ? count : avail;
+  memcpy(colors, o->dib_colors + start, (size_t)n * 4);
+  return n;
+}
+
+// Glyph indices: the host renders text through its own stack, which indexes by
+// UTF-16 code unit. Returning the input characters is a usable documented
+// identity mapping instead of an invented glyph table.
+u32 TRT_GUEST_ABI trt_GetGlyphIndicesW(void* hdc, const u16* text, int count,
+                                       u16* indices, u32 flags) {
+  (void)hdc; (void)flags;
+  if (!text || !indices || count < 0) return 0xFFFFFFFFu;  // GDI_ERROR
+  for (int i = 0; i < count; ++i) indices[i] = text[i];
+  return (u32)count;
+}
+
+// OUTLINETEXTMETRICW: there is no outline font engine behind the DC, so the
+// structure is zeroed and otmSize is filled as the API requires. A caller that
+// only probes the size (otm == nullptr or cb_size == 0) gets the required size
+// (216 bytes for OUTLINETEXTMETRICW on Win64); one that provides a buffer gets
+// otmSize filled.
+u32 TRT_GUEST_ABI trt_GetOutlineTextMetricsW(void* hdc, u32 cb_size, void* otm) {
+  (void)hdc;
+  constexpr u32 k_otm_size = 216;  // sizeof(OUTLINETEXTMETRICW) on x64
+  if (!otm || cb_size == 0) return k_otm_size;
+  if (cb_size < 4) return 0;
+  const u32 to_write = (cb_size < k_otm_size) ? cb_size : k_otm_size;
+  memset(otm, 0, to_write);
+  *(u32*)otm = to_write;  // otmSize
+  return to_write;
+}
+
 int trt_bridge_register_gdi(void) {
   static const trt_named_fn k_gdi32_fns[] = {
       {"GetICMProfileW", (void*)&gdi_GetICMProfileW},
@@ -1047,6 +1200,16 @@ int trt_bridge_register_gdi(void) {
       {"ExtEscape", (void*)&trt_ExtEscape},
       {"GetGlyphOutlineW", (void*)&trt_GetGlyphOutlineW},
       {"GetKerningPairsW", (void*)&trt_GetKerningPairsW},
+      // Palette and font-metric surface: real palette objects & DIB color table storage.
+      {"CreatePalette", (void*)&trt_CreatePalette},
+      {"SelectPalette", (void*)&trt_SelectPalette},
+      {"RealizePalette", (void*)&trt_RealizePalette},
+      {"GetPaletteEntries", (void*)&trt_GetPaletteEntries},
+      {"SetPaletteEntries", (void*)&trt_SetPaletteEntries},
+      {"SetDIBColorTable", (void*)&trt_SetDIBColorTable},
+      {"GetDIBColorTable", (void*)&trt_GetDIBColorTable},
+      {"GetGlyphIndicesW", (void*)&trt_GetGlyphIndicesW},
+      {"GetOutlineTextMetricsW", (void*)&trt_GetOutlineTextMetricsW},
       {"AddFontResourceExW", (void*)&trt_AddFontResourceExW},
       {"RemoveFontResourceExW", (void*)&trt_RemoveFontResourceExW},
       {"EnumFontFamiliesExW", (void*)&trt_EnumFontFamiliesExW},

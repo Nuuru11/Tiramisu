@@ -287,6 +287,19 @@ trt_image* trt_images_by_handle(void* handle) {
   return g_images[idx].img;
 }
 
+int trt_fault_is_guest(const void* addr) {
+  if (!addr) return 0;
+  const uintptr_t p = (uintptr_t)addr;
+  std::lock_guard<std::mutex> lk(g_img_mu);
+  for (int i = 0; i < g_image_count; ++i) {
+    const trt_image* im = g_images[i].img;
+    if (!im || !im->base || im->size_of_image == 0) continue;
+    const uintptr_t b = (uintptr_t)im->base;
+    if (p >= b && p < b + (uintptr_t)im->size_of_image) return 1;
+  }
+  return 0;
+}
+
 trt_image* trt_images_first(void) {
   // the MAIN image (the exe), not merely the first registered: a DLL can
   // register before the exe while the exe's own imports bind, so slot 0

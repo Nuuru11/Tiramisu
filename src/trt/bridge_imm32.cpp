@@ -160,9 +160,18 @@ u32 TRT_GUEST_ABI imm_ImmGetIMEFileNameA(void* hwnd, char* buf, u32 max_len) {
   return 0;
 }
 
+// ImmGetProperty. With no IME installed there are no property flags to report;
+// 0 is the documented "no properties" answer, not a failure. SDL asks this to
+// decide whether to enable IME handling at all.
+u32 TRT_GUEST_ABI imm_ImmGetProperty(void* hkl, u32 prop) {
+  (void)hkl; (void)prop;
+  return 0;
+}
+
 int trt_bridge_register_imm32(void) {
   static const trt_named_fn k_fns[] = {
       {"ImmGetContext", (void*)&imm_ImmGetContext},
+      {"ImmGetProperty", (void*)&imm_ImmGetProperty},
       {"ImmAssociateContext", (void*)&imm_ImmAssociateContext},
       {"ImmAssociateContextEx", (void*)&imm_ImmAssociateContextEx},
       {"ImmReleaseContext", (void*)&imm_ImmReleaseContext},

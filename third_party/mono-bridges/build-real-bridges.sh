@@ -84,13 +84,13 @@ $CXX $CXXFLAGS -c third_party/mono-bridges/mono_steam_door.cpp \
   -o "$objs/mono_steam_door.o"
 
 # 3. Link.
-$CXX -shared -fPIC -Bsymbolic -Wl,--no-undefined \
+$CXX -shared -fPIC -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-undefined \
   "$objs/bridge_fmod.o" "$objs/bridge_fmod_studio.o" \
   "$objs/trt_trace.o" \
   "$objs/vendor_stb_vorbis.o" "$objs/vendor_dr_mp3.o" "$objs/mono_dllmap_shim.o" \
   "$objs/mono_fmod_door.o" -lpthread -lm \
   -o "$out/libfmod-real.so"
-$CXX -shared -fPIC -Bsymbolic -Wl,--no-undefined \
+$CXX -shared -fPIC -Wl,-Bsymbolic -Wl,-Bsymbolic-functions -Wl,--no-undefined \
   "$objs/bridge_steam.o" "$objs/steam_auth.o" "$objs/steam_library.o" \
   "$objs/mono_dllmap_shim.o" \
   "$objs/mono_steam_door.o" -lpthread -lm \

@@ -345,7 +345,23 @@ void route_label(const char* dll, char* out, size_t cap) {
     }
     case TRT_ROUTE_BUILTIN: snprintf(out, cap, "BUILTIN"); break;
     case TRT_ROUTE_STUB:    snprintf(out, cap, "STUB");    break;
-    default:                snprintf(out, cap, "SYSTEM");  break; // console-real
+    default: {
+      // Not in the builtin table. Two very different things land here:
+      //   - a DLL reached through the module redirect table
+      //     (vcruntime140.dll -> vcruntime140_app.dll), whose console
+      //     presence the whitelist proves even though trt_module_route()
+      //     has no row for it;
+      //   - a module with no proven console presence at all.
+      // Printing "SYSTEM" for both made the boot-determinism check report a
+      // MISMATCH on the first while hiding the second as if it were proven.
+      // The whitelist is the only thing that can tell them apart.
+      const char c = whitelist_class(dll);
+      if (c == 'P' || c == 'U')
+        snprintf(out, cap, c == 'P' ? "SYSTEM(P)" : "SYSTEM(U)");
+      else
+        snprintf(out, cap, "MISSING");
+      break;
+    }
   }
 }
 
@@ -530,14 +546,18 @@ struct dry_result {
 // these lines into the measured compatibility report.
 bool g_coverage_mode = false;
 bool g_symbols_mode = false;
+bool g_gaps_mode = false;
 const char* g_sym_pe = "";
 int g_cov_real = 0, g_cov_recorded = 0, g_cov_silent = 0;
+int g_cov_unresolved = 0;
 int g_cov_delay = 0;
+void gap_record(const char* dll, const char* sym, int cls);
 
 const char* impl_class_name(int cls) {
   switch (cls) {
     case TRT_IMPL_RECORDED: return "recorded";
     case TRT_IMPL_NAMED_SILENT: return "named-silent";
+    case TRT_IMPL_UNRESOLVED: return "unresolved";
     default: return "real";
   }
 }
@@ -545,18 +565,118 @@ const char* impl_class_name(int cls) {
 // Classify one bound symbol and add it to this PE's coverage totals.
 // Game-dir exports, SYSTEM routes and ordinal-only binds are REAL by
 // construction (native code / a real host DLL).
-int classify_one(const char* dll, const char* sym) {
-  int cls = TRT_IMPL_REAL;
+int classify_one(const char* dll, const char* sym, u16 ordinal = 0) {
   int have_cls = 0;
-  if (sym && trt_symbol_class(dll, sym, &have_cls)) cls = have_cls;
-  return cls;
+  if (sym && trt_symbol_class(dll, sym, &have_cls)) return have_cls;
+  // An ordinal-only import carries no name to classify. A module publishes its
+  // ordinal exports as "#<n>", so classify that name. Without this, every
+  // ordinal bind on a BUILTIN module (UnityPlayer's eight oleaut32 thunks)
+  // was counted UNRESOLVED on the line right after trt_module_query_ordinal
+  // had confirmed it binds - a measurement bug that inflated the unresolved
+  // column of the support matrix.
+  if (!sym && ordinal) {
+    char ord_name[16];
+    snprintf(ord_name, sizeof(ord_name), "#%u", (unsigned)ordinal);
+    if (trt_symbol_class(dll, ord_name, &have_cls)) return have_cls;
+  }
+  // Not resolvable. On a SYSTEM/GAMEDIR/STUB module that is expected: the
+  // console provides the DLL, the game ships it, or the stub IS the design.
+  // On a BUILTIN module Tiramisu claims the DLL and does not export the
+  // symbol - a real gap, and one that used to be counted as REAL, which is
+  // how a coverage row can read 100% while a title still cannot bind.
+  if (trt_module_route(dll) == TRT_ROUTE_BUILTIN) return TRT_IMPL_UNRESOLVED;
+  return TRT_IMPL_REAL;
 }
 
-void add_coverage(const char* dll, const char* sym) {
-  const int cls = classify_one(dll, sym);
+void add_coverage(const char* dll, const char* sym, u16 ordinal = 0) {
+  const int cls = classify_one(dll, sym, ordinal);
   if (cls == TRT_IMPL_RECORDED) ++g_cov_recorded;
   else if (cls == TRT_IMPL_NAMED_SILENT) ++g_cov_silent;
+  else if (cls == TRT_IMPL_UNRESOLVED) ++g_cov_unresolved;
   else ++g_cov_real;
+  gap_record(dll, sym, cls);
+}
+
+// ---- gap worklist (--gaps) ------------------------------------------------
+// The support matrix answers "how much of this title binds". This answers the
+// question that actually drives work: "which symbols are missing, and how many
+// titles need each one". Aggregated by module!symbol across every PE, ranked by
+// how many titles need it and then by severity, so the top line is the single
+// most valuable API to implement next.
+struct gap_entry {
+  char key[192];
+  int cls;      // TRT_IMPL_* (the worst verdict seen for this symbol)
+  int pes;      // how many distinct PEs import it
+  int last_pe;  // PE sequence that last recorded it (dedup within one PE)
+};
+int g_gap_count = 0;
+int g_pe_seq = 0;
+static gap_entry g_gaps[8192];
+
+int gap_class_rank(int cls) {  // most severe first
+  switch (cls) {
+    case TRT_IMPL_UNRESOLVED: return 0;
+    case TRT_IMPL_RECORDED: return 1;
+    default: return 2;  // named-silent
+  }
+}
+
+void gap_record(const char* dll, const char* sym, int cls) {
+  if (!g_gaps_mode || cls == TRT_IMPL_REAL) return;
+  if (!dll || !*dll || !sym || !*sym) return;  // ordinal-only binds carry no name
+  char key[192];
+  snprintf(key, sizeof(key), "%s!%s", dll, sym);
+  for (int i = 0; i < g_gap_count; ++i) {
+    if (strcmp(g_gaps[i].key, key) != 0) continue;
+    if (g_gaps[i].last_pe != g_pe_seq) {
+      g_gaps[i].last_pe = g_pe_seq;
+      ++g_gaps[i].pes;
+    }
+    if (gap_class_rank(cls) < gap_class_rank(g_gaps[i].cls)) g_gaps[i].cls = cls;
+    return;
+  }
+  if (g_gap_count >= (int)(sizeof(g_gaps) / sizeof(g_gaps[0]))) return;
+  gap_entry& e = g_gaps[g_gap_count++];
+  snprintf(e.key, sizeof(e.key), "%s", key);
+  e.cls = cls;
+  e.pes = 1;
+  e.last_pe = g_pe_seq;
+}
+
+// Rank: titles that need it first, then severity (unresolved before
+// named-silent before recorded), then name. Selection sort keeps the order
+// deterministic without allocation, so two runs diff cleanly.
+void gap_sort() {
+  for (int i = 0; i < g_gap_count; ++i) {
+    int best = i;
+    for (int j = i + 1; j < g_gap_count; ++j) {
+      const gap_entry& a = g_gaps[j];
+      const gap_entry& b = g_gaps[best];
+      bool better;
+      if (a.pes != b.pes) {
+        better = a.pes > b.pes;
+      } else if (gap_class_rank(a.cls) != gap_class_rank(b.cls)) {
+        better = gap_class_rank(a.cls) < gap_class_rank(b.cls);
+      } else {
+        better = strcmp(a.key, b.key) < 0;
+      }
+      if (better) best = j;
+    }
+    if (best != i) {
+      const gap_entry t = g_gaps[i];
+      g_gaps[i] = g_gaps[best];
+      g_gaps[best] = t;
+    }
+  }
+}
+
+void gap_print() {
+  if (!g_gaps_mode) return;
+  gap_sort();
+  printf("GAPS %d distinct symbol(s) across %d PE(s)\n", g_gap_count, g_pe_seq);
+  for (int i = 0; i < g_gap_count; ++i)
+    printf("GAP %s class=%s pes=%d\n", g_gaps[i].key,
+           impl_class_name(g_gaps[i].cls), g_gaps[i].pes);
 }
 
 void append_csv(char* dst, size_t cap, const char* item) {
@@ -646,13 +766,22 @@ void dry_thunks(const u8* file, size_t size, const trt_section_header* secs,
 
     if (binds) {
       ++out->bound;
-      add_coverage(dll_name, sym_name);
+      add_coverage(dll_name, sym_name, ordinal);
       if (g_symbols_mode) {
+        char ord_label[16];
+        if (!sym_name && ordinal)
+          snprintf(ord_label, sizeof(ord_label), "#%u", (unsigned)ordinal);
+        else
+          snprintf(ord_label, sizeof(ord_label), "#ordinal");
         printf("SYMBOL %s %s!%s %s\n", g_sym_pe, dll_name,
-               sym_name ? sym_name : "#ordinal",
-               impl_class_name(classify_one(dll_name, sym_name)));
+               sym_name ? sym_name : ord_label,
+               impl_class_name(classify_one(dll_name, sym_name, ordinal)));
       }
     } else {
+      // Nothing binds this symbol: the loader fails right here, which makes it
+      // the most severe gap class. Record it by name for the worklist, since
+      // add_coverage() is only reached for symbols that do bind.
+      if (sym_name) gap_record(dll_name, sym_name, TRT_IMPL_UNRESOLVED);
       char one[160];
       if (sym_name) snprintf(one, sizeof(one), "%s!%s", dll_name, sym_name);
       else snprintf(one, sizeof(one), "%s!#%u", dll_name, (unsigned)ordinal);
@@ -724,7 +853,9 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
                 size_t size) {
   (void)path;
   g_sym_pe = name;
-  g_cov_real = g_cov_recorded = g_cov_silent = g_cov_delay = 0;
+  g_cov_real = g_cov_recorded = g_cov_silent = g_cov_unresolved = 0;
+  g_cov_delay = 0;
+  ++g_pe_seq;  // gap dedup is per PE, not per import
   file_pe pe;
   if (!file_pe_open(file, size, &pe)) {
     printf("  dry-run: PE HEADERS UNREADABLE\n");
@@ -786,10 +917,12 @@ void dry_run_pe(const char* path, const char* name, const u8* file,
 
   if (g_coverage_mode) {
     delay_coverage(pe, file, size);
-    const int total = g_cov_real + g_cov_recorded + g_cov_silent;
+    const int total =
+        g_cov_real + g_cov_recorded + g_cov_silent + g_cov_unresolved;
     printf("COVERAGE %s: imports=%d real=%d recorded=%d named-silent=%d "
-           "delay=%d\n",
-           name, total, g_cov_real, g_cov_recorded, g_cov_silent, g_cov_delay);
+           "unresolved=%d delay=%d\n",
+           name, total, g_cov_real, g_cov_recorded, g_cov_silent,
+           g_cov_unresolved, g_cov_delay);
   }
 }
 
@@ -843,10 +976,11 @@ int run_corpus(int argc, char** argv) {
       printf("COVERAGE SELFTEST FAIL: d3d12!DrawInstanced must be RECORDED\n");
       return 1;
     }
+    // shell32!ExtractIconExW used to be NAMED_SILENT; it now ships a real
+    // PE .rsrc RT_GROUP_ICON extractor so the classifier must say REAL.
     if (!trt_symbol_class("shell32.dll", "ExtractIconExW", &cls) ||
-        cls != TRT_IMPL_NAMED_SILENT) {
-      printf("COVERAGE SELFTEST FAIL: shell32!ExtractIconExW must be "
-             "NAMED_SILENT\n");
+        cls != TRT_IMPL_REAL) {
+      printf("COVERAGE SELFTEST FAIL: shell32!ExtractIconExW must be REAL\n");
       return 1;
     }
     if (!trt_symbol_class("kernel32.dll", "VirtualAlloc", &cls) ||
@@ -854,10 +988,19 @@ int run_corpus(int argc, char** argv) {
       printf("COVERAGE SELFTEST FAIL: kernel32!VirtualAlloc must be REAL\n");
       return 1;
     }
+    // msacm32 used to be whole-module named-silent. It now ships real
+    // decoders, so the classifier must say REAL - otherwise the support matrix
+    // would keep under-reporting a capability that exists.
     if (!trt_symbol_class("msacm32.dll", "acmStreamOpen", &cls) ||
+        cls != TRT_IMPL_REAL) {
+      printf("COVERAGE SELFTEST FAIL: msacm32!acmStreamOpen must be REAL "
+             "(acm_codec decodes ADPCM/u-law/A-law)\n");
+      return 1;
+    }
+    if (!trt_symbol_class("msvfw32.dll", "ICOpen", &cls) ||
         cls != TRT_IMPL_NAMED_SILENT) {
-      printf("COVERAGE SELFTEST FAIL: msacm32 must be NAMED_SILENT "
-             "(no codecs installed)\n");
+      printf("COVERAGE SELFTEST FAIL: msvfw32 must stay NAMED_SILENT "
+             "(no video codecs)\n");
       return 1;
     }
     if (!trt_symbol_class("mscoree.dll", "CorExitProcess", &cls) ||
@@ -875,6 +1018,44 @@ int run_corpus(int argc, char** argv) {
     }
     printf("MSCOREE SELFTEST: OK (CorExitProcess posts clean guest quit)\n");
     printf("COVERAGE SELFTEST: OK (real / recorded / named-silent)\n");
+
+    // Gap aggregation is what the worklist ranking rests on, so it is checked
+    // rather than assumed: duplicates within one PE must merge, titles must be
+    // counted, the worst verdict must win, real symbols must not be recorded,
+    // and the sort order must be titles-then-severity-then-name.
+    {
+      const bool saved_mode = g_gaps_mode;
+      const int saved_count = g_gap_count;
+      const int saved_seq = g_pe_seq;
+      g_gaps_mode = true;
+      gap_record("selftest.dll", "Beta", TRT_IMPL_RECORDED);
+      gap_record("selftest.dll", "Beta", TRT_IMPL_UNRESOLVED);  // same PE: merge
+      ++g_pe_seq;
+      gap_record("selftest.dll", "Beta", TRT_IMPL_RECORDED);    // second PE
+      gap_record("selftest.dll", "Alpha", TRT_IMPL_NAMED_SILENT);
+      gap_record("selftest.dll", "Gamma", TRT_IMPL_REAL);       // must not appear
+      int beta = -1, alpha = -1, gamma = -1;
+      for (int i = saved_count; i < g_gap_count; ++i) {
+        if (strcmp(g_gaps[i].key, "selftest.dll!Beta") == 0) beta = i;
+        if (strcmp(g_gaps[i].key, "selftest.dll!Alpha") == 0) alpha = i;
+        if (strcmp(g_gaps[i].key, "selftest.dll!Gamma") == 0) gamma = i;
+      }
+      if (g_gap_count - saved_count != 2 || beta < 0 || alpha < 0 || gamma >= 0 ||
+          g_gaps[beta].pes != 2 || g_gaps[beta].cls != TRT_IMPL_UNRESOLVED ||
+          g_gaps[alpha].pes != 1) {
+        printf("GAPS SELFTEST FAIL: merge / per-PE count / severity wrong\n");
+        return 1;
+      }
+      gap_sort();
+      if (strcmp(g_gaps[saved_count].key, "selftest.dll!Beta") != 0) {
+        printf("GAPS SELFTEST FAIL: ranking is not titles-first\n");
+        return 1;
+      }
+      g_gap_count = saved_count;  // drop the synthetic entries
+      g_pe_seq = saved_seq;
+      g_gaps_mode = saved_mode;
+      printf("GAPS SELFTEST: OK (merge, per-PE count, severity, ranking)\n");
+    }
   }
 
   printf("tiramisu real-game corpus load matrix\n");
@@ -1051,6 +1232,10 @@ int run_corpus(int argc, char** argv) {
     free(file);
   }
 
+  // The ranked worklist is the point of --gaps: printed last so it sits at the
+  // end of the report, right where someone deciding what to implement looks.
+  gap_print();
+
   printf("\nCORPUS: %d ok, %d failed, %d skipped", n_ok, n_failed, n_skipped);
   if (g_uncertain_bound)
     printf("  [NOTE: %d DLLs bound via UNCERTAIN SYSTEM routes (C) - console presence unproven, the TV run names them]", g_uncertain_bound);
@@ -1068,6 +1253,13 @@ int main(int argc, char** argv) {
   for (; pe_start < argc; ++pe_start) {
     if (strcmp(argv[pe_start], "--coverage") == 0) g_coverage_mode = true;
     else if (strcmp(argv[pe_start], "--symbols") == 0) g_symbols_mode = true;
+    else if (strcmp(argv[pe_start], "--gaps") == 0) {
+      // --gaps implies --coverage: the ranking is built from the same
+      // classification, and printing the per-PE totals alongside it keeps one
+      // invocation enough to see both the score and the worklist.
+      g_gaps_mode = true;
+      g_coverage_mode = true;
+    }
     else break;
   }
   int n = 0;

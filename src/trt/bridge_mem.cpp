@@ -4,9 +4,17 @@
 // Commercial games map multi-GB asset archives (Unity bundles, Unreal .pak,
 // custom containers) and inspect rolling windows via CreateFileMapping +
 // MapViewOfFile(offset, bytes) + UnmapViewOfFile. On console AppContainer,
-// cross-process file-mapping permissions can be restricted, so each view is
-// backed by a private allocation populated exclusively for [offset, offset+len)
-// via 64-bit positional I/O and released immediately on UnmapViewOfFile.
+// cross-process file-mapping permissions can be restricted, so a view is never
+// shared with another process. Two backing strategies, chosen per view:
+//
+//   file (default, read-only): the view IS the file's clean page cache —
+//     mmap(PROT_READ, MAP_PRIVATE) over the host descriptor. The SSD and RAM
+//     overlap: the window costs address space instead of committed RAM, the
+//     kernel drops its pages under pressure for free and the next touch
+//     re-faults them from the SSD. Read-only has no divergent state to lose.
+//   copy (write/COW views, views past EOF, TRT_MAP_MODE=copy): a private
+//     allocation populated for [offset, offset+len) via 64-bit positional I/O,
+//     released on UnmapViewOfFile (write-back when the view is dirty).
 #include "trt.h"
 #include "thunk.h"
 #include "bridge_mem.h"
@@ -18,6 +26,11 @@
 #include <string.h>
 #include <vector>
 
+#ifdef __linux__
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
 // 5 GB memory-budget governor (bridge_membudget.cpp): mapped views charge
 // the same ledger as VirtualAlloc/heap commit — over-budget maps refuse.
@@ -28,6 +41,12 @@ extern "C" int trt_mem_budget_charge_commit(u64 bytes);
 extern "C" void trt_mem_budget_discharge_commit(u64 bytes);
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
 extern "C" void trt_mem_budget_discharge_va(u64 bytes);
+// File-backed read-only views: the view's pages ARE the file's clean page
+// cache, so the mapping charges VA only — never commit.
+extern "C" int trt_mem_budget_charge_file_view(u64 bytes);
+extern "C" void trt_mem_budget_discharge_file_view(u64 bytes);
+// host descriptor + size behind a guest file handle (bridge_kernel32.cpp)
+extern "C" int trt_file_host_fd(void* handle, u64* size_out);
 
 namespace {
 
@@ -66,6 +85,13 @@ struct mapped_view {
   bool flush_on_unmap = false;
   bool from_be = false;
   u64 stamp = 0;  // LRU recency stamp (g_map_clock at last registry touch)
+  // File-backed read-only views (map, don't copy): map_base/map_span are the
+  // munmap target, charge_span is exactly what the budget ledger was charged
+  // (the mapping span, which exceeds bytes when the offset is page-misaligned).
+  bool file_backed = false;
+  void* map_base = nullptr;
+  size_t map_span = 0;
+  u64 charge_span = 0;
 };
 
 std::mutex g_mem_mu;
@@ -268,6 +294,63 @@ void free_view_buf(void* p, size_t bytes, bool from_be) {
   free(p);
 }
 
+// ---------------------------------------------------------------------------
+// Read-only views over real files are MAPPED, not copied. The kernel already
+// holds the bytes in the page cache, so the view costs address space instead of
+// committed RAM; clean pages are reclaimable for free under pressure and the
+// next touch re-faults them from the SSD rather than failing an allocation.
+// That is the SSD/RAM overlap: a multi-GB asset archive streams through the
+// 5 GB budget instead of being copied into it. TRT_MAP_MODE=copy restores the
+// private-copy path for diagnosis; write/COW views always copy.
+// ---------------------------------------------------------------------------
+
+bool file_view_mode_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("TRT_MAP_MODE");
+    if (env && strcmp(env, "copy") == 0) return false;
+    return true;
+  }();
+  return enabled;
+}
+
+bool file_view_readahead_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("TRT_MAP_READAHEAD");
+    return !(env && strcmp(env, "0") == 0);
+  }();
+  return enabled;
+}
+
+void log_file_view_once() {
+  static bool done = false;
+  if (done) return;
+  done = true;
+  trt_core_log("trt: mem: read-only map mode = file — views are file-backed "
+               "page cache (mapped, not copied; clean pages reclaimable, "
+               "re-faulted from the SSD; TRT_MAP_MODE=copy restores the copy "
+               "path)");
+}
+
+// Discharge exactly what the view charged: file-backed views charged VA only
+// (charge_span), copy views charged the full map ledger (bytes).
+void release_view_charge_locked(const mapped_view& mv) {
+  if (mv.file_backed) {
+    trt_mem_budget_discharge_file_view(mv.charge_span);
+    return;
+  }
+  trt_mem_budget_discharge_map((u64)mv.bytes);
+}
+
+void release_view_backing_locked(const mapped_view& mv) {
+  if (mv.file_backed) {
+#ifdef __linux__
+    if (mv.map_base && mv.map_span) munmap(mv.map_base, mv.map_span);
+#endif
+    return;
+  }
+  free_view_buf(mv.ptr, mv.bytes, mv.from_be);
+}
+
 bool flush_view_locked(const mapped_view& v, size_t sub_off, size_t len) {
   if (!v.flush_on_unmap || !v.core || len == 0) return true;
   const u8* src = (const u8*)v.ptr + sub_off;
@@ -294,8 +377,8 @@ mapped_view evict_view_locked(size_t idx) {
   if (g_evicted.size() >= 128) g_evicted.erase(g_evicted.begin());
   g_evicted.push_back({(uintptr_t)mv.ptr, mv.bytes, mv.offset,
                        g_map_clock - mv.stamp, false});
-  trt_mem_budget_discharge_map((u64)mv.bytes);
-  free_view_buf(mv.ptr, mv.bytes, mv.from_be);
+  release_view_charge_locked(mv);
+  release_view_backing_locked(mv);
   if (mv.core && mv.core->view_refs > 0) --mv.core->view_refs;
   maybe_destroy_core_locked(mv.core);
   return mv;
@@ -549,88 +632,149 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
     return nullptr;
   }
 
-  bool from_be = false;
-  // Budget: the view's bytes join the same ledger as VirtualAlloc commit.
-  // Refusal fails the map honestly (named, 1455) — the guest's streaming
-  // layer retries with a smaller window instead of walking off the 5 GB
-  // cliff and getting the whole process killed by the platform.
-  if (trt_mem_budget_charge_map((u64)req_len) != 0) return nullptr;
-  void* view_ptr = alloc_view_buf((size_t)req_len, &from_be);
-  if (!view_ptr) {
-    trt_mem_budget_discharge_map((u64)req_len);
-    trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
-    return nullptr;
-  }
-
-  // The backend may hand back the SAME address an evicted view used to have
-  // (the pages were released). Any evicted-range record overlapping this live
-  // view is stale from this instant — purge it, or every later unmap/flush of
-  // this live view would be falsely named use-after-evict and refused.
-  for (size_t i = 0; i < g_evicted.size();) {
-    const uintptr_t s = g_evicted[i].ptr;
-    const uintptr_t e = s + g_evicted[i].bytes;
-    const uintptr_t vs = (uintptr_t)view_ptr;
-    const uintptr_t ve = vs + (size_t)req_len;
-    if (s < ve && vs < e) {
-      g_evicted.erase(g_evicted.begin() + (ptrdiff_t)i);
-    } else {
-      ++i;
-    }
-  }
-
-  if (core->file_handle) {
-    size_t got = 0;
-    if (!trt_file_pread(core->file_handle, offset, view_ptr, (size_t)req_len,
-                        &got)) {
-      trt_mem_budget_discharge_map((u64)req_len);
-      free_view_buf(view_ptr, (size_t)req_len, from_be);
-      trt_SetLastError(k_err_invalid_handle);
-      return nullptr;
-    }
-    if (got < (size_t)req_len) {
-      memset((u8*)view_ptr + got, 0, (size_t)req_len - got);
-    }
-  } else {
-    // Lazily allocate shared pagefile backing for reasonable anonymous mappings
-    if (!core->anon_buf && core->size <= (128ull << 20)) {
-      // the backing buffer is real committed memory: charge it (commit +
-      // VA); on refusal leave anon_buf null — the view still works, it
-      // just reads zeros instead of shared backing (existing graceful path)
-      const u64 sz = core->size;
-      bool charged = false;
-      if (trt_mem_budget_charge_va(sz) == 0) {
-        if (trt_mem_budget_charge_commit(sz) == 0) {
-          charged = true;
-        } else {
-          trt_mem_budget_discharge_va(sz);  // commit refused: roll VA back
-        }
-      }
-      if (charged) {
-        core->anon_buf = (u8*)calloc(1, (size_t)sz);
-        if (core->anon_buf) {
-          core->anon_cap = sz;
-        } else {
-          trt_mem_budget_discharge_commit(sz);
-          trt_mem_budget_discharge_va(sz);
-        }
-      }
-    }
-    if (core->anon_buf && offset < core->anon_cap) {
-      size_t cp = (size_t)req_len;
-      if (offset + cp > core->anon_cap) cp = (size_t)(core->anon_cap - offset);
-      memcpy(view_ptr, core->anon_buf + offset, cp);
-    }
-  }
-
-  const int prot_bits = map_access_to_prot_bits(access, core->protect);
-  const trt_backend* be = trt_core_backend();
-  if (be && be->protect && prot_bits != (PROT_READ_ | PROT_WRITE_)) {
-    be->protect(view_ptr, (size_t)req_len, prot_bits_to_trt(prot_bits));
-  }
-
-  // FILE_MAP_WRITE (0x02) or ALL_ACCESS (0xF001F), excluding pure COPY (0x01)
+  // LAYER 1 — map, don't copy. A read-only view over a real file needs no
+  // private copy: the pages already live in the page cache, and mapping them
+  // costs address space, not commit. Under pressure the kernel drops the clean
+  // pages and the next touch re-faults them from the SSD, so a streaming game's
+  // multi-GB asset archive behaves as if it fit inside the 5 GB budget.
+  //
+  // Only a view the guest can solely READ may be mapped: FILE_MAP_COPY (0x01)
+  // is writable through private COW pages, FILE_MAP_WRITE (0x02) needs real
+  // write-back, and FILE_MAP_EXECUTE (0x20) needs executable protection.
+  // Handing any of them a PROT_READ mapping would fault the guest on its first
+  // store (or instruction fetch), so they keep the private-copy path.
+  const bool read_only_view = (access & (0x01u | 0x02u | 0x20u)) == 0;
   const bool flush_back =
       ((access & 0x02u) != 0 || access == 0xF001Fu) && (access != 0x01u);
+  bool file_backed = false;
+  void* view_ptr = nullptr;
+  void* map_base = nullptr;
+  size_t map_span = 0;
+  u64 charge_span = 0;
+  if (read_only_view && !flush_back && core->file_handle &&
+      file_view_mode_enabled()) {
+#ifdef __linux__
+    u64 fsz = 0;
+    const int fd = trt_file_host_fd(core->file_handle, &fsz);
+    // Only a view that lies entirely inside the file can be mapped. A view
+    // reaching past EOF (CreateFileMapping with max_size > file size) must
+    // copy, so the tail stays zero-filled instead of faulting on a page the
+    // file does not have.
+    if (fd >= 0 && fsz > 0 && offset < fsz && req_len <= fsz - offset) {
+      const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+      const u64 base_off = offset & ~(u64)(page - 1);
+      const size_t delta = (size_t)(offset - base_off);
+      const size_t span = delta + (size_t)req_len;
+      if (trt_mem_budget_charge_file_view((u64)span) == 0) {
+        void* m = mmap(nullptr, span, PROT_READ, MAP_PRIVATE, fd,
+                       (off_t)base_off);
+        if (m != MAP_FAILED) {
+          // async SSD -> page-cache readahead; the fault path stays lazy
+          if (file_view_readahead_enabled()) {
+            (void)madvise(m, span, MADV_WILLNEED);
+          }
+          view_ptr = (u8*)m + delta;
+          file_backed = true;
+          map_base = m;
+          map_span = span;
+          charge_span = (u64)span;
+          log_file_view_once();
+        } else {
+          trt_mem_budget_discharge_file_view((u64)span);
+        }
+      }
+    }
+#endif
+  }
+
+  bool from_be = false;
+  if (!file_backed) {
+    // Budget: the view's bytes join the same ledger as VirtualAlloc commit.
+    // Refusal fails the map honestly (named, 1455) — the guest's streaming
+    // layer retries with a smaller window instead of walking off the 5 GB
+    // cliff and getting the whole process killed by the platform.
+    if (trt_mem_budget_charge_map((u64)req_len) != 0) return nullptr;
+    view_ptr = alloc_view_buf((size_t)req_len, &from_be);
+    if (!view_ptr) {
+      trt_mem_budget_discharge_map((u64)req_len);
+      trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
+      return nullptr;
+    }
+
+    // The backend may hand back the SAME address an evicted view used to have
+    // (the pages were released). Any evicted-range record overlapping this
+    // live view is stale from this instant — purge it, or every later
+    // unmap/flush of this live view would be falsely named use-after-evict and
+    // refused.
+    for (size_t i = 0; i < g_evicted.size();) {
+      const uintptr_t s = g_evicted[i].ptr;
+      const uintptr_t e = s + g_evicted[i].bytes;
+      const uintptr_t vs = (uintptr_t)view_ptr;
+      const uintptr_t ve = vs + (size_t)req_len;
+      if (s < ve && vs < e) {
+        g_evicted.erase(g_evicted.begin() + (ptrdiff_t)i);
+      } else {
+        ++i;
+      }
+    }
+
+    if (core->file_handle) {
+      size_t got = 0;
+      if (!trt_file_pread(core->file_handle, offset, view_ptr,
+                          (size_t)req_len, &got)) {
+        trt_mem_budget_discharge_map((u64)req_len);
+        free_view_buf(view_ptr, (size_t)req_len, from_be);
+        trt_SetLastError(k_err_invalid_handle);
+        return nullptr;
+      }
+      if (got < (size_t)req_len) {
+        memset((u8*)view_ptr + got, 0, (size_t)req_len - got);
+      }
+    } else {
+      // Lazily allocate shared pagefile backing for reasonable anonymous
+      // mappings
+      if (!core->anon_buf && core->size <= (128ull << 20)) {
+        // the backing buffer is real committed memory: charge it (commit +
+        // VA); on refusal leave anon_buf null — the view still works, it
+        // just reads zeros instead of shared backing (existing graceful path)
+        const u64 sz = core->size;
+        bool charged = false;
+        if (trt_mem_budget_charge_va(sz) == 0) {
+          if (trt_mem_budget_charge_commit(sz) == 0) {
+            charged = true;
+          } else {
+            trt_mem_budget_discharge_va(sz);  // commit refused: roll VA back
+          }
+        }
+        if (charged) {
+          core->anon_buf = (u8*)calloc(1, (size_t)sz);
+          if (core->anon_buf) {
+            core->anon_cap = sz;
+          } else {
+            trt_mem_budget_discharge_commit(sz);
+            trt_mem_budget_discharge_va(sz);
+          }
+        }
+      }
+      if (core->anon_buf && offset < core->anon_cap) {
+        size_t cp = (size_t)req_len;
+        if (offset + cp > core->anon_cap) {
+          cp = (size_t)(core->anon_cap - offset);
+        }
+        memcpy(view_ptr, core->anon_buf + offset, cp);
+      }
+    }
+  }  // if (!file_backed)
+
+  // A file-backed mapping is already PROT_READ; only the copy path needs a
+  // host re-protect.
+  if (!file_backed) {
+    const int prot_bits = map_access_to_prot_bits(access, core->protect);
+    const trt_backend* be = trt_core_backend();
+    if (be && be->protect && prot_bits != (PROT_READ_ | PROT_WRITE_)) {
+      be->protect(view_ptr, (size_t)req_len, prot_bits_to_trt(prot_bits));
+    }
+  }
 
   mapped_view mv{};
   mv.ptr = view_ptr;
@@ -640,6 +784,10 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   mv.flush_on_unmap = flush_back;
   mv.from_be = from_be;
   mv.stamp = ++g_map_clock;  // LRU touch: this map is the most recent use
+  mv.file_backed = file_backed;
+  mv.map_base = map_base;
+  mv.map_span = map_span;
+  mv.charge_span = charge_span;
   ++core->view_refs;
   g_views.push_back(mv);
 
@@ -685,8 +833,8 @@ int TRT_STDCALL trt_UnmapViewOfFile(void* view) {
       const mapped_view mv = g_views[i];
       g_views.erase(g_views.begin() + (ptrdiff_t)i);
       if (mv.flush_on_unmap) flush_view_locked(mv, 0, mv.bytes);
-      trt_mem_budget_discharge_map((u64)mv.bytes);
-      free_view_buf(mv.ptr, mv.bytes, mv.from_be);
+      release_view_charge_locked(mv);
+      release_view_backing_locked(mv);
       if (mv.core && mv.core->view_refs > 0) --mv.core->view_refs;
       maybe_destroy_core_locked(mv.core);
       return 1;

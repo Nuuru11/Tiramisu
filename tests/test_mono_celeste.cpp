@@ -46,6 +46,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "../src/trt/bridge_audio.h"
 #include "../src/trt/mono_host.h"
 #include "../src/trt/pe.h"
 #include "../src/trt/trt.h"
@@ -222,6 +223,7 @@ int main(int argc, char** argv) {
       return 1;
     }
     set_hook((void*)pcm_hook, nullptr);
+    trt_audio_set_voice_hook((trt_audio_voice_submit_fn)pcm_hook, nullptr);
   }
 
   // Managed-exe sanity: the game must have a CLR header (else the native

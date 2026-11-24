@@ -1778,6 +1778,16 @@ void handle_client(sock_t s) {
   respond(s, "404 Not Found", "text/plain", "not found");
 }
 
+// The HTTP listener and its workers run beside a guest that spins at ~100% CPU,
+// so they ask for one notch above normal. Only the Windows host can raise its
+// own priority without privileges; elsewhere this is a documented no-op rather
+// than an unguarded Win32 call that fails to compile on the Linux harness.
+inline void boost_current_thread() {
+#if defined(_WIN32)
+  ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+#endif
+}
+
 void listener_thread() {
   // .237 FIX: the app server goes deaf during guest runs (both
   // games) -- the listener runs at normal priority and starves
@@ -1788,7 +1798,7 @@ void listener_thread() {
   // the guest is unaffected. If :9127 still goes deaf in .237,
   // the cause is a lock (g_mu), not scheduling, and .238
   // investigates. Does NOT change /api/stop behavior.
-  ::SetThreadPriority(::GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  boost_current_thread();
   while (!g_stop) {
     sock_t c = accept(g_listener, nullptr, nullptr);
     // .238 DIAG: prove the listener ACCEPTED during a guest run
@@ -1828,8 +1838,7 @@ void listener_thread() {
         // that never gets scheduled leaves its request unanswered
         // and holds a worker slot (16 cap), so a starved pool
         // refuses new connections. One notch up.
-        ::SetThreadPriority(::GetCurrentThread(),
-                            THREAD_PRIORITY_ABOVE_NORMAL);
+        boost_current_thread();
         // .238 DIAG: prove the worker thread STARTED during a
         // guest run (throttled) -- ACCEPT without this line
         // means thread creation/startup is blocked (loader

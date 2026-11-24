@@ -28,8 +28,33 @@ extern struct fake_steam_iface g_steam_apps_obj;
 extern struct fake_steam_iface g_steam_utils_obj;
 extern struct fake_steam_iface g_steam_friends_obj;
 extern struct fake_steam_iface g_steam_userstats_obj;
+extern struct fake_steam_iface g_steam_matchmaking_obj;
+extern struct fake_steam_iface g_steam_networking_obj;
 extern struct fake_steam_iface g_steam_rs_obj;
 extern struct fake_steam_iface g_steam_input_obj;
+
+// Host <-> Bridge Friends & Achievement observation (for in-game overlay & UI)
+struct trt_steam_friend_info {
+  u64 steam_id;
+  char persona[64];
+  int state;           // 0=Offline, 1=Online, 3=Away, 6=In-Game
+  char game_name[64];  // non-empty when playing
+};
+
+struct trt_steam_achievement_info {
+  char name[128];
+  bool achieved;
+  u32 unlock_time;
+  u32 cur_progress;
+  u32 max_progress;
+};
+
+void trt_steam_set_friends(const trt_steam_friend_info* list, int count);
+int  trt_steam_get_friend_count(void);
+int  trt_steam_get_friend_at(int idx, trt_steam_friend_info* out);
+const char* trt_steam_current_persona(void);
+int  trt_steam_get_achievement_count(void);
+int  trt_steam_get_achievement_at(int idx, trt_steam_achievement_info* out);
 
 int trt_bridge_register_steam(void);
 
@@ -48,6 +73,8 @@ int TRT_GUEST_ABI trt_SteamAPI_RestartAppIfNecessary(u32 app_id);
 int TRT_GUEST_ABI trt_SteamAPI_IsSteamRunning(void);
 u64 TRT_GUEST_ABI trt_SteamAPI_GetSteamID(void);
 int TRT_GUEST_ABI trt_SteamAPI_ActivateGameOverlay(const char* url);
+int trt_steam_overlay_check_and_reset(void);
+void trt_steam_trigger_overlay(void);
 int TRT_GUEST_ABI trt_SteamAPI_SetRichPresence(const char* key,
                                               const char* value);
 void TRT_GUEST_ABI trt_SteamAPI_RunCallbacks(void);
@@ -68,6 +95,10 @@ void TRT_GUEST_ABI trt_SteamAPI_ManualDispatch_FreeLastCallback(int pipe);
 void* TRT_GUEST_ABI trt_SteamAPI_SteamUser_v021(void);
 void* TRT_GUEST_ABI trt_SteamAPI_SteamUser_v023(void);
 void* TRT_GUEST_ABI trt_SteamAPI_SteamApps_v008(void);
+
+// Registration-table observability (host side only; no guest export).
+int trt_steam_callresult_count(void);
+int trt_steam_callback_count(void);
 void* TRT_GUEST_ABI trt_SteamAPI_SteamUtils_v010(void);
 int TRT_GUEST_ABI trt_SteamAPI_ISteamApps_BIsSubscribedApp(void*, u32 app_id);
 int TRT_GUEST_ABI trt_SteamAPI_ISteamApps_BIsDlcInstalled(void*, u32 dlc_id);

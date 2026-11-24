@@ -22,6 +22,11 @@ int   trt_user32_dc_is_valid(void* hdc);
 void* trt_user32_dc_selected(void* hdc);
 void  trt_user32_dc_set_selected(void* hdc, void* hobj);
 
+// ---- Icon object table (shared with bridge_shell ExtractIconEx*) ----
+void* trt_user32_icon_alloc(int w, int h);
+int   trt_user32_icon_free(void* hicon);
+int   trt_user32_icon_size(void* hicon, int* w_out, int* h_out);
+
 #ifdef __cplusplus
 }
 #endif

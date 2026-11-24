@@ -2,6 +2,82 @@
 // Binary SPIR-V (1.0..1.6) + GLSL.std.450 -> HLSL SM5 compiler.
 #include "spirv_hlsl.h"
 
+#include <cstdio>
+#include <mutex>
+#include <string>
+
+// ---- shader census (see spirv_hlsl.h) -------------------------------------
+// Counted after each translation from the HLSL we actually emitted, so the
+// census reflects what had to be lowered rather than what was requested.
+namespace {
+std::mutex g_census_mu;
+spirv_census g_census;
+}  // namespace
+
+void spirv_census_reset() {
+  std::lock_guard<std::mutex> lk(g_census_mu);
+  g_census = spirv_census{};
+}
+
+spirv_census spirv_census_snapshot() {
+  std::lock_guard<std::mutex> lk(g_census_mu);
+  return g_census;
+}
+
+std::string spirv_census_json() {
+  const spirv_census c = spirv_census_snapshot();
+  char buf[768];
+  std::string out = "{\n  \"compiles\": ";
+  snprintf(buf, sizeof(buf), "%u,\n", c.compiles);
+  out += buf;
+  out += "  \"stages\": {";
+  static const char* const names[6] = {"vertex", "tess_control", "tess_eval",
+                                       "geometry", "fragment", "compute"};
+  for (int i = 0; i < 6; ++i) {
+    snprintf(buf, sizeof(buf), "%s\"%s\": %u", i ? ", " : "", names[i],
+             c.per_stage[i]);
+    out += buf;
+  }
+  out += "},\n";
+  snprintf(buf, sizeof(buf),
+           "  \"features\": {\"derivatives\": %u, \"atomics\": %u, "
+           "\"storage_images\": %u, \"groupshared\": %u, "
+           "\"tessellation\": %u}\n}\n",
+           c.derivatives, c.atomics, c.storage_images, c.groupshared,
+           c.tessellation);
+  out += buf;
+  return out;
+}
+
+bool spirv_census_write(const char* path) {
+  if (!path || !*path) return false;
+  const std::string text = spirv_census_json();
+  FILE* f = fopen(path, "wb");
+  if (!f) return false;
+  const size_t w = fwrite(text.data(), 1, text.size(), f);
+  fclose(f);
+  return w == text.size();
+}
+
+namespace {
+void census_record(const spirv_compile_result& r) {
+  if (!r.ok) return;
+  auto has = [&r](const char* needle) {
+    return r.hlsl.find(needle) != std::string::npos;
+  };
+  std::lock_guard<std::mutex> lk(g_census_mu);
+  ++g_census.compiles;
+  const u32 st = (u32)r.stage;
+  if (st < 6) ++g_census.per_stage[st];
+  if (has("ddx(") || has("ddy(") || has("fwidth(")) ++g_census.derivatives;
+  if (has("Interlocked")) ++g_census.atomics;
+  if (has("RWTexture")) ++g_census.storage_images;
+  if (has("groupshared")) ++g_census.groupshared;
+  if (has("[domain(") || has("SV_TessFactor") || has("[patchconstantfunc"))
+    ++g_census.tessellation;
+}
+}  // namespace
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -2177,5 +2253,6 @@ spirv_compile_result spirv_to_hlsl(const u32* words, u32 word_count,
   ctx.res.hlsl = std::move(hlsl);
   ctx.res.ok = true;
   ctx.res.log = "SPIR-V -> HLSL SM5 ok";
+  census_record(ctx.res);  // what the corpus asked for, counted
   return ctx.res;
 }

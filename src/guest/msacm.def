@@ -2,6 +2,9 @@ LIBRARY msacm32.dll
 EXPORTS
     acmGetVersion
     acmStreamOpen
+    acmStreamPrepareHeader
+    acmStreamUnprepareHeader
     acmStreamConvert
+    acmStreamSize
     acmStreamClose
     acmFormatTagEnumW

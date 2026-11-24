@@ -28,6 +28,8 @@ int TRT_STDCALL trt_PeekMessageW(void* out, void* hwnd, u32 min, u32 max,
 int TRT_STDCALL trt_ClipCursor(const void* lpRect);
 int TRT_STDCALL trt_GetClipCursor(void* lpRect);
 int TRT_STDCALL trt_SetCursorPos(int x, int y);
+int TRT_STDCALL trt_GetSystemMetrics(int idx);
+u32 TRT_STDCALL trt_GetMessagePos(void);
 u32 TRT_STDCALL trt_XInputGetState(u32 user_index, void* state_out);
 u32 TRT_STDCALL trt_XInputSetState(u32 user_index, const void* vibration);
 }
@@ -416,6 +418,22 @@ int main() {
     trt_mouse_delta(&dx, &dy);
     CHECK(mx == 100 && my == 100 && dx == 0 && dy == 0,
           "SetCursorPos moves cursor without injecting fake delta jump");
+    {  // a warp must notify the window, like Windows does
+      bool saw_move = false;
+      trt_msg wm{};
+      while (trt_msg_peek(&wm, true)) {
+        if (wm.message == 0x0200u /*WM_MOUSEMOVE*/) saw_move = true;
+      }
+      CHECK(saw_move, "SetCursorPos posts WM_MOUSEMOVE for guests that wait on it");
+    }
+    // games gate mouse creation on these metrics
+    {
+      struct { int idx, want; } sm[] = {
+          {19, 1}, {43, 5}, {75, 1}, {13, 32}, {14, 32}, {80, 1}, {23, 0}};
+      bool ok = true;
+      for (const auto& e : sm) ok = ok && trt_GetSystemMetrics(e.idx) == e.want;
+      CHECK(ok, "GetSystemMetrics reports mouse, buttons, wheel and cursor metrics");
+    }
 
     // Hidden/locked cursor refuses OS pointer snapback when raw mouse owns input
     trt_set_cursor_visible(false);
@@ -455,6 +473,22 @@ int main() {
               got_l == 12345u && got_r == 54321u &&
               trt_XInputSetState(2, vib) == 1167u,
           "XInputSetState stores per-slot vibration and checks connection");
+  }
+
+  // A pad, mouse button or key held when the console suspends the app must
+  // not look held after resume: the host re-polls the device on the way back.
+  {
+    trt_input_pad_state(32767, 32767, 0, 0, 0x1000, 255, 255);
+    trt_input_mouse_button(0, true);
+    trt_input_key_event('W', true);
+    CHECK(trt_pad_down(0x1000) && trt_mouse_button(0) && trt_key_down('W'),
+          "input held before suspend is visible");
+    trt_input_release_all();
+    CHECK(!trt_pad_down(0x1000) && trt_pad_thumb(0) == 0 &&
+              trt_pad_trigger(0) == 0,
+          "suspend releases every pad button, stick and trigger");
+    CHECK(!trt_mouse_button(0) && !trt_key_down('W'),
+          "suspend releases mouse buttons and keys");
   }
 
   printf(failures ? "\nRESULT: %d FAILURES\n" : "\nRESULT: ALL PASS\n",

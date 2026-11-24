@@ -5,8 +5,8 @@
 // Returns a bitmask:
 //   0x01 acmGetVersion nonzero
 //   0x02 acmStreamOpen PCM->PCM opened a stream
-//   0x04 acmStreamOpen ADPCM->PCM failed visibly (not zero)
-//   0x08 acmStreamConvert/Close on the identity stream succeeded
+//   0x04 acmStreamOpen ADPCM->PCM opened (real MS ADPCM decoder)
+//   0x08 prepare/convert/close on the ADPCM stream produced PCM bytes
 //   0x10 acmFormatTagEnum returned PCM as tag 0
 //   0x20 ICInfo/ICOpen report no codecs (engine skips AVI logos)
 //   0x40 DrawDibOpen reports NULL
@@ -31,6 +31,8 @@ __attribute__((dllimport)) u32 GSTD acmStreamOpen(void** has_h, void* hi,
                                                   const void* wfx_dst,
                                                   void* filt, u64 callback,
                                                   u32 instance, u32 flags);
+__attribute__((dllimport)) u32 GSTD acmStreamPrepareHeader(void* h, void* hdr,
+                                                            u32 cb);
 __attribute__((dllimport)) u32 GSTD acmStreamConvert(void* h, void* hdr,
                                                      u32 flags);
 __attribute__((dllimport)) u32 GSTD acmStreamClose(void* h, u32 flags);
@@ -58,6 +60,21 @@ static void wfx(u8* b, u16 tag) {
   *(u16*)(b + 14) = 16;
 }
 
+// MS ADPCM needs its block geometry: mono 22050, 256-byte blocks, 4-bit
+// samples, 500 samples per block. That is the shape a compressed WAV asset
+// carries, and the shape the decoder now converts.
+static void wfx_msadpcm(u8* b) {
+  for (u32 i = 0; i < 20; ++i) b[i] = 0;
+  *(u16*)(b + 0) = 2;                     // WAVE_FORMAT_ADPCM
+  *(u16*)(b + 2) = 1;                     // mono
+  *(u32*)(b + 4) = 22050;
+  *(u32*)(b + 8) = 22050 * 256 / 500;     // nAvgBytesPerSec
+  *(u16*)(b + 12) = 256;                  // nBlockAlign
+  *(u16*)(b + 14) = 4;                    // wBitsPerSample
+  *(u16*)(b + 16) = 2;                    // cbSize
+  *(u16*)(b + 18) = 500;                  // wSamplesPerBlock
+}
+
 u32 GSTD guest_mmedia_main(u64 a, u64 b, u64 c) {
   (void)a; (void)b; (void)c;
   u32 bits = 0;
@@ -66,22 +83,38 @@ u32 GSTD guest_mmedia_main(u64 a, u64 b, u64 c) {
   if (acmGetVersion() != 0) bits |= 0x01u;
 
   // 2. PCM->PCM stream opens
-  u8 p1[18], p2[18], ad[18];
+  u8 p1[18], p2[18], ad[20];
   wfx(p1, 1);
   wfx(p2, 1);
-  wfx(ad, 2);  // ADPCM
+  wfx_msadpcm(ad);
   void* h = 0;
   if (acmStreamOpen(&h, 0, p1, p2, 0, 0, 0, 0) == 0 && h) bits |= 0x02u;
 
-  // 3. ADPCM->PCM fails visibly
+  // 3. ADPCM->PCM opens: the decoder is real now
   void* h2 = 0;
-  if (acmStreamOpen(&h2, 0, ad, p2, 0, 0, 0, 0) != 0) bits |= 0x04u;
+  if (acmStreamOpen(&h2, 0, ad, p2, 0, 0, 0, 0) == 0 && h2) bits |= 0x04u;
+  if (h) acmStreamClose(h, 0);
 
-  // 4. convert + close on the identity stream
-  if (h) {
-    u32 hdr[8];
-    for (u32 i = 0; i < 8; ++i) hdr[i] = 0;
-    if (acmStreamConvert(h, hdr, 0) == 0 && acmStreamClose(h, 0) == 0)
+  // 4. a real 64-bit ACMSTREAMHEADER through prepare -> convert -> close on
+  //    the ADPCM stream: the decoder runs inside the guest, not just in tests.
+  if (h2) {
+    // Statics, not a 4 KiB stack frame: the freestanding guest has no
+    // __chkstk, and a large frame would need one.
+    static u8 src[256];
+    static u8 dst[4096];
+    for (u32 i = 0; i < 256; ++i) src[i] = 0;  // block header + silence
+    u64 hdr[18];  // 144 bytes: the x64 ACMSTREAMHEADER
+    for (u32 i = 0; i < 18; ++i) hdr[i] = 0;
+    *(u32*)((u8*)hdr + 0) = 144;                // cbStruct
+    *(void**)((u8*)hdr + 16) = (void*)src;      // pbSrc
+    *(u32*)((u8*)hdr + 24) = 256;               // cbSrcLength (one block)
+    *(void**)((u8*)hdr + 40) = (void*)dst;      // pbDst
+    *(u32*)((u8*)hdr + 48) = 4096;              // cbDstLength
+    if (acmStreamPrepareHeader(h2, hdr, 144) == 0 &&
+        acmStreamConvert(h2, hdr, 144) == 0 &&
+        (*(u32*)((u8*)hdr + 4) & 0x10000u) != 0 &&   // STATUSF_DONE
+        *(u32*)((u8*)hdr + 52) > 0 &&                // cbDstLengthUsed
+        acmStreamClose(h2, 0) == 0)
       bits |= 0x08u;
   }
 

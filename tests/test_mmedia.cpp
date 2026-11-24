@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
 
   CHECK(ret & 0x01u, "acmGetVersion nonzero");
   CHECK(ret & 0x02u, "acmStreamOpen PCM->PCM opens");
-  CHECK(ret & 0x04u, "acmStreamOpen ADPCM fails visibly");
+  CHECK(ret & 0x04u, "acmStreamOpen ADPCM->PCM opens (real decoder)");
   CHECK(ret & 0x08u, "acmStreamConvert/Close succeed");
   CHECK(ret & 0x10u, "acmFormatTagEnum returns PCM");
   CHECK(ret & 0x20u, "no AVI codecs (skips logos)");

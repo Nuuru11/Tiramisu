@@ -514,6 +514,646 @@ d3d12_blob* make_blob(const void* data, size_t sz) {
   return b;
 }
 
+// ---- Root-signature serialization / deserialization -------------------------
+// Both serializers used to return S_OK with a fixed 64-byte DXBC shell whose
+// only payload was the version number: a title could serialize its layout, hand
+// the blob to CreateRootSignature, and never learn that nothing had been carried
+// (the "recorded" class). This is the real pair:
+//   * parse the guest's D3D12_ROOT_SIGNATURE_DESC / ...DESC1 / ...DESC2
+//     (root parameters, descriptor tables and ranges, static samplers, flags),
+//   * validate it the way the runtime does, and on rejection return an ID3DBlob
+//     holding the human-readable reason (exactly what D3D12 does),
+//   * emit a self-describing DXBC container,
+//   * parse that container back in D3D12Create[Versioned]RootSignatureDeserializer
+//     and hand out a real D3D12_ROOT_SIGNATURE_DESC / ...VERSIONED...DESC,
+//   * and let ID3D12Device::CreateRootSignature see the actual layout.
+//
+// Container (little-endian; keeps the DXBC shell so magic sniffers still work):
+//   0  u32 'DXBC'        20 u32 container version (1)
+//   4  16-byte hash (0)  24 u32 total size
+//   28 u32 chunk count (3), then one u32 chunk offset each; every chunk is a
+//   4-byte tag followed by its payload:
+//     'RTS0' u32 version, u32 flags, u32 num_params, u32 num_samplers
+//     'RDAT' u32 num_params, then per parameter 24 bytes
+//            {type, visibility, a, b, c, range_count} followed by range_count
+//            24-byte ranges {type, num_descriptors, reg, space, flags, offset}
+//     'STAT' u32 num_samplers, then num_samplers verbatim 52-byte
+//            D3D12_STATIC_SAMPLER_DESC records
+// A blob serialized by a real Windows d3d12.dll carries a different RDAT payload;
+// it is rejected here with a named reason (never mis-read), while
+// CreateRootSignature still accepts it for compatibility and logs that its
+// layout is not introspectable.
+constexpr u32 k_rsbox_magic = 0x43425844u;  // 'DXBC'
+constexpr u32 k_rsbox_format = 1;
+constexpr u32 k_rsbox_chunks = 3;
+constexpr u32 k_rsbox_header = 32 + 4 * k_rsbox_chunks;  // 44
+
+constexpr u32 k_rsdesc_num_params = 0;
+constexpr u32 k_rsdesc_params = 8;
+constexpr u32 k_rsdesc_num_samplers = 16;
+constexpr u32 k_rsdesc_samplers = 24;
+constexpr u32 k_rsdesc_flags = 32;
+constexpr u32 k_rsdesc_size = 40;
+
+constexpr u32 k_rsparam_size = 32;
+constexpr u32 k_rsparam_union = 8;
+constexpr u32 k_rsparam_visibility = 24;
+
+constexpr u32 k_rsrange_size_10 = 20;  // D3D12_DESCRIPTOR_RANGE
+constexpr u32 k_rsrange_size_11 = 24;  // D3D12_DESCRIPTOR_RANGE1
+
+constexpr u32 k_rssampler_size = 52;  // D3D12_STATIC_SAMPLER_DESC
+
+// The D3D12 documented limits; exceeding them is what the runtime rejects.
+constexpr u32 k_rs_max_params = 64;
+constexpr u32 k_rs_max_ranges_per_table = 64;
+constexpr u32 k_rs_max_static_samplers = 2032;
+
+struct rs_range {
+  u32 type = 0, num = 0, reg = 0, space = 0, flags = 0, offset = 0;
+};
+
+struct rs_param {
+  u32 type = 0;              // D3D12_ROOT_PARAMETER_TYPE
+  u32 visibility = 0;        // D3D12_SHADER_VISIBILITY
+  u32 a = 0, b = 0, c = 0;   // constants {reg, space, num32} / descriptor {reg, space, flags}
+  std::vector<rs_range> ranges;
+};
+
+struct rs_desc {
+  u32 version = 1;  // D3D_ROOT_SIGNATURE_VERSION (1 = 1.0, 2 = 1.1, 3 = 1.2)
+  u32 flags = 0;
+  std::vector<rs_param> params;
+  std::vector<u8> samplers;  // N * 52 verbatim records
+};
+
+inline u32 rs_get32(const u8* p, size_t off) {
+  u32 v = 0;
+  memcpy(&v, p + off, 4);
+  return v;
+}
+inline const void* rs_getptr(const u8* p, size_t off) {
+  u64 v = 0;
+  memcpy(&v, p + off, sizeof(v));
+  return (const void*)(uintptr_t)v;
+}
+inline void rs_put32(u8* p, size_t off, u32 v) { memcpy(p + off, &v, 4); }
+inline void rs_putptr(u8* p, size_t off, const void* v) { memcpy(p + off, &v, sizeof(v)); }
+
+// Parse a guest desc body (the D3D12_ROOT_SIGNATURE_DESC at the end of a
+// D3D12_VERSIONED_ROOT_SIGNATURE_DESC, or the desc handed to
+// D3D12SerializeRootSignature). 1.0/1.1/1.2 differ only in the element sizes.
+int rs_parse_desc(const void* body, u32 version, rs_desc* out, char* err, size_t err_sz) {
+  if (!out || !err || !err_sz) return k_e_invalidarg;
+  if (!body) {
+    snprintf(err, err_sz, "pRootSignature is NULL");
+    return k_e_invalidarg;
+  }
+  if (version < 1 || version > 3) {
+    snprintf(err, err_sz, "D3D_ROOT_SIGNATURE_VERSION %u is not serializable", version);
+    return k_e_invalidarg;
+  }
+  const u8* b = (const u8*)body;
+  out->version = version;
+  out->flags = rs_get32(b, k_rsdesc_flags);
+  const u32 n = rs_get32(b, k_rsdesc_num_params);
+  const void* params = rs_getptr(b, k_rsdesc_params);
+  const u32 ns = rs_get32(b, k_rsdesc_num_samplers);
+  const void* samplers = rs_getptr(b, k_rsdesc_samplers);
+  if (n > k_rs_max_params) {
+    snprintf(err, err_sz, "NumParameters is %u, above the D3D12 limit of %u", n,
+             k_rs_max_params);
+    return k_e_invalidarg;
+  }
+  if (n && !params) {
+    snprintf(err, err_sz, "NumParameters is %u but pParameters is NULL", n);
+    return k_e_invalidarg;
+  }
+  if (ns > k_rs_max_static_samplers) {
+    snprintf(err, err_sz, "NumStaticSamplers is %u, above the D3D12 limit of %u", ns,
+             k_rs_max_static_samplers);
+    return k_e_invalidarg;
+  }
+  if (ns && !samplers) {
+    snprintf(err, err_sz, "NumStaticSamplers is %u but pStaticSamplers is NULL", ns);
+    return k_e_invalidarg;
+  }
+
+  const u32 range_size = (version >= 2) ? k_rsrange_size_11 : k_rsrange_size_10;
+  out->params.assign(n, rs_param());
+  for (u32 i = 0; i < n; ++i) {
+    const u8* p = (const u8*)params + (size_t)i * k_rsparam_size;
+    rs_param& d = out->params[i];
+    d.type = rs_get32(p, 0);
+    d.visibility = rs_get32(p, k_rsparam_visibility);
+    if (d.type > 4) {
+      snprintf(err, err_sz, "root parameter %u has an invalid ParameterType %u", i, d.type);
+      return k_e_invalidarg;
+    }
+    if (d.visibility > 7) {
+      snprintf(err, err_sz, "root parameter %u has an invalid ShaderVisibility %u", i,
+               d.visibility);
+      return k_e_invalidarg;
+    }
+    if (d.type == 0) {  // D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+      const u32 nr = rs_get32(p, k_rsparam_union);
+      const void* ranges = rs_getptr(p, k_rsparam_union + sizeof(void*));
+      if (nr > k_rs_max_ranges_per_table) {
+        snprintf(err, err_sz,
+                 "root parameter %u has %u descriptor ranges, above the D3D12 limit of %u", i,
+                 nr, k_rs_max_ranges_per_table);
+        return k_e_invalidarg;
+      }
+      if (nr && !ranges) {
+        snprintf(err, err_sz, "root parameter %u has %u ranges but pDescriptorRanges is NULL",
+                 i, nr);
+        return k_e_invalidarg;
+      }
+      d.ranges.assign(nr, rs_range());
+      for (u32 j = 0; j < nr; ++j) {
+        const u8* r = (const u8*)ranges + (size_t)j * range_size;
+        rs_range& o = d.ranges[j];
+        o.type = rs_get32(r, 0);
+        o.num = rs_get32(r, 4);
+        o.reg = rs_get32(r, 8);
+        o.space = rs_get32(r, 12);
+        o.flags = (version >= 2) ? rs_get32(r, 16) : 0;
+        o.offset = rs_get32(r, (version >= 2) ? 20 : 16);
+        if (o.type > 3) {
+          snprintf(err, err_sz, "parameter %u range %u has an invalid RangeType %u", i, j,
+                   o.type);
+          return k_e_invalidarg;
+        }
+      }
+    } else {
+      d.a = rs_get32(p, k_rsparam_union);
+      d.b = rs_get32(p, k_rsparam_union + 4);
+      d.c = rs_get32(p, k_rsparam_union + 8);
+    }
+  }
+
+  out->samplers.assign((size_t)ns * k_rssampler_size, 0);
+  if (ns) memcpy(out->samplers.data(), samplers, (size_t)ns * k_rssampler_size);
+  for (u32 i = 0; i < ns; ++i) {
+    const u8* s = out->samplers.data() + (size_t)i * k_rssampler_size;
+    const u32 au = rs_get32(s, 4), av = rs_get32(s, 8), aw = rs_get32(s, 12);
+    if (au < 1 || au > 4 || av < 1 || av > 4 || aw < 1 || aw > 4) {
+      snprintf(err, err_sz,
+               "static sampler %u has an invalid AddressU/V/W (%u/%u/%u; valid 1..4)", i, au, av,
+               aw);
+      return k_e_invalidarg;
+    }
+    const u32 cmp = rs_get32(s, 24);
+    if (cmp < 1 || cmp > 8) {
+      snprintf(err, err_sz, "static sampler %u has an invalid ComparisonFunc %u", i, cmp);
+      return k_e_invalidarg;
+    }
+    const u32 border = rs_get32(s, 28);
+    if (border > 3) {
+      snprintf(err, err_sz, "static sampler %u has an invalid BorderColor %u", i, border);
+      return k_e_invalidarg;
+    }
+    const u32 vis = rs_get32(s, 48);
+    if (vis > 7) {
+      snprintf(err, err_sz, "static sampler %u has an invalid ShaderVisibility %u", i, vis);
+      return k_e_invalidarg;
+    }
+  }
+  return k_s_ok;
+}
+
+int rs_emit(const rs_desc& d, void** out_blob) {
+  u32 rdat_payload = 4;
+  for (const rs_param& p : d.params) {
+    rdat_payload += 24;
+    if (p.type == 0) rdat_payload += (u32)p.ranges.size() * 24;
+  }
+  const u32 rts0_payload = 16;
+  const u32 stat_payload = 4 + (u32)d.samplers.size();
+  const u32 off_rts0 = k_rsbox_header;
+  const u32 off_rdat = off_rts0 + 4 + rts0_payload;
+  const u32 off_stat = off_rdat + 4 + rdat_payload;
+  const u32 total = off_stat + 4 + stat_payload;
+
+  std::vector<u8> buf(total, 0);
+  u8* b = buf.data();
+  rs_put32(b, 0, k_rsbox_magic);
+  rs_put32(b, 20, k_rsbox_format);
+  rs_put32(b, 24, total);
+  rs_put32(b, 28, k_rsbox_chunks);
+  rs_put32(b, 32, off_rts0);
+  rs_put32(b, 36, off_rdat);
+  rs_put32(b, 40, off_stat);
+
+  rs_put32(b, off_rts0, 0x30535452u);  // 'RTS0'
+  rs_put32(b, off_rts0 + 4, d.version);
+  rs_put32(b, off_rts0 + 8, d.flags);
+  rs_put32(b, off_rts0 + 12, (u32)d.params.size());
+  rs_put32(b, off_rts0 + 16, (u32)(d.samplers.size() / k_rssampler_size));
+
+  rs_put32(b, off_rdat, 0x54414452u);  // 'RDAT'
+  rs_put32(b, off_rdat + 4, (u32)d.params.size());
+  u32 o = off_rdat + 8;
+  for (const rs_param& p : d.params) {
+    rs_put32(b, o + 0, p.type);
+    rs_put32(b, o + 4, p.visibility);
+    rs_put32(b, o + 8, p.a);
+    rs_put32(b, o + 12, p.b);
+    rs_put32(b, o + 16, p.c);
+    rs_put32(b, o + 20, (u32)p.ranges.size());
+    o += 24;
+    for (const rs_range& r : p.ranges) {
+      rs_put32(b, o + 0, r.type);
+      rs_put32(b, o + 4, r.num);
+      rs_put32(b, o + 8, r.reg);
+      rs_put32(b, o + 12, r.space);
+      rs_put32(b, o + 16, r.flags);
+      rs_put32(b, o + 20, r.offset);
+      o += 24;
+    }
+  }
+
+  rs_put32(b, off_stat, 0x54415453u);  // 'STAT'
+  rs_put32(b, off_stat + 4, (u32)(d.samplers.size() / k_rssampler_size));
+  if (!d.samplers.empty()) memcpy(b + off_stat + 8, d.samplers.data(), d.samplers.size());
+
+  d3d12_blob* blob = make_blob(buf.data(), buf.size());
+  if (!blob) return k_e_outofmemory;
+  *out_blob = blob;
+  return k_s_ok;
+}
+
+int rs_read_container(const void* blob, u64 size, rs_desc* out, char* err, size_t err_sz) {
+  if (!out || !err || !err_sz) return k_e_invalidarg;
+  if (!blob || !size) {
+    snprintf(err, err_sz, "blob is NULL or empty");
+    return k_e_invalidarg;
+  }
+  if (size < k_rsbox_header) {
+    snprintf(err, err_sz, "blob is %llu bytes, shorter than the 44-byte DXBC header",
+             (unsigned long long)size);
+    return k_e_invalidarg;
+  }
+  const u8* b = (const u8*)blob;
+  if (rs_get32(b, 0) != k_rsbox_magic) {
+    snprintf(err, err_sz, "blob does not begin with the DXBC magic");
+    return k_e_invalidarg;
+  }
+  const u32 total = rs_get32(b, 24);
+  const u32 nchunks = rs_get32(b, 28);
+  if (total > size || total < k_rsbox_header) {
+    snprintf(err, err_sz, "DXBC size field %u disagrees with the %llu-byte blob", total,
+             (unsigned long long)size);
+    return k_e_invalidarg;
+  }
+  if (nchunks > 16) {
+    snprintf(err, err_sz, "DXBC chunk count %u is implausible", nchunks);
+    return k_e_invalidarg;
+  }
+  const u8* rts0 = nullptr;
+  const u8* rdat = nullptr;
+  const u8* stat = nullptr;
+  u32 rts0_len = 0, rdat_len = 0, stat_len = 0;
+  for (u32 i = 0; i < nchunks; ++i) {
+    const u32 off = rs_get32(b, 32 + i * 4);
+    if (off < k_rsbox_header || (u64)off + 8 > total) continue;
+    u32 next = total;
+    for (u32 j = 0; j < nchunks; ++j) {
+      const u32 other = rs_get32(b, 32 + j * 4);
+      if (other > off && other < next) next = other;
+    }
+    const u32 len = (next > off) ? next - off - 4 : 0;
+    const u32 tag = rs_get32(b, off);
+    if (tag == 0x30535452u) {
+      rts0 = b + off + 4;
+      rts0_len = len;
+    } else if (tag == 0x54414452u) {
+      rdat = b + off + 4;
+      rdat_len = len;
+    } else if (tag == 0x54415453u) {
+      stat = b + off + 4;
+      stat_len = len;
+    }
+  }
+  if (!rts0 || rts0_len < 16) {
+    snprintf(err, err_sz, "blob has no 'RTS0' chunk (not a Tiramisu-root-signature)");
+    return k_e_invalidarg;
+  }
+  if (!rdat || rdat_len < 4) {
+    snprintf(err, err_sz, "blob has no 'RDAT' chunk (parameter data missing)");
+    return k_e_invalidarg;
+  }
+
+  out->version = rs_get32(rts0, 0);
+  out->flags = rs_get32(rts0, 4);
+  const u32 n = rs_get32(rts0, 8);
+  const u32 ns = rs_get32(rts0, 12);
+  if (n > k_rs_max_params || ns > k_rs_max_static_samplers) {
+    snprintf(err, err_sz, "'RTS0' declares %u parameters / %u samplers, above the D3D12 limits",
+             n, ns);
+    return k_e_invalidarg;
+  }
+  if (rs_get32(rdat, 0) != n) {
+    snprintf(err, err_sz, "'RDAT' carries %u parameters but 'RTS0' declares %u",
+             rs_get32(rdat, 0), n);
+    return k_e_invalidarg;
+  }
+
+  out->params.assign(n, rs_param());
+  u32 o = 4;
+  for (u32 i = 0; i < n; ++i) {
+    if (o + 24 > rdat_len) {
+      snprintf(err, err_sz, "'RDAT' is truncated at parameter %u", i);
+      return k_e_invalidarg;
+    }
+    rs_param& p = out->params[i];
+    p.type = rs_get32(rdat, o);
+    p.visibility = rs_get32(rdat, o + 4);
+    p.a = rs_get32(rdat, o + 8);
+    p.b = rs_get32(rdat, o + 12);
+    p.c = rs_get32(rdat, o + 16);
+    const u32 nr = rs_get32(rdat, o + 20);
+    o += 24;
+    if (p.type == 0) {
+      if (nr > k_rs_max_ranges_per_table || o + nr * 24 > rdat_len) {
+        snprintf(err, err_sz, "'RDAT' has an invalid range count %u at parameter %u", nr, i);
+        return k_e_invalidarg;
+      }
+      p.ranges.assign(nr, rs_range());
+      for (u32 j = 0; j < nr; ++j) {
+        rs_range& r = p.ranges[j];
+        r.type = rs_get32(rdat, o + 0);
+        r.num = rs_get32(rdat, o + 4);
+        r.reg = rs_get32(rdat, o + 8);
+        r.space = rs_get32(rdat, o + 12);
+        r.flags = rs_get32(rdat, o + 16);
+        r.offset = rs_get32(rdat, o + 20);
+        o += 24;
+      }
+    } else if (nr != 0) {
+      snprintf(err, err_sz, "parameter %u is not a descriptor table but carries %u ranges", i,
+               nr);
+      return k_e_invalidarg;
+    }
+  }
+
+  if (stat) {
+    if (stat_len < 4 || rs_get32(stat, 0) != ns) {
+      snprintf(err, err_sz, "'STAT' declares %u samplers but 'RTS0' declares %u",
+               stat_len < 4 ? 0 : rs_get32(stat, 0), ns);
+      return k_e_invalidarg;
+    }
+    if ((u64)stat_len < 4 + (u64)ns * k_rssampler_size) {
+      snprintf(err, err_sz, "'STAT' is truncated (%u bytes for %u samplers)", stat_len, ns);
+      return k_e_invalidarg;
+    }
+    out->samplers.assign((size_t)ns * k_rssampler_size, 0);
+    if (ns) memcpy(out->samplers.data(), stat + 4, (size_t)ns * k_rssampler_size);
+  } else if (ns) {
+    snprintf(err, err_sz, "'RTS0' declares %u static samplers but there is no 'STAT' chunk", ns);
+    return k_e_invalidarg;
+  }
+  return k_s_ok;
+}
+
+// Rebuild the desc structures a deserializer hands to the guest. One buffer per
+// (version, versioned) pair so the pointers in it stay valid for the object's
+// lifetime, as the real deserializer guarantees.
+struct rs_layout {
+  std::vector<u8> buf;
+};
+
+void rs_build_layout(const rs_desc& d, bool v11, bool versioned, u32 decl_version,
+                     rs_layout& out) {
+  const u32 n = (u32)d.params.size();
+  u32 ranges_total = 0;
+  for (const rs_param& p : d.params)
+    if (p.type == 0) ranges_total += (u32)p.ranges.size();
+  const u32 range_size = v11 ? k_rsrange_size_11 : k_rsrange_size_10;
+  const u32 ns = (u32)(d.samplers.size() / k_rssampler_size);
+  const u32 desc_size = versioned ? 48 : k_rsdesc_size;  // 8-byte version + body
+  const u32 off_params = desc_size;
+  const u32 off_ranges = off_params + n * k_rsparam_size;
+  const u32 off_samplers = off_ranges + ranges_total * range_size;
+  out.buf.assign(off_samplers + (size_t)ns * k_rssampler_size, 0);
+
+  u8* base = out.buf.data();
+  const u32 body = versioned ? 8 : 0;
+  if (versioned) rs_put32(base, 0, decl_version);
+  rs_put32(base, body + k_rsdesc_num_params, n);
+  rs_putptr(base, body + k_rsdesc_params, n ? base + off_params : nullptr);
+  rs_put32(base, body + k_rsdesc_num_samplers, ns);
+  rs_putptr(base, body + k_rsdesc_samplers, ns ? base + off_samplers : nullptr);
+  rs_put32(base, body + k_rsdesc_flags, d.flags);
+
+  u32 roff = off_ranges;
+  for (u32 i = 0; i < n; ++i) {
+    const rs_param& p = d.params[i];
+    u8* o = base + off_params + (size_t)i * k_rsparam_size;
+    rs_put32(o, 0, p.type);
+    rs_put32(o, k_rsparam_visibility, p.visibility);
+    if (p.type == 0) {
+      const u32 nr = (u32)p.ranges.size();
+      rs_put32(o, k_rsparam_union, nr);
+      rs_putptr(o, k_rsparam_union + sizeof(void*), nr ? base + roff : nullptr);
+      for (u32 j = 0; j < nr; ++j) {
+        const rs_range& r = p.ranges[j];
+        u8* q = base + roff;
+        rs_put32(q, 0, r.type);
+        rs_put32(q, 4, r.num);
+        rs_put32(q, 8, r.reg);
+        rs_put32(q, 12, r.space);
+        if (v11) {
+          rs_put32(q, 16, r.flags);
+          rs_put32(q, 20, r.offset);
+        } else {
+          rs_put32(q, 16, r.offset);
+        }
+        roff += range_size;
+      }
+    } else {
+      rs_put32(o, k_rsparam_union, p.a);
+      rs_put32(o, k_rsparam_union + 4, p.b);
+      if (v11 || p.type == 1) rs_put32(o, k_rsparam_union + 8, p.c);
+    }
+  }
+  if (ns) memcpy(base + off_samplers, d.samplers.data(), d.samplers.size());
+}
+
+// ---- ID3D12RootSignatureDeserializer / ID3D12VersionedRootSignatureDeserializer
+// QI answers IUnknown plus the exact IID the caller created the object with, so
+// the bridge never has to invent (or get wrong) an SDK GUID.
+struct d3d12_rs_deser : com_base {
+  rs_desc d;
+  u8 created_iid[16] = {0};
+  bool versioned = false;
+  rs_layout plain, v10, v11;
+  bool have_plain = false, have_v10 = false, have_v11 = false;
+  u32 v11_decl = 2;
+};
+
+void rsdeser_destroy(com_base* b) { delete (d3d12_rs_deser*)b; }
+
+int TRT_GUEST_ABI rsdeser_qi(void* self, const void* riid, void** ppv) {
+  if (!ppv) return k_e_invalidarg;
+  *ppv = nullptr;
+  auto* d = (d3d12_rs_deser*)self;
+  if (!riid || is_iunknown(riid) || memcmp(riid, d->created_iid, 16) == 0) {
+    *ppv = self;
+    base_addref(self);
+    return k_s_ok;
+  }
+  const raw_guid* g = (const raw_guid*)riid;
+  char line[176];
+  snprintf(line, sizeof(line),
+           "d3d12: %s QueryInterface({%08x-%04x-%04x-...}) -> E_NOINTERFACE "
+           "(only the IID it was created with)",
+           d->versioned ? "VersionedRootSignatureDeserializer" : "RootSignatureDeserializer",
+           g->d1, g->d2, g->d3);
+  trt_core_log(line);
+  return k_e_nointerface;
+}
+
+const void* TRT_GUEST_ABI rsdeser_get_desc(void* self) {
+  auto* d = (d3d12_rs_deser*)self;
+  if (!d->have_plain) {
+    rs_build_layout(d->d, /*v11=*/false, /*versioned=*/false, 1, d->plain);
+    d->have_plain = true;
+  }
+  return d->plain.buf.data();
+}
+
+int TRT_GUEST_ABI vrsdeser_get_at_version(void* self, u32 version, void** ppdesc) {
+  if (!ppdesc) return k_e_invalidarg;
+  auto* d = (d3d12_rs_deser*)self;
+  *ppdesc = nullptr;
+  if (version == 1) {
+    if (!d->have_v10) {
+      rs_build_layout(d->d, /*v11=*/false, /*versioned=*/true, 1, d->v10);
+      d->have_v10 = true;
+    }
+    *ppdesc = d->v10.buf.data();
+    return k_s_ok;
+  }
+  if (version == 2 || version == 3) {
+    if (!d->have_v11 || d->v11_decl != version) {
+      rs_build_layout(d->d, /*v11=*/true, /*versioned=*/true, version, d->v11);
+      d->have_v11 = true;
+      d->v11_decl = version;
+    }
+    *ppdesc = d->v11.buf.data();
+    return k_s_ok;
+  }
+  char line[176];
+  snprintf(line, sizeof(line),
+           "d3d12: GetRootSignatureDescAtVersion(%u) -> E_INVALIDARG (only 1.0/1.1/1.2 "
+           "exist)",
+           version);
+  trt_core_log(line);
+  return k_e_invalidarg;
+}
+
+const void* TRT_GUEST_ABI vrsdeser_get_unconverted(void* self) {
+  auto* d = (d3d12_rs_deser*)self;
+  if (d->d.version >= 2) {
+    const u32 want = (d->d.version >= 3) ? 3 : 2;
+    if (!d->have_v11 || d->v11_decl != want) {
+      rs_build_layout(d->d, /*v11=*/true, /*versioned=*/true, want, d->v11);
+      d->have_v11 = true;
+      d->v11_decl = want;
+    }
+    return d->v11.buf.data();
+  }
+  if (!d->have_v10) {
+    rs_build_layout(d->d, /*v11=*/false, /*versioned=*/true, 1, d->v10);
+    d->have_v10 = true;
+  }
+  return d->v10.buf.data();
+}
+
+const void* g_rsdeser_vtbl[4] = {
+    (const void*)&rsdeser_qi, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&rsdeser_get_desc,
+};
+
+const void* g_vrsdeser_vtbl[5] = {
+    (const void*)&rsdeser_qi, (const void*)&base_addref, (const void*)&base_release,
+    (const void*)&vrsdeser_get_at_version, (const void*)&vrsdeser_get_unconverted,
+};
+
+int rs_create_deserializer(const void* src, u64 size, const void* riid, bool versioned,
+                           void** out) {
+  if (!out) return k_e_invalidarg;
+  *out = nullptr;
+  char err[224] = {0};
+  rs_desc d;
+  if (rs_read_container(src, size, &d, err, sizeof(err)) != k_s_ok) {
+    char line[352];
+    snprintf(line, sizeof(line), "d3d12: %sRootSignatureDeserializer -> E_INVALIDARG (%s)",
+             versioned ? "CreateVersioned" : "Create", err);
+    trt_core_log(line);
+    return k_e_invalidarg;
+  }
+  auto* o = new d3d12_rs_deser();
+  o->d = d;
+  o->versioned = versioned;
+  o->vtbl = versioned ? g_vrsdeser_vtbl : g_rsdeser_vtbl;
+  o->destroy_fn = &rsdeser_destroy;
+  if (riid) memcpy(o->created_iid, riid, 16);
+  *out = o;
+  char line[224];
+  snprintf(line, sizeof(line),
+           "d3d12: %sRootSignatureDeserializer recovered %u root parameter(s), %u static "
+           "sampler(s), version %u",
+           versioned ? "CreateVersioned" : "Create", (u32)o->d.params.size(),
+           (u32)(o->d.samplers.size() / k_rssampler_size), o->d.version);
+  trt_core_log(line);
+  return k_s_ok;
+}
+
+int rs_serialize(const void* desc, u32 version, bool versioned, void** out_blob,
+                 void** out_err) {
+  if (out_err) *out_err = nullptr;
+  if (out_blob) *out_blob = nullptr;
+  if (!out_blob) return k_e_invalidarg;
+  char err[224] = {0};
+  rs_desc d;
+  int hr;
+  if (versioned) {
+    if (!desc) {
+      snprintf(err, sizeof(err), "pRootSignature is NULL");
+      hr = k_e_invalidarg;
+    } else {
+      hr = rs_parse_desc((const u8*)desc + 8, rs_get32((const u8*)desc, 0), &d, err,
+                         sizeof(err));
+    }
+  } else {
+    hr = rs_parse_desc(desc, version, &d, err, sizeof(err));
+  }
+  if (hr != k_s_ok) {
+    if (out_err) *out_err = make_blob(err, strlen(err) + 1);
+    char line[352];
+    snprintf(line, sizeof(line), "d3d12: %s -> E_INVALIDARG (%s)",
+             versioned ? "D3D12SerializeVersionedRootSignature"
+                       : "D3D12SerializeRootSignature",
+             err);
+    trt_core_log(line);
+    return k_e_invalidarg;
+  }
+  hr = rs_emit(d, out_blob);
+  if (hr != k_s_ok) return hr;
+  char line[256];
+  snprintf(line, sizeof(line),
+           "d3d12: %s serialized %u root parameter(s), %u static sampler(s), version %u, "
+           "flags %#x into a %llu-byte DXBC container",
+           versioned ? "D3D12SerializeVersionedRootSignature"
+                     : "D3D12SerializeRootSignature",
+           (u32)d.params.size(), (u32)(d.samplers.size() / k_rssampler_size), d.version,
+           d.flags, (unsigned long long)((d3d12_blob*)*out_blob)->bytes.size());
+  d3d12_log_once(25, line);
+  return k_s_ok;
+}
+
 // ---- ID3D12Fence -----------------------------------------------------------
 struct fence_waiter {
   u64 target;
@@ -970,6 +1610,12 @@ static_assert(sizeof(g_resource_vtbl) / sizeof(g_resource_vtbl[0]) == 15,
 struct d3d12_simple_child : com_base {
   d3d12_heap_desc_t heap_desc{};
   std::vector<u8> cached_pso;
+  // Root-signature layout recovered from the blob CreateRootSignature
+  // accepted; 0/0 for a blob this bridge did not serialize.
+  u32 rs_num_params = 0;
+  u32 rs_num_samplers = 0;
+  u32 rs_flags = 0;
+  rs_desc rs_layout_store;
   bool is_root_sig = false;
   bool is_compute = false;
   void* root_sig = nullptr;
@@ -2607,6 +3253,21 @@ void TRT_GUEST_ABI dev_create_cbv(void* self, const d3d12_cbv_desc_t* desc,
   d3d12_log_once(15, line);
 }
 
+#include "quality_policy.h"
+
+// Texture quality tier, weak so an offline test binary without settings.cpp
+// resolves it to null and keeps the default tier (full quality).
+#if defined(__clang__) || defined(__GNUC__)
+extern "C" int trt_settings_texture_quality_int(void) __attribute__((weak));
+#endif
+
+static int quality_tier() {
+#if defined(__clang__) || defined(__GNUC__)
+  if (trt_settings_texture_quality_int) return trt_settings_texture_quality_int();
+#endif
+  return 2;  // high: the guest's request passes through unchanged
+}
+
 // Parses the SRV/UAV union payload per ViewDimension into the record. The
 // payload layouts are the SDK union arms (see the ABI probe asserts).
 static bool parse_srv_payload(const d3d12_srv_desc_t* d, d3d12_view_record* r,
@@ -2901,7 +3562,10 @@ void TRT_GUEST_ABI dev_create_sampler(void* self,
   r.kind = 5;  // SAMPLER
   r.sampler_filter = desc->filter;
   r.sampler_cmp = desc->comparison_func;
-  r.max_anisotropy = desc->max_anisotropy;
+  // texture_quality can only lower what the guest asked for, never raise it,
+  // so the default tier reproduces the guest's value exactly. This is the
+  // consumer the setting never had.
+  r.max_anisotropy = trt_quality_clamp_aniso(quality_tier(), desc->max_anisotropy);
   r.addr_u = desc->address_u;
   r.addr_v = desc->address_v;
   r.addr_w = desc->address_w;
@@ -3054,16 +3718,34 @@ int TRT_GUEST_ABI dev_create_rootsig(void* self, u32, const void* blob, u64 len,
   rs->device = (d3d12_device*)self;
   rs->destroy_fn = &simple_child_destroy;
   rs->is_root_sig = true;
+  char rs_err[192] = {0};
+  if (rs_read_container(blob, len, &rs->rs_layout_store, rs_err, sizeof(rs_err)) == k_s_ok) {
+    rs->rs_num_params = (u32)rs->rs_layout_store.params.size();
+    rs->rs_num_samplers = (u32)(rs->rs_layout_store.samplers.size() / k_rssampler_size);
+    rs->rs_flags = rs->rs_layout_store.flags;
+    char line[192];
+    snprintf(line, sizeof(line),
+             "d3d12: CreateRootSignature accepted %u root parameter(s), %u static "
+             "sampler(s), flags %#x (version %u, blob %llu bytes)",
+             rs->rs_num_params, rs->rs_num_samplers, rs->rs_flags,
+             rs->rs_layout_store.version, (unsigned long long)len);
+    d3d12_log_once(23, line);
+  } else {
+    // Not a container this bridge wrote: a hand-authored test vector, or a blob
+    // a real Windows d3d12.dll produced and the title cached. Accept it (the
+    // corpus relies on that) but never quietly say the layout is known.
+    char line[320];
+    snprintf(line, sizeof(line),
+             "d3d12: CreateRootSignature accepted an unrecognized blob (%llu bytes: %s) - "
+             "layout not introspectable",
+             (unsigned long long)len, rs_err);
+    d3d12_log_once(24, line);
+  }
   {
     std::lock_guard<std::mutex> lk(g_live_mu);
     g_live_rootsigs.insert(rs);
   }
   *out_rs = rs;
-  char line[96];
-  snprintf(line, sizeof(line),
-           "d3d12: CreateRootSignature recorded (blob %llu bytes)",
-           (unsigned long long)len);
-  d3d12_log_once(23, line);
   return k_s_ok;
 }
 
@@ -3652,49 +4334,55 @@ int TRT_GUEST_ABI trt_D3D12GetDebugInterface(const void* riid, void** out_dbg) {
   return k_e_nointerface;
 }
 
+u32 trt_d3d12_rootsig_param_count(void* obj) {
+  if (!obj) return 0;
+  auto* rs = (d3d12_simple_child*)obj;
+  return rs->is_root_sig ? rs->rs_num_params : 0;
+}
+
+u32 trt_d3d12_rootsig_static_sampler_count(void* obj) {
+  if (!obj) return 0;
+  auto* rs = (d3d12_simple_child*)obj;
+  return rs->is_root_sig ? rs->rs_num_samplers : 0;
+}
+
+int trt_d3d12_rootsig_flags(void* obj) {
+  if (!obj) return -1;
+  auto* rs = (d3d12_simple_child*)obj;
+  return rs->is_root_sig ? (int)rs->rs_flags : -1;
+}
+
 int TRT_GUEST_ABI trt_D3D12SerializeRootSignature(const void* desc, u32 version,
                                                   void** out_blob, void** out_err) {
-  if (out_err) *out_err = nullptr;
-  if (g_hooks.serialize_root_sig)
+  if (g_hooks.serialize_root_sig) {
+    if (out_err) *out_err = nullptr;
     return g_hooks.serialize_root_sig(desc, version, out_blob, out_err);
-  if (!desc || !out_blob) return k_e_invalidarg;
-  // Valid minimal DXBC root-signature container header
-  u32 hdr[10] = {0x43425844u /*'DXBC'*/, 0, 0, 0, 0, 1, 40, 1, 36, 0x30535452u /*'RTS0'*/};
-  u8 buf[64]{};
-  memcpy(buf, hdr, sizeof(hdr));
-  memcpy(buf + 40, &version, 4);
-  *out_blob = make_blob(buf, sizeof(buf));
-  return *out_blob ? k_s_ok : k_e_outofmemory;
+  }
+  return rs_serialize(desc, version, /*versioned=*/false, out_blob, out_err);
 }
 
 int TRT_GUEST_ABI trt_D3D12SerializeVersionedRootSignature(const void* desc,
                                                            void** out_blob,
                                                            void** out_err) {
-  if (out_err) *out_err = nullptr;
-  if (g_hooks.serialize_versioned_root_sig)
+  if (g_hooks.serialize_versioned_root_sig) {
+    if (out_err) *out_err = nullptr;
     return g_hooks.serialize_versioned_root_sig(desc, out_blob, out_err);
-  if (!desc || !out_blob) return k_e_invalidarg;
-  return trt_D3D12SerializeRootSignature(desc, *(const u32*)desc, out_blob, out_err);
+  }
+  return rs_serialize(desc, 0, /*versioned=*/true, out_blob, out_err);
 }
 
 int TRT_GUEST_ABI trt_D3D12CreateRootSignatureDeserializer(
     const void* src, u64 size, const void* riid, void** out_des) {
   if (g_hooks.create_root_deserializer)
     return g_hooks.create_root_deserializer(src, size, riid, out_des);
-  if (out_des) *out_des = nullptr;
-  if (!src || !size) return k_e_invalidarg;
-  trt_core_log("d3d12: CreateRootSignatureDeserializer -> E_NOTIMPL (offline)");
-  return k_e_notimpl;
+  return rs_create_deserializer(src, size, riid, /*versioned=*/false, out_des);
 }
 
 int TRT_GUEST_ABI trt_D3D12CreateVersionedRootSignatureDeserializer(
     const void* src, u64 size, const void* riid, void** out_des) {
   if (g_hooks.create_versioned_root_deserializer)
     return g_hooks.create_versioned_root_deserializer(src, size, riid, out_des);
-  if (out_des) *out_des = nullptr;
-  if (!src || !size) return k_e_invalidarg;
-  trt_core_log("d3d12: CreateVersionedRootSignatureDeserializer -> E_NOTIMPL (offline)");
-  return k_e_notimpl;
+  return rs_create_deserializer(src, size, riid, /*versioned=*/true, out_des);
 }
 
 int TRT_GUEST_ABI trt_D3D12GetInterface(const void* rclsid, const void* riid,

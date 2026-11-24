@@ -144,7 +144,7 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x01u, "timeBeginPeriod(1) accepted");
   CHECK(ret & 0x02u, "clock nondecreasing");
   CHECK(ret & 0x04u, "clock advances during spin");
-  CHECK(ret & 0x08u, "waveOutGetNumDevs -> 0 without crash");
+  CHECK(ret & 0x08u, "waveOutGetNumDevs -> 1 real output device");
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
   CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
 

@@ -1384,12 +1384,21 @@ static void spin_capture_stage_flush(u32 tid, const char** buf,
 // (xdata241.py) before deploying; if the scope is absent,
 // do NOT deploy -- fall back to a ReadProcessMemory stack
 // read instead.
-static __declspec(noinline) u64 spin_deref_qword(u64 addr) {
+// __declspec is MSVC-only; the Linux host compiles this file too (it builds
+// the same diagnostics for the desktop backend), so the attribute is spelled
+// per compiler rather than assumed.
+#if defined(_WIN32)
+#define TRT_THREAD_NOINLINE __declspec(noinline)
+#else
+#define TRT_THREAD_NOINLINE __attribute__((noinline))
+#endif
+
+static TRT_THREAD_NOINLINE u64 spin_deref_qword(u64 addr) {
   return *(const u64*)(uintptr_t)addr;
 }
 
-static __declspec(noinline) int spin_read_qword_guarded(u64 addr,
-                                                       u64* out) {
+static TRT_THREAD_NOINLINE int spin_read_qword_guarded(u64 addr,
+                                                      u64* out) {
 #if defined(_WIN32)
   int ok = 0;
   __try {
@@ -3141,7 +3150,9 @@ static std::atomic<const char*> g_d3d11_last_name{nullptr};
 static std::atomic<unsigned long long> g_d3d11_last_tick_ms{0};
 extern "C" void d3d11_note_last(const char* name) {
   g_d3d11_last_name.store(name, std::memory_order_relaxed);
-  g_d3d11_last_tick_ms.store((unsigned long long)GetTickCount64(),
+  // The bridge's own implementation, declared above; the bare Win32 name
+  // does not exist on the Linux host.
+  g_d3d11_last_tick_ms.store((unsigned long long)trt_GetTickCount64(),
                              std::memory_order_relaxed);
 }
 extern "C" void d3d11_last_call(const char** name_out,
@@ -3635,12 +3646,16 @@ extern "C" void trt_host_crash_addr(u64 addr, char* buf, size_t cap) {
     snprintf(buf, cap, "%s+0x%llx", nm, (unsigned long long)off);
     return;
   }
+#if defined(_WIN32)
+  // Host-crash attribution only exists on a Windows host; HMODULE and
+  // GetModuleHandleW have no Linux meaning.
   HMODULE exe = ::GetModuleHandleW(nullptr);
   if (exe && addr >= (u64)(uintptr_t)exe) {
     snprintf(buf, cap, "exe+0x%llx",
              (unsigned long long)(addr - (u64)(uintptr_t)exe));
     return;
   }
+#endif
   snprintf(buf, cap, "none");
 }
 

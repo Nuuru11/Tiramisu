@@ -17,6 +17,7 @@
 
 extern "C" u32 TRT_STDCALL trt_MapVirtualKeyW(u32 code, u32 type);
 extern "C" u32 trt_vk_to_char_ex(u32 vk, const u8* ks);
+extern "C" u64 trt_mem_budget_committed(void);
 
 namespace longan {
 
@@ -288,6 +289,16 @@ class native_gameinput {
           available ? state.buttons : 0u);
     }
     log_line(line);
+    // .211 DIAG: log the commit level at each input-read log so the
+    // post-input-init death can be attributed (memory climbing to the
+    // 5120MB cap vs a host crash vs a guest fault that never logs).
+    {
+      char mline[128];
+      std::snprintf(mline, sizeof(mline),
+          "input: mem committed=%lluMB budget=5120MB",
+          static_cast<unsigned long long>(trt_mem_budget_committed() / (1024ULL * 1024ULL)));
+      log_line(mline);
+    }
   }
 
   static void CALLBACK mouse_reading_callback(

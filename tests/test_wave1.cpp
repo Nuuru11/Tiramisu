@@ -785,11 +785,11 @@ int main() {
               vtbl_ok(s_stats) && vtbl_ok(s_unk),
           "All Steamworks interface singletons expose non-null safe vtables");
 
-    // Calling virtual slot on generic interface must not jump to NULL
-    using vt0_u64 = u64(TRT_GUEST_ABI*)(void*);
+    // Calling RequestCurrentStats (slot 0) on ISteamUserStats returns 1 cleanly
+    using vt0_i32 = int(TRT_GUEST_ABI*)(void*);
     const void* const* stats_vt = *(const void* const* const*)s_stats;
-    CHECK(((vt0_u64)stats_vt[0])(s_stats) == 0,
-          "Calling SteamUserStats vtable slot 0 returns safely without NULL deref");
+    CHECK(((vt0_i32)stats_vt[0])(s_stats) == 1,
+          "Calling SteamUserStats vtable slot 0 (RequestCurrentStats) returns 1 safely");
 
     // DRM / Ownership honesty preserved
     const void* const* apps_vt = *(const void* const* const*)s_apps;

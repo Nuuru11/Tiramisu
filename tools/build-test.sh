@@ -20,18 +20,21 @@ LLVM_DLLTOOL="$LLVM_BIN/llvm-dlltool"
 
 # --- 0. Precompile src/trt/*.cpp + miniz_tinfl.c in parallel into libtrt.a ---
 objdir="$out/trt_objs"
-rm -rf "$objdir" "$out/libtrt.a"
 mkdir -p "$objdir"
-printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-$(nproc)}" -I{} bash -c '
-  f="$1"
-  base="$(basename "$f" .cpp)"
-  clang++ -std=c++20 -O2 -Wall -fno-pie -Ithird_party/mono/usr/include/mono-2.0 -c "$f" -o "'"$objdir"'/${base}.o"
-' _ {}
-clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
-clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
-clang -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$objdir/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO
-clang -O2 -Wall -fno-pie -c src/trt/vendor_dr_mp3.c -o "$objdir/vendor_dr_mp3.o"
-ar rcs "$out/libtrt.a" "$objdir"/*.o
+if [[ -z "${SKIP_PRECOMPILE:-}" || ! -f "$out/libtrt.a" ]]; then
+  rm -rf "$objdir" "$out/libtrt.a"
+  mkdir -p "$objdir"
+  printf '%s\n' src/trt/*.cpp | xargs -P"${TRT_JOBS:-4}" -I{} bash -c '
+    f="$1"
+    base="$(basename "$f" .cpp)"
+    clang++ -std=c++20 -O2 -Wall -fno-pie -Ithird_party/mono/usr/include/mono-2.0 -c "$f" -o "'"$objdir"'/${base}.o"
+  ' _ {}
+  clang -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$objdir/miniz_tinfl.o"
+  clang -std=gnu11 -O2 -fno-pie -c src/trt/mojo_hlsl.c -o "$objdir/mojo_hlsl.o"
+  clang -O2 -Wall -fno-pie -c src/trt/vendor_stb_vorbis.c -o "$objdir/vendor_stb_vorbis.o" -DSTB_VORBIS_NO_STDIO
+  clang -O2 -Wall -fno-pie -c src/trt/vendor_dr_mp3.c -o "$objdir/vendor_dr_mp3.o"
+  ar rcs "$out/libtrt.a" "$objdir"/*.o
+fi
 
 # --- 1. import library for the guest (tiramisu_host.dll) ---
 rm -f "$out/tiramisu_host.lib"
@@ -744,6 +747,14 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   -o "$out/test_settings"
 "$out/test_settings"
 
+# --- 34b. Settings linkage: the bridges' weak extern "C" hooks must resolve
+#          to settings.cpp and forward the stored values (they used to stay
+#          null because the getters were namespace-scoped) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_settings_linkage.cpp src/host/settings.cpp \
+  -o "$out/test_settings_linkage"
+"$out/test_settings_linkage"
+
 # --- 35. PE resource directory: .rsrc walk + FindResource/LoadResource/
 #         LockResource/SizeofResource/LoadStringW/EnumResourceNamesW ---
 bash tools/build_guest_res.sh
@@ -818,6 +829,15 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_membudget.cpp "$out/libtrt.a" -lpthread \
   -o "$out/test_membudget"
 "$out/test_membudget"
+
+# --- 41b. file-backed read-only views: MapViewOfFile over a real archive
+#          maps the page cache (address space, NOT the 5 GB commit ledger) so
+#          the SSD and RAM overlap; write/COW views, views past EOF and
+#          TRT_MAP_MODE=copy keep the private-copy path ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_mem_mapfile.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_mem_mapfile"
+"$out/test_mem_mapfile"
 
 # --- 42. async file-I/O contract: overlapped read -> GQCS packet, the
 #         FILE_SKIP_COMPLETION_PORT_ON_SUCCESS flag honored (no packet),
@@ -956,3 +976,86 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
   tests/test_crash_report.cpp src/host/crash_report.cpp \
   -o "$out/test_crash_report"
 "$out/test_crash_report"
+
+# --- 50. ABI conformance ratchet: every claimed BUILTIN symbol must answer the
+#         x86 dispatcher's argument-count question. A symbol without an entry
+#         is a silent stack corruption, not a missing feature. The gap set is
+#         compared with tests/abi-gaps.baseline and may only shrink. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_conformance.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_conformance"
+"$out/test_conformance"
+
+# --- 51. waveOut is a REAL device: enumerable, readable caps, PCM-only open,
+#         and write/prepare/position honour the WAVEHDR contract ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_waveout.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_waveout"
+"$out/test_waveout"
+
+# --- 52. msacm32 decodes: hand-computed IMA/MS-ADPCM and u-law/A-law vectors,
+#         PCM format conversion, and the ACMSTREAMHEADER prepare/convert/close
+#         contract (it used to answer NOTPOSSIBLE for everything but PCM) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_acm.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_acm"
+"$out/test_acm"
+
+# --- 53. waveIn is a REAL capture device: enumerable, readable caps, PCM-only
+#         open, and addBuffer returns a completed WAVEHDR with recorded bytes
+#         (it used to report zero devices, which disabled voice capture) ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_wavein.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_wavein"
+"$out/test_wavein"
+
+# --- 54. D3D12 root-signature round trip: the serializers must carry the real
+#         layout (parameters, descriptor ranges, static samplers, flags), the
+#         deserializers must hand it back at 1.0 and 1.1, and
+#         CreateRootSignature must be able to see it. They used to return S_OK
+#         with an empty container and E_NOTIMPL respectively. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_d3d12_rootsig.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_d3d12_rootsig"
+"$out/test_d3d12_rootsig"
+
+# --- 55. Media Foundation objects and the Steam lifecycle are REAL, and the
+#         classifier says so exactly where it is true: the attribute store,
+#         buffer and sample return what was set on them, a registered Steam
+#         callback really runs and really stops when unregistered, the call
+#         result table holds and drops entries, and the surfaces that are still
+#         empty (SteamMatchmaking/Networking/UserStats, MFShutdown, the source
+#         reader, shell32 icon extraction) stay named-silent. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_mf_steam_impl.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_mf_steam_impl"
+"$out/test_mf_steam_impl"
+
+# --- 56. The ordinal imports the corpus actually uses bind and are
+#         classifiable, and the two mis-mapped oleaut32 ordinals behave:
+#         ordinal 12 is VariantChangeType (it used to clear the destination
+#         and never convert) and ordinal 15 is SafeArrayCreate (it used to
+#         read three scalars where the caller passes one bounds pointer). ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_ordinal_binds.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_ordinal_binds"
+"$out/test_ordinal_binds"
+
+# --- 57. Multimedia timers are REAL: timeSetEvent runs a thread that fires the
+#         guest callback (or sets the caller's event) at the requested interval,
+#         TIME_ONESHOT fires once, TIME_PERIODIC repeats until timeKillEvent
+#         joins it, and an unknown id answers TIMERR_NOCANDO. It used to return
+#         0 ("no timer exists") for every request. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_winmm_timer.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_winmm_timer"
+"$out/test_winmm_timer"
+
+# --- 58. WINMM MIDI virtual synthesizer is REAL: midiOutGetNumDevs reports 1
+#         virtual synthesizer device, DevCapsW/A describe the device, and
+#         open/close/shortMsg/longMsg/volume control all succeed with standard
+#         WinMM semantics. ---
+clang++ -std=c++20 -O2 -Wall -no-pie \
+  tests/test_winmm_midi.cpp "$out/libtrt.a" -lpthread \
+  -o "$out/test_winmm_midi"
+"$out/test_winmm_midi"

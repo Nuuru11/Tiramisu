@@ -4,7 +4,7 @@
 //   0x01 timeBeginPeriod(1) accepted
 //   0x02 clock nondecreasing
 //   0x04 clock advances (within a busy-spin window)
-//   0x08 waveOutGetNumDevs answers 0 without crashing
+//   0x08 waveOutGetNumDevs answers 1 (one real output device)
 //   0x10 timeGetDevCaps returns sane min/max
 //   0x20 mciSendStringW fails visibly (263), no crash
 typedef unsigned int u32;
@@ -44,7 +44,7 @@ u32 GSTD guest_winmm_main(u64 a, u64 b, u64 c) {
   if (t1 > t0) bits |= 0x04u;
 
   // 3. legacy device probes answer without crashing
-  if (waveOutGetNumDevs() == 0) bits |= 0x08u;
+  if (waveOutGetNumDevs() == 1) bits |= 0x08u;
 
   // 4. TIMECAPS sane
   u32 caps[2] = {0, 0};

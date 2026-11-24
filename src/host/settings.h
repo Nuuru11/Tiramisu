@@ -16,6 +16,13 @@ namespace longan {
 struct host_settings {
   // ---- game defaults ----
   std::string default_input = "auto";  // auto | controller | kbm | pad2kbm
+  // Per-title launch arguments (also settable in a per-title profile file).
+  // A game-shipped tiramisu_args.txt still wins over both.
+  std::string launch_args;
+  // Comma-separated host services a title expects ("xinput,wasapi,steam").
+  // A title that needs one we do not have should say so in the log before it
+  // fails somewhere confusing; a typo in the list is caught the same way.
+  std::string required_services;
   int mouse_speed = 50;                // gamepad-as-mouse speed, 1..100
   int wheel_speed = 50;                // pad dpad wheel speed, 1..100
   bool pad_vibration = true;           // let guests rumble the pad
@@ -59,10 +66,29 @@ struct host_settings {
 // Load from <local_state>\settings.ini (missing file = defaults) and store
 // as the live settings. Returns the applied-key count.
 int settings_load(const std::string& local_state);
+// Apply TIRAMISU_<KEY> environment overrides on top of whatever is loaded
+// (for a launcher that needs one knob changed for a single run). Returns the
+// number of overrides applied. Values go through the same validation as the
+// ini, so a bad env value clamps instead of poisoning the session.
+int settings_apply_env();
 // Load a per-game profile from <game_dir>/tiramisu.profile.ini and apply
 // overrides on top of the live settings. Returns applied-key count (0 if
 // no profile file). Unknown keys are ignored (never fatal).
-int settings_load_profile(const std::string& game_dir);
+// When the game folder has no profile, <fallback_dir>/tiramisu.profile.ini is
+// used instead (the writable per-title store), so a title can be tuned on the
+// console without touching a read-only game folder.
+int settings_load_profile(const std::string& game_dir,
+                          const std::string& fallback_dir = "");
+// Write a commented starter profile to <dir>/tiramisu.profile.ini, creating
+// <dir> if needed. An existing file is never touched. Returns 1 when written,
+// 0 when one was already there, -1 on I/O failure.
+int settings_write_profile_stub(const std::string& dir,
+                                const std::string& title);
+// Which ids in a comma-separated required_services list this host does not
+// recognise. Returns the count and fills unknown with them (empty when all
+// are known). Pure: used by the host log line and by the offline tests.
+int settings_unknown_services(const std::string& list,
+                              std::string* unknown = nullptr);
 // Replace the live settings (clamped to valid ranges) and persist.
 void settings_store(const host_settings& s, const std::string& local_state);
 host_settings settings_get();
@@ -92,6 +118,12 @@ bool trt_settings_shader_cache();
 int trt_settings_audio_buffer_ms();
 int trt_settings_input_deadzone();
 int trt_settings_texture_quality();
+// Directory for the persistent SPIR-V->HLSL cache (<LocalState>\cache\shaders).
+// C linkage so the bridge can take it as a weak symbol.
+extern "C" const char* trt_settings_shader_cache_dir();
+// Texture quality tier (0=low .. 3=ultra) for the D3D12 sampler policy. C
+// linkage for the same weak-symbol reason as the cache directory above.
+extern "C" int trt_settings_texture_quality_int();
 
 } // namespace longan
 

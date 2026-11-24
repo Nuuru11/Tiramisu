@@ -333,8 +333,76 @@ int main(int argc, char** argv) {
     CHECK(caps && caps(hdc, 8) == 1920 && caps(hdc, 10) == 1080 &&
               caps(hdc, 12) == 32 && caps(hdc, 14) == 1,
           "GetDeviceCaps HORZRES/VERTRES/BITSPIXEL/PLANES plausible");
+
+    using fn_otm = u32(TRT_GUEST_ABI*)(void*, u32, void*);
+    const fn_otm otm_fn = (fn_otm)resolve_gdi("GetOutlineTextMetricsW");
+    CHECK(otm_fn != nullptr, "gdi32!GetOutlineTextMetricsW resolves");
+    if (otm_fn) {
+      CHECK(otm_fn(hdc, 0, nullptr) == 216,
+            "GetOutlineTextMetricsW(0, NULL) queries required size (216)");
+      u8 otm_buf[256] = {};
+      CHECK(otm_fn(hdc, 216, otm_buf) == 216,
+            "GetOutlineTextMetricsW fills buffer");
+      CHECK(*(u32*)otm_buf == 216,
+            "GetOutlineTextMetricsW sets otmSize");
+      CHECK(otm_fn(hdc, 2, otm_buf) == 0,
+            "GetOutlineTextMetricsW refuses buffer smaller than 4 bytes");
+    }
+
     CHECK(releasedc(nullptr, hdc) == 1, "gdi32!ReleaseDC released the window DC");
     CHECK(deldc(memdc) == 1, "DeleteDC released the memory DC");
+
+    // ---- Palettes & DIB color tables (former gaps -> real state) ---------
+    {
+      using fn_crpal = void*(TRT_GUEST_ABI*)(const void*);
+      using fn_selpal = void*(TRT_GUEST_ABI*)(void*, void*, int);
+      using fn_realpal = u32(TRT_GUEST_ABI*)(void*);
+      using fn_palent = u32(TRT_GUEST_ABI*)(void*, u32, u32, void*);
+      using fn_dibct = u32(TRT_GUEST_ABI*)(void*, u32, u32, const void*);
+      using fn_getdibct = u32(TRT_GUEST_ABI*)(void*, u32, u32, void*);
+      using fn_crdib = void*(TRT_GUEST_ABI*)(void*, const void*, u32, void**, void*, u32);
+      auto p_crpal = (fn_crpal)resolve_gdi("CreatePalette");
+      auto p_selpal = (fn_selpal)resolve_gdi("SelectPalette");
+      auto p_realpal = (fn_realpal)resolve_gdi("RealizePalette");
+      auto p_getent = (fn_palent)resolve_gdi("GetPaletteEntries");
+      auto p_setdibct = (fn_dibct)resolve_gdi("SetDIBColorTable");
+      auto p_getdibct = (fn_getdibct)resolve_gdi("GetDIBColorTable");
+      auto p_crdib = (fn_crdib)resolve_gdi("CreateDIBSection");
+      CHECK(p_crpal && p_selpal && p_realpal && p_setdibct, "palette + DIB color table exports resolve");
+      if (p_crpal && p_selpal && p_realpal && p_getent && p_setdibct && p_getdibct && p_crdib) {
+        u8 logpal[4 + 2 * 4] = {};
+        *(u16*)(logpal + 0) = 0x0300;
+        *(u16*)(logpal + 2) = 2;
+        *(u32*)(logpal + 4) = 0x00FF0000u;
+        *(u32*)(logpal + 8) = 0x0000FF00u;
+        void* hpal = p_crpal(logpal);
+        CHECK(hpal != nullptr, "CreatePalette returns real HPALETTE handle");
+        u32 entries[2] = {};
+        CHECK(p_getent(hpal, 0, 2, entries) == 2 && entries[0] == 0x00FF0000u,
+              "GetPaletteEntries reads stored entries");
+        void* pdc = ccdc(nullptr);
+        void* prev = p_selpal(pdc, hpal, 0);
+        CHECK(prev != nullptr && p_realpal(pdc) == 2,
+              "SelectPalette + RealizePalette reports 2 realized entries");
+        u8 bmi[40] = {};
+        *(u32*)(bmi + 0) = 40;
+        *(i32*)(bmi + 4) = 8;
+        *(i32*)(bmi + 8) = 8;
+        *(u16*)(bmi + 12) = 1;
+        *(u16*)(bmi + 14) = 8;
+        void* dib = p_crdib(pdc, bmi, 0, nullptr, nullptr, 0);
+        selobj(pdc, dib);
+        u32 ct_in[2] = {0x11223344u, 0x55667788u};
+        u32 ct_out[2] = {};
+        CHECK(p_setdibct(pdc, 0, 2, ct_in) == 2 && p_getdibct(pdc, 0, 2, ct_out) == 2 &&
+                  ct_out[1] == 0x55667788u,
+              "SetDIBColorTable/GetDIBColorTable round-trips");
+        deldc(pdc);
+        const fn_delobj del = (fn_delobj)resolve_gdi("DeleteObject");
+        if (del) { del(dib); del(hpal); }
+      }
+    }
+
     const fn_delobj delobj2 = (fn_delobj)resolve_gdi("DeleteObject");
     if (delobj2) delobj2(hbmp);  // free the compatible bitmap record
   } else {

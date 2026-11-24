@@ -21,6 +21,7 @@ extern "C" int x86_arg_count(const char* module, const char* symbol);
 extern "C" int trt_pe32_is_trap(uint32_t guest_va);
 extern "C" uint32_t trt_pe32_bind_dynamic(const char* module, const char* symbol,
                                           uint32_t ordinal, void* host_fn);
+extern "C" void x86_set_hotloop_limit(uint64_t limit);
 
 static void put_cstr(x86_context* ctx, uint32_t addr, const char* s) {
     do { x86_mem_write8(ctx, addr++, (uint8_t)*s); } while (*s++);
@@ -90,6 +91,24 @@ int main() {
         CHECK((ctx.regs.edx & (1u << 25)) != 0, "SSE feature bit");
         CHECK((ctx.regs.edx & (1u << 26)) != 0, "SSE2 feature bit");
         CHECK((ctx.regs.edx & (1u << 23)) != 0, "MMX feature bit");
+    }
+
+    printf("== XCHG [mem], reg (0x87 with a memory operand) ==\n");
+    {
+        x86_mem_write32(&ctx, 0x10400, 0x11223344u);
+        ctx.regs.ecx = 0x10400;
+        ctx.regs.eax = 0xAABBCCDDu;
+        const uint8_t code[] = {0x87, 0x01}; // xchg dword [ecx], eax
+        put(&ctx, 0x10000, code, sizeof(code));
+        ctx.regs.eip = 0x10000;
+        int rc = x86_step(&ctx);
+        CHECK(rc == 0, "xchg [mem],reg executes");
+        CHECK(ctx.regs.eax == 0x11223344u,
+              "register receives the old memory value");
+        CHECK(x86_mem_read32(&ctx, 0x10400) == 0xAABBCCDDu,
+              "memory receives the register value");
+        CHECK(ctx.regs.eip == 0x10002,
+              "EIP advances past the whole instruction");
     }
 
     printf("== RDTSC ==\n");
@@ -315,6 +334,64 @@ int main() {
         uint32_t r = x86_dispatch_import(&ctx, -1, "kernel32", "InterlockedIncrement", &nargs, &cdecl_call);
         CHECK(r == 42, "returns incremented value");
         CHECK(x86_mem_read32(&ctx, 0x00060000) == 42, "memory updated");
+    }
+
+    printf("== import dispatch: VirtualQuery / VirtualProtect ==\n");
+    {
+        x86_mem_commit(&ctx, 0x00061000, 0x1000);
+        ctx.regs.esp = 0x0010E000;
+        x86_mem_write32(&ctx, ctx.regs.esp, 0xDEADBEEF);
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 0x00061000);
+        x86_mem_write32(&ctx, ctx.regs.esp + 8, 0x00062000);
+        x86_mem_write32(&ctx, ctx.regs.esp + 12, 28);
+        int nargs = 0, cdecl_call = 0;
+        uint32_t r = x86_dispatch_import(&ctx, -1, "kernel32", "VirtualQuery",
+                                         &nargs, &cdecl_call);
+        CHECK(r == 28, "VirtualQuery returns 28 (sizeof MBI32)");
+        CHECK(nargs == 3, "VirtualQuery takes 3 args");
+        CHECK(x86_mem_read32(&ctx, 0x00062000) == 0x00061000u,
+              "MBI.BaseAddress is page-aligned");
+        CHECK(x86_mem_read32(&ctx, 0x00062000 + 16) == 0x1000u,
+              "MBI.State == MEM_COMMIT");
+
+        ctx.regs.esp = 0x0010E000;
+        x86_mem_write32(&ctx, ctx.regs.esp, 0xDEADBEEF);
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 0x00061000);
+        x86_mem_write32(&ctx, ctx.regs.esp + 8, 0x1000);
+        x86_mem_write32(&ctx, ctx.regs.esp + 12, 0x40);
+        x86_mem_write32(&ctx, ctx.regs.esp + 16, 0x00062100);
+        nargs = 0; cdecl_call = 0;
+        uint32_t old_prot = 0;
+        r = x86_dispatch_import(&ctx, -1, "kernel32", "VirtualProtect",
+                                &nargs, &cdecl_call);
+        CHECK(r == 1, "VirtualProtect reports success");
+        CHECK(nargs == 4, "VirtualProtect takes 4 args");
+        CHECK(x86_mem_read32(&ctx, 0x00062100) != 0,
+              "VirtualProtect writes the old protect value");
+    }
+
+    printf("== import dispatch: GetSystemInfo / IsThreadAFiber ==\n");
+    {
+        x86_mem_commit(&ctx, 0x00063000, 0x1000);
+        ctx.regs.esp = 0x0010E000;
+        x86_mem_write32(&ctx, ctx.regs.esp, 0xDEADBEEF);
+        x86_mem_write32(&ctx, ctx.regs.esp + 4, 0x00063000); // LPSYSTEM_INFO
+        int nargs = 0, cdecl_call = 0;
+        uint32_t r = x86_dispatch_import(&ctx, -1, "kernel32", "GetSystemInfo",
+                                         &nargs, &cdecl_call);
+        CHECK(r == 0, "GetSystemInfo returns void (0)");
+        CHECK(nargs == 1, "GetSystemInfo takes 1 arg");
+        CHECK(x86_mem_read32(&ctx, 0x00063000 + 4) == 4096, "dwPageSize == 4096");
+        CHECK(x86_mem_read32(&ctx, 0x00063000 + 20) == 8, "dwNumberOfProcessors == 8");
+
+        trt_modules_register_defaults();
+        trt_bridge_register_kernel32();
+        ctx.regs.esp = 0x0010E000;
+        x86_mem_write32(&ctx, ctx.regs.esp, 0xDEADBEEF);
+        nargs = -1; cdecl_call = -1;
+        r = x86_dispatch_import(&ctx, -1, "kernel32", "IsThreadAFiber",
+                                &nargs, &cdecl_call);
+        CHECK(nargs == 0, "IsThreadAFiber takes 0 args");
     }
 
     printf("== 32-bit runtime loader: LoadLibrary -> GetProcAddress -> CALL ==\n");
@@ -671,6 +748,76 @@ int main() {
         CHECK(jit_ms < interp_ms, "recompiler is faster than the interpreter");
         x86_mem_free(&a);
         x86_mem_free(&b);
+    }
+
+    // ==================================================================
+    // Hot-loop probe: a spinning guest names its own window
+    // ==================================================================
+    printf("== HOT LOOP: `jmp $` is reported by name, not silently capped ==\n");
+    {
+        static char hot_log[4096];
+        hot_log[0] = 0;
+        x86_set_hotloop_limit(20000);
+        x86_context c = {};
+        x86_cpu_init(&c);
+        c.log = [](const char* s) {
+            const size_t used = strlen(hot_log);
+            if (used + 2 < sizeof(hot_log))
+                snprintf(hot_log + used, sizeof(hot_log) - used, "%s\n", s);
+        };
+        x86_mem_commit(&c, 0x10000, 0x1000);
+        x86_mem_commit(&c, 0x100000, 0x10000);
+        const uint8_t spin[] = {0xEB, 0xFE};  // jmp $ (2-byte self jump)
+        memcpy(c.mem.base + 0x10000, spin, sizeof(spin));
+        c.regs.esp = 0x0010F000;
+        c.regs.ebp = c.regs.esp;
+        c.regs.eip = 0x10000;
+        c.jit_enabled = 0;
+        c.insn_limit = 300000;
+        x86_run(&c);
+        CHECK(strstr(hot_log, "HOT LOOP") != NULL,
+              "stalled window logged by name");
+        CHECK(strstr(hot_log, "0x00010000..0x00010000") != NULL,
+              "reported window is the spin address");
+        CHECK(c.regs.eip == 0x10000, "probe never moves the guest");
+        x86_mem_free(&c);
+        x86_set_hotloop_limit(20000000);
+    }
+
+    // ==================================================================
+    // EIP profile: the instruction budget's top regions are named
+    // ==================================================================
+    printf("== EIP PROFILE: a spinning region is named after a long run ==\n");
+    {
+        static char prof_log[4096];
+        prof_log[0] = 0;
+        x86_set_hotloop_limit(0);  // profile only, no hot-loop line
+        x86_context c = {};
+        x86_cpu_init(&c);
+        c.log = [](const char* s) {
+            const size_t used = strlen(prof_log);
+            if (used + 2 < sizeof(prof_log))
+                snprintf(prof_log + used, sizeof(prof_log) - used, "%s\n", s);
+        };
+        x86_mem_commit(&c, 0x10000, 0x1000);
+        x86_mem_commit(&c, 0x100000, 0x10000);
+        const uint8_t spin[] = {0xEB, 0xFE};  // jmp $
+        memcpy(c.mem.base + 0x10000, spin, sizeof(spin));
+        c.regs.esp = 0x0010F000;
+        c.regs.ebp = c.regs.esp;
+        c.regs.eip = 0x10000;
+        c.jit_enabled = 0;
+        c.insn_limit = 1200000;
+        x86_run(&c);
+        CHECK(strstr(prof_log, "eip profile") != NULL,
+              "instruction budget is profiled");
+        CHECK(strstr(prof_log, "0x00010000..0x0001FFFF") != NULL,
+              "hottest region named (0x00010000)");
+        CHECK(strstr(prof_log, "hot instructions:") != NULL &&
+                  strstr(prof_log, "0x00010000") != NULL,
+              "hottest individual instruction named");
+        x86_mem_free(&c);
+        x86_set_hotloop_limit(20000000);
     }
 
     // ==================================================================

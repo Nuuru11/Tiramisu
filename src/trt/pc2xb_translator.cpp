@@ -3,7 +3,13 @@
 
 #include <stdio.h>
 #include <string.h>
-#include <strings.h>
+#ifdef _WIN32
+#  ifndef strcasecmp
+#    define strcasecmp _stricmp
+#  endif
+#else
+#  include <strings.h>
+#endif
 #include <string>
 
 namespace {
