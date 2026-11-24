@@ -11,8 +11,7 @@ on it. No coding needed.
 - The Xbox and your phone/computer on the **same Wi-Fi**.
 - A Microsoft account (for Dev Mode activation).
 - A browser (Edge, Chrome, or Safari).
-- About $19 (one time) for a Microsoft Partner Center developer account —
-  required to turn on Dev Mode.
+- A free Microsoft Partner Center developer account (Individual accounts are free — no fee to turn on Dev Mode).
 
 ## Step 1 — Turn on Developer Mode
 
@@ -21,7 +20,7 @@ on it. No coding needed.
 2. Open the app. It shows an **activation code** — write it down.
 3. On your phone or computer, register a developer account at Partner Center:
    <https://developer.microsoft.com/en-us/microsoft-store/register/>
-   (one-time fee, about $19 for an individual account).
+   (Individual accounts are free.)
 4. In Partner Center, go to **Xbox configuration → Devices**
    (<https://partner.microsoft.com/xboxconfig/devices>), enter the activation
    code, and click **Agree and activate**.
