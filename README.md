@@ -4,7 +4,7 @@
 
 # Tiramisu UWP
 
-### Run PC games on Xbox Series X|S — natively.
+### Run PC games on Xbox Series X|S & Xbox One / One S / One X — natively.
 
 **A Windows PE64 application runtime for Xbox Dev Mode.**
 Wine's job, targeting UWP instead of POSIX.
@@ -12,7 +12,7 @@ Wine's job, targeting UWP instead of POSIX.
 ![Status](https://img.shields.io/badge/status-RACCOIN%20playable%20%7C%20God%20of%20War%20renders%20%7C%20Celeste%20playable-brightgreen)
 ![Suites](https://img.shields.io/badge/offline%20suites-78-blue)
 ![Coverage](https://img.shields.io/badge/corpus%20imports-100%25%20real-brightgreen)
-![Platform](https://img.shields.io/badge/platform-Xbox%20Series%20X%20%7C%20S-107C10?logo=xbox&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Xbox%20One%20%7C%20One%20S%20%7C%20One%20X%20%7C%20Series%20X%7CS-107C10?logo=xbox&logoColor=white)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DRM](https://img.shields.io/badge/DRM%20bypass-none%2C%20ever-red)
 
@@ -27,7 +27,7 @@ Wine's job, targeting UWP instead of POSIX.
 > - **64-bit (`x64` PE32+) Windows games only.** 32-bit `x86` games, kernel anti-cheat (EasyAntiCheat/BattlEye), Xbox GDK/GameOS packages (for example a `MicrosoftGame.Config` + `gameos.xvd` console build), and heavy desktop productivity suites (After Effects, DaVinci Resolve) are **not** supported yet.
 > - **APIs today:** D3D11, D3D9/D3D8, Vulkan (via SPIR-V→HLSL→D3D11), and OpenGL. **D3D12 execution, Bink video cutscenes, and Wwise audio** are still incomplete/experimental.
 > - **Celeste v1.4.0.0 is playable but silent.** FSB5 Vorbis decode is disabled on console after it heap-corrupted on a Series S; `fsb_decode=1` is test-only. See [known issues](docs/known-issues.md).
-> - **Things not supported on Xbox One S|X** (in principle possible to sideload, but untested): see [docs/known-issues.md — “Xbox One S/X”](docs/known-issues.md#xbox-one-sx).
+> - **Full Xbox One Family Support:** Native profiling, 32 MB ESRAM acceleration, and 5 GB Dev Mode game memory headroom are fully supported across Original Xbox One (Durango), Xbox One S (Edmonton), and Xbox One X (Scorpio). See [docs/xbox-one-family.md](docs/xbox-one-family.md).
 > - **Set Dev Home to Game mode (5 GB RAM)** and **back up your saves** via the LAN dashboard (`Saves & Support → Backup Saves (.zip)`) before uninstalling or updating Tiramisu — Xbox Dev Mode wipes `LocalState` on uninstall.
 
 ---
@@ -846,3 +846,9 @@ the cake.
 ⭐ Star this repo if you like native-speed PC games on Series X|S.
 
 </div>
+
+---
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=xanstomper%2Ftiramisu&type=Date)](https://star-history.com/#xanstomper/Tiramisu&Date)
