@@ -10,7 +10,7 @@ This guide is for someone who has never used Developer Mode before.
 
 ## Step 1 — Put the Xbox in Developer Mode
 
-1. On the Xbox, open the **Microsoft Store** and install the app called **Xbox Dev Mode**.
+1. On the Xbox, open the **Microsoft Store** and install the app called **Dev Mode** (some people call it Xbox Dev Mode).
 2. Open it and sign in with a Microsoft account.
 3. Choose **Switch to Dev Mode**. The Xbox will restart.
 4. After the restart, open **Dev Home**. This is your new home screen while in Dev Mode.
@@ -50,14 +50,21 @@ Keep them together in the same folder.
    Tap **Advanced** → **Continue** (or **Proceed anyway**).
 4. Sign in with the same account you used in Dev Home, if it asks.
 
-## Step 6 — Trust the certificate, then install
+## Step 6 — Add the certificate and the app
 
 1. On the website, go to **My games & apps** → **Add**.
-2. If it asks for a certificate, choose **`dev.cer`**.
-   (If there is no certificate box, look for **Certificate** or **Manage certificates** on the site and install `dev.cer` there.)
-3. Now choose **`Tiramisu.msix`** as the app.
-4. **Important:** do not put `dev.cer` in the Dependencies box. Only the `.msix` is the app.
-5. Wait until the website says the install finished.
+2. You will see separate file boxes:
+   - **App package** (or "Package") — choose **`Tiramisu.msix`**.
+   - **Dependencies** — leave this **empty**.
+   - **Certificate** — choose **`dev.cer`**.
+3. Click **Add** and wait until the page says the install finished.
+
+If your Xbox does not show a Certificate box, install `dev.cer` first from
+**Dev Home → My games & apps → Certificates** (or the Device Portal's
+certificate page), then come back and add only `Tiramisu.msix`.
+
+**Remember:** `dev.cer` goes in the **Certificate** box. It is not a dependency
+and it is not the app.
 
 ## Step 7 — Launch Tiramisu
 
