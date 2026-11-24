@@ -8,6 +8,7 @@
 #include "../trt/engine_synthesizer.h"
 #include "../trt/pc2xb_translator.h"
 #include "vendor/miniz.h"
+#include "../../third_party/zstd.h"
 
 #include <windows.h>
 #include <bcrypt.h>
@@ -759,10 +760,58 @@ bool lzma1_decode_raw(const uint8_t props[5], const uint8_t* src, size_t src_len
 bool decompress_steam_payload(const uint8_t* raw, size_t len,
                               uint32_t expected_size,
                               std::vector<uint8_t>* out, std::string* err) {
-  if (len >= 4 && raw[0] == 'V' && raw[1] == 'S' && raw[2] == 'Z' &&
+  if (len >= 23 && raw[0] == 'V' && raw[1] == 'S' && raw[2] == 'Z' &&
       raw[3] == 'a') {
-    if (err) *err = "unsupported Steam chunk codec VSZa (zstd not bundled on Xbox)";
-    return false;
+    // Valve VZstd container (SteamKit VZstdUtil):
+    //   header: "VSZa" + CRC32 (4 bytes)
+    //   body:   standard zstd frame
+    //   footer: CRC32 (4), decompressed size (4), 4 unknown bytes, "zsv" (3)
+    // The body is NOT just the bytes after the magic; the header CRC and the
+    // 15-byte footer must be stripped before calling zstd.
+    if (raw[len - 3] != 'z' || raw[len - 2] != 's' || raw[len - 1] != 'v') {
+      if (err) *err = "VSZa footer missing zsv";
+      return false;
+    }
+    const uint32_t footer_size =
+        (uint32_t)raw[len - 11] | ((uint32_t)raw[len - 10] << 8) |
+        ((uint32_t)raw[len - 9] << 16) | ((uint32_t)raw[len - 8] << 24);
+    if (expected_size != 0 && footer_size != expected_size) {
+      if (err) *err = "VSZa size " + std::to_string(footer_size) +
+                      " does not match manifest " +
+                      std::to_string(expected_size);
+      return false;
+    }
+
+    unsigned long long need = expected_size ? expected_size : footer_size;
+    const uint8_t* frame = raw + 8;
+    const size_t frame_len = len - 8 - 15;
+    if (need == 0) {
+      need = ZSTD_getFrameContentSize(frame, frame_len);
+      if (need == ZSTD_CONTENTSIZE_ERROR || need == ZSTD_CONTENTSIZE_UNKNOWN) {
+        if (err) *err = "VSZa frame size unknown";
+        return false;
+      }
+    }
+    if (need > (unsigned long long)64 * 1024 * 1024) {
+      if (err) *err = "VSZa frame too large";
+      return false;
+    }
+    out->resize((size_t)need);
+    size_t written = ZSTD_decompress(out->data(), out->size(), frame, frame_len);
+    if (ZSTD_isError(written)) {
+      if (err) *err = std::string("VSZa zstd error: ") +
+                      ZSTD_getErrorName(written);
+      out->clear();
+      return false;
+    }
+    if (footer_size != 0 && written != footer_size) {
+      if (err) *err = "VSZa decompressed to " + std::to_string(written) +
+                      ", footer says " + std::to_string(footer_size);
+      out->clear();
+      return false;
+    }
+    out->resize(written);
+    return true;
   }
   if (len >= 2 && raw[0] == 'P' && raw[1] == 'K') {
     mz_zip_archive za{};

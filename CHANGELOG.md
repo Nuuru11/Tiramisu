@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.4.12] — Steam Zstd chunks
+- **Zstd-compressed Steam depot chunks now decode on Xbox.** The downloader
+  understands Valve's `VSZa` container (8-byte magic + CRC header, inner Zstd
+  frame, 15-byte `zsv` footer) and links the bundled decoder-only Zstandard
+  1.5.6 library, so no external DLL is needed. This fixes newer depots that
+  previously stopped with `unsupported Steam chunk codec VSZa (zstd not
+  bundled on Xbox)`, including Bloons TD Battles and Terraria (both verified
+  live) and BAPBAP.
+- **Verified live on 0.2.4.12:** Bloons TD Battles (98.9 MB) and Terraria
+  (766.7 MB) both downloaded through the `VSZa` path and reached `Ready to
+  Play`; both had stopped at the first Zstd chunk on 0.2.4.11.
+- The existing LZMA `VZa`, PKZip, and uncompressed chunk paths are unchanged.
+- Added `docs/xbox-one-family.md`: hardware/API support map and acceptance
+  matrix for Xbox One, One S and One X (untested targets).
+
 ## [0.2.4.11] — console verification
 - **Steam depot download now works on Xbox Series S (live hardware proof).**
   HoloCure - Save the Fans! (app 2420510, depot 2420511) downloaded

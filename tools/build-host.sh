@@ -128,7 +128,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/host/vendor/miniz.c src/host/vendor/miniz_tdef.c \
   src/host/vendor/miniz_tinfl.c src/host/vendor/miniz_zip.c \
   src/host/vendor/qrcodegen.c src/trt/mojo_hlsl.c src/trt/vendor_stb_vorbis.c \
-  src/trt/vendor_dr_mp3.c \
+  src/trt/vendor_dr_mp3.c third_party/zstddeclib.c \
   --link-arg d3d11.lib --link-arg d3d12.lib --link-arg dxgi.lib --link-arg xinput.lib \
   --link-arg d3dcompiler.lib --link-arg xaudio2_8.lib --link-arg ws2_32.lib \
   --link-arg mfplat.lib --link-arg mfreadwrite.lib --link-arg mfuuid.lib \

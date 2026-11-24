@@ -5,6 +5,7 @@ Vendored, with licenses preserved in their directories:
 | Component | Where | License | Why |
 |---|---|---|---|
 | miniz | `src/host/vendor/` | MIT | PNG inflate, zip (phone transfer) |
+| Zstandard | `third_party/zstd.h`, `third_party/zstddeclib.c` | BSD-3-Clause | Decoder-only Zstd 1.5.6 for Steam `VSZa` depot chunks |
 | stb_image | `src/host/vendor/stb_image.h` | public domain / MIT | image-format fallback loader |
 | mojoshader | `third_party/mojoshader` | zlib | GLSL → HLSL translation |
 | d3d8to9 | `third_party/d3d8to9` | MIT | D3D8 semantics reference for the d3d8 bridge |

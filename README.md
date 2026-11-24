@@ -791,6 +791,7 @@ failure is a red gate, never a skipped test.
 | [docs/support-matrix.md](docs/support-matrix.md) | auto-generated, measured per-title `real / recorded / named-silent` import coverage |
 | [docs/gap-worklist.md](docs/gap-worklist.md) | auto-generated gap list (currently empty) — the next thing to implement if it is not |
 | [docs/console-type.md](docs/console-type.md) | `tools/console_type.py` console-generation autodetect (Series X/S, Xbox One X/S) |
+| [docs/xbox-one-family.md](docs/xbox-one-family.md) | Xbox One / One S / One X support map — hardware, manifest capabilities, test matrix |
 | [docs/promo-reel.md](docs/promo-reel.md) | 60-second setup/promo shot list and capture recipe |
 | [docs/known-issues.md](docs/known-issues.md) · [docs/troubleshooting.md](docs/troubleshooting.md) | measured limitations, and how to get unstuck |
 | [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |

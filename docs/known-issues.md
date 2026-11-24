@@ -12,6 +12,8 @@ not a guess. Rows are removed only when verified fixed on-device or in the gate.
   do not expect the Series‑S playables (RACCOIN, Celeste, God of War) or 60 FPS
   targets to reproduce. D3D12/Vulkan/Compute features and CPU‑bound titles are the
   first to fail. Treat the next step as an experiment until on-console proof exists.
+  Full hardware/API mapping and the acceptance matrix:
+  [docs/xbox-one-family.md](xbox-one-family.md).
 - **Celeste v1.4.0.0 — audio silent.** FSB5 Vorbis decode is disabled on console after
   it heap-corrupted on a Series S. Gate defaults off (`fsb_decode = false`); per-game
   override via `tiramisu.profile.ini` (`fsb_decode=1`) is available for testing but
