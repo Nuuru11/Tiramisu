@@ -230,6 +230,26 @@ It is **not** a game, **not** a dependency and **not** an app you open. The
 command-line installer sends it with the `.msix`, which is why Step 7 works
 even though the web page has no Certificate box.
 
+### Why do other MSIX apps not have a `.cer`?
+
+Every MSIX app **is** signed — otherwise Windows/Xbox refuses to install it.
+The difference is *who signed it and whether the console already trusts that
+signature*:
+
+- **Store apps:** signed by Microsoft/the developer with a Store certificate.
+  The Xbox already trusts it, so nothing extra is needed.
+- **Sideloaded apps made by other people/tools:** often signed with a
+  self-signed certificate too, but the tool that installs them creates the
+  certificate and trusts it automatically, or the `.cer` is already installed
+  on your console from an earlier app. You just don't see a separate file.
+- **Tiramisu:** signed with our own self-signed certificate and shipped as a
+  public release. We include `dev.cer` so you (or `tools/deploy.sh`) can trust
+  that exact signature once. After that, updates signed with the same
+  certificate install without needing to trust it again.
+
+So it is not unusual — it is just visible in our release. The `.cer` is the
+"trust this publisher" file for our self-signed build.
+
 ---
 
 ## Updates and saves
