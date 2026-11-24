@@ -2086,7 +2086,7 @@ void trt_bridge_set_cwd(const char* guest_dir) {
 void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
                                   void* sa, u32 disposition, u32 flags,
                                   void* tmpl) {
-  (void)share; (void)sa; (void)flags; (void)tmpl;
+  (void)share; (void)sa; (void)tmpl;
   if (!name) return (void*)(uintptr_t)-1;
   // All write access masks need a writable VFS target, including
   // FILE_APPEND_DATA, FILE_WRITE_EA, FILE_WRITE_ATTRIBUTES and GENERIC_ALL.
@@ -2197,6 +2197,50 @@ void* TRT_STDCALL trt_CreateFileW(const u16* name, u32 access, u32 share,
     const int open_errno = errno;
     int cf_is_dir = 0;
     (void)trt_vfs_stat(host, &cf_is_dir, nullptr);
+    // .252 FIX: directory open with FILE_FLAG_BACKUP_SEMANTICS --
+    // the .251 Sekiro run 2 proves the guest opens its game
+    // directory the correct Windows way (flags=0x02000080,
+    // is_dir=1) and the bridge drops it (fopen cannot open a
+    // directory, errno=EACCES). Open the directory with the
+    // REAL host CreateFileW and return a directory handle
+    // (mode 'd', host HANDLE in os). GetFileType reports
+    // FILE_TYPE_DISK; ReadFile/WriteFile/Seek fail with
+    // ERROR_ACCESS_DENIED / INVALID_HANDLE, as on real Windows.
+#ifdef _WIN32
+    if ((flags & 0x02000000u) && cf_is_dir) {
+      wchar_t wdir[1024];
+      if (::MultiByteToWideChar(CP_UTF8, 0, host, -1, wdir, 1024) > 0) {
+        // .252 FIX: CreateFile2 (not CreateFileW -- CreateFileW is
+        // desktop-partition only; this is a UWP build,
+        // WINAPI_FAMILY_APP, so it is not declared). CreateFile2
+        // is the UWP file-open API; the directory-open flag
+        // (FILE_FLAG_BACKUP_SEMANTICS) rides in dwFileFlags.
+        CREATEFILE2_EXTENDED_PARAMETERS ext = {};
+        ext.dwSize = sizeof(ext);
+        ext.dwFileAttributes = 0x00000080u; /*FILE_ATTRIBUTE_NORMAL*/
+        ext.dwFileFlags = 0x02000000u; /*FILE_FLAG_BACKUP_SEMANTICS*/
+        HANDLE hdir = ::CreateFile2(wdir, 0x80000000u /*GENERIC_READ*/,
+                                    share ? share : 0x00000007u,
+                                    3u /*OPEN_EXISTING*/, &ext);
+        if (hdir != INVALID_HANDLE_VALUE) {
+          char vpath[512];
+          build_guest_vpath(name, vpath, sizeof(vpath));
+          char dlog[1100];
+          snprintf(dlog, sizeof(dlog),
+                   "kernel32: CreateFileW directory open -> handle (path: %s flags=0x%08x)",
+                   host, flags);
+          trt_core_log(dlog);
+          return file_alloc((FILE*)hdir, 'd', vpath);
+        }
+      }
+      // Host open failed -- fall through to the .250 DIAG failure log.
+      char flog[1100];
+      snprintf(flog, sizeof(flog),
+               "kernel32: CreateFileW directory host-open failed (path: %s flags=0x%08x err=%u)",
+               host, flags, (unsigned)::GetLastError());
+      trt_core_log(flog);
+    }
+#endif
     err_ref_for_current_thread() = 2; // FILE_NOT_FOUND
     trt_core_log("kernel32: CreateFileW open failed on host (see path)");
     char plog[1100];
