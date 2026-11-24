@@ -2,8 +2,6 @@
 
 <img src="docs/banner-chrome.png" alt="Tiramisu UWP — PC games on Xbox Series X|S" width="100%"/>
 
-# Tiramisu UWP
-
 ### Run PC games on Xbox Series X|S — natively.
 
 **A Windows PE64 application runtime for Xbox Dev Mode.**
