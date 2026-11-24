@@ -1,0 +1,66 @@
+name: Game Compatibility Report
+description: Report how a Windows PC game (PE64 / x64) behaves on Tiramisu
+title: "[Compat] <Game Title>"
+labels: ["compatibility"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing a game! Note: Tiramisu currently targets **64-bit (`x64` PE32+) DRM-free or own-Steam Windows games** (no 32-bit x86 apps or kernel anti-cheat yet).
+  - type: input
+    id: game
+    attributes:
+      label: Game Title & Storefront
+      placeholder: e.g. Ultra Pool (Steam, x64)
+    validations:
+      required: true
+  - type: dropdown
+    id: console
+    attributes:
+      label: Xbox Console Model
+      options:
+        - Xbox Series S
+        - Xbox Series X
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tiramisu Version
+      placeholder: e.g. v0.2.4.0
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Executable Architecture / Dashboard Badge
+      options:
+        - x64 D3D11 Ready
+        - x64 Unity Ready
+        - x64 Vulkan Ready
+        - x64 D3D9 Ready
+        - x64 D3D12 (Experimental)
+        - x64 OpenGL (Experimental)
+        - Other / Unknown
+    validations:
+      required: true
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Furthest Stage Reached
+      options:
+        - Playable (gameplay + input work)
+        - Renders frames / menu, stalls or crashes later
+        - Audio works / Silent audio
+        - Crashes or closes immediately on Launch
+        - Failed / flagged before Launch
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: What happened & Debug Bundle
+      description: Please attach `tiramisu-debug-bundle.zip` (from the LAN dashboard -> Saves & Support -> Download Debug Bundle) by dragging it here.
+      placeholder: Describe what appeared on the TV and paste any error line or attach tiramisu-debug-bundle.zip.
+    validations:
+      required: true

@@ -79,23 +79,101 @@ flight rings; neither is settable for a sideloaded package.
 
 ## Experiment (unsupported, own console, dev mode)
 
-1. Copy `tiramisu-woowop-engine-vk1/package/AppxManifest.xml`.
-2. Set `Identity Name="Microsoft.MicrosoftEdge"` and
-   `Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond,
-   S=Washington, C=US"`.
-3. Create a self-signed cert with that exact subject, install it as trusted,
-   sign the package with it.
-4. Deploy through Device Portal and launch.
-5. Watch the host log for either
-   `input: physical mouse button received` (allowlist was satisfied), or
-   `input: GameInput mouse callback failed hr=0x80004001` (still refused).
+The spoofer ships as the **KBM edition** of every release (the normal
+`Tiramisu.msix` keeps the public `Xan.Tiramisu` identity). The one-command entry
+point builds the experimental flavor into its own output dir:
 
-Do not ship this identity. It cannot be published, it can collide with a real
-Edge package, and a future console build may reject the signature outright.
+- `tools/edge_spoof.py` — patches the manifest Identity/Publisher to
+  `Microsoft.MicrosoftEdge` + the Microsoft publisher string (PFN
+  `Microsoft.MicrosoftEdge_8wekyb3d8bbwe`) and exposes the matching cert subject.
+- `tools/pack.sh` — `EDGE_SPOOF=1` (or `--edge-spoof`) stages the patched
+  manifest and signs with a *separate* self-signed cert (`edge-dev.cer`) whose
+  subject matches the Microsoft Publisher string. The normal `dev.cer` is never
+  reused or overwritten.
+- `tools/edge-spoof.sh` — one-command entry point, builds into a separate
+  `out-edgespoof/` so the normal build is untouched.
+- `tools/release.sh` — builds the host once and packs **both** flavors into
+  `out/release/` (`Tiramisu.msix` + `dev.cer`, `Tiramisu-EdgeSpoof.msix` +
+  `edge-dev.cer`). Keep both in the GitHub Release: public builds cannot unlock
+  hardware mouse, so the KBM artifact is the only path for keyboard/mouse users.
+
+```sh
+tools/release.sh                         # both flavors from one host build
+tools/edge-spoof.sh                      # KBM only → out-edgespoof/
+# or, reusing an existing host build:
+SKIP_BUILD=1 tools/edge-spoof.sh out_mousefix
+# prints the deploy command with the Edge PFN package + edge-dev.cer
+```
+
+A mouse attached after launch is picked up by the host loop: GameInput device
+status or a fresh CoreWindow pointer event flips `g_host_mouse_present`, and an
+auto-selected pad-as-mouse cursor is released (`hardware mouse active ->
+pad-as-mouse OFF`) so the physical device drives the cursor immediately.
+
+With the spoof active the shell really does grant a pointer (console log:
+`keyboard=1 mouse=1`, `PointerDevices count=1`, `physical relative mouse motion
+received`). The host therefore leaves the OS/shell cursor visible and no longer
+stacks its D2D arrow on top of it; the drawn cursor is kept only as a fallback
+for pad-as-mouse sessions. Two cursors used to overlap and the drawn one froze
+when GameInput stopped reporting deltas.
+
+**Games disappear after the identity change** because the PFN determines the
+LocalState folder. Migrate the old state (games, profiles, covers, drive_c,
+incoming, settings.ini) with
+`tools/migrate-localstate.py --from-pfn <old-full-name> --to-pfn <new-full-name>`;
+it resumes on rerun. Use the **full** package name including version/arch.
+
+The pack step verifies signature, round-trip unpack, entry point and the Edge
+identity before it reports success. Note the cert subject is built with its RDNs
+in **reverse** order (`/C=US/ST=Washington/.../CN=Microsoft Corporation`):
+OpenSSL drops `S=`, and the MSIX tool reads the name back in reverse, yielding
+the exact `CN=..., O=..., L=..., S=..., C=US` string the manifest requires.
+
+Deploy to your own Dev Mode console and launch, then watch the host log for
+either `input: physical mouse button received` (allowlist was satisfied) or
+`input: GameInput mouse callback failed hr=0x80004001` (still refused). If the
+install refuses with `0x80073CF3`, a package with that identity is already
+registered; `0x8007000B` means the cert subject did not match the Publisher.
+
+Do not submit this identity to the Microsoft Store, and do not use it outside
+your own Dev Mode console. It cannot be published, it can collide with a real
+Edge package, and a future console build may reject the signature outright. It
+is shipped only as the clearly-labelled KBM experiment artifact.
 
 ## What actually helps without spoofing
 
-- Keep the `Chromium`-style pointer paths alive (`PointerPressed` already
-  fires for touch and for mouse when the console allows it).
-- Pad-as-mouse (`webxfer.cpp`) remains the only guaranteed pointer for
-  sideloaded titles today.
+There is no API that turns hardware mouse on. A Microsoft employee answer on
+Q&A states it plainly: "For UWPs, developers are not able to enable hardware
+mouse support themselves ... it is not broadly available for UWPs"
+(`learn.microsoft.com/en-us/answers/questions/505382`), and Chuck Walbourn
+(DirectX team) gives the same answer on Stack Overflow: "Mouse support is only
+'enabled' for specific applications. It's not available to general UWP on Xbox
+applications." The WebView2 discussion asking for exactly this
+(`MicrosoftEdge/WebView2Feedback#4117`) is still unanswered for the same reason.
+The allowlist is a publisher opt-in held outside the package.
+
+What the host does instead, and what was fixed for it:
+
+- **Every pointer source the shell is willing to deliver is now consumed.**
+  `PointerPressed` / `PointerMoved` / `PointerReleased` no longer bail out
+  because GameInput *once* reported a mouse: they defer only while GameInput has
+  produced data in the last 300 ms (`mouse_active_recent()`), so a GameInput
+  device that goes quiet can no longer silence CoreWindow pointer input for the
+  rest of the session.
+- **The Win32 fallback runs in-game.** `GetCursorPos` + `GetAsyncKeyState`
+  (L/R/M) used to be confined to the launcher; it now feeds the guest during
+  play too, and yields for 500 ms after any real CoreWindow pointer event so the
+  two absolute sources never fight over a frame.
+- **A pad-driven pointer is selected automatically when the shell presents no
+  mouse.** The boot probe logs `input: Xbox device query keyboard=… mouse=…`; if
+  `MouseCapabilities()` reports no mouse, a title launched in `auto` input mode
+  starts with pad-as-mouse on (`input: auto input mode, no hardware pointer ->
+  pad-as-mouse ON for this launch`) instead of starting with a dead cursor.
+  `default_input=pad2kbm` or `F1` selects it explicitly; `F8` is the
+  keyboard-driven cursor.
+
+The spoof above remains the only path to actual hardware mouse on the console.
+It ships as the KBM edition (`tools/edge-spoof.sh` / `tools/release.sh`), but its
+premise is still unverified on real hardware — check the host log for `physical
+mouse button received` after deploying. Do **not** drop `Tiramisu-EdgeSpoof.msix`
+from a release while public builds still cannot enable hardware mouse.

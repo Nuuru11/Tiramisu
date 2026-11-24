@@ -7,8 +7,11 @@
 //   * optional Steam QR login (own account; depot pipeline is M6)
 #include "host_log.h"
 #include "audio.h"
+#include "boot_anim.h"
 #include "swapchain.h"
 #include "ui.h"
+#include "ui_sfx.h"
+#include "cover_art.h"
 #include "webxfer.h"
 #include "host_autopilot.h"
 #include "settings.h"
@@ -123,6 +126,11 @@ std::string g_pending_launch;
 static longan::host_autopilot_state& g_host_ap = longan::host_ap_state();
 bool g_mouse_mode = false;
 bool g_kbd_mouse_mode = false;
+// Set only when pad-as-mouse was chosen automatically because no pointer was
+// visible at boot. A mouse connected later clears it so the real device takes
+// over the cursor immediately (the mouse allowlist is present in our package
+// identity, but the shell may attach the device after launch).
+std::atomic<bool> g_auto_pad_mouse{false};
 bool g_quick_menu_open = false;
 std::string g_control_code_cached;
 std::atomic<bool> g_f8_down{false};
@@ -132,10 +140,49 @@ std::atomic<bool> g_km_keys[256]{};
 bool g_booted = false;
 bool g_setup_done = false;      // first-run setup screen flag
 bool g_setup_active = false;    // currently showing the setup screen
+// Adaptive Controller-vs-KBM mode: starts true on Xbox; switches false on any
+// keyboard/mouse input and hides controller button prompts until gamepad input
+// resumes.
+std::atomic<bool> g_controller_active{true};
+std::atomic<ULONGLONG> g_last_mouse_move_ms{0};
+std::atomic<ULONGLONG> g_last_raw_mouse_ms{0};
+// Last CoreWindow-derived pointer event (motion/press/wheel). The Win32
+// GetCursorPos fallback yields while this is fresh so the two absolute
+// sources never fight over the same frame.
+std::atomic<ULONGLONG> g_last_core_pointer_ms{0};
+// Whether the OS presents a hardware pointer to this package. Xbox withholds
+// mouse input from titles that do not carry the publisher's opt-in, and the
+// shell does not expose a way for an app to request it; the launcher needs to
+// know this before it decides how a mouse-driven title will get a pointer.
+std::atomic<bool> g_host_mouse_present{true};
+std::wstring g_tool_result;
+int g_del_confirm_idx = -1;
+ULONGLONG g_del_confirm_ms = 0;
+
+bool delete_dir_recursive_host(const std::string& path) {
+  WIN32_FIND_DATAA fd{};
+  HANDLE h = FindFirstFileA((path + "\\*").c_str(), &fd);
+  if (h != INVALID_HANDLE_VALUE) {
+    do {
+      if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0)
+        continue;
+      const std::string child = path + "\\" + fd.cFileName;
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+        delete_dir_recursive_host(child);
+      } else {
+        SetFileAttributesA(child.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileA(child.c_str());
+      }
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+  }
+  SetFileAttributesA(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+  return RemoveDirectoryA(path.c_str()) != 0;
+}
 
 // dashboard settings screen state (rows mirror longan::host_settings;
 // the string/int buffers are edited here, applied via settings_store)
-longan::ui_setting g_set_rows[18];
+longan::ui_setting g_set_rows[24];
 int g_set_count = 0;
 int g_set_selected = 0;
 longan::ui_screen g_screen = longan::UI_SHELF;
@@ -365,16 +412,22 @@ inline u16 disambiguate_modifier_vk(u16 vk, u16 scan, bool ext) {
 
 void feed_core_pointer(CoreWindow const& window,
                        winrt::Windows::Foundation::Point point) {
-  // Once Xbox delivers relative motion, the drawn cursor owns the position.
-  // Absolute events can still report a system pointer stuck at a screen edge.
-  if (g_uwp_raw_mouse.load()) return;
+  // Only defer to MouseDevice while relative deltas arrived recently (<300ms);
+  // never permanently lock out CoreWindow pointer motion on Xbox UWP.
+  const ULONGLONG now = GetTickCount64();
+  const ULONGLONG last_raw = g_last_raw_mouse_ms.load();
+  if (g_uwp_raw_mouse.load() && last_raw != 0 && (now - last_raw) < 300) return;
   const auto bounds = window.Bounds();
   if (bounds.Width <= 0 || bounds.Height <= 0) return;
   int w, h;
   trt_display_size(&w, &h);
+  if (w <= 0) w = 1920;
+  if (h <= 0) h = 1080;
   const int x = std::clamp(static_cast<int>(point.X * w / bounds.Width), 0, w - 1);
   const int y = std::clamp(static_cast<int>(point.Y * h / bounds.Height), 0, h - 1);
   trt_input_pointer_move(x, y, false);
+  g_last_mouse_move_ms.store(now);
+  g_last_core_pointer_ms.store(now);
 }
 
 inline int host_mouse_btn_for_press(winrt::Windows::UI::Input::PointerUpdateKind k) {
@@ -754,6 +807,9 @@ void scan_compat_stream(std::istream& f, char* out, unsigned cap) {
       else if (!_strnicmp(nm, "vulkan-1", 8)) mark = "[VK->D3D OK]";
       else if (!_strnicmp(nm, "opengl32", 8)) mark = "[GL->D3D OK]";
       else if (!_strnicmp(nm, "unityplayer", 11)) mark = "[unity OK]";
+      else if (!_strnicmp(nm, "easyanticheat", 13) ||
+               !_strnicmp(nm, "battleye", 8) ||
+               !_strnicmp(nm, "beclient", 8)) mark = "[anti-cheat BLOCKED]";
       o += (size_t)snprintf(mods + o, sizeof(mods) - o, " %s%s", nm, mark);
     }
   }
@@ -844,6 +900,7 @@ void scan_game_entry(
     scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
     ge.compat = compat;
     trt_iso_close(iso);
+    longan::cover_art_request(ge.name, ge.dir, 0);
     g_games.push_back(std::move(ge));
     return;
   }
@@ -937,6 +994,15 @@ void scan_game_entry(
     scan_compat(gdir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
   }
   ge.compat = compat;
+  {
+    uint32_t appid = 0;
+    std::ifstream sf(gdir + "\\steam_appid.txt");
+    if (sf) {
+      unsigned long v = 0;
+      if (sf >> v) appid = static_cast<uint32_t>(v);
+    }
+    longan::cover_art_request(ge.name, ge.dir, appid);
+  }
   g_games.push_back(std::move(ge));
 }
 
@@ -966,6 +1032,101 @@ std::vector<std::pair<std::string, std::string>> snapshot_prev_choice() {
   return prev_choice;
 }
 
+void refresh_storage_stats() {
+  if (g_local_state.empty()) return;
+  ULARGE_INTEGER avail{}, total{}, free_b{};
+  if (GetDiskFreeSpaceExA(g_local_state.c_str(), &avail, &total, &free_b) &&
+      total.QuadPart > 0) {
+    const double total_gb = static_cast<double>(total.QuadPart) / 1e9;
+    const double used_gb =
+        static_cast<double>(total.QuadPart - free_b.QuadPart) / 1e9;
+    longan::ui_set_storage(used_gb, total_gb);
+  }
+}
+
+std::wstring infer_engine_label(const game_entry& ge) {
+  const std::string c = lower_ascii(ge.compat);
+  if (c.find("anti-cheat") != std::string::npos) return L"Anti-Cheat (Blocked)";
+  if (c.find("32-bit") != std::string::npos) return L"32-bit x86 (Unsupported)";
+  if (c.find("arm64") != std::string::npos) return L"ARM64 (Unsupported)";
+  if (c.find("d3d12") != std::string::npos) return L"Direct3D 12";
+  if (c.find("vulkan") != std::string::npos) return L"Vulkan -> D3D11";
+  if (c.find("unity") != std::string::npos) return L"Unity Engine";
+  if (c.find("d3d11") != std::string::npos) return L"Direct3D 11";
+  if (c.find("opengl") != std::string::npos) return L"OpenGL -> D3D11";
+  if (c.find("d3d9") != std::string::npos) return L"Direct3D 9";
+  if (!ge.image.empty()) return L"Disc Image";
+  return L"Windows x64";
+}
+
+void cycle_selected_exe(int idx, int delta) {
+  if (idx < 0 || idx >= static_cast<int>(g_games.size())) return;
+  auto& ge = g_games[idx];
+  const int n = static_cast<int>(ge.exes.size());
+  if (n <= 1) {
+    longan::ui_toast(L"Only one executable in " + u82ws(ge.name), 2.2f);
+    return;
+  }
+  ge.exe_idx = (ge.exe_idx + n + delta) % n;
+  ge.exe = ge.exes[ge.exe_idx];
+  if (ge.image.empty() && !ge.dir.empty()) {
+    std::ofstream ef(ge.dir + "\\tiramisu_exe.txt", std::ios::binary);
+    if (ef) ef << ge.exe << "\n";
+  }
+  char compat[280];
+  if (!ge.image.empty()) {
+    trt_iso* iso = trt_iso_open(ge.image.c_str());
+    scan_compat_iso(iso, ge.exe, compat, (unsigned)sizeof(compat));
+    trt_iso_close(iso);
+  } else {
+    scan_compat(ge.dir + "\\" + ge.exe, compat, (unsigned)sizeof(compat));
+  }
+  ge.compat = compat;
+  longan::ui_toast(L"Switched exe: " + u82ws(ge.exe), 2.5f);
+}
+
+void cycle_selected_input(int idx) {
+  if (idx < 0 || idx >= static_cast<int>(g_games.size())) return;
+  auto& ge = g_games[idx];
+  static const char* kModes[4] = {"auto", "controller", "kbm", "pad2kbm"};
+  int cur = 0;
+  for (int i = 0; i < 4; ++i) {
+    if (ge.input_mode == kModes[i]) cur = i;
+  }
+  ge.input_mode = kModes[(cur + 1) % 4];
+  if (ge.image.empty() && !ge.dir.empty()) {
+    std::ofstream inf(ge.dir + "\\tiramisu_input.txt", std::ios::binary);
+    if (inf) inf << ge.input_mode << "\n";
+  }
+  longan::ui_toast(u82ws(ge.name + " input -> " + ge.input_mode), 2.5f);
+}
+
+void sort_games_shelf() {
+  // Hide synthetic test harnesses (d3d12triangle / guest_hello) from the real shelf
+  g_games.erase(std::remove_if(g_games.begin(), g_games.end(),
+                               [](const game_entry& ge) {
+                                 const std::string low = lower_ascii(ge.name);
+                                 return low == "d3d12triangle" ||
+                                        low == "selftest" ||
+                                        low == "guest_hello";
+                               }),
+                g_games.end());
+  auto rank = [](const game_entry& ge) -> int {
+    const std::string low = lower_ascii(ge.name);
+    if (low == "celeste") return 0;
+    if (low == "sekiro") return 1;
+    if (low == "ultrapool") return 2;
+    if (low.rfind("stage-", 0) == 0 || low.rfind("stage_", 0) == 0) return 4;
+    return 3;
+  };
+  std::sort(g_games.begin(), g_games.end(),
+            [&](const game_entry& a, const game_entry& b) {
+              const int ra = rank(a), rb = rank(b);
+              if (ra != rb) return ra < rb;
+              return lower_ascii(a.name) < lower_ascii(b.name);
+            });
+}
+
 void rescan_games() {
   std::vector<std::pair<std::string, std::string>> prev_choice =
       snapshot_prev_choice();
@@ -979,8 +1140,10 @@ void rescan_games() {
       scan_games_root(std::string(1, drv) + ":\\TiramisuGames", drv, prev_choice);
     }
   }
+  sort_games_shelf();
   if (g_selected >= (int)g_games.size()) g_selected = 0;
   g_last_rescan_ms = (ULONGLONG)GetTickCount64();
+  refresh_storage_stats();
 }
 
 // Full rescan of the games root only (no D:-Y: drive sweep): the
@@ -991,10 +1154,20 @@ void rescan_games() {
 void rescan_games_root_only() {
   std::vector<std::pair<std::string, std::string>> prev_choice =
       snapshot_prev_choice();
+  // Preserve USB / external-drive entries while refreshing LocalState\games
+  std::vector<game_entry> external_games;
+  for (auto& ge : g_games) {
+    if (_strnicmp(ge.dir.c_str(), g_games_dir.c_str(), g_games_dir.size()) != 0) {
+      external_games.push_back(std::move(ge));
+    }
+  }
   g_games.clear();
   scan_games_root(g_games_dir, 0, prev_choice);
+  for (auto& eg : external_games) g_games.push_back(std::move(eg));
+  sort_games_shelf();
   if (g_selected >= (int)g_games.size()) g_selected = 0;
   g_last_rescan_ms = (ULONGLONG)GetTickCount64();
+  refresh_storage_stats();
 }
 
 // Scoped rescan (item 4): rebuild only the entries for one game dir.
@@ -1033,8 +1206,10 @@ void rescan_one_game(const std::string& name) {
         !(ia & FILE_ATTRIBUTE_DIRECTORY))
       scan_game_entry(g_games_dir, name + ext, false, 0, prev_choice);
   }
+  sort_games_shelf();
   if (g_selected >= (int)g_games.size()) g_selected = 0;
   g_last_rescan_ms = (ULONGLONG)GetTickCount64();
+  refresh_storage_stats();
 }
 
 extern "C" int trt_mem_budget_charge_va(u64 bytes);
@@ -2053,18 +2228,37 @@ void sync_settings_rows() {
   swprintf(g_set_rows[i].value, 64, L"%d", s.memory_budget_mb);
   ++i;
   // 15 input deadzone
-  wcscpy(g_set_rows[i].label, L"Controller deadzone (0-20000)");
+  wcscpy(g_set_rows[i].label, L"Controller deadzone % (0-50)");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = false;
   g_set_rows[i].is_int = true;
   swprintf(g_set_rows[i].value, 64, L"%d", s.input_deadzone);
   ++i;
   // 16 audio buffer
-  wcscpy(g_set_rows[i].label, L"Audio buffer ms");
+  wcscpy(g_set_rows[i].label, L"Audio buffer ms (10-50)");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = false;
   g_set_rows[i].is_int = true;
   swprintf(g_set_rows[i].value, 64, L"%d", s.audio_buffer_ms);
   ++i;
   // 17 shader cache
   wcscpy(g_set_rows[i].label, L"Shader compile cache");
   set_bool(g_set_rows[i], s.shader_cache);
+  ++i;
+  // 18 resolution scale
+  wcscpy(g_set_rows[i].label, L"Resolution scale % (50-200)");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = false;
+  g_set_rows[i].is_int = true;
+  swprintf(g_set_rows[i].value, 64, L"%d", s.resolution_scale);
+  ++i;
+  // 19 texture quality
+  static const wchar_t* k_tex_choices[4] = {L"Low", L"Medium", L"High", L"Ultra"};
+  wcscpy(g_set_rows[i].label, L"Texture quality");
+  g_set_rows[i].is_bool = false; g_set_rows[i].is_choice = true;
+  g_set_rows[i].is_int = false;
+  wcscpy(g_set_rows[i].value, k_tex_choices[std::clamp(s.texture_quality, 0, 3)]);
+  ++i;
+  // 20 FMOD FSB5 decode
+  wcscpy(g_set_rows[i].label, L"FMOD FSB5 audio decode");
+  set_bool(g_set_rows[i], s.fsb_decode);
   ++i;
   g_set_count = i;
 }
@@ -2102,11 +2296,30 @@ void apply_settings_rows() {
     else if (i == 15) s.input_deadzone = _wtoi(r.value);
     else if (i == 16) s.audio_buffer_ms = _wtoi(r.value);
     else if (i == 17) s.shader_cache = (wcscmp(r.value, L"1") == 0);
+    else if (i == 18) s.resolution_scale = _wtoi(r.value);
+    else if (i == 19) {
+      if (wcscmp(r.value, L"Low") == 0) s.texture_quality = 0;
+      else if (wcscmp(r.value, L"Medium") == 0) s.texture_quality = 1;
+      else if (wcscmp(r.value, L"Ultra") == 0) s.texture_quality = 3;
+      else s.texture_quality = 2;
+    } else if (i == 20) s.fsb_decode = (wcscmp(r.value, L"1") == 0);
   }
   longan::settings_store(s, g_local_state);
-  char line[128];
+  apply_bridge_launch_settings();
+  sync_settings_rows();
+  longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+  longan::ui_toast(L"Settings saved", 2.0f);
   longan::log_line("settings: saved from the TV dashboard");
-  (void)line;
+}
+
+void reset_all_settings() {
+  longan::host_settings def{};
+  longan::settings_store(def, g_local_state);
+  apply_bridge_launch_settings();
+  sync_settings_rows();
+  longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+  longan::ui_toast(L"All settings reset to defaults", 2.8f);
+  longan::log_line("settings: reset to defaults");
 }
 
 // Cycle/edit the selected row: dir = -1/+1 for LR cycles and int edit,
@@ -2114,15 +2327,15 @@ void apply_settings_rows() {
 bool edit_setting_row(int dir) {
   if (g_set_selected < 0 || g_set_selected >= g_set_count) return false;
   longan::ui_setting& r = g_set_rows[g_set_selected];
-  if (r.is_bool && dir == 1) {
+  if (r.is_bool) {
     r.value[0] = (wcscmp(r.value, L"1") == 0) ? L'0' : L'1';
     r.value[1] = 0;
     return true;
   }
   if (r.is_choice) {
-    // row-specific choice lists: frame cap (13) cycles 0/30/60/120,
-    // everything else is the input-mode list.
+    static const wchar_t* k_tex_choices[4] = {L"Low", L"Medium", L"High", L"Ultra"};
     const wchar_t** list = (g_set_selected == 13) ? k_cap_choices
+                         : (g_set_selected == 19) ? k_tex_choices
                                                   : k_input_choices;
     int cur = 0;
     for (int k = 0; k < 4; ++k)
@@ -2132,20 +2345,19 @@ bool edit_setting_row(int dir) {
     return true;
   }
   if (r.is_int) {
-    // per-row step and range: mouse/wheel speeds 1..100, memory budget
-    // 128..8192 MB, deadzone 0..20000, audio buffer 10..500 ms
     int step = 2, lo = 1, hi = 100;
     if (g_set_selected == 2) { step = 5; }
-    else if (g_set_selected == 14) { step = 128; lo = 128; hi = 8192; }
-    else if (g_set_selected == 15) { step = 500; lo = 0; hi = 20000; }
-    else if (g_set_selected == 16) { step = 10; lo = 10; hi = 500; }
+    else if (g_set_selected == 14) { step = 128; lo = 1024; hi = 8192; }
+    else if (g_set_selected == 15) { step = 5; lo = 0; hi = 50; }
+    else if (g_set_selected == 16) { step = 5; lo = 10; hi = 50; }
+    else if (g_set_selected == 18) { step = 10; lo = 50; hi = 200; }
     int v = _wtoi(r.value) + dir * step;
     if (v < lo) v = lo;
     if (v > hi) v = hi;
     swprintf(r.value, 64, L"%d", v);
     return true;
   }
-  return false;  // text row: keyboard edits through CoreWindow
+  return false;
 }
 
 // ---------------- the app ----------------
@@ -2218,6 +2430,20 @@ struct tiramisu_host
         dxgidev->Release();
       }
     }
+    // Opt into full-screen CoreWindow bounds & raw pointer capture on Xbox UWP.
+    // We keep the OS cursor visible: the Edge-identity package is granted a real
+    // hardware pointer, so the shell's cursor IS the pointer. Hiding it left only
+    // our drawn D2D arrow, which freezes when GameInput stops reporting deltas.
+    // The drawn arrow is now a fallback for pad-as-mouse sessions only.
+    try {
+      using namespace winrt::Windows::UI::ViewManagement;
+      ApplicationViewScaling::TrySetDisableLayoutScaling(true);
+      ApplicationView::GetForCurrentView().SetDesiredBoundsMode(
+          ApplicationViewBoundsMode::UseCoreWindow);
+    } catch (...) {
+    }
+    trt_input_display_size(static_cast<int>(sc.width),
+                           static_cast<int>(sc.height));
     longan::ui_init(sc.width, sc.height, d2df, dwf, d2d_device_v,
                     longan::swapchain_dxgi());
     longan::swapchain_bind_d3d9();
@@ -2225,7 +2451,8 @@ struct tiramisu_host
                              static_cast<int>(sc.height / 2));
 
     m_kd = window.KeyDown([](CoreWindow const&, KeyEventArgs const& a) {
-      if (g_native_input.keyboard_active()) return;
+      g_controller_active.store(false);
+      if (g_native_input.keyboard_active() && g_guest_running.load()) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -2281,7 +2508,9 @@ struct tiramisu_host
         });
     m_pp = window.PointerPressed([](CoreWindow const& sender,
                                     PointerEventArgs const& a) {
-      if (g_native_input.mouse_active()) return;
+      g_controller_active.store(false);
+      g_last_mouse_move_ms.store(GetTickCount64());
+      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_press(point.Properties().PointerUpdateKind());
@@ -2296,7 +2525,7 @@ struct tiramisu_host
     });
     m_pr = window.PointerReleased([this](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
-      if (g_native_input.mouse_active()) return;
+      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       const int btn = host_mouse_btn_for_release(point.Properties().PointerUpdateKind());
@@ -2305,7 +2534,9 @@ struct tiramisu_host
     });
     m_pm = window.PointerMoved([](CoreWindow const& sender,
                                   PointerEventArgs const& a) {
-      if (g_native_input.mouse_active()) return;
+      g_controller_active.store(false);
+      g_last_mouse_move_ms.store(GetTickCount64());
+      if (g_guest_running.load() && g_native_input.mouse_active_recent(300)) return;
       static bool logged = false;
       if (!logged) {
         logged = true;
@@ -2337,6 +2568,7 @@ struct tiramisu_host
     m_pw = window.PointerWheelChanged([](CoreWindow const& sender,
                                          PointerEventArgs const& a) {
       if (g_native_input.mouse_active()) return;
+      g_controller_active.store(false);
       const auto point = a.CurrentPoint();
       feed_core_pointer(sender, point.Position());
       trt_input_wheel(static_cast<i32>(point.Properties().MouseWheelDelta()));
@@ -2364,6 +2596,7 @@ struct tiramisu_host
 
   void apply_web_controls() {
     const auto events = longan::webxfer_control_events();
+    if (!events.empty()) g_controller_active.store(false);
     for (const auto& event : events) {
       const bool down = event.second != 0;
       switch (event.kind) {
@@ -2421,17 +2654,172 @@ struct tiramisu_host
     }
   }
 
+  void trigger_steam_item_action(int idx) {
+    const auto items = longan::steam_client_items();
+    if (idx < 0 || idx >= static_cast<int>(items.size())) return;
+    const auto& it = items[idx];
+    if (it.installed) {
+      std::string launch_name;
+      for (const auto& ge : g_games) {
+        if (!it.install_dir.empty() &&
+            _stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
+          launch_name = ge.name;
+          break;
+        }
+      }
+      if (launch_name.empty() && !it.install_dir.empty()) {
+        rescan_games();
+        for (const auto& ge : g_games) {
+          if (_stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
+            launch_name = ge.name;
+            break;
+          }
+        }
+      }
+      if (launch_name.empty()) launch_name = it.title;
+      g_pending_launch = launch_name;
+    } else if (!it.downloading) {
+      longan::steam_client_download_app(
+          it.app_id, []() { g_steam_needs_rescan.store(true); });
+    }
+  }
+
+  void sync_tools_list() {
+    std::vector<longan::ui_tool_item> items = {
+        {L"Rescan Game Library", L"Internal SSD + USB Drives (D:–Y:)", L"RUN"},
+        {L"Refresh Game Cover Art", L"Re-fetch HD Steam covers for all games", L"RUN"},
+        {L"Run Runtime Self-Test", L"Verify PE64 loader & syscall hooks", L"RUN"},
+        {L"Gamepad-as-Mouse Mode", L"Right stick moves cursor (R3 / F1)",
+         g_mouse_mode ? L"ON" : L"OFF"},
+        {L"Keyboard Cursor Mode", L"Arrows/Numpad move cursor (F8)",
+         g_kbd_mouse_mode ? L"ON" : L"OFF"},
+        {L"Open On-Screen Keyboard", L"Show Xbox virtual keyboard", L"OPEN"},
+        {L"Refresh Storage & Health", L"Update disk space & system diagnostics", L"RUN"},
+    };
+    longan::ui_set_tools(items, longan::ui_tools_selected(), g_tool_result);
+  }
+
+  void run_console_tool(int idx) {
+    switch (idx) {
+      case 0:
+        rescan_games();
+        g_tool_result = L"Rescanned: " + std::to_wstring(g_games.size()) + L" games";
+        break;
+      case 1:
+        longan::cover_art_reset_queue();
+        rescan_games();
+        g_tool_result = L"Cover art refresh queued for " +
+                        std::to_wstring(g_games.size()) + L" games";
+        break;
+      case 2: {
+        const auto gr = run_game("selftest", "guest_hello.exe", package_install_path());
+        g_tool_result = L"Self-test: " + u82ws(trt_errstr(gr.map_rc));
+        break;
+      }
+      case 3:
+        g_mouse_mode = !g_mouse_mode;
+        g_tool_result = g_mouse_mode ? L"Gamepad-as-Mouse ON" : L"Gamepad-as-Mouse OFF";
+        break;
+      case 4:
+        g_kbd_mouse_mode = !g_kbd_mouse_mode;
+        longan::set_pointer_cursor_mode(g_kbd_mouse_mode);
+        refresh_control_hint();
+        g_tool_result = g_kbd_mouse_mode ? L"KBM Cursor ON (F8)" : L"KBM Cursor OFF";
+        break;
+      case 5:
+        try {
+          winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryShow();
+          g_tool_result = L"On-Screen Keyboard requested";
+        } catch (...) {
+          g_tool_result = L"On-Screen Keyboard unavailable";
+        }
+        break;
+      case 6:
+        refresh_storage_stats();
+        run_probes();
+        g_tool_result = L"Storage & hardware probes refreshed";
+        break;
+      default:
+        break;
+    }
+    sync_tools_list();
+    longan::ui_sfx_confirm();
+    if (!g_tool_result.empty()) longan::ui_toast(g_tool_result, 2.8f);
+  }
+
+  void handle_delete_game(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(g_games.size())) return;
+    const ULONGLONG now = GetTickCount64();
+    if (g_del_confirm_idx == idx && (now - g_del_confirm_ms) < 5500ull) {
+      const std::string name = g_games[idx].name;
+      const std::string dir = g_games[idx].dir;
+      const std::string img = g_games[idx].image;
+      g_del_confirm_idx = -1;
+      g_del_confirm_ms = 0;
+      longan::ui_set_delete_confirm(-1);
+      bool ok = false;
+      if (!img.empty()) {
+        ok = DeleteFileA(img.c_str()) != 0;
+      } else if (!dir.empty() && dir.size() > g_games_dir.size()) {
+        ok = delete_dir_recursive_host(dir);
+      }
+      longan::ui_sfx_delete();
+      rescan_games();
+      refresh_storage_stats();
+      longan::ui_toast(
+          ok ? (L"Uninstalled " + u82ws(name))
+             : (L"Could not uninstall " + u82ws(name)),
+          3.2f);
+    } else {
+      g_del_confirm_idx = idx;
+      g_del_confirm_ms = now;
+      longan::ui_set_delete_confirm(idx);
+      longan::ui_sfx_confirm();
+      longan::ui_toast(
+          L"Click Uninstall again within 5s to delete " + u82ws(g_games[idx].name),
+          3.2f);
+    }
+  }
+
+  void execute_quick_menu_action(int qsel) {
+    if (qsel == 0) {
+      g_quick_menu_open = false;
+      longan::ui_set_quick_menu(false);
+    } else if (qsel == 1 || qsel == 4) {
+      longan::steam_client_refresh_remote(
+          []() { g_steam_needs_rescan.store(true); });
+      longan::ui_toast(L"Refreshing Steam profile & friends…", 2.5f);
+    } else if (qsel == 3) {
+      g_mouse_mode = !g_mouse_mode;
+      longan::ui_toast(g_mouse_mode ? L"Pad-as-Mouse ON" : L"Pad-as-Mouse OFF", 2.2f);
+    } else if (qsel == 5) {
+      g_quick_menu_open = false;
+      longan::ui_set_quick_menu(false);
+      request_guest_stop();
+    }
+  }
+
   void launcher_click() {
-    if (g_guest_running.load()) return;
+    if (longan::boot_anim_is_active()) {
+      longan::boot_anim_skip();
+      return;
+    }
+    if (g_guest_running.load() && !g_quick_menu_open) return;
+    g_controller_active.store(false);
     int x, y;
     trt_mouse_pos(&x, &y);
     const auto hit = longan::ui_hit_test(x, y);
     switch (hit.type) {
+      case longan::ui_click_type::quick_menu_item:
+        execute_quick_menu_action(hit.index);
+        break;
       case longan::ui_click_type::open_home:
         if (g_setup_active && g_setup_done) {
           g_setup_active = false;
           longan::ui_dismiss_first_run();
         }
+        g_screen = longan::UI_SHELF;
+        longan::ui_set_screen(g_screen);
         break;
       case longan::ui_click_type::tab:
         if (g_setup_active) break;
@@ -2440,15 +2828,43 @@ struct tiramisu_host
         if (g_screen == longan::UI_SETTINGS) {
           sync_settings_rows();
           longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+        } else if (g_screen == longan::UI_TOOLS) {
+          sync_tools_list();
+        } else if (g_screen == longan::UI_STEAM) {
+          const auto acct = longan::steam_client_account();
+          if (!acct.signed_in && !acct.busy && acct.qr_url.empty()) {
+            steam_begin();
+          }
         }
+        break;
+      case longan::ui_click_type::open_transfer:
+        g_setup_active = false;
+        longan::ui_dismiss_first_run();
+        g_screen = longan::UI_TOOLS;
+        longan::ui_set_screen(g_screen);
+        sync_tools_list();
         break;
       case longan::ui_click_type::select_game:
         if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size()))
           g_selected = hit.index;
         break;
       case longan::ui_click_type::play:
-        if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size()))
+        if (hit.index >= 0 && hit.index < static_cast<int>(g_games.size())) {
           g_pending_launch = g_games[hit.index].name;
+          longan::ui_sfx_launch();
+          longan::ui_toast(L"Launching " + u82ws(g_games[hit.index].name) + L"…", 3.0f);
+        }
+        break;
+      case longan::ui_click_type::cycle_exe:
+        longan::ui_sfx_confirm();
+        cycle_selected_exe(hit.index, 1);
+        break;
+      case longan::ui_click_type::cycle_input:
+        longan::ui_sfx_confirm();
+        cycle_selected_input(hit.index);
+        break;
+      case longan::ui_click_type::delete_game:
+        handle_delete_game(hit.index);
         break;
       case longan::ui_click_type::select_setting:
         if (hit.index >= 0 && hit.index < g_set_count) {
@@ -2458,6 +2874,20 @@ struct tiramisu_host
             apply_settings_rows();
           longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
         }
+        break;
+      case longan::ui_click_type::reset_settings:
+        reset_all_settings();
+        break;
+      case longan::ui_click_type::select_steam:
+        break;
+      case longan::ui_click_type::steam_action:
+        trigger_steam_item_action(hit.index);
+        break;
+      case longan::ui_click_type::steam_qr:
+        steam_begin();
+        break;
+      case longan::ui_click_type::run_tool:
+        run_console_tool(hit.index);
         break;
       case longan::ui_click_type::none:
         break;
@@ -2473,6 +2903,10 @@ struct tiramisu_host
     // Managed (FNA) games save under LocalState.
     trt_fna_set_storage_root(g_local_state.c_str());
     g_games_dir = g_local_state + "\\games";
+    CreateDirectoryA(g_games_dir.c_str(), nullptr);
+    CreateDirectoryA((g_local_state + "\\incoming").c_str(), nullptr);
+    longan::cover_art_init(g_local_state);
+    refresh_storage_stats();
     longan::log_open(install);
     char line[256];
     snprintf(line, sizeof(line), "tiramisu boot: pkg=%s state=%s",
@@ -2551,6 +2985,13 @@ struct tiramisu_host
     snprintf(line, sizeof(line), "input: Xbox device query keyboard=%d mouse=%d (-1 unavailable)",
              keyboard, mouse);
     longan::log_line(line);
+    // -1 means the query itself is unavailable; keep the optimistic default.
+    if (mouse >= 0) g_host_mouse_present.store(mouse != 0);
+    if (mouse == 0) {
+      longan::log_line(
+          "input: no hardware pointer presented to this package -> pad-driven "
+          "pointer will be used for mouse-driven titles");
+    }
     try {
       const auto pdevs = wdi::PointerDevice::GetPointerDevices();
       snprintf(line, sizeof(line), "input: PointerDevices count=%u",
@@ -2614,7 +3055,18 @@ struct tiramisu_host
                  L"Audio ready", url_step, L"Game shelf scanned",
                  L"Self-test: " + u82ws(trt_errstr(gr.map_rc))},
                 nullptr, true);
-    g_setup_done = true;  // A press on the finished screen opens the shelf
+    g_setup_done = true;
+    sync_settings_rows();
+    longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+    sync_tools_list();
+    // Land straight on the Home dashboard beneath the HD startup boot animation
+    g_setup_active = false;
+    longan::ui_dismiss_first_run();
+    g_screen = longan::UI_SHELF;
+    longan::ui_set_screen(g_screen);
+    if (!install.empty()) {
+      longan::boot_anim_start(install + "\\boot_anim.tanim");
+    }
   }
 
   void enable_keyboard_interceptor() {
@@ -2640,6 +3092,7 @@ struct tiramisu_host
             }
           }
           const u16 vk = disambiguate_modifier_vk(raw_vk, scan, ext);
+          g_controller_active.store(false);
           g_interceptor_kbd_active.store(true);
           g_native_input.notify_interceptor_key(vk);
           g_native_input.notify_interceptor_key(raw_vk);
@@ -2675,6 +3128,7 @@ struct tiramisu_host
             }
           }
           const u16 vk = disambiguate_modifier_vk(raw_vk, scan, ext);
+          g_controller_active.store(false);
           g_interceptor_kbd_active.store(true);
           g_native_input.notify_interceptor_key(vk);
           g_native_input.notify_interceptor_key(raw_vk);
@@ -2704,9 +3158,14 @@ struct tiramisu_host
         m_mm = m_mouse_device.MouseMoved(
             [](wdi::MouseDevice const&, wdi::MouseEventArgs const& a) {
           if (g_native_input.mouse_active()) return;
+          const auto d = a.MouseDelta();
+          if (d.X == 0 && d.Y == 0) return;
+          const ULONGLONG now = GetTickCount64();
+          g_controller_active.store(false);
+          g_last_mouse_move_ms.store(now);
+          g_last_raw_mouse_ms.store(now);
           if (!g_uwp_raw_mouse.exchange(true))
             longan::log_line("input: physical relative mouse motion received");
-          const auto d = a.MouseDelta();
           trt_input_mouse_delta_raw(static_cast<i32>(d.X), static_cast<i32>(d.Y));
         });
         m_mouse_device_available = true;
@@ -2775,8 +3234,10 @@ struct tiramisu_host
       poll_host_gamepads(&xs, &pad_ok);
       {
         static bool d_up = false, d_dn = false, d_lt = false, d_rt = false,
-                    a_btn = false, y_btn = false, rs_btn = false, vkbd_btn = false;
+                    a_btn = false, b_btn = false, x_btn = false, y_btn = false,
+                    rs_btn = false, vkbd_btn = false;
         static bool lb_btn = false, rb_btn = false;
+        static int prev_mx = -1, prev_my = -1;
         static bool mm_was_active = false, mm_was_rt = false, mm_was_lt = false,
                     mm_was_rb = false, mm_was_lb = false, mm_was_ls = false,
                     mm_was_a = false, mm_was_b = false, mm_was_x = false,
@@ -2785,8 +3246,201 @@ struct tiramisu_host
                     mm_was_d = false, guest_was_running = false;
         static int mm_wheel_tick = 0, vm_hold_ticks = 0;
         const u16 b = pad_ok ? xs.Gamepad.wButtons : 0;
-        // RB/LB cycle dashboard screens (shelf -> settings -> log) on the
-        // launcher; keyboard: Tab / Shift+Tab.
+
+        // Adaptive Controller vs KBM detection + CoreWindow::PointerPosition + Win32 GetCursorPos fallback:
+        const ULONGLONG now_input_ms = GetTickCount64();
+        {
+          // 1) WinRT CoreWindow::PointerPosition() poll
+          if (m_window) {
+            try {
+              static float last_cw_x = -9999.0f, last_cw_y = -9999.0f;
+              const auto pos = m_window.PointerPosition();
+              const auto bnd = m_window.Bounds();
+              if (bnd.Width > 0 && bnd.Height > 0) {
+                const float rx = pos.X - bnd.X;
+                const float ry = pos.Y - bnd.Y;
+                if (last_cw_x > -9000.0f &&
+                    (fabsf(rx - last_cw_x) > 0.5f || fabsf(ry - last_cw_y) > 0.5f)) {
+                  int dw = 1920, dh = 1080;
+                  trt_display_size(&dw, &dh);
+                  const int cx = std::clamp((int)(rx * dw / bnd.Width), 0, dw - 1);
+                  const int cy = std::clamp((int)(ry * dh / bnd.Height), 0, dh - 1);
+                  trt_input_pointer_move(cx, cy, false);
+                  g_controller_active.store(false);
+                  g_last_mouse_move_ms.store(now_input_ms);
+                }
+                last_cw_x = rx;
+                last_cw_y = ry;
+              }
+            } catch (...) {
+            }
+          }
+          // 2) Direct user32 GetCursorPos + GetAsyncKeyState probe (catches the
+          //    desktop/Xbox pointer even when WinRT PointerMoved never fires).
+          //    This runs in-game too: a title that polls the cursor must not be
+          //    left with a frozen pointer just because CoreWindow is silent. It
+          //    yields whenever CoreWindow pointer events are live.
+          const ULONGLONG last_core = g_last_core_pointer_ms.load();
+          const bool core_pointer_recent =
+              last_core != 0 && (now_input_ms - last_core) < 500;
+          {
+            using get_cp_fn = BOOL(WINAPI*)(POINT*);
+            using get_aks_fn = SHORT(WINAPI*)(int);
+            static get_cp_fn p_get_cp = nullptr;
+            static get_aks_fn p_get_aks = nullptr;
+            static bool u32_probed = false;
+            static POINT last_pt{-99999, -99999};
+            static bool was_btn[3] = {false, false, false};
+            if (!u32_probed) {
+              u32_probed = true;
+              HMODULE u32 = GetModuleHandleW(L"user32.dll");
+              if (!u32) u32 = LoadLibraryW(L"user32.dll");
+              if (u32) {
+                p_get_cp = reinterpret_cast<get_cp_fn>(GetProcAddress(u32, "GetCursorPos"));
+                p_get_aks = reinterpret_cast<get_aks_fn>(GetProcAddress(u32, "GetAsyncKeyState"));
+              }
+            }
+            if (p_get_cp && !core_pointer_recent) {
+              POINT pt{};
+              if (p_get_cp(&pt)) {
+                if (last_pt.x != -99999 && (pt.x != last_pt.x || pt.y != last_pt.y)) {
+                  int dw = 1920, dh = 1080;
+                  trt_display_size(&dw, &dh);
+                  const int cx = std::clamp((int)pt.x, 0, dw - 1);
+                  const int cy = std::clamp((int)pt.y, 0, dh - 1);
+                  trt_input_pointer_move(cx, cy, false);
+                  g_controller_active.store(false);
+                  g_last_mouse_move_ms.store(now_input_ms);
+                }
+                last_pt = pt;
+              }
+            }
+            if (p_get_aks && !core_pointer_recent) {
+              static const u16 k_probe_vk[3] = {0x01 /*VK_LBUTTON*/,
+                                                0x02 /*VK_RBUTTON*/,
+                                                0x04 /*VK_MBUTTON*/};
+              for (int i = 0; i < 3; ++i) {
+                const bool down = (p_get_aks(k_probe_vk[i]) & 0x8000) != 0;
+                if (down == was_btn[i]) continue;
+                was_btn[i] = down;
+                g_controller_active.store(false);
+                if (trt_mouse_button(i) != down) trt_input_mouse_button(i, down);
+                if (i == 0 && !down && !g_guest_running.load()) launcher_click();
+              }
+            }
+          }
+        }
+        if (!g_mouse_mode) {
+          int cur_mx = 0, cur_my = 0;
+          trt_mouse_pos(&cur_mx, &cur_my);
+          if (prev_mx >= 0 && (cur_mx != prev_mx || cur_my != prev_my)) {
+            g_controller_active.store(false);
+            g_last_mouse_move_ms.store(now_input_ms);
+          }
+          prev_mx = cur_mx;
+          prev_my = cur_my;
+        }
+        // Hot-plug: the shell can attach the pointer after launch. Trust either
+        // GameInput's device status or a fresh CoreWindow pointer event, then
+        // hand the cursor from the pad to the real mouse in auto mode.
+        if (!g_host_mouse_present.load() &&
+            (g_native_input.mouse_connected() || g_last_mouse_move_ms.load() != 0)) {
+          g_host_mouse_present.store(true);
+          longan::log_line("input: mouse connected -> hardware pointer active");
+        }
+        if (g_host_mouse_present.load() && g_auto_pad_mouse.load() &&
+            g_guest_running.load()) {
+          g_auto_pad_mouse.store(false);
+          g_mouse_mode = false;
+          longan::log_line("input: hardware mouse active -> pad-as-mouse OFF");
+        }
+        if (g_native_input.mouse_active() || g_native_input.keyboard_active() ||
+            (!pad_ok && (g_native_input.mouse_connected() ||
+                         g_native_input.keyboard_connected()))) {
+          g_controller_active.store(false);
+        }
+        // Any keyboard launcher key switches to KBM mode
+        if (launcher_key(0x09) || launcher_key(0x0D) || launcher_key(0x1B) ||
+            launcher_key(0x20) || launcher_key(0x25) || launcher_key(0x26) ||
+            launcher_key(0x27) || launcher_key(0x28) || launcher_key('W') ||
+            launcher_key('A') || launcher_key('S') || launcher_key('D')) {
+          g_controller_active.store(false);
+        }
+        // Real gamepad input switches back to Controller mode (high stick
+        // threshold of 20000 prevents stick drift from hiding the mouse cursor)
+        if (pad_ok) {
+          const bool pad_input =
+              (b != 0) ||
+              std::abs((int)xs.Gamepad.sThumbLX) > 20000 ||
+              std::abs((int)xs.Gamepad.sThumbLY) > 20000 ||
+              std::abs((int)xs.Gamepad.sThumbRX) > 20000 ||
+              std::abs((int)xs.Gamepad.sThumbRY) > 20000 ||
+              xs.Gamepad.bLeftTrigger > 80 ||
+              xs.Gamepad.bRightTrigger > 80;
+          if (pad_input) g_controller_active.store(true);
+        } else {
+          // If no controller is connected at all, default to KBM + visible cursor!
+          g_controller_active.store(false);
+        }
+        longan::ui_set_input_mode(g_controller_active.load(), pad_ok);
+        {
+          int pmx = -1000, pmy = -1000;
+          trt_mouse_pos(&pmx, &pmy);
+          longan::ui_set_pointer_pos(pmx, pmy);
+        }
+        const bool mouse_recent =
+            (g_last_mouse_move_ms.load() != 0) &&
+            (now_input_ms - g_last_mouse_move_ms.load() < 15000);
+        // A real mouse owns the on-screen pointer now (the shell grants one to
+        // the Edge identity). Do not stack our D2D arrow on top of it; keep the
+        // drawn cursor only when there is no hardware pointer at all.
+        const bool hw_pointer = g_host_mouse_present.load() ||
+                                g_native_input.mouse_connected() ||
+                                g_last_raw_mouse_ms.load() != 0;
+        // The shell owns the pointer on the dashboard. Only draw our own arrow
+        // while an actual game is being driven by pad-as-mouse.
+        const bool show_cursor = !hw_pointer && g_guest_running.load() &&
+                                 g_mouse_mode;
+        longan::ui_set_cursor_visible(show_cursor);
+        longan::set_launcher_cursor_visible(false);
+
+        // Launcher mouse wheel scrolling across all screens
+        if (!g_guest_running.load() && !g_setup_active) {
+          const i32 wh = trt_mouse_wheel();
+          if (wh != 0) {
+            const int dir = (wh > 0) ? -1 : 1;
+            if (g_screen == longan::UI_SETTINGS && g_set_count > 0) {
+              g_set_selected = std::clamp(g_set_selected + dir, 0, g_set_count - 1);
+              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+            } else if (g_screen == longan::UI_STEAM) {
+              if (dir < 0) longan::ui_steam_nav_up();
+              else longan::ui_steam_nav_down();
+            } else if (g_screen == longan::UI_TOOLS) {
+              longan::ui_log_scroll(dir < 0 ? 4 : -4);
+            } else if ((g_screen == longan::UI_SHELF || g_screen == longan::UI_LIBRARY) &&
+                       !g_games.empty()) {
+              g_selected = std::clamp(g_selected + dir, 0, (int)g_games.size() - 1);
+            }
+          }
+        }
+
+        // RB/LB cycle dashboard screens (Home -> Library -> Steam -> Tools -> Settings)
+        // on the launcher; keyboard: Tab / Shift+Tab.
+        auto on_screen_enter = [&](longan::ui_screen s) {
+          g_screen = s;
+          longan::ui_set_screen(g_screen);
+          if (g_screen == longan::UI_SETTINGS) {
+            sync_settings_rows();
+            longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+          } else if (g_screen == longan::UI_TOOLS) {
+            sync_tools_list();
+          } else if (g_screen == longan::UI_STEAM) {
+            const auto acct = longan::steam_client_account();
+            if (!acct.signed_in && !acct.busy && acct.qr_url.empty()) {
+              steam_begin();
+            }
+          }
+        };
         const bool want_rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) ||
                              (launcher_key(0x09 /*VK_TAB*/) &&
                               !trt_key_down(0x10 /*VK_SHIFT*/));
@@ -2796,22 +3450,12 @@ struct tiramisu_host
         if (!g_guest_running.load() && g_setup_active == false) {
           if (want_rb && !rb_btn) {
             rb_btn = true;
-            g_screen = (longan::ui_screen)(((int)g_screen + 1) % longan::UI_TAB_COUNT);
-            longan::ui_set_screen(g_screen);
-            if (g_screen == longan::UI_SETTINGS) {
-              sync_settings_rows();
-              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
-            }
+            on_screen_enter((longan::ui_screen)(((int)g_screen + 1) % longan::UI_TAB_COUNT));
           } else if (!want_rb) rb_btn = false;
           if (want_lb && !lb_btn) {
             lb_btn = true;
-            g_screen = (longan::ui_screen)(((int)g_screen + longan::UI_TAB_COUNT - 1) %
-                                          longan::UI_TAB_COUNT);
-            longan::ui_set_screen(g_screen);
-            if (g_screen == longan::UI_SETTINGS) {
-              sync_settings_rows();
-              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
-            }
+            on_screen_enter((longan::ui_screen)(((int)g_screen + longan::UI_TAB_COUNT - 1) %
+                                                longan::UI_TAB_COUNT));
           } else if (!want_lb) lb_btn = false;
         }
         static bool km_was_lmb = false, km_was_rmb = false,
@@ -2914,17 +3558,25 @@ struct tiramisu_host
         }
 
         const bool km_lock = g_kbd_mouse_mode;
-        const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) ||
+        const bool ls_up = pad_ok && !g_mouse_mode && xs.Gamepad.sThumbLY > 15000;
+        const bool ls_dn = pad_ok && !g_mouse_mode && xs.Gamepad.sThumbLY < -15000;
+        const bool ls_lt = pad_ok && !g_mouse_mode && xs.Gamepad.sThumbLX < -15000;
+        const bool ls_rt = pad_ok && !g_mouse_mode && xs.Gamepad.sThumbLX > 15000;
+        const bool want_up = (b & XINPUT_GAMEPAD_DPAD_UP) || ls_up ||
                              (!km_lock && (launcher_key(0x26 /*VK_UP*/) || launcher_key('W')));
-        const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) ||
+        const bool want_dn = (b & XINPUT_GAMEPAD_DPAD_DOWN) || ls_dn ||
                              (!km_lock && (launcher_key(0x28 /*VK_DOWN*/) || launcher_key('S')));
-        const bool want_lt = (b & XINPUT_GAMEPAD_DPAD_LEFT) ||
-                             (!km_lock && launcher_key(0x25 /*VK_LEFT*/));
-        const bool want_rt = (b & XINPUT_GAMEPAD_DPAD_RIGHT) ||
-                             (!km_lock && launcher_key(0x27 /*VK_RIGHT*/));
+        const bool want_lt = (b & XINPUT_GAMEPAD_DPAD_LEFT) || ls_lt ||
+                             (!km_lock && (launcher_key(0x25 /*VK_LEFT*/) || launcher_key('A')));
+        const bool want_rt = (b & XINPUT_GAMEPAD_DPAD_RIGHT) || ls_rt ||
+                             (!km_lock && (launcher_key(0x27 /*VK_RIGHT*/) || launcher_key('D')));
         const bool want_go = (b & XINPUT_GAMEPAD_A) ||
                              (!km_lock && (launcher_key(0x0D /*VK_RETURN*/) ||
                                            launcher_key(0x20 /*VK_SPACE*/)));
+        const bool want_back = (b & XINPUT_GAMEPAD_B) ||
+                               (!km_lock && launcher_key(0x1B /*VK_ESCAPE*/));
+        const bool want_x = ((b & XINPUT_GAMEPAD_X) && !(b & XINPUT_GAMEPAD_BACK)) ||
+                            (!km_lock && launcher_key('X'));
         const bool want_st = (b & XINPUT_GAMEPAD_Y) || (!km_lock && launcher_key('Y'));
         const bool pad_vm = (b & XINPUT_GAMEPAD_BACK) && (b & XINPUT_GAMEPAD_START);
         if (g_guest_running.load()) {
@@ -2938,8 +3590,11 @@ struct tiramisu_host
             force_kill_guest("stop ignored 10s");
           }
           static bool qm_was = false;
-          if (longan::trt_settings_quick_menu_enabled() && (pad_vm || trt_steam_overlay_check_and_reset())) {
-            // RetroArch/Steam overlay: Back+Start or Steam API ActivateGameOverlay toggles overlay
+          const bool shift_tab =
+              trt_key_down(0x10 /*VK_SHIFT*/) && trt_key_down(0x09 /*VK_TAB*/);
+          if (longan::trt_settings_quick_menu_enabled() &&
+              (pad_vm || shift_tab || trt_steam_overlay_check_and_reset())) {
+            // RetroArch/Steam overlay: Back+Start, Shift+Tab, or Steam API toggles overlay
             if (!qm_was) {
               qm_was = true;
               g_quick_menu_open = !g_quick_menu_open;
@@ -2962,6 +3617,8 @@ struct tiramisu_host
             trt_input_reset_cursor_mode(false);
             g_mouse_mode = false;
             longan::webxfer_set_running_game("");
+            const std::string gs = get_guest_status();
+            if (!gs.empty() && gs != "idle") longan::ui_toast(u82ws(gs), 3.6f);
           }
         }
         guest_was_running = g_guest_running.load();
@@ -2977,144 +3634,179 @@ struct tiramisu_host
         } else if (!want_vkbd) {
           vkbd_btn = false;
         }
-        if (!g_guest_running.load() && g_screen == longan::UI_SHELF) {
-          if (want_up && !d_up) {
-            d_up = true;
-            if (g_selected > 0) --g_selected;
-          } else if (!want_up) d_up = false;
-          if (want_dn && !d_dn) {
-            d_dn = true;
-            if (g_selected + 1 < (int)g_games.size()) ++g_selected;
-          } else if (!want_dn) d_dn = false;
-          if (!g_setup_active && !g_games.empty() && g_selected < (int)g_games.size()) {
-            auto& ge = g_games[g_selected];
-            const int n = (int)ge.exes.size();
-            if (want_lt && !d_lt) {
-              d_lt = true;
-              if (n > 1) {
-                ge.exe_idx = (ge.exe_idx + n - 1) % n;
-                ge.exe = ge.exes[ge.exe_idx];
-                char compat[280];
-                scan_compat(ge.dir + "\\" + ge.exe, compat,
-                            (unsigned)sizeof(compat));
-                ge.compat = compat;
-              }
-            } else if (!want_lt) d_lt = false;
-            if (want_rt && !d_rt) {
-              d_rt = true;
-              if (n > 1) {
-                ge.exe_idx = (ge.exe_idx + 1) % n;
-                ge.exe = ge.exes[ge.exe_idx];
-                char compat[280];
-                scan_compat(ge.dir + "\\" + ge.exe, compat,
-                            (unsigned)sizeof(compat));
-                ge.compat = compat;
-              }
-            } else if (!want_rt) d_rt = false;
-          } else {
-            d_lt = d_rt = false;
+        // Console-standard directional auto-repeat (340ms initial, 95ms repeat)
+        static ULONGLONG rep_up = 0, rep_dn = 0, rep_lt = 0, rep_rt = 0;
+        auto nav_pulse = [&](bool held, bool& latched, ULONGLONG& next_ms) -> bool {
+          if (!held) { latched = false; next_ms = 0; return false; }
+          if (!latched) { latched = true; next_ms = now_input_ms + 340ull; return true; }
+          if (now_input_ms >= next_ms) { next_ms = now_input_ms + 95ull; return true; }
+          return false;
+        };
+        const bool step_up = nav_pulse(want_up, d_up, rep_up);
+        const bool step_dn = nav_pulse(want_dn, d_dn, rep_dn);
+        const bool step_lt = nav_pulse(want_lt, d_lt, rep_lt);
+        const bool step_rt = nav_pulse(want_rt, d_rt, rep_rt);
+
+        if (longan::boot_anim_is_active()) {
+          // Allow skipping the startup boot animation cleanly with any face button / key
+          const bool skip_btn =
+              (b & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_START)) != 0 ||
+              launcher_key(0x0D /*VK_RETURN*/) || launcher_key(0x20 /*VK_SPACE*/) ||
+              launcher_key(0x1B /*VK_ESCAPE*/);
+          if (skip_btn) {
+            longan::boot_anim_skip();
+            a_btn = b_btn = true;  // latch so skip press never launches a game
           }
+        } else if (!g_guest_running.load() && g_screen == longan::UI_SHELF) {
+          // Home screen: Left/Right (or Up/Down) moves across Continue Playing cards,
+          // A launches (or opens Tools if empty), X cycles exe, Y jumps to Tools/Transfer.
+          if ((step_lt || step_up) && !g_games.empty() && g_selected > 0) --g_selected;
+          if ((step_rt || step_dn) && !g_games.empty() && g_selected + 1 < (int)g_games.size()) ++g_selected;
           if (want_go && !a_btn) {
             a_btn = true;
             if (g_setup_active && g_setup_done) {
-              g_setup_active = false;  // leave setup, open the shelf
+              g_setup_active = false;
               longan::ui_dismiss_first_run();
             } else if (!g_setup_active && !g_games.empty()) {
               g_pending_launch = g_games[g_selected].name;
+              longan::ui_sfx_launch();
+              longan::ui_toast(L"Launching " + u82ws(g_games[g_selected].name) + L"…", 3.0f);
+            } else if (!g_setup_active && g_games.empty()) {
+              on_screen_enter(longan::UI_TOOLS);
             }
           } else if (!want_go) a_btn = false;
+          if (want_x && !x_btn) {
+            x_btn = true;
+            longan::ui_sfx_confirm();
+            cycle_selected_exe(g_selected, 1);
+          } else if (!want_x) x_btn = false;
           if (want_st && !y_btn) {
             y_btn = true;
-            steam_begin();
+            on_screen_enter(longan::UI_TOOLS);
           } else if (!want_st) y_btn = false;
+          b_btn = want_back;
+        } else if (!g_guest_running.load() && g_screen == longan::UI_LIBRARY) {
+          // Clear expired 2-step delete confirmation automatically
+          if (g_del_confirm_idx >= 0 &&
+              (g_del_confirm_idx != g_selected ||
+               (now_input_ms - g_del_confirm_ms) >= 5500ull)) {
+            g_del_confirm_idx = -1;
+            longan::ui_set_delete_confirm(-1);
+          }
+          // Library screen: 4-column grid nav (L/R ±1, U/D ±4), A Play, X Exe, Y Rescan, Del Uninstall, B Home
+          if (step_lt && !g_games.empty() && g_selected > 0) --g_selected;
+          if (step_rt && !g_games.empty() && g_selected + 1 < (int)g_games.size()) ++g_selected;
+          if (step_up && !g_games.empty()) g_selected = std::max(0, g_selected - 4);
+          if (step_dn && !g_games.empty())
+            g_selected = std::min((int)g_games.size() - 1, g_selected + 4);
+          static bool del_k_was = false;
+          const bool want_del = !km_lock && launcher_key(0x2E /*VK_DELETE*/);
+          if (want_del && !del_k_was) {
+            del_k_was = true;
+            handle_delete_game(g_selected);
+          } else if (!want_del) {
+            del_k_was = false;
+          }
+          if (want_go && !a_btn) {
+            a_btn = true;
+            if (!g_games.empty()) {
+              g_pending_launch = g_games[g_selected].name;
+              longan::ui_sfx_launch();
+              longan::ui_toast(L"Launching " + u82ws(g_games[g_selected].name) + L"…", 3.0f);
+            }
+          } else if (!want_go) a_btn = false;
+          if (want_x && !x_btn) {
+            x_btn = true;
+            longan::ui_sfx_confirm();
+            cycle_selected_exe(g_selected, 1);
+          } else if (!want_x) x_btn = false;
+          if (want_st && !y_btn) {
+            y_btn = true;
+            rescan_games();
+            longan::ui_sfx_confirm();
+            longan::ui_toast(L"Library rescanned: " + std::to_wstring(g_games.size()) + L" games", 2.5f);
+          } else if (!want_st) y_btn = false;
+          if (want_back && !b_btn) {
+            b_btn = true;
+            longan::ui_sfx_back();
+            on_screen_enter(longan::UI_SHELF);
+          } else if (!want_back) b_btn = false;
+        } else if (!g_guest_running.load() && g_screen == longan::UI_TOOLS) {
+          // Tools / Transfer / Logs screen: U/D select tool, A run tool,
+          // X/Y scroll log up/down, B Home
+          if (step_up) longan::ui_tools_nav_up();
+          if (step_dn) longan::ui_tools_nav_down();
+          if (want_go && !a_btn) {
+            a_btn = true;
+            run_console_tool(longan::ui_tools_selected());
+          } else if (!want_go) a_btn = false;
+          if (want_x && !x_btn) {
+            x_btn = true;
+            longan::ui_log_scroll(4);
+          } else if (!want_x) x_btn = false;
+          if (want_st && !y_btn) {
+            y_btn = true;
+            longan::ui_log_scroll(-4);
+          } else if (!want_st) y_btn = false;
+          if (want_back && !b_btn) {
+            b_btn = true;
+            on_screen_enter(longan::UI_SHELF);
+          } else if (!want_back) b_btn = false;
         } else if (!g_guest_running.load() && g_screen == longan::UI_SETTINGS) {
-          // settings screen nav: up/down select, LR edit + persist, A toggle
-          if (want_up && !d_up) {
-            d_up = true;
-            if (g_set_selected > 0) {
-              --g_set_selected;
-              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
-            }
-          } else if (!want_up) d_up = false;
-          if (want_dn && !d_dn) {
-            d_dn = true;
-            if (g_set_selected + 1 < g_set_count) {
-              ++g_set_selected;
-              longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
-            }
-          } else if (!want_dn) d_dn = false;
-          if (want_lt && !d_lt) {
-            d_lt = true;
-            if (edit_setting_row(-1)) apply_settings_rows();
-          } else if (!want_lt) d_lt = false;
-          if (want_rt && !d_rt) {
-            d_rt = true;
-            if (edit_setting_row(1)) apply_settings_rows();
-          } else if (!want_rt) d_rt = false;
+          // settings screen nav: up/down select (auto-repeat), LR edit + persist,
+          // A toggle, Y reset defaults, B Home
+          if (step_up && g_set_selected > 0) {
+            --g_set_selected;
+            longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+          }
+          if (step_dn && g_set_selected + 1 < g_set_count) {
+            ++g_set_selected;
+            longan::ui_set_settings(g_set_rows, g_set_count, g_set_selected);
+          }
+          if (step_lt && edit_setting_row(-1)) apply_settings_rows();
+          if (step_rt && edit_setting_row(1)) apply_settings_rows();
           if (want_go && !a_btn) {
             a_btn = true;
             if (edit_setting_row(1)) apply_settings_rows();
           } else if (!want_go) a_btn = false;
+          if (want_st && !y_btn) {
+            y_btn = true;
+            reset_all_settings();
+          } else if (!want_st) y_btn = false;
+          if (want_back && !b_btn) {
+            b_btn = true;
+            on_screen_enter(longan::UI_SHELF);
+          } else if (!want_back) b_btn = false;
+          x_btn = false;
         } else if (!g_guest_running.load() && g_screen == longan::UI_STEAM) {
-          // on-console Steam screen: up/down select title, A download/play,
-          // X refresh library, Y QR login
-          if (want_up && !d_up) {
-            d_up = true;
-            longan::ui_steam_nav_up();
-          } else if (!want_up) d_up = false;
-          if (want_dn && !d_dn) {
-            d_dn = true;
-            longan::ui_steam_nav_down();
-          } else if (!want_dn) d_dn = false;
-          static bool x_btn = false;
-          const bool want_ref =
-              ((b & XINPUT_GAMEPAD_X) && !(b & XINPUT_GAMEPAD_BACK)) ||
-              (!km_lock && launcher_key('R'));
+          // on-console Steam screen: up/down select title (auto-repeat), A download/play,
+          // X refresh library, Y QR login, B Home
+          if (step_up) longan::ui_steam_nav_up();
+          if (step_dn) longan::ui_steam_nav_down();
+          const bool want_ref = want_x || (!km_lock && launcher_key('R'));
           if (want_ref && !x_btn) {
             x_btn = true;
             longan::steam_client_refresh_remote(
                 []() { g_steam_needs_rescan.store(true); });
+            longan::ui_toast(L"Refreshing Steam library…", 2.4f);
           } else if (!want_ref) {
             x_btn = false;
           }
           if (want_go && !a_btn) {
             a_btn = true;
-            const auto items = longan::steam_client_items();
-            const int idx = longan::ui_steam_selected_index();
-            if (idx >= 0 && idx < static_cast<int>(items.size())) {
-              const auto& it = items[idx];
-              if (it.installed) {
-                std::string launch_name;
-                for (const auto& ge : g_games) {
-                  if (!it.install_dir.empty() &&
-                      _stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
-                    launch_name = ge.name;
-                    break;
-                  }
-                }
-                if (launch_name.empty() && !it.install_dir.empty()) {
-                  rescan_games();
-                  for (const auto& ge : g_games) {
-                    if (_stricmp(ge.dir.c_str(), it.install_dir.c_str()) == 0) {
-                      launch_name = ge.name;
-                      break;
-                    }
-                  }
-                }
-                if (launch_name.empty()) launch_name = it.title;
-                g_pending_launch = launch_name;
-              } else if (!it.downloading) {
-                longan::steam_client_download_app(
-                    it.app_id, []() { g_steam_needs_rescan.store(true); });
-              }
-            }
+            trigger_steam_item_action(longan::ui_steam_selected_index());
           } else if (!want_go) a_btn = false;
           if (want_st && !y_btn) {
             y_btn = true;
             steam_begin();
+            longan::ui_toast(L"Generating Steam Mobile QR code…", 2.5f);
           } else if (!want_st) y_btn = false;
+          if (want_back && !b_btn) {
+            b_btn = true;
+            on_screen_enter(longan::UI_SHELF);
+          } else if (!want_back) b_btn = false;
         } else {
-          d_up = d_dn = d_lt = d_rt = a_btn = y_btn = false;
+          a_btn = b_btn = x_btn = y_btn = false;
         }
         if (want_mm && !rs_btn) {
           rs_btn = true;
@@ -3249,6 +3941,7 @@ struct tiramisu_host
               std::string gdir = g_local_state + "\\games\\" + game;
               trt_synthesize_engine(gdir.c_str(), nullptr, &sprof);
               rescan_one_game(game);
+              longan::ui_toast(L"Transfer ready: " + u82ws(game), 3.5f);
             }
             // any rescan resets the periodic clock
             m_next_full_rescan_ms = now_ms + 30000ull;
@@ -3325,6 +4018,14 @@ struct tiramisu_host
                 g_mouse_mode = true;
               } else if (ge.input_mode == "controller") {
                 g_mouse_mode = false;
+              } else if (!g_host_mouse_present.load()) {
+                // Auto mode with no hardware pointer available: launch with the
+                // pad-driven cursor rather than a title that polls the mouse and
+                // never receives a single event.
+                g_mouse_mode = true;
+                g_auto_pad_mouse.store(true);
+                longan::log_line("input: auto input mode, no hardware pointer -> "
+                                 "pad-as-mouse ON for this launch");
               }
               trt_input_release_all();
               // Keep the visible console cursor active for all games unless
@@ -3395,18 +4096,23 @@ struct tiramisu_host
         continue;
       }
       if (g_guest_running.load() && g_quick_menu_open) {
-        // quick menu navigation — this branch runs on the UI loop, NOT in the
-        // pad-poll block above (whose locals are out of scope here), so poll
-        // the pad fresh.
+        // Quick menu navigation: D-Pad + Left Stick + Keyboard (Up/Down/Enter/Esc) + Mouse clicks
         static bool qm_up = false, qm_dn = false, qm_go = false, qm_back = false;
         XINPUT_STATE qm_xs{};
         ZeroMemory(&qm_xs, sizeof(qm_xs));
-        const u16 qm_b = (XInputGetState(0, &qm_xs) == ERROR_SUCCESS)
-                             ? qm_xs.Gamepad.wButtons
-                             : 0;
-        const bool want_up = (qm_b & XINPUT_GAMEPAD_DPAD_UP) != 0;
-        const bool want_dn = (qm_b & XINPUT_GAMEPAD_DPAD_DOWN) != 0;
-        const bool want_go = (qm_b & XINPUT_GAMEPAD_A) != 0;
+        const bool qm_pad = (XInputGetState(0, &qm_xs) == ERROR_SUCCESS);
+        const u16 qm_b = qm_pad ? qm_xs.Gamepad.wButtons : 0;
+        const bool want_up = (qm_b & XINPUT_GAMEPAD_DPAD_UP) != 0 ||
+                             (qm_pad && qm_xs.Gamepad.sThumbLY > 16000) ||
+                             launcher_key(0x26 /*VK_UP*/) || launcher_key('W');
+        const bool want_dn = (qm_b & XINPUT_GAMEPAD_DPAD_DOWN) != 0 ||
+                             (qm_pad && qm_xs.Gamepad.sThumbLY < -16000) ||
+                             launcher_key(0x28 /*VK_DOWN*/) || launcher_key('S');
+        const bool want_go = (qm_b & XINPUT_GAMEPAD_A) != 0 ||
+                             launcher_key(0x0D /*VK_RETURN*/) ||
+                             launcher_key(0x20 /*VK_SPACE*/);
+        const bool want_bk = (qm_b & XINPUT_GAMEPAD_B) != 0 ||
+                             launcher_key(0x1B /*VK_ESCAPE*/);
         const bool pad_vm =
             (qm_b & XINPUT_GAMEPAD_BACK) && (qm_b & XINPUT_GAMEPAD_START);
         if (want_up && !qm_up) {
@@ -3419,27 +4125,13 @@ struct tiramisu_host
         } else if (!want_dn) qm_dn = false;
         if (want_go && !qm_go) {
           qm_go = true;
-          const int qsel = longan::ui_quick_menu_selected();
-          if (qsel == 0) {
-            g_quick_menu_open = false;
-            longan::ui_set_quick_menu(false);
-          } else if (qsel == 1 || qsel == 4) {
-            longan::steam_client_refresh_remote(
-                []() { g_steam_needs_rescan.store(true); });
-          } else if (qsel == 3) {
-            g_mouse_mode = !g_mouse_mode;
-          } else if (qsel == 5) {
-            g_quick_menu_open = false;
-            longan::ui_set_quick_menu(false);
-            request_guest_stop();
-          }
+          execute_quick_menu_action(longan::ui_quick_menu_selected());
         } else if (!want_go) qm_go = false;
-        // B or Back+Start again: close menu
-        if ((qm_b & XINPUT_GAMEPAD_B) && !qm_back) {
+        if (want_bk && !qm_back) {
           qm_back = true;
           g_quick_menu_open = false;
           longan::ui_set_quick_menu(false);
-        } else if (!(qm_b & XINPUT_GAMEPAD_B)) qm_back = false;
+        } else if (!want_bk) qm_back = false;
         static bool qm_toggle = false;
         if (pad_vm) {
           if (!qm_toggle) {
@@ -3483,13 +4175,20 @@ struct tiramisu_host
       const std::string transfer_url = longan::webxfer_url();
       longan::ui_set_transfer(u82ws(transfer_url),
                                u82ws(longan::webxfer_status_line()));
-      const bool showing_setup = g_setup_active || g_screen == longan::UI_SETUP;
-      longan::ui_set_qr(showing_setup ? transfer_url
-                        : g_steam_busy ? g_steam_qr
-                        : longan::settings_get().show_qr ? transfer_url
-                        : std::string());
+      {
+        uint64_t up_done = 0, up_total = 0;
+        std::string up_label;
+        longan::webxfer_upload_progress(&up_done, &up_total, &up_label);
+        longan::ui_set_upload_progress(up_done, up_total, u82ws(up_label));
+      }
+      if (g_screen == longan::UI_STEAM && g_steam_busy && !g_steam_qr.empty()) {
+        longan::ui_set_qr(g_steam_qr);
+      } else {
+        longan::ui_set_qr(transfer_url);
+      }
       if (!g_setup_active) {
         std::vector<longan::ui_game> uig;
+        uig.reserve(g_games.size());
         for (const auto& ge : g_games) {
           std::wstring disp = u82ws(ge.exe);
           if (!ge.image.empty()) disp = L"[disc] " + disp;
@@ -3497,7 +4196,8 @@ struct tiramisu_host
             disp = L"[" + std::to_wstring(ge.exe_idx + 1) + L"/" +
                    std::to_wstring(ge.exes.size()) + L"] " + disp;
           }
-          uig.push_back({u82ws(ge.name), disp, u82ws(ge.input_mode)});
+          uig.push_back({u82ws(ge.name), disp, u82ws(ge.input_mode),
+                         infer_engine_label(ge), ge.name});
         }
         longan::ui_set_games(uig, g_selected);
         std::vector<std::wstring> lines;
@@ -3509,18 +4209,13 @@ struct tiramisu_host
         char audio_line[128];
         longan::audio_status(audio_line, sizeof(audio_line));
         lines.push_back(u82ws(audio_line));
-        // the selected game's static compat scan: what will happen on launch
         if (!g_games.empty() && g_selected < (int)g_games.size()) {
           lines.push_back(u82ws(g_games[g_selected].compat));
         }
-        lines.push_back(
-            L"RB/LB or Tab: screens  U/D: game  L/R: exe  A/Enter: launch  Y: steam");
-        lines.push_back(
-            L"F8: KBM cursor (Arrows+Space)  R3/F1: pad mouse  Hold View+Menu: stop");
         longan::ui_set_lines(lines);
       }
-      if (g_screen == longan::UI_LOG && !g_setup_active) {
-        // live log tail on the LOG screen: pull the in-memory ring
+      if (g_screen == longan::UI_TOOLS && !g_setup_active) {
+        // live log tail on the Tools/Transfer screen: pull the in-memory ring
         static char logbuf[16384];
         logbuf[0] = 0;
         longan::log_get_recent(logbuf, sizeof(logbuf));
@@ -3535,7 +4230,9 @@ struct tiramisu_host
         }
         longan::ui_set_log_tail(tail);
       }
-      longan::swapchain_render_frame((m_frames % 180) / 180.0f);
+      const float t_sec =
+          static_cast<float>(GetTickCount64() - g_boot_ms) * 0.001f;
+      longan::swapchain_render_frame(t_sec);
       longan::ui_render();
       longan::swapchain_present();
       ++m_frames;

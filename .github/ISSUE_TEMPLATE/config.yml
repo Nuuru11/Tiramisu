@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Compatibility Matrix (Verified Games)
+    url: https://github.com/xanstomper/Tiramisu/blob/master/docs/title-matrix.md
+    about: Check which titles are already console-verified before opening a report.
+  - name: Known Issues & Scope FAQ
+    url: https://github.com/xanstomper/Tiramisu/blob/master/docs/known-issues.md
+    about: Current platform limits (x64 PE32+ only, D3D12 experimental, silent FSB5 audio, anti-cheat).
+  - name: Latest Releases (Tiramisu.msix)
+    url: https://github.com/xanstomper/Tiramisu/releases
+    about: Download the latest signed MSIX release and dev.cer certificate.

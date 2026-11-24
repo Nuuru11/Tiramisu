@@ -1,18 +1,60 @@
 #!/bin/bash
 # tiramisu/tools/pack.sh — package + sign + verify (proven recipe).
-# Self-signed cert subject MUST equal manifest Publisher (CN=TiramisuDev).
-# Verify = osslsigncode with trust anchor + makemsix round-trip unpack +
-# entry-point grep. Any doubt fails the build here, never on the TV.
+#
+# Normal build:  manifest Identity = Xan.Tiramisu / CN=TiramisuDev
+#                -> out/Tiramisu.msix + out/dev.cer
+# KBM edition:   EDGE_SPOOF=1 (or --edge-spoof)
+#                -> out/Tiramisu-EdgeSpoof.msix + out/edge-dev.cer
+#                (experimental Microsoft Edge identity; see XBOX-MOUSE.md)
+#
+# Self-signed cert subject MUST equal the manifest Publisher. Verify =
+# osslsigncode with trust anchor + makemsix round-trip unpack + identity grep.
+# Any doubt fails the build here, never on the TV.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 here="$(cd "$(dirname "$0")/.." && pwd)"; cd "$here"
-out="${1:-out}"
+
+# ---- arguments --------------------------------------------------------------
+# Accept the output dir in any position plus --edge-spoof / --no-spoof.
+args=()
+for a in "$@"; do
+  case "$a" in
+    --edge-spoof) EDGE_SPOOF=1 ;;
+    --no-spoof)   EDGE_SPOOF=0 ;;
+    *)            args+=("$a") ;;
+  esac
+done
+out="${args[0]:-out}"
+spoof="${EDGE_SPOOF:-0}"
+
+if [[ "$spoof" == "1" || "$spoof" == "true" ]]; then
+  spoof=1
+  pkg_name="Tiramisu-EdgeSpoof"
+  cert_prefix="$out/edge-dev"
+  cert_subj="$(python3 tools/edge_spoof.py --cert-subj)"
+  cert_label="Edge identity (KBM edition)"
+else
+  spoof=0
+  pkg_name="Tiramisu"
+  cert_prefix="$out/dev"
+  cert_subj="/CN=TiramisuDev"
+  cert_label="Xan.Tiramisu"
+fi
+
 [[ -x "$out/layout/tiramisu.exe" ]] || { echo "ERROR: run build-host.sh first" >&2; exit 2; }
 
 # ---- stage package root: manifest + exe + guest + assets ---------------------
-cp package/AppxManifest.xml "$out/layout/AppxManifest.xml"
+if [[ "$spoof" == "1" ]]; then
+  python3 tools/edge_spoof.py package/AppxManifest.xml "$out/layout/AppxManifest.xml"
+  python3 tools/edge_spoof.py --check "$out/layout/AppxManifest.xml"
+else
+  cp package/AppxManifest.xml "$out/layout/AppxManifest.xml"
+fi
 mkdir -p "$out/layout/Assets"
 cp tests/out/guest_hello.exe "$out/layout/guest_hello.exe"
+if [[ -f "package/branding/boot_anim.tanim" ]]; then
+  cp package/branding/boot_anim.tanim "$out/layout/boot_anim.tanim"
+fi
 # regenerate the real branding assets every pack (sources: package/branding)
 python3 tools/gen-assets.py "$out/layout/Assets"
 # CONSOLE-PROVEN envelope ONLY: the Xbox AppX deployment is picky about asset
@@ -25,38 +67,79 @@ find "$out/layout/Assets" -type f ! -name 'StoreLogo.png' \
 find "$out/layout/Assets" -type d -empty -delete
 
 # ---- test cert (never committed; subject == Publisher) ----------------------
-if [[ ! -f "$out/dev.pfx" ]]; then
+# Compare the cert subject to the manifest Publisher. OpenSSL prints the RDNs
+# in the reverse of the /C=.../CN=... input order; normalize S/ST and spaces.
+cert_normalize() {
+  local s="$1"
+  s="${s#subject=}"
+  s="${s//ST=/S=}"
+  s="${s// /}"
+  printf '%s' "$s"
+}
+cert_matches() {
+  local prefix="$1" want
+  want="$(cert_normalize "$2")"
+  [[ -f "$prefix.pem" ]] || return 1
+  local got
+  got="$(openssl x509 -in "$prefix.pem" -noout -subject -nameopt RFC2253 2>/dev/null)"
+  got="$(cert_normalize "$got")"
+  [[ "$got" == "$want" ]]
+}
+
+if ! cert_matches "$cert_prefix" "$cert_subj"; then
+  if [[ -f "$cert_prefix.pfx" ]]; then
+    echo "note: regenerating $cert_label cert (subject changed or missing)"
+    rm -f "$cert_prefix.pfx" "$cert_prefix.cer" "$cert_prefix.key" \
+          "$cert_prefix.pem" "$cert_prefix-ca.pem"
+  fi
   openssl req -x509 -newkey rsa:2048 -nodes \
-    -keyout "$out/dev.key" -out "$out/dev.pem" -days 825 \
-    -subj "/CN=TiramisuDev" \
+    -keyout "$cert_prefix.key" -out "$cert_prefix.pem" -days 825 \
+    -subj "$cert_subj" \
     -addext "basicConstraints=critical,CA:FALSE" \
     -addext "keyUsage=critical,digitalSignature" \
     -addext "extendedKeyUsage=codeSigning,1.3.6.1.5.5.7.3.3" 2>/dev/null
-  openssl pkcs12 -export -out "$out/dev.pfx" -inkey "$out/dev.key" \
-    -in "$out/dev.pem" -passout pass:tiramisu
-  openssl x509 -in "$out/dev.pem" -outform DER -out "$out/dev.cer"
+  openssl pkcs12 -export -out "$cert_prefix.pfx" -inkey "$cert_prefix.key" \
+    -in "$cert_prefix.pem" -passout pass:tiramisu
+  openssl x509 -in "$cert_prefix.pem" -outform DER -out "$cert_prefix.cer"
 fi
+[[ -f "$cert_prefix.cer" ]] || { echo "ERROR: $cert_prefix.cer missing" >&2; exit 3; }
 
 # ---- pack + sign -------------------------------------------------------------
-rm -f "$out/Tiramisu-unsigned.msix" "$out/Tiramisu.msix"
-makemsix pack -d "$out/layout" -p "$out/Tiramisu-unsigned.msix"
-osslsigncode sign -pkcs12 "$out/dev.pfx" -pass tiramisu -h sha256 \
-  -in "$out/Tiramisu-unsigned.msix" -out "$out/Tiramisu.msix"
+rm -f "$out/$pkg_name-unsigned.msix" "$out/$pkg_name.msix"
+makemsix pack -d "$out/layout" -p "$out/$pkg_name-unsigned.msix"
+osslsigncode sign -pkcs12 "$cert_prefix.pfx" -pass tiramisu -h sha256 \
+  -in "$out/$pkg_name-unsigned.msix" -out "$out/$pkg_name.msix"
 
 # ---- verify (fail the build on any doubt) ------------------------------------
-openssl x509 -in "$out/dev.cer" -inform DER -out "$out/dev-ca.pem" -outform PEM
-osslsigncode verify -in "$out/Tiramisu.msix" -CAfile "$out/dev-ca.pem" \
+openssl x509 -in "$cert_prefix.cer" -inform DER -out "$cert_prefix-ca.pem" -outform PEM
+osslsigncode verify -in "$out/$pkg_name.msix" -CAfile "$cert_prefix-ca.pem" \
   | grep -q 'Signature verification: ok' \
   || { echo "FATAL: signature verification FAILED" >&2; exit 4; }
-rm -rf /tmp/msix-rt.$$ && makemsix unpack -p "$out/Tiramisu.msix" -d "/tmp/msix-rt.$$" -ac >/dev/null 2>&1 \
+rm -rf /tmp/msix-rt.$$ && makemsix unpack -p "$out/$pkg_name.msix" -d "/tmp/msix-rt.$$" -ac >/dev/null 2>&1 \
   || { echo "FATAL: round-trip unpack FAILED" >&2; exit 4; }
 grep -q 'Executable="tiramisu.exe"' "/tmp/msix-rt.$$/AppxManifest.xml" \
   || { echo "FATAL: packed manifest lost the entry point" >&2; exit 4; }
+if [[ "$spoof" == "1" ]]; then
+  python3 tools/edge_spoof.py --check "/tmp/msix-rt.$$/AppxManifest.xml" \
+    || { echo "FATAL: packed manifest lost the Edge identity" >&2; exit 4; }
+else
+  grep -q 'Name="Xan.Tiramisu"' "/tmp/msix-rt.$$/AppxManifest.xml" \
+    || { echo "FATAL: packed manifest lost the public identity" >&2; exit 4; }
+  grep -q 'Publisher="CN=TiramisuDev"' "/tmp/msix-rt.$$/AppxManifest.xml" \
+    || { echo "FATAL: packed manifest lost the public publisher" >&2; exit 4; }
+fi
 [[ -f "/tmp/msix-rt.$$/guest_hello.exe" ]] \
   || { echo "FATAL: guest exe missing from package" >&2; exit 4; }
 rm -rf "/tmp/msix-rt.$$"
 
-echo "---- done ----"
-ls -l "$out/Tiramisu.msix" "$out/dev.cer"
+echo "---- done ($cert_label) ----"
+ls -l "$out/$pkg_name.msix" "$cert_prefix.cer"
 echo
-echo "Deploy:  DP_HOST=<console-ip> DP_PASS=<portal-pass> $here/tools/deploy.sh install $out/Tiramisu.msix $out/dev.cer"
+if [[ "$spoof" == "1" ]]; then
+  echo "Deploy (own Dev Mode console; KBM / hardware-mouse experiment):"
+  echo "  DP_HOST=<console-ip> DP_PASS=<portal-pass> $here/tools/deploy.sh install $out/$pkg_name.msix $cert_prefix.cer"
+  echo "  Read XBOX-MOUSE.md first. The Edge PFN has its own LocalState;"
+  echo "  migrate existing games/saves with tools/migrate-localstate.py."
+else
+  echo "Deploy:  DP_HOST=<console-ip> DP_PASS=<portal-pass> $here/tools/deploy.sh install $out/$pkg_name.msix $cert_prefix.cer"
+fi

@@ -348,6 +348,19 @@ bool install_dir(char* out, size_t out_cap) {
   return utf16_to_utf8(path_w, out, out_cap);
 }
 
+// Mono's assembly search path for managed XNA titles. The offline gate sets
+// cfg.assemblies_path to third_party/fna/out; on console the host leaves it
+// unset, so default to the FNA substitutes shipped in <install>/fna.
+static char g_default_assemblies_path[1120];
+bool default_assemblies_path() {
+  char install[1024];
+  if (!install_dir(install, sizeof(install))) return false;
+  const int n = std::snprintf(g_default_assemblies_path,
+                              sizeof(g_default_assemblies_path), "%s\\fna",
+                              install);
+  return n > 0 && static_cast<size_t>(n) < sizeof(g_default_assemblies_path);
+}
+
 }  // namespace
 
 extern "C" int trt_mono_run(const trt_mono_config* cfg,
@@ -456,6 +469,8 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   mono_config_parse(nullptr);
   if (cfg->assemblies_path && cfg->assemblies_path[0])
     mono_set_assemblies_path(cfg->assemblies_path);
+  else if (default_assemblies_path())
+    mono_set_assemblies_path(g_default_assemblies_path);
   {
     char line[2300];
     std::snprintf(line, sizeof(line), "mono dirs: framework=%s config=%s",
@@ -907,6 +922,8 @@ extern "C" int trt_mono_run(const trt_mono_config* cfg,
   api.p_mono_config_parse(nullptr);
   api.p_mono_set_dirs(cfg->framework_dir ? cfg->framework_dir : "/usr/lib",
                       cfg->config_dir ? cfg->config_dir : "/etc");
+  // Offline callers (build-test's Celeste gate) pass third_party/fna/out
+  // explicitly; the console host goes through the _WIN32 path above.
   if (cfg->assemblies_path && cfg->assemblies_path[0])
     api.p_mono_set_assemblies_path(cfg->assemblies_path);
 

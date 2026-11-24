@@ -26,6 +26,11 @@ not a guess. Rows are removed only when verified fixed on-device or in the gate.
 
 - **x86-32 not supported.** `game-stage.py` refuses 32-bit exes; Tiramisu runs PE32+
   only. Resolution requires a license/interpreter decision (JIT vs. drop).
+- **Xbox GDK / GameOS packages are not Windows targets.** An x64 Scarlett/GDK
+  build (`MicrosoftGame.Config`, `gameos.xvd`, `xgameruntime`/`gamingservices`
+  imports) is a console package, not a Win32 desktop game. The LAN dashboard and
+  `tools/auto-compat.py` now flag it as unsupported instead of showing a
+  misleading D3D11 badge. Tiramisu does not bypass platform or DRM checks.
 - **D3D12 execution beyond the triangle gate.** Device/queue/list/PSO/draw/fence/present
   gate passes (`test_d3d12_triangle`); real game draw paths (descriptor tables,
   compute, barriers) untested.

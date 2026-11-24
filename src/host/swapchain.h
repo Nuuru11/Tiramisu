@@ -28,6 +28,7 @@ void swapchain_restore_d3d11();         // rebind D3D11 CoreWindow swapchain if 
 void swapchain_restore_launcher_format();
 void draw_pointer(bool launcher);
 void set_pointer_cursor_mode(bool kbm_active);
+void set_launcher_cursor_visible(bool visible);
 void swapchain_present();
 void swapchain_shutdown();
 

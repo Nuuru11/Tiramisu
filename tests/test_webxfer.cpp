@@ -333,13 +333,92 @@ int main() {
               g3.find("\"log_lines\":4") != std::string::npos,
           "POST /api/settings clamps out-of-range values");
 
-    // dashboard page carries the settings card + connect card
+    // dashboard page carries the settings, connect, saves backup/debug & mobile folder guidance
     std::string page = http_req(port, "GET", "/", "");
     CHECK(page.find("200 OK") != std::string::npos &&
               page.find("id=settings") != std::string::npos &&
               page.find("/api/settings") != std::string::npos &&
-              page.find("Console connection") != std::string::npos,
-          "dashboard HTML ships settings + connect cards");
+              page.find("Console connection") != std::string::npos &&
+              page.find("openDirPicker") != std::string::npos &&
+              page.find("/api/backup-saves") != std::string::npos &&
+              page.find("/api/debug-bundle") != std::string::npos,
+          "dashboard HTML ships settings, connect, mobile folder help, save backup & debug bundle");
+  }
+
+  // 8b. Pre-launch PE compat badges + save backup/restore + debug bundle endpoints
+  {
+    const std::string cgame = root + "/games/Compat32";
+    std::string mk = "mkdir -p '" + cgame + "' '" + root + "/drive_c/users/SaveDir' '" + root + "/profiles'";
+    (void)system(mk.c_str());
+    // Minimal 32-bit x86 PE header (Machine = 0x014C)
+    uint8_t pe32[256] = {};
+    pe32[0] = 'M'; pe32[1] = 'Z';
+    pe32[0x3C] = 0x80;
+    pe32[0x80] = 'P'; pe32[0x81] = 'E';
+    pe32[0x84] = 0x4C; pe32[0x85] = 0x01; // x86
+    pe32[0x94] = 0xE0; // OptionalHeader size
+    pe32[0x98] = 0x0B; pe32[0x99] = 0x01; // PE32 magic
+    FILE* pf = fopen((cgame + "/Compat32.exe").c_str(), "wb");
+    if (pf) { fwrite(pe32, 1, sizeof(pe32), pf); fclose(pf); }
+    std::string gl_compat = http_req(port, "GET", "/games", "");
+    CHECK(gl_compat.find("Compat32") != std::string::npos &&
+              gl_compat.find("32-bit x86 (Unsupported)") != std::string::npos &&
+              gl_compat.find("\"compat_ok\":false") != std::string::npos,
+          "/games flags 32-bit x86 executables as unsupported pre-launch");
+
+    // An Xbox GDK / GameOS console payload is x64 but not a Win32 target.
+    // The dashboard must say so instead of showing a misleading D3D11 badge.
+    const std::string ggame = root + "/games/CompatGdk";
+    mk = "mkdir -p '" + ggame + "'";
+    (void)system(mk.c_str());
+    uint8_t pe64[320] = {};
+    pe64[0] = 'M'; pe64[1] = 'Z';
+    pe64[0x3C] = 0x80;
+    pe64[0x80] = 'P'; pe64[0x81] = 'E';
+    pe64[0x84] = 0x64; pe64[0x85] = 0x86; // Machine = 0x8664 (x64)
+    pe64[0x94] = 0xF0;                    // SizeOfOptionalHeader
+    pe64[0x98] = 0x0B; pe64[0x99] = 0x02; // PE32+ magic
+    FILE* gf = fopen((ggame + "/CompatGdk.exe").c_str(), "wb");
+    if (gf) { fwrite(pe64, 1, sizeof(pe64), gf); fclose(gf); }
+    FILE* gc = fopen((ggame + "/MicrosoftGame.Config").c_str(), "wb");
+    if (gc) { fputs("<Game config />\n", gc); fclose(gc); }
+    std::string gl_gdk = http_req(port, "GET", "/games", "");
+    CHECK(gl_gdk.find("CompatGdk") != std::string::npos &&
+              gl_gdk.find("Xbox GDK / GameOS build (Unsupported)") != std::string::npos &&
+              gl_gdk.find("\"compat_ok\":false") != std::string::npos,
+          "/games flags Xbox GDK / GameOS packages as unsupported pre-launch");
+
+    // Seed save file + log, download backup zip & debug bundle, delete save, restore zip
+    const std::string save_path = root + "/drive_c/users/SaveDir/slot1.sav";
+    FILE* sf = fopen(save_path.c_str(), "wb");
+    if (sf) { fputs("SAVE_PAYLOAD_99", sf); fclose(sf); }
+    FILE* lf = fopen((root + "/tiramisu.log").c_str(), "wb");
+    if (lf) { fputs("tiramisu: test log line\n", lf); fclose(lf); }
+
+    std::string bresp = http_req(port, "GET", "/api/backup-saves", "");
+    const size_t bsplit = bresp.find("\r\n\r\n");
+    std::string bzip = (bsplit == std::string::npos) ? "" : bresp.substr(bsplit + 4);
+    CHECK(bresp.find("200 OK") != std::string::npos &&
+              bresp.find("tiramisu-saves-backup.zip") != std::string::npos &&
+              bzip.size() > 64 && bzip[0] == 'P' && bzip[1] == 'K',
+          "GET /api/backup-saves streams valid zip");
+
+    remove(save_path.c_str());
+    CHECK(read_str_file(save_path).empty(), "save deleted before restore test");
+
+    std::string rresp = http_req(port, "POST", "/api/restore-saves", bzip);
+    CHECK(rresp.find("200 OK") != std::string::npos &&
+              rresp.find("\"ok\":true") != std::string::npos &&
+              read_str_file(save_path) == "SAVE_PAYLOAD_99",
+          "POST /api/restore-saves restores drive_c saves cleanly");
+
+    std::string dresp = http_req(port, "GET", "/api/debug-bundle", "");
+    const size_t dsplit = dresp.find("\r\n\r\n");
+    std::string dzip = (dsplit == std::string::npos) ? "" : dresp.substr(dsplit + 4);
+    CHECK(dresp.find("200 OK") != std::string::npos &&
+              dresp.find("tiramisu-debug-bundle.zip") != std::string::npos &&
+              dzip.size() > 64 && dzip[0] == 'P' && dzip[1] == 'K',
+          "GET /api/debug-bundle streams valid support zip");
   }
 
   // 9. In-console autopilot: armed by transfer, driven by the launch result,

@@ -6,6 +6,9 @@
 //   GET  /games                                 -> JSON array of games + exes + config
 //   GET  /api/status                            -> JSON live status & upload progress
 //   GET  /api/logs                              -> Tail of tiramisu.log
+//   GET  /api/backup-saves                      -> Download .zip of drive_c + profiles + settings
+//   POST /api/restore-saves                     -> Restore drive_c + profiles + settings from .zip
+//   GET  /api/debug-bundle                      -> Download support .zip (logs + settings + summary)
 //   GET  /progress/<id>                         -> Fractional upload progress 0..1
 //   PUT  /upload/<name>.zip                     -> Streaming .zip upload -> extract to games\<stem>
 //   PUT  /api/upload-file?game=<n>&rel=<path>   -> Streaming unpacked folder file upload
@@ -19,9 +22,21 @@
 #include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
+#ifdef TIRAMISU_UWP_HOST
+  #include "cover_art.h"
+  #include "steam_client.h"
+  #include "vendor/qrcodegen.h"
+  #include <winrt/base.h>
+  #include <winrt/Windows.Foundation.h>
+  #include <winrt/Windows.Storage.Streams.h>
+  #include <winrt/Windows.Web.Http.h>
+  #include <winrt/windows.web.http.headers.h>
+#endif
 
 #ifdef _WIN32
-  #define WIN32_LEAN_AND_MEAN
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
@@ -309,6 +324,13 @@ static bool ap_evaluate_locked() {
 
 std::atomic<uint64_t> g_upload_total{0};
 std::atomic<uint64_t> g_upload_done{0};
+std::mutex g_upload_label_mu;
+std::string g_upload_label;
+
+void set_upload_label(const std::string& s) {
+  std::lock_guard<std::mutex> lk(g_upload_label_mu);
+  g_upload_label = s;
+}
 
 void sock_close(sock_t s) {
   if (s == kBadSock) return;
@@ -674,7 +696,7 @@ void collect_files_rec(const std::string& base_dir, const std::string& rel_dir,
   }
 }
 
-// ---------- zip extraction (miniz) ----------
+// ---------- zip extraction (miniz, smart single-folder unwrap) ----------
 bool extract_zip(const std::string& zip_path, const std::string& dest,
                  std::string* note) {
   mz_zip_archive zip{};
@@ -684,13 +706,54 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
     return false;
   }
   const int n = (int)mz_zip_reader_get_num_files(&zip);
+  // Detect if every real file lives inside a single top-level wrapper dir
+  // (e.g. "MyGame/MyGame.exe"), and unwrap it so it lands at games\MyGame\MyGame.exe
+  // rather than games\MyGame\MyGame\MyGame.exe.
+  std::string common_top;
+  bool can_unwrap = (n > 0);
+  for (int i = 0; i < n && can_unwrap; ++i) {
+    mz_zip_archive_file_stat st{};
+    if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
+    if (st.m_is_directory) continue;
+    std::string rel;
+    if (!sanitize_rel_path(st.m_filename, '/', &rel)) continue;
+    if (rel.rfind("__MACOSX/", 0) == 0) continue;
+    size_t sl = rel.find('/');
+    if (sl == std::string::npos) {
+      can_unwrap = false;
+      break;
+    }
+    std::string top = rel.substr(0, sl);
+    if (common_top.empty()) common_top = top;
+    else if (!xfer_ieq(common_top, top)) can_unwrap = false;
+  }
+  if (common_top.empty()) can_unwrap = false;
+  if (can_unwrap) {
+    // Only unwrap when the single top folder matches the destination game name
+    // (avoids stripping legitimate subdirs like "bin/").
+    const size_t ds = dest.find_last_of("/\\");
+    const std::string dest_base =
+        (ds == std::string::npos) ? dest : dest.substr(ds + 1);
+    if (!xfer_ieq(common_top, dest_base)) can_unwrap = false;
+  }
+
   int extracted = 0;
   for (int i = 0; i < n; ++i) {
     mz_zip_archive_file_stat st{};
     if (!mz_zip_reader_file_stat(&zip, i, &st)) continue;
     if (st.m_is_directory) continue;
+    std::string rel_raw = st.m_filename;
+    if (can_unwrap) {
+      std::string norm;
+      if (sanitize_rel_path(rel_raw, '/', &norm) &&
+          norm.size() > common_top.size() + 1 &&
+          xfer_ieq(norm.substr(0, common_top.size()), common_top) &&
+          norm[common_top.size()] == '/') {
+        rel_raw = norm.substr(common_top.size() + 1);
+      }
+    }
     std::string rel;
-    if (!sanitize_rel_path(st.m_filename, XFER_SEP, &rel)) continue;
+    if (!sanitize_rel_path(rel_raw, XFER_SEP, &rel)) continue;
     const std::string out_path = dest + std::string(1, XFER_SEP) + rel;
     const size_t slash = out_path.rfind(XFER_SEP);
     if (slash != std::string::npos) mkdirs(out_path.substr(0, slash));
@@ -703,6 +766,278 @@ bool extract_zip(const std::string& zip_path, const std::string& dest,
   snprintf(tmp, sizeof(tmp), "%d files", extracted);
   *note = tmp;
   return extracted > 0;
+}
+
+// ---------- Pre-launch PE compatibility inspection ----------
+struct pe_compat_info {
+  std::string arch = "x64";
+  std::string badge = "Windows x64";
+  bool ok = true;
+};
+
+static pe_compat_info inspect_pe_compat(const std::string& gdir,
+                                        const std::string& exe_rel) {
+  pe_compat_info out;
+  const std::string sep(1, XFER_SEP);
+  const std::string full = gdir + sep + exe_rel;
+  FILE* f = fopen(full.c_str(), "rb");
+  if (!f) {
+    out.arch = "unknown";
+    out.badge = "exe unreadable";
+    out.ok = false;
+    return out;
+  }
+  uint8_t hdr[4096] = {};
+  const size_t got = fread(hdr, 1, sizeof(hdr), f);
+  if (got < 0x40 || hdr[0] != 'M' || hdr[1] != 'Z') {
+    fclose(f);
+    out.arch = "unknown";
+    out.badge = "not a Windows PE";
+    out.ok = false;
+    return out;
+  }
+  uint32_t e_lfanew = 0;
+  memcpy(&e_lfanew, hdr + 0x3C, 4);
+  if (e_lfanew + 26 > got || hdr[e_lfanew] != 'P' || hdr[e_lfanew + 1] != 'E') {
+    fclose(f);
+    out.arch = "unknown";
+    out.badge = "invalid PE header";
+    out.ok = false;
+    return out;
+  }
+  const uint16_t machine = (uint16_t)(hdr[e_lfanew + 4] | (hdr[e_lfanew + 5] << 8));
+  const uint16_t num_sec = (uint16_t)(hdr[e_lfanew + 6] | (hdr[e_lfanew + 7] << 8));
+  const uint16_t opt_size = (uint16_t)(hdr[e_lfanew + 20] | (hdr[e_lfanew + 21] << 8));
+  const uint16_t opt_magic = (uint16_t)(hdr[e_lfanew + 24] | (hdr[e_lfanew + 25] << 8));
+  if (machine == 0x8664 && opt_magic == 0x20B) {
+    out.arch = "x64";
+  } else if (machine == 0x014C) {
+    fclose(f);
+    out.arch = "x86";
+    out.badge = "32-bit x86 (Unsupported)";
+    out.ok = false;
+    return out;
+  } else if (machine == 0xAA64) {
+    fclose(f);
+    out.arch = "arm64";
+    out.badge = "ARM64 (Unsupported)";
+    out.ok = false;
+    return out;
+  } else {
+    fclose(f);
+    out.arch = "unknown";
+    out.badge = "Unsupported Arch";
+    out.ok = false;
+    return out;
+  }
+
+  uint32_t imp_rva = 0;
+  const uint32_t opt_off = e_lfanew + 24;
+  if (opt_off + 128 <= got) memcpy(&imp_rva, hdr + opt_off + 120, 4);
+  const uint32_t sec_off = opt_off + opt_size;
+  auto rva_to_file = [&](uint32_t rva) -> uint64_t {
+    const uint32_t secs = num_sec < 96 ? num_sec : 96;
+    for (uint32_t s = 0; s < secs; ++s) {
+      const uint32_t so = sec_off + s * 40;
+      if (so + 40 > got) break;
+      uint32_t vaddr = 0, vsize = 0, raw = 0, rawsz = 0;
+      memcpy(&vsize, hdr + so + 8, 4);
+      memcpy(&vaddr, hdr + so + 12, 4);
+      memcpy(&rawsz, hdr + so + 16, 4);
+      memcpy(&raw, hdr + so + 20, 4);
+      const uint32_t span = vsize > rawsz ? vsize : rawsz;
+      if (rva >= vaddr && rva < vaddr + span && (rva - vaddr) < rawsz) {
+        return (uint64_t)raw + (uint64_t)(rva - vaddr);
+      }
+    }
+    return 0;
+  };
+
+  bool has_d3d11 = false, has_d3d12 = false, has_vk = false;
+  bool has_gl = false, has_d3d9 = false, has_unity = false, has_ac = false;
+  bool has_gdk = false;
+  const uint64_t imp_file = imp_rva ? rva_to_file(imp_rva) : 0;
+  if (imp_file > 0) {
+    uint8_t desc[2048] = {};
+    if (xfer_fseek(f, (long long)imp_file, SEEK_SET) == 0) {
+      const size_t dgot = fread(desc, 1, sizeof(desc), f);
+      for (uint32_t d = 0; d * 20 + 20 <= dgot; ++d) {
+        uint32_t name_rva = 0;
+        memcpy(&name_rva, desc + d * 20 + 12, 4);
+        if (!name_rva) break;
+        const uint64_t nfile = rva_to_file(name_rva);
+        if (!nfile || xfer_fseek(f, (long long)nfile, SEEK_SET) != 0) break;
+        char nm[64] = {};
+        if (fread(nm, 1, sizeof(nm) - 1, f) == 0) continue;
+        const std::string low = xfer_lower(nm);
+        if (low.rfind("d3d11", 0) == 0) has_d3d11 = true;
+        else if (low.rfind("d3d12", 0) == 0) has_d3d12 = true;
+        else if (low.rfind("vulkan-1", 0) == 0) has_vk = true;
+        else if (low.rfind("opengl32", 0) == 0) has_gl = true;
+        else if (low.rfind("d3d9", 0) == 0 || low.rfind("d3d8", 0) == 0 ||
+                 low.rfind("ddraw", 0) == 0) has_d3d9 = true;
+        else if (low.rfind("unityplayer", 0) == 0) has_unity = true;
+        else if (low.find("easyanticheat") != std::string::npos ||
+                 low.find("battleye") != std::string::npos) has_ac = true;
+        else if (low.rfind("xgameruntime", 0) == 0 ||
+                 low.rfind("gamingservices", 0) == 0 ||
+                 low.rfind("gameos", 0) == 0 ||
+                 low.rfind("libhttpclient.gdk", 0) == 0) has_gdk = true;
+      }
+    }
+  }
+  fclose(f);
+
+  // Also check top-level game dir for common kernel anti-cheat launchers/DLLs
+  // and Xbox GDK / GameOS console payloads (not Win32 targets).
+  std::vector<dir_ent> top;
+  list_dir_entries(gdir, &top);
+  for (const auto& e : top) {
+    const std::string low = xfer_lower(e.name);
+    if (low.find("easyanticheat") != std::string::npos ||
+        low.find("battleye") != std::string::npos) {
+      has_ac = true;
+    }
+    if (low == "microsoftgame.config" || low == "gameos.xvd" ||
+        low.rfind("libhttpclient.gdk", 0) == 0) {
+      has_gdk = true;
+    }
+  }
+
+  if (has_ac) {
+    out.badge = "Anti-Cheat Detected (Blocked)";
+    out.ok = false;
+  } else if (has_gdk) {
+    out.badge = "Xbox GDK / GameOS build (Unsupported)";
+    out.ok = false;
+  } else if (has_d3d12 && !has_d3d11) {
+    out.badge = "x64 D3D12 (Experimental)";
+  } else if (has_vk) {
+    out.badge = "x64 Vulkan Ready";
+  } else if (has_unity) {
+    out.badge = "x64 Unity Ready";
+  } else if (has_d3d11) {
+    out.badge = "x64 D3D11 Ready";
+  } else if (has_gl && !has_d3d11) {
+    out.badge = "x64 OpenGL (Experimental)";
+  } else if (has_d3d9) {
+    out.badge = "x64 D3D9 Ready";
+  } else {
+    out.badge = "x64 Windows Ready";
+  }
+  return out;
+}
+
+// ---------- Backup saves / restore / debug bundle zip helpers ----------
+void zip_add_dir_capped(mz_zip_archive* zip, const std::string& dir,
+                        const std::string& prefix, uint64_t max_file_bytes,
+                        uint64_t* total_added, uint64_t max_total_bytes,
+                        std::string* manifest) {
+  if (!dir_exists(dir)) return;
+  std::vector<file_item> files;
+  collect_files_rec(dir, "", 0, &files);
+  const std::string sep(1, XFER_SEP);
+  for (const auto& it : files) {
+    std::string rel = it.rel;
+    for (char& c : rel) if (c == '\\') c = '/';
+    const std::string arc = prefix + "/" + rel;
+    if (it.size > max_file_bytes || *total_added + it.size > max_total_bytes) {
+      if (manifest) *manifest += "SKIP " + arc + " (" + std::to_string(it.size) + " bytes)\n";
+      continue;
+    }
+    const std::string src = dir + sep + it.rel;
+    if (mz_zip_writer_add_file(zip, arc.c_str(), src.c_str(), nullptr, 0,
+                               MZ_DEFAULT_COMPRESSION)) {
+      *total_added += it.size;
+      if (manifest) *manifest += "OK   " + arc + "\n";
+    }
+  }
+}
+
+void zip_add_file_if_present(mz_zip_archive* zip, const std::string& path,
+                             const char* arc_name, uint64_t max_tail_bytes) {
+  FILE* f = fopen(path.c_str(), "rb");
+  if (!f) return;
+  xfer_fseek(f, 0, SEEK_END);
+  const int64_t sz = (int64_t)xfer_ftell(f);
+  if (sz < 0) { fclose(f); return; }
+  const int64_t off = (max_tail_bytes > 0 && sz > (int64_t)max_tail_bytes)
+                          ? (sz - (int64_t)max_tail_bytes)
+                          : 0;
+  xfer_fseek(f, off, SEEK_SET);
+  std::string data((size_t)(sz - off), '\0');
+  const size_t n = data.empty() ? 0 : fread(&data[0], 1, data.size(), f);
+  fclose(f);
+  data.resize(n);
+  mz_zip_writer_add_mem(zip, arc_name, data.data(), data.size(),
+                        MZ_DEFAULT_COMPRESSION);
+}
+
+bool restore_saves_zip(const std::string& zip_path, const std::string& root,
+                       int* out_restored, std::string* out_err) {
+  mz_zip_archive zip{};
+  if (!mz_zip_reader_init_file(&zip, zip_path.c_str(), 0)) {
+    *out_err = "not a valid backup zip";
+    return false;
+  }
+  const int n = (int)mz_zip_reader_get_num_files(&zip);
+  const std::string sep(1, XFER_SEP);
+  int count = 0;
+  for (int i = 0; i < n; ++i) {
+    mz_zip_archive_file_stat st{};
+    if (!mz_zip_reader_file_stat(&zip, i, &st) || st.m_is_directory) continue;
+    std::string norm;
+    if (!sanitize_rel_path(st.m_filename, '/', &norm)) continue;
+    const bool allowed = (norm == "settings.ini") ||
+                         (norm.rfind("drive_c/", 0) == 0) ||
+                         (norm.rfind("profiles/", 0) == 0);
+    if (!allowed) continue;
+    std::string os_rel;
+    if (!sanitize_rel_path(norm, XFER_SEP, &os_rel)) continue;
+    const std::string dest = root + sep + os_rel;
+    const size_t sl = dest.rfind(XFER_SEP);
+    if (sl != std::string::npos) mkdirs(dest.substr(0, sl));
+    if (mz_zip_reader_extract_to_file(&zip, i, dest.c_str(), 0)) ++count;
+  }
+  mz_zip_reader_end(&zip);
+  *out_restored = count;
+  return true;
+}
+
+void send_all(sock_t s, const char* data, size_t len);
+
+void send_temp_zip_download(sock_t s, const std::string& zip_path,
+                            const char* dl_name) {
+  FILE* f = fopen(zip_path.c_str(), "rb");
+  if (!f) {
+    remove(zip_path.c_str());
+    return;
+  }
+  xfer_fseek(f, 0, SEEK_END);
+  const int64_t sz = (int64_t)xfer_ftell(f);
+  xfer_fseek(f, 0, SEEK_SET);
+  if (sz < 0) {
+    fclose(f);
+    remove(zip_path.c_str());
+    return;
+  }
+  char hdr[512];
+  int hl = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/zip\r\n"
+                    "Content-Disposition: attachment; filename=\"%s\"\r\n"
+                    "Content-Length: %lld\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Connection: close\r\n\r\n",
+                    dl_name, (long long)sz);
+  if (hl > 0) send_all(s, hdr, (size_t)hl);
+  char buf[65536];
+  size_t n = 0;
+  while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+    send_all(s, buf, n);
+  }
+  fclose(f);
+  remove(zip_path.c_str());
 }
 
 // ---------- JSON + lightweight config parsing ----------
@@ -763,12 +1098,15 @@ std::string games_json() {
     const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
     std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
     if (input.empty()) input = "auto";
+    const pe_compat_info compat = inspect_pe_compat(gdir, exe);
     if (!first) j += ",";
     first = false;
     j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
          json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
          "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
-         json_escape(input) + "\",\"exes\":[";
+         json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
+         "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
+         (compat.ok ? "true" : "false") + ",\"exes\":[";
     for (size_t i = 0; i < exes.size(); ++i) {
       if (i) j += ",";
       j += "\"" + json_escape(exes[i]) + "\"";
@@ -781,102 +1119,168 @@ std::string games_json() {
 const char* k_upload_page =
   "<!doctype html><html><head><meta charset=utf-8>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<meta name=theme-color content='#1b120e'><title>Tiramisu Companion</title><style>"
-  "*{box-sizing:border-box}button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #f1b477;outline-offset:2px}"
-  "body{background:#1b120e;color:#fff0dc;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;"
-  "max-width:780px;margin:0 auto;padding:20px}"
-  "header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:16px}"
-  "h1{color:#e5a568;font-size:24px;margin:0}h2{font-size:15px;color:#d7b89f;margin:0 0 10px}"
-  ".card{background:#2b1e17;border:1px solid #513829;border-radius:12px;padding:16px;margin-bottom:16px}"
+  "<meta name=theme-color content='#08070a'><title>Tiramisu — Xbox LAN Dashboard</title><style>"
+  "*{box-sizing:border-box}"
+  "button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid #cbbab5;outline-offset:2px}"
+  "body{background:#08070a;color:#f6f3f2;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;"
+  "max-width:860px;margin:0 auto;padding:20px;min-height:100vh;"
+  "background-image:radial-gradient(circle at 12% 18%,rgba(246,192,202,.16),transparent 42%),radial-gradient(circle at 88% 92%,rgba(247,188,199,.14),transparent 44%)}"
+  "header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:18px}"
+  "h1{color:#f6f3f2;font-size:24px;margin:0;letter-spacing:-.02em}h2{font-size:15px;color:#cbbab5;margin:0 0 12px;letter-spacing:.02em;text-transform:uppercase}"
+  ".card{background:linear-gradient(180deg,rgba(28,26,31,.88),rgba(19,18,22,.94));border:1px solid rgba(255,255,255,.10);border-radius:20px;padding:18px;margin-bottom:16px;box-shadow:0 16px 40px rgba(0,0,0,.55)}"
   ".row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}"
-  ".btn{padding:10px 14px;min-height:44px;border:0;border-radius:8px;background:#e5a568;color:#241812;font-weight:700;cursor:pointer;font-size:14px}"
-  ".btn:hover{background:#f1b477}.btn:disabled{background:#2a3a3e;color:#789}"
-  ".btn-sec{background:#423024;color:#f8e7d3}.btn-danger{background:#8b2635;color:#ffd6dc}"
-  "input,select{background:#211612;color:#fff0dc;border:1px solid #614534;border-radius:8px;padding:8px 10px;font-size:14px}"
-  ".drop{border:2px dashed #b47340;border-radius:10px;padding:20px;text-align:center;color:#d7b89f;background:#211612;margin-bottom:10px}"
-  ".drop.over{border-color:#f1b477;background:#3c281c}"
-  "#bar{height:8px;background:#483222;border-radius:4px;overflow:hidden;margin:10px 0}"
-  "#fill{height:100%;width:0;background:#e5a568;transition:width .2s}"
-  ".game{background:#241812;border:1px solid #553a2b;border-radius:10px;padding:12px;margin-bottom:10px}"
-  ".game-top{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}"
+  ".btn{padding:10px 16px;min-height:42px;border:0;border-radius:999px;background:linear-gradient(180deg,#cbbab5,#bdaaa4);color:#161316;font-weight:700;cursor:pointer;font-size:14px}"
+  ".btn:hover{filter:brightness(1.06)}.btn:disabled{opacity:.45;cursor:not-allowed}"
+  ".btn-sec{background:rgba(255,255,255,.09);color:#f6f3f2;border:1px solid rgba(255,255,255,.12)}.btn-danger{background:#7f2230;color:#ffe2e7}"
+  "input,select{background:#121116;color:#f6f3f2;border:1px solid rgba(255,255,255,.14);border-radius:12px;padding:9px 12px;font-size:14px}"
+  ".drop{border:2px dashed rgba(203,186,181,.45);border-radius:16px;padding:24px 16px;text-align:center;color:#d5cecc;background:rgba(255,255,255,.03);margin-bottom:12px;transition:all .15s}"
+  ".drop.over{border-color:#f6f3f2;background:rgba(203,186,181,.12)}"
+  "#bar{height:10px;background:rgba(255,255,255,.12);border-radius:999px;overflow:hidden;margin:12px 0}"
+  "#fill{height:100%;width:0;background:linear-gradient(90deg,#cbbab5,#f6f3f2);transition:width .15s}"
+  ".game{background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.09);border-radius:16px;padding:14px;margin-bottom:10px}"
+  ".game-top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}"
+  ".game-head{display:flex;align-items:center;gap:12px;min-width:0}"
+  ".cover-thumb{width:84px;height:48px;border-radius:10px;object-fit:cover;background:#16141a;border:1px solid rgba(255,255,255,.12);flex-shrink:0}"
   ".game-cfg{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px}"
   "@media(max-width:560px){.game-cfg{grid-template-columns:1fr}}"
-  "pre{background:#1f1510;border:1px solid #503728;border-radius:8px;padding:10px;max-height:240px;overflow:auto;font-size:12px;color:#e4c5ac;white-space:pre-wrap}"
-  ".pill{font-size:12px;padding:4px 9px;border-radius:999px;background:#3f2a1d;color:#f1b477}"
-  ".connect{display:flex;gap:16px;align-items:center;flex-wrap:wrap}"
-  "#qrx canvas{border:8px solid #fff;border-radius:8px;background:#fff}"
+  "pre{background:#0e0d11;border:1px solid rgba(255,255,255,.09);border-radius:12px;padding:12px;max-height:260px;overflow:auto;font-size:12px;color:#d5cecc;white-space:pre-wrap}"
+  ".pill{display:inline-block;font-size:12px;padding:4px 10px;border-radius:999px;background:rgba(203,186,181,.16);color:#cbbab5;border:1px solid rgba(203,186,181,.3)}"
+  ".connect{display:flex;gap:18px;align-items:center;flex-wrap:wrap}"
+  "#qrx img{width:136px;height:136px;border-radius:12px;background:#fff;padding:6px;display:block}"
   ".conn-info{flex:1;min-width:220px}"
-  ".conn-url{font-size:18px;font-weight:600;color:#f1b477;word-break:break-all}"
-  ".conn-sub{font-size:13px;color:#c9a88f;margin-top:6px}"
-  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:7px 0;border-bottom:1px solid #4b3426}"
-  ".setrow label{font-size:14px;color:#f8e7d3}"
-  ".setrow input,.setrow select{width:100%}"
+  ".conn-url{font-size:18px;font-weight:700;color:#cbbab5;word-break:break-all}"
+  ".conn-sub{font-size:13px;color:#9e9699;margin-top:6px}"
+  ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.08)}"
+  ".setrow label{font-size:14px;color:#f6f3f2}.setrow input,.setrow select{width:100%}"
   "@media(max-width:560px){.setrow{grid-template-columns:1fr}}"
   "nav{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 16px}"
-  "nav a{color:#f1b477;background:#3f2a1d;padding:10px 14px;border-radius:8px;text-decoration:none}"
-  "@media(max-width:560px){body{padding:12px}.card{padding:12px}input,select{font-size:16px}}"
+  "nav a{color:#d5cecc;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);padding:9px 15px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600}"
+  "@media(max-width:560px){body{padding:12px}.card{padding:14px}input,select{font-size:16px}}"
   "</style></head><body>"
   "<header><div><h1>Tiramisu</h1><span class=pill id=runpill role=status>Connecting…</span></div>"
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
   "<nav aria-label=Companion><a href='#transfer'>Transfer</a><a href='#games'>Games</a>"
-  "<a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
-  "<div class=card><h2>Console connection</h2>"
-  "<div class=connect><div id=qrx></div><div class=conn-info>"
-  "<div class=conn-url id=connurl>—</div>"
-  "<div class=conn-sub>Keep this device and Xbox on the same network.</div>"
-  "<div class=conn-sub style='color:#c9a88f'>Open Setup on the Xbox to find its QR code.</div>"
+  "<a href='#steam'>Steam</a><a href='#support'>Saves &amp; Support</a><a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
+  "<div class=card><h2>Console connection &amp; QR</h2>"
+  "<div class=connect><div id=qrx><img src='/api/qr.svg' alt='LAN QR Code' onerror=\"this.style.display='none'\"></div>"
+  "<div class=conn-info><div class=conn-url id=connurl>—</div>"
+  "<div class=conn-sub>Scan this QR on any phone or open the URL on your PC over the same Wi-Fi / LAN.</div>"
+  "<div class=conn-sub>Remote Keyboard &amp; Mouse: <a id=ctrlLink href='/controls' style='color:#cbbab5;font-weight:700'>Open Remote KBM / Trackpad →</a></div>"
   "</div></div></div>"
-  "<div class=card id=transfer><h2>Transfer a game</h2>"
-  "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b> or <b>.zip</b> here, or use the buttons below</div>"
+  "<div class=card id=transfer><h2>Transfer Games to Xbox</h2>"
+  "<div class=drop id=dz>Drag &amp; drop a <b>game folder</b>, <b>.zip archive</b>, or <b>files</b> here</div>"
   "<div class=row style='margin-bottom:10px'>"
   "<input id=gname placeholder='Game Name (auto from folder/zip)' style='flex:1;min-width:180px'>"
-  "<button class=btn onclick=\"document.getElementById('fdir').click()\">Pick Folder</button>"
-  "<button class='btn btn-sec' onclick=\"document.getElementById('fzip').click()\">Pick .zip</button>"
+  "<button class=btn onclick=\"E('fzip').click()\">Upload .zip</button>"
+  "<button class='btn btn-sec' onclick=openDirPicker()>Upload Folder</button>"
+  "<button class='btn btn-sec' onclick=\"E('ffiles').click()\">Pick Files (Phone)</button>"
   "<input type=file id=fdir webkitdirectory directory multiple style='display:none'>"
-  "<input type=file id=fzip accept='.zip' style='display:none'></div>"
+  "<input type=file id=fzip accept='.zip,application/zip' style='display:none'>"
+  "<input type=file id=ffiles multiple style='display:none'></div>"
+  "<div id=dirhint style='font-size:12px;color:#9e9699;margin:-2px 0 10px'>Tip: iPhone/mobile browsers cannot upload raw folders — zip the folder first (<b>Upload .zip</b>) or use an Xbox USB drive.</div>"
+  "<div class=row style='margin-bottom:6px'>"
+  "<input id=dlurl placeholder='Direct .zip URL for Xbox to download itself (https://...)' style='flex:1;min-width:200px'>"
+  "<button class='btn btn-sec' onclick=downloadFromUrl()>Download on Xbox</button></div>"
   "<div id=bar><div id=fill></div></div>"
-  "<div id=log role=status style='font-size:13px;color:#c9a88f;min-height:18px'>Ready over LAN</div></div>"
-  "<div class=card id=games><h2>Installed games</h2><div id=list><span style='color:#c9a88f'>loading...</span></div></div>"
-  "<div class=card id=settings><h2>Console settings</h2>"
-  "<div id=setwrap><span style='color:#c9a88f'>loading settings...</span></div>"
-  "<div class=row style='margin-top:10px'><button class=btn onclick=saveSettings()>Save Settings</button>"
-  "<span id=setstat style='color:#c9a88f;font-size:13px'></span></div></div>"
+  "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
+  "<div class=card id=games><h2>Installed Games on Xbox</h2><div id=list><span style='color:#9e9699'>loading...</span></div></div>"
+  "<div class=card id=steam><div class=game-top><h2 style='margin:0'>Steam Account &amp; Direct Downloads</h2>"
+  "<div class=row><button class=btn onclick=startSteamQr()>Sign in with Steam QR</button>"
+  "<button class='btn btn-sec' onclick=refreshSteam()>Refresh Steam</button>"
+  "<button class='btn btn-danger' onclick=steamSignOut()>Sign Out</button></div></div>"
+  "<div id=steaminfo style='margin:10px 0;font-size:13px;color:#d5cecc'>Checking Steam account...</div>"
+  "<div id=steamqrwrap style='display:none;margin:10px 0'><img id=steamqrimg style='width:180px;height:180px;background:#fff;padding:8px;border-radius:14px' alt='Steam QR'></div>"
+  "<div id=steamlist></div></div>"
+  "<div class=card id=support><h2>Save Backups &amp; Support Bundle</h2>"
+  "<div style='font-size:13px;color:#d5cecc;margin-bottom:10px'>Dev Mode uninstalls wipe <code>LocalState</code>. Back up saves before updating Tiramisu, or download a debug zip for bug reports.</div>"
+  "<div class=row>"
+  "<a class=btn href='/api/backup-saves' download='tiramisu-saves-backup.zip' style='text-decoration:none;display:inline-flex;align-items:center'>Backup Saves (.zip)</a>"
+  "<button class='btn btn-sec' onclick=\"E('frestore').click()\">Restore Saves (.zip)</button>"
+  "<a class='btn btn-sec' href='/api/debug-bundle' download='tiramisu-debug-bundle.zip' style='text-decoration:none;display:inline-flex;align-items:center'>Download Debug Bundle (.zip)</a>"
+  "<input type=file id=frestore accept='.zip,application/zip' style='display:none'></div>"
+  "<div id=supstat style='margin-top:8px;font-size:13px;color:#cbbab5'></div></div>"
+  "<div class=card id=settings><h2>Console Settings</h2>"
+  "<div id=setwrap><span style='color:#9e9699'>loading settings...</span></div>"
+  "<div class=row style='margin-top:12px'><button class=btn onclick=saveSettings()>Save Settings</button>"
+  "<span id=setstat style='color:#cbbab5;font-size:13px'></span></div></div>"
   "<div class=card id=console-logs><div class=game-top><h2 style='margin:0'>Live Console Logs</h2>"
-  "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div>"
-  "<pre id=logs style='margin-top:10px'>Click Refresh Logs or wait for auto-refresh...</pre></div>"
+  "<div class=row><a class='btn btn-sec' href='/api/debug-bundle' download='tiramisu-debug-bundle.zip' style='text-decoration:none;display:inline-flex;align-items:center'>Debug Bundle (.zip)</a>"
+  "<button class='btn btn-sec' onclick=loadLogs()>Refresh Logs</button></div></div>"
+  "<pre id=logs style='margin-top:10px'>Loading logs...</pre></div>"
   "<script>"
   "const E=id=>document.getElementById(id);"
   "function setLog(s){E('log').textContent=s;}"
-  "function safeRel(p){return p.split('/').filter(Boolean).join('/');}"
+  "function safeRel(p){return (p||'').replace(/\\\\/g,'/').split('/').filter(Boolean).join('/');}"
+  "function xhrPut(url,blob,onProg){return new Promise((res,rej)=>{const x=new XMLHttpRequest();"
+  "x.open('PUT',url,true);x.timeout=0;"
+  "if(x.upload&&onProg)x.upload.onprogress=e=>{if(e.lengthComputable)onProg(e.loaded,e.total);};"
+  "x.onload=()=>res({ok:x.status>=200&&x.status<300,status:x.status,text:x.responseText});"
+  "x.onerror=()=>rej(new Error('network error'));x.ontimeout=()=>rej(new Error('upload timeout'));"
+  "x.send(blob);});}"
+  "async function putWithRetry(url,blob,onProg){let lastErr;"
+  "for(let a=0;a<3;a++){try{const r=await xhrPut(url,blob,onProg);if(r.ok)return r;lastErr=new Error('HTTP '+r.status+': '+r.text);}catch(e){lastErr=e;}"
+  "await new Promise(r=>setTimeout(r,400*(a+1)));}throw lastErr;}"
   "async function uploadFiles(items,forcedRoot){"
   "if(!items.length)return;"
   "let g=(E('gname').value||'').trim();"
   "if(!g){g=forcedRoot||(items[0].rel.split('/')[0]||'UploadedGame');g=g.replace(/\\.zip$/i,'');E('gname').value=g;}"
-  "let total=0,done=0;items.forEach(x=>total+=x.file.size);"
-  "setLog('Uploading '+items.length+' files ('+(total/1048576).toFixed(1)+' MB) -> '+g+'...');"
+  "let total=0,done=0,count=0;const inflight=new Map();const t0=Date.now();items.forEach(x=>total+=x.file.size);"
+  "const paint=()=>{let curBytes=done;inflight.forEach(v=>curBytes+=v);"
+  "const sec=Math.max(0.2,(Date.now()-t0)/1000);const mbps=(curBytes/1048576)/sec;"
+  "const pct=total?Math.min(99,(curBytes/total)*100):Math.min(99,(count/items.length)*100);"
+  "E('fill').style.width=pct.toFixed(1)+'%';"
+  "setLog('Uploading '+count+'/'+items.length+' ('+(curBytes/1048576).toFixed(1)+' / '+(total/1048576).toFixed(1)+' MB @ '+mbps.toFixed(1)+' MB/s) -> '+g);};"
+  "setLog('Uploading '+items.length+' file(s) ('+(total/1048576).toFixed(1)+' MB) -> '+g+'...');"
+  "E('fill').style.width='1%';"
   "let idx=0;"
-  "async function worker(){while(idx<items.length){const cur=items[idx++];"
+  "async function worker(){while(idx<items.length){const myId=idx++;const cur=items[myId];"
   "let rel=safeRel(cur.rel);const p0=rel.indexOf('/');"
   "if(!forcedRoot&&p0>0&&rel.slice(0,p0)===g)rel=rel.slice(p0+1);"
   "if(cur.stripFirst&&rel.includes('/'))rel=rel.slice(rel.indexOf('/')+1);"
-  "const url='/api/upload-file?game='+encodeURIComponent(g)+'&rel='+encodeURIComponent(rel);"
-  "const r=await fetch(url,{method:'PUT',body:cur.file});"
-  "if(!r.ok)throw new Error('HTTP '+r.status+' on '+rel);"
-  "done+=cur.file.size;E('fill').style.width=(total?Math.min(100,done/total*100):100)+'%';}}"
-  "try{await Promise.all([worker(),worker(),worker(),worker(),worker(),worker()]);"
-  "setLog('Uploaded '+items.length+' files to '+g+' — ready to Launch!');refresh();}catch(e){setLog('Upload error: '+e.message);}}"
+  "const url='/api/upload-file?game='+encodeURIComponent(g)+'&rel='+encodeURIComponent(rel)+'&batch=1';"
+  "await putWithRetry(url,cur.file,(ld)=>{inflight.set(myId,ld);paint();});"
+  "inflight.delete(myId);done+=cur.file.size;count++;paint();}}"
+  "try{await Promise.all([worker(),worker(),worker()]);"
+  "await fetch('/api/upload-complete?game='+encodeURIComponent(g),{method:'POST'});"
+  "E('fill').style.width='100%';"
+  "setLog('Uploaded '+items.length+' file(s) ('+(total/1048576).toFixed(1)+' MB) to '+g+' — ready on Xbox!');refresh();}catch(e){setLog('Upload error: '+e.message);}}"
   "async function uploadZip(f){if(!f)return;"
-  "setLog('Uploading '+f.name+'...');E('fill').style.width='5%';"
-  "const t=setInterval(()=>{fetch('/progress/'+encodeURIComponent(f.name)).then(r=>r.text()).then(v=>{"
-  "E('fill').style.width=Math.min(99,parseFloat(v)*100)+'%';});},600);"
-  "try{const r=await fetch('/upload/'+encodeURIComponent(f.name),{method:'PUT',body:f});"
-  "clearInterval(t);E('fill').style.width='100%';setLog(await r.text());refresh();}"
-  "catch(e){clearInterval(t);setLog('Error: '+e.message);}}"
-  "E('fzip').onchange=e=>{if(e.target.files[0])uploadZip(e.target.files[0]);};"
-  "E('fdir').onchange=e=>{const fs=[...e.target.files];if(!fs.length)return;"
+  "let name=(E('gname').value||'').trim();"
+  "let fname=name?(name.replace(/\\.zip$/i,'')+'.zip'):f.name;"
+  "setLog('Uploading '+fname+' ('+(f.size/1048576).toFixed(1)+' MB)...');E('fill').style.width='2%';"
+  "try{const r=await putWithRetry('/upload/'+encodeURIComponent(fname),f,(ld,tot)=>{"
+  "const pct=tot?Math.min(95,(ld/tot)*95):50;E('fill').style.width=pct.toFixed(1)+'%';"
+  "setLog(pct>=94?('Extracting '+fname+' on Xbox...'):('Uploading '+fname+': '+(ld/1048576).toFixed(1)+' / '+(tot/1048576).toFixed(1)+' MB'));});"
+  "E('fill').style.width='100%';setLog(r.text||'Extracted cleanly!');refresh();}catch(e){setLog('Upload failed: '+e.message);}}"
+  "async function downloadFromUrl(){const u=(E('dlurl').value||'').trim();if(!u)return;"
+  "let g=(E('gname').value||'').trim();"
+  "setLog('Starting direct Xbox download...');E('fill').style.width='5%';"
+  "const r=await fetch('/api/download-url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:u,game:g})});"
+  "setLog(await r.text());refresh();}"
+  "function openDirPicker(){"
+  "const inp=E('fdir');"
+  "const ios=/iPhone|iPad|iPod/i.test(navigator.userAgent);"
+  "if(ios||!('webkitdirectory' in inp)){"
+  "setLog('Folder upload is not supported in this browser — compress the game folder as a .zip and tap Upload .zip, or use Pick Files (Phone).');"
+  "E('dirhint').style.color='#f3dbc4';return;}"
+  "if(/Android|Mobile/i.test(navigator.userAgent)||(navigator.userAgentData&&navigator.userAgentData.mobile)){"
+  "setLog('Opening the mobile folder picker. If it selects no files, use Upload .zip or Pick Files (Phone) instead.');}"
+  "inp.click();}"
+  "if(/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)||(navigator.userAgentData&&navigator.userAgentData.mobile)){"
+  "E('dirhint').innerHTML='Mobile browser detected: folder upload may be blocked — <b>Upload .zip</b> or <b>Pick Files (Phone)</b> is the reliable path. Large games: use an Xbox USB drive.';"
+  "E('dirhint').style.color='#f3dbc4';}"
+  "E('fzip').onchange=e=>{if(e.target.files[0])uploadZip(e.target.files[0]);e.target.value='';};"
+  "E('fdir').onchange=e=>{const fs=[...e.target.files];if(!fs.length){"
+  "setLog('No files found in selected folder — zip the folder and use Upload .zip instead.');return;}"
   "const root=(fs[0].webkitRelativePath||fs[0].name).split('/')[0];"
-  "uploadFiles(fs.map(f=>({file:f,rel:f.webkitRelativePath||f.name,stripFirst:true})),root);};"
+  "uploadFiles(fs.map(f=>({file:f,rel:f.webkitRelativePath||f.name,stripFirst:true})),root);e.target.value='';};"
+  "E('ffiles').onchange=e=>{const fs=[...e.target.files];if(!fs.length)return;"
+  "if(fs.length===1&&/\\.zip$/i.test(fs[0].name)){uploadZip(fs[0]);}else{"
+  "uploadFiles(fs.map(f=>({file:f,rel:f.name,stripFirst:false})),'');}e.target.value='';};"
+  "E('frestore').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;"
+  "E('supstat').textContent='Restoring saves from '+f.name+'...';"
+  "try{const r=await putWithRetry('/api/restore-saves',f);E('supstat').textContent='Restore complete: '+r.text;loadSettings();}catch(err){E('supstat').textContent='Restore failed: '+err.message;}};"
   "async function walkEntry(ent,prefix,out){if(ent.isFile){"
   "const f=await new Promise(res=>ent.file(res));out.push({file:f,rel:prefix+f.name,stripFirst:false});"
   "}else if(ent.isDirectory){const rdr=ent.createReader();"
@@ -891,8 +1295,12 @@ const char* k_upload_page =
   "if(ents.length===1&&ents[0].isFile&&/\\.zip$/i.test(ents[0].name)){const f=await new Promise(r=>ents[0].file(r));return uploadZip(f);}"
   "if(ents.length){const out=[];for(const en of ents)await walkEntry(en,'',out);"
   "const root=ents[0].isDirectory?ents[0].name:'';await uploadFiles(out.map(x=>({...x,stripFirst:ents[0].isDirectory})),root);}"
-  "else if(e.dataTransfer.files.length){uploadZip(e.dataTransfer.files[0]);}};"
-  "async function launch(n){setLog('Launching '+n+' — look at TV');await fetch('/launch/'+encodeURIComponent(n),{method:'POST'});refreshStatus();}"
+  "else if(e.dataTransfer.files.length){const f=e.dataTransfer.files[0];if(/\\.zip$/i.test(f.name))uploadZip(f);else uploadFiles([...e.dataTransfer.files].map(x=>({file:x,rel:x.name,stripFirst:false})),'');}};"
+  "async function uploadCover(name,inp){const f=inp.files[0];if(!f)return;"
+  "setLog('Uploading cover art for '+name+'...');"
+  "const r=await fetch('/api/cover/'+encodeURIComponent(name),{method:'PUT',body:f});"
+  "setLog(r.ok?('Updated cover art for '+name):('Cover upload failed: HTTP '+r.status));refresh();}"
+  "async function launch(n,ok,badge){if(ok===false&&!confirm(n+' flagged: '+(badge||'unsupported')+'\\nTry launching anyway?'))return;setLog('Launching '+n+' — look at TV');await fetch('/launch/'+encodeURIComponent(n),{method:'POST'});refreshStatus();}"
   "async function stopGame(){setLog('Stopping active game...');await fetch('/api/stop',{method:'POST'});refreshStatus();}"
   "async function rescan(){await fetch('/api/rescan',{method:'POST'});refresh();}"
   "async function delGame(n){if(!confirm('Delete '+n+'?'))return;await fetch('/api/game/'+encodeURIComponent(n),{method:'DELETE'});refresh();}"
@@ -901,20 +1309,38 @@ const char* k_upload_page =
   "setLog('Saved config for '+name);refresh();}"
   "function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
   "async function refresh(){const g=await(await fetch('/games')).json();const el=E('list');"
-  "if(!g.length){el.innerHTML='<span style=\"color:#678\">No games yet — drag a game folder or .zip above</span>';return;}"
+  "if(!g.length){el.innerHTML='<span style=\"color:#9e9699\">No games yet — drag a game folder or .zip above</span>';return;}"
   "el.innerHTML=g.map((x,i)=>{const opts=(x.exes||[x.exe]).map(e=>'<option value=\"'+esc(e)+'\"'+(e===x.exe?' selected':'')+'>'+esc(e)+'</option>').join('');"
   "const inps=['auto','controller','kbm','pad2kbm'].map(m=>'<option value=\"'+m+'\"'+(m===x.input?' selected':'')+'>Input: '+m+'</option>').join('');"
-  "return '<div class=game><div class=game-top><b>'+esc(x.name)+'</b><div class=row>'"
-  "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\')\">Launch ▶</button>'"
+  "const ccol=(x.compat_ok===false)?'#ff9aa8':'#b6e3c6';"
+  "const cbadge=x.compat?('<span class=pill style=\"color:'+ccol+';border-color:rgba(255,255,255,.16)\">'+esc(x.compat)+'</span>'):'';"
+  "return '<div class=game><div class=game-top><div class=game-head>'"
+  "+'<img class=cover-thumb src=\"/api/cover/'+encodeURIComponent(x.name)+'?t='+Date.now()+'\" onerror=\"this.style.opacity=0.2\">'"
+  "+'<b>'+esc(x.name)+'</b> '+cbadge+'</div><div class=row>'"
+  "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>'"
+  "+'<button class=\"btn btn-sec\" onclick=\"E(\\'cov'+i+'\\').click()\">Cover</button>'"
+  "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover(\\''+esc(x.name)+'\\',this)\">'"
   "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+',\\''+esc(x.name)+'\\')\">Save</button>'"
   "+'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button></div></div>'"
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
-  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox connected';}catch{E('runpill').textContent='Xbox unavailable';}}"
-  "async function loadLogs(){E('logs').textContent=await(await fetch('/api/logs')).text();}"
-  // ---- settings editor ----
+  "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
+  "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
+  "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
+  "async function loadSteam(){try{const st=await(await fetch('/api/steam/status')).json();"
+  "E('steaminfo').textContent=(st.signed_in?('Signed in as '+(st.persona||st.steamid64)+' · '):'')+(st.status||'Ready');"
+  "if(st.qr_url){E('steamqrwrap').style.display='block';E('steamqrimg').src='/api/steam/qr.svg?t='+Date.now();}else{E('steamqrwrap').style.display='none';}"
+  "const items=await(await fetch('/api/steam/library')).json();"
+  "E('steamlist').innerHTML=items.length?items.slice(0,40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
+  "+(x.installed?'<span class=pill>Installed</span>':(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>':'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>'))+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
+  "}catch{}}"
+  "async function startSteamQr(){await fetch('/api/steam/qr',{method:'POST'});setTimeout(loadSteam,1200);}"
+  "async function refreshSteam(){await fetch('/api/steam/refresh',{method:'POST'});setTimeout(loadSteam,1200);}"
+  "async function steamSignOut(){await fetch('/api/steam/signout',{method:'POST'});loadSteam();}"
+  "async function dlSteam(id){await fetch('/api/steam/download/'+id,{method:'POST'});setLog('Started native Steam download for AppID '+id);loadSteam();}"
+  "async function loadLogs(){try{E('logs').textContent=await(await fetch('/api/logs')).text();}catch{}}"
   "const SET_DEFS=["
   "['default_input','Default input mode','choice',['auto','controller','kbm','pad2kbm']],"
   "['mouse_speed','Pad-as-mouse speed (1-100)','int',null],"
@@ -927,23 +1353,29 @@ const char* k_upload_page =
   "['write_watch','Write-watch GC (GetWriteWatch)','bool',null],"
   "['steam_auth','Steam QR link (own account)','bool',null],"
   "['show_qr','Show QR / LAN link on TV','bool',null],"
+  "['show_fps','Show FPS counter','bool',null],"
+  "['vsync','VSync','bool',null],"
+  "['frame_rate_cap','Frame rate cap (0=off, 30, 60, 120)','int',null],"
+  "['resolution_scale','Resolution scale % (50-200)','int',null],"
+  "['memory_budget_mb','Memory budget MB (1024-8192)','int',null],"
+  "['input_deadzone','Controller deadzone % (0-50)','int',null],"
+  "['audio_buffer_ms','Audio buffer ms (10-50)','int',null],"
+  "['shader_cache','Shader compile cache','bool',null],"
   "['log_lines','Dashboard log tail lines (4-40)','int',null]];"
   "async function loadSettings(){"
   "let s;try{s=await(await fetch('/api/settings')).json();}catch{E('setwrap').innerHTML='<span style=\"color:#a66\">settings unavailable</span>';return;}"
   "E('setwrap').innerHTML=SET_DEFS.map(d=>{const [k,lab,ty,chs]=d;const v=s[k];"
   "if(ty==='bool')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>'"
   "+'<option value=\"1\"'+(v?' selected':'')+'>ON</option><option value=\"0\"'+(!v?' selected':'')+'>OFF</option></select></div>';"
-  "if(ty==='choice')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>"
-  "+'+chs.map(c=>'<option value=\"'+c+'\"'+(c===v?' selected':'')+'>'+c+'</option>').join('')+'</select></div>';"
+  "if(ty==='choice')return '<div class=setrow><label>'+lab+'</label><select id=set_'+k+'>'"
+  "+chs.map(c=>'<option value=\"'+c+'\"'+(c===v?' selected':'')+'>'+c+'</option>').join('')+'</select></div>';"
   "return '<div class=setrow><label>'+lab+'</label><input id=set_'+k+' type=number value=\"'+v+'\"></div>';}).join('');}"
   "async function saveSettings(){const p={};SET_DEFS.forEach(d=>{const k=d[0],ty=d[2];const el=E('set_'+k);if(!el)return;"
   "if(ty==='bool')p[k]=el.value==='1';else if(ty==='int')p[k]=parseInt(el.value||'0',10);else p[k]=el.value;});"
   "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
-  // ---- connect card: derive this page's own URL as the LAN link ----
   "E('connurl').textContent=location.href.split('?')[0];"
-  "loadSettings();"
-  "refresh();refreshStatus();setInterval(refreshStatus,2000);setInterval(loadLogs,4000);</script></body></html>";
+  "loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
                     std::string* out) {
@@ -1027,6 +1459,68 @@ uint64_t stream_to_file(sock_t s, const char* pre, size_t pre_len,
   return got;
 }
 
+bool stream_chunked_to_file(sock_t s, const char* pre, size_t pre_len,
+                            const char* path, uint64_t* out_written) {
+  FILE* f = fopen(path, "wb");
+  if (!f) return false;
+  std::string buf(pre ? pre : "", pre_len);
+  auto ensure = [&](size_t need) -> bool {
+    char tmp[65536];
+    while (buf.size() < need && !g_stop) {
+      int n = recv(s, tmp, sizeof(tmp), 0);
+      if (n <= 0) return false;
+      buf.append(tmp, (size_t)n);
+    }
+    return buf.size() >= need;
+  };
+  uint64_t written = 0;
+  bool ok = true;
+  while (ok && !g_stop) {
+    size_t crlf = buf.find("\r\n");
+    while (crlf == std::string::npos) {
+      char tmp[4096];
+      int n = recv(s, tmp, sizeof(tmp), 0);
+      if (n <= 0) { ok = false; break; }
+      buf.append(tmp, (size_t)n);
+      crlf = buf.find("\r\n");
+      if (buf.size() > 65536 && crlf == std::string::npos) { ok = false; break; }
+    }
+    if (!ok) break;
+    std::string line = buf.substr(0, crlf);
+    buf.erase(0, crlf + 2);
+    size_t semi = line.find(';');
+    if (semi != std::string::npos) line.resize(semi);
+    uint64_t csz = strtoull(line.c_str(), nullptr, 16);
+    if (csz == 0) break;
+    uint64_t rem = csz;
+    while (rem > 0) {
+      if (buf.empty() && !ensure(1)) { ok = false; break; }
+      size_t take = (size_t)std::min<uint64_t>(rem, buf.size());
+      if (fwrite(buf.data(), 1, take, f) != take) { ok = false; break; }
+      buf.erase(0, take);
+      rem -= take;
+      written += take;
+      g_upload_done += take;
+    }
+    if (!ok || !ensure(2)) { ok = false; break; }
+    buf.erase(0, 2); // trailing CRLF
+  }
+  if (fclose(f) != 0) ok = false;
+  if (!ok) remove(path);
+  if (out_written) *out_written = written;
+  return ok;
+}
+
+void set_upload_timeout(sock_t s) {
+#ifdef _WIN32
+  const DWORD to_ms = 120000;  // 120s for slow Wi-Fi uploads
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_ms, sizeof(to_ms));
+#else
+  struct timeval to_tv = {120, 0};
+  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to_tv, sizeof(to_tv));
+#endif
+}
+
 void send_all(sock_t s, const char* data, size_t len) {
   size_t sent = 0;
   while (sent < len) {
@@ -1055,9 +1549,12 @@ void respond(sock_t s, const char* code, const char* ctype,
              code, body.size());
     log_line(rb);
   }
-  char hdr[256];
+  char hdr[384];
   int hl = snprintf(hdr, sizeof(hdr),
                     "HTTP/1.1 %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                    "Access-Control-Allow-Origin: *\r\n"
+                    "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
+                    "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
                     "Connection: close\r\n\r\n", code, ctype, body.size());
   if (hl > 0) send_all(s, hdr, (size_t)hl);
   if (!body.empty()) send_all(s, body.data(), body.size());
@@ -1211,6 +1708,7 @@ void handle_client(sock_t s) {
 
   uint64_t content_len = 0;
   bool expect_100 = false;
+  bool is_chunked = false;
   std::string hdrs(req, (size_t)hdr_end);
   std::string hdrs_low = xfer_lower(hdrs);
   size_t clp = hdrs_low.find("\r\ncontent-length:");
@@ -1220,6 +1718,15 @@ void handle_client(sock_t s) {
   if (hdrs_low.find("\r\nexpect: 100-continue") != std::string::npos) {
     expect_100 = true;
   }
+  if (hdrs_low.find("\r\ntransfer-encoding:") != std::string::npos &&
+      hdrs_low.find("chunked") != std::string::npos) {
+    is_chunked = true;
+  }
+
+  if (strcmp(method, "OPTIONS") == 0) {
+    respond(s, "204 No Content", "text/plain", "");
+    return;
+  }
 
   std::string target = raw_target;
   std::string url_path = target;
@@ -1228,6 +1735,248 @@ void handle_client(sock_t s) {
   if (qm != std::string::npos) {
     url_path = target.substr(0, qm);
     query = target.substr(qm + 1);
+  }
+
+  if (strcmp(method, "GET") == 0 && url_path == "/api/qr.svg") {
+#ifdef TIRAMISU_UWP_HOST
+    std::string u;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      u = g.url;
+    }
+    uint8_t qr[qrcodegen_BUFFER_LEN_MAX], tmp[qrcodegen_BUFFER_LEN_MAX];
+    if (!u.empty() && qrcodegen_encodeText(u.c_str(), tmp, qr, qrcodegen_Ecc_MEDIUM,
+                                           qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                                           qrcodegen_Mask_AUTO, true)) {
+      const int sz = qrcodegen_getSize(qr);
+      const int brd = 3;
+      const int tot = sz + brd * 2;
+      std::string svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " +
+                        std::to_string(tot) + " " + std::to_string(tot) +
+                        "' shape-rendering='crispEdges'><rect width='100%' height='100%' fill='#fff'/><path fill='#08070a' d='";
+      for (int y = 0; y < sz; ++y) {
+        for (int x = 0; x < sz; ++x) {
+          if (qrcodegen_getModule(qr, x, y)) {
+            svg += "M" + std::to_string(x + brd) + "," + std::to_string(y + brd) + "h1v1h-1z";
+          }
+        }
+      }
+      svg += "'/></svg>";
+      respond(s, "200 OK", "image/svg+xml", svg);
+      return;
+    }
+#endif
+    respond(s, "404 Not Found", "text/plain", "qr unavailable");
+    return;
+  }
+
+  if (strcmp(method, "GET") == 0 && url_path.rfind("/api/cover/", 0) == 0) {
+#ifdef TIRAMISU_UWP_HOST
+    std::string name;
+    if (sanitize_game_name(url_decode(url_path.substr(11), false), &name)) {
+      std::string p = cover_art_disk_path(name);
+      if (!p.empty()) {
+        FILE* cf = fopen(p.c_str(), "rb");
+        if (cf) {
+          xfer_fseek(cf, 0, SEEK_END);
+          long long sz = (long long)xfer_ftell(cf);
+          xfer_fseek(cf, 0, SEEK_SET);
+          if (sz > 0 && sz < 8 * 1024 * 1024) {
+            std::string body((size_t)sz, '\0');
+            size_t n = fread(&body[0], 1, (size_t)sz, cf);
+            body.resize(n);
+            fclose(cf);
+            const bool is_png = (n >= 4 && (unsigned char)body[0] == 0x89 && body[1] == 'P');
+            respond(s, "200 OK", is_png ? "image/png" : "image/jpeg", body);
+            return;
+          }
+          fclose(cf);
+        }
+      }
+    }
+#endif
+    respond(s, "404 Not Found", "text/plain", "no cover");
+    return;
+  }
+
+  if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
+      url_path.rfind("/api/cover/", 0) == 0) {
+#ifdef TIRAMISU_UWP_HOST
+    std::string name;
+    if (!sanitize_game_name(url_decode(url_path.substr(11), false), &name) ||
+        content_len == 0 || content_len > 8 * 1024 * 1024) {
+      respond(s, "400 Bad Request", "text/plain", "bad cover request");
+      return;
+    }
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    std::string body;
+    body.reserve((size_t)content_len);
+    size_t take_pre = std::min<size_t>(pre_len, (size_t)content_len);
+    if (take_pre) body.append(pre, take_pre);
+    char btmp[8192];
+    while (body.size() < content_len && !g_stop) {
+      int n = recv(s, btmp, (int)std::min<uint64_t>(content_len - body.size(), sizeof(btmp)), 0);
+      if (n <= 0) break;
+      body.append(btmp, (size_t)n);
+    }
+    if (body.size() == content_len &&
+        cover_art_save_bytes(name, (const uint8_t*)body.data(), body.size())) {
+      respond(s, "200 OK", "application/json", "{\"ok\":true}");
+      return;
+    }
+#endif
+    respond(s, "400 Bad Request", "text/plain", "invalid cover image");
+    return;
+  }
+
+  if (strcmp(method, "POST") == 0 && url_path == "/api/upload-complete") {
+    std::string game;
+    if (!sanitize_game_name(query_param(query, "game"), &game)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid game");
+      return;
+    }
+    g_upload_total = 0;
+    g_upload_done = 0;
+    set_upload_label("");
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.last_upload = game + " (uploaded)";
+      g.last_error.clear();
+      g.rescan_requested = true;
+      g.rescan_game = game;
+    }
+    webxfer_autopilot_begin(game);
+    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    return;
+  }
+
+  if (strcmp(method, "POST") == 0 && url_path == "/api/download-url") {
+    std::string body;
+    if (!recv_exact_all(s, pre, pre_len, content_len, &body)) {
+      respond(s, "400 Bad Request", "text/plain", "bad body");
+      return;
+    }
+    std::string dl_url, game_v;
+    if (!parse_json_str_field(body, "url", &dl_url) ||
+        (dl_url.rfind("http://", 0) != 0 && dl_url.rfind("https://", 0) != 0)) {
+      respond(s, "400 Bad Request", "text/plain", "provide a valid http(s):// URL");
+      return;
+    }
+    parse_json_str_field(body, "game", &game_v);
+#ifdef TIRAMISU_UWP_HOST
+    std::string stem = game_v;
+    if (stem.empty()) {
+      size_t sl = dl_url.rfind('/');
+      stem = (sl == std::string::npos) ? "DownloadedGame" : dl_url.substr(sl + 1);
+      size_t qq = stem.find('?');
+      if (qq != std::string::npos) stem.resize(qq);
+      if (stem.size() > 4 && xfer_ieq(stem.substr(stem.size() - 4), ".zip"))
+        stem.resize(stem.size() - 4);
+    }
+    std::string safe_game;
+    if (!sanitize_game_name(stem, &safe_game)) safe_game = "DownloadedGame";
+    std::thread([dl_url, safe_game]() {
+      try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+        using namespace winrt::Windows::Web::Http;
+        using namespace winrt::Windows::Storage::Streams;
+        set_upload_label("Downloading " + safe_game);
+        HttpClient http;
+        std::wstring wurl(dl_url.begin(), dl_url.end());
+        auto resp = http.GetAsync(winrt::Windows::Foundation::Uri(wurl),
+                                  HttpCompletionOption::ResponseHeadersRead).get();
+        if (!resp.IsSuccessStatusCode()) {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_error = "URL download HTTP " + std::to_string((int)resp.StatusCode());
+          set_upload_label("");
+          return;
+        }
+        uint64_t total_sz = 0;
+        if (auto cl = resp.Content().Headers().ContentLength()) total_sz = cl.Value();
+        g_upload_total = total_sz > 0 ? total_sz : 1048576;
+        g_upload_done = 0;
+        const std::string sep(1, XFER_SEP);
+        mkdirs(g_incoming);
+        mkdirs(g_games_dir);
+        // Support direct disc-image URLs (.iso/.bin/.img) as well as .zip archives
+        std::string url_no_q = dl_url;
+        size_t qpos = url_no_q.find('?');
+        if (qpos != std::string::npos) url_no_q.resize(qpos);
+        std::string direct_ext;
+        for (const char* e : {".iso", ".bin", ".img"}) {
+          const size_t el = strlen(e);
+          if (url_no_q.size() > el &&
+              xfer_ieq(url_no_q.substr(url_no_q.size() - el), e)) {
+            direct_ext = e;
+            break;
+          }
+        }
+        const std::string tmp = direct_ext.empty()
+            ? (g_incoming + sep + safe_game + ".zip")
+            : (g_games_dir + sep + safe_game + direct_ext);
+        FILE* fp = fopen(tmp.c_str(), "wb");
+        if (!fp) {
+          g_upload_total = 0;
+          g_upload_done = 0;
+          set_upload_label("");
+          std::lock_guard<std::mutex> lk(g_mu);
+          g.last_error = "cannot open Xbox storage path: " + tmp;
+          return;
+        }
+        auto stream = resp.Content().ReadAsInputStreamAsync().get();
+        Buffer buf(65536);
+        uint64_t got = 0;
+        while (!g_stop) {
+          auto res = stream.ReadAsync(buf, 65536, InputStreamOptions::Partial).get();
+          uint32_t n = res.Length();
+          if (n == 0) break;
+          DataReader dr = DataReader::FromBuffer(res);
+          std::vector<uint8_t> chunk(n);
+          dr.ReadBytes(chunk);
+          fwrite(chunk.data(), 1, n, fp);
+          got += n;
+          g_upload_done = got;
+          if (got > g_upload_total.load()) g_upload_total = got;
+        }
+        fclose(fp);
+        bool ok = false;
+        std::string note;
+        if (!direct_ext.empty()) {
+          ok = (got > 0);
+          note = std::to_string(got / 1048576) + " MB disc image";
+        } else {
+          set_upload_label("Extracting " + safe_game);
+          const std::string dest = g_games_dir + sep + safe_game;
+          mkdirs(dest);
+          ok = extract_zip(tmp, dest, &note);
+          remove(tmp.c_str());
+        }
+        g_upload_total = 0;
+        g_upload_done = 0;
+        set_upload_label("");
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (ok) {
+          g.last_upload = safe_game + " (" + note + ")";
+          g.last_error.clear();
+          g.rescan_requested = true;
+          g.rescan_game = safe_game;
+        } else {
+          g.last_error = "URL extract failed: " + note;
+        }
+      } catch (...) {
+        g_upload_total = 0;
+        g_upload_done = 0;
+        set_upload_label("");
+        std::lock_guard<std::mutex> lk(g_mu);
+        g.last_error = "URL download failed";
+      }
+    }).detach();
+    respond(s, "202 Accepted", "text/plain",
+            "Downloading " + safe_game + " directly onto Xbox — watch TV or progress bar!");
+#else
+    respond(s, "501 Not Implemented", "text/plain", "URL download requires Xbox UWP host");
+#endif
+    return;
   }
 
   if (strcmp(method, "GET") == 0 && url_path == "/controls") {
@@ -1278,6 +2027,114 @@ void handle_client(sock_t s) {
     respond(s, "200 OK", "application/json", games_json());
     return;
   }
+#ifdef TIRAMISU_UWP_HOST
+  if (strcmp(method, "GET") == 0 && url_path == "/api/steam/status") {
+    const auto acct = steam_client_account();
+    const auto items = steam_client_items();
+    char sb[1024];
+    snprintf(sb, sizeof(sb),
+             "{\"signed_in\":%s,\"steamid64\":\"%llu\",\"persona\":\"%s\","
+             "\"status\":\"%s\",\"qr_url\":\"%s\",\"busy\":%s,\"count\":%zu}",
+             acct.signed_in ? "true" : "false",
+             (unsigned long long)acct.steamid64,
+             json_escape(acct.persona.empty() ? acct.account_name : acct.persona).c_str(),
+             json_escape(acct.status_line).c_str(),
+             json_escape(acct.qr_url).c_str(),
+             acct.busy ? "true" : "false", items.size());
+    respond(s, "200 OK", "application/json", sb);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/steam/qr.svg") {
+    const auto acct = steam_client_account();
+    if (acct.qr_url.empty()) {
+      respond(s, "404 Not Found", "text/plain", "no active steam qr");
+      return;
+    }
+    uint8_t qr[qrcodegen_BUFFER_LEN_MAX];
+    uint8_t tmp[qrcodegen_BUFFER_LEN_MAX];
+    if (!qrcodegen_encodeText(acct.qr_url.c_str(), tmp, qr, qrcodegen_Ecc_LOW,
+                              qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX,
+                              qrcodegen_Mask_AUTO, true)) {
+      respond(s, "500 Internal Server Error", "text/plain", "qr encode error");
+      return;
+    }
+    const int sz = qrcodegen_getSize(qr);
+    const int quiet = 2;
+    const int vb = sz + quiet * 2;
+    std::string svg = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 " +
+                      std::to_string(vb) + " " + std::to_string(vb) +
+                      "' shape-rendering='crispEdges'><rect width='100%' height='100%' fill='#fff'/>"
+                      "<path fill='#121011' d='";
+    for (int y = 0; y < sz; ++y) {
+      for (int x = 0; x < sz; ++x) {
+        if (qrcodegen_getModule(qr, x, y)) {
+          svg += "M" + std::to_string(x + quiet) + "," + std::to_string(y + quiet) + "h1v1h-1z";
+        }
+      }
+    }
+    svg += "'/></svg>";
+    respond(s, "200 OK", "image/svg+xml", svg);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/steam/qr") {
+    steam_client_begin_qr([]() {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+      g.rescan_game.clear();
+    });
+    respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/steam/refresh") {
+    steam_client_refresh_remote([]() {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+      g.rescan_game.clear();
+    });
+    respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path == "/api/steam/signout") {
+    steam_client_sign_out();
+    respond(s, "200 OK", "application/json", "{\"ok\":true}");
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/steam/library") {
+    const auto items = steam_client_items();
+    std::string out = "[";
+    for (size_t i = 0; i < items.size(); ++i) {
+      if (i) out += ",";
+      char b[512];
+      snprintf(b, sizeof(b),
+               "{\"appid\":%u,\"title\":\"%s\",\"size\":\"%s\","
+               "\"installed\":%s,\"downloading\":%s,\"pct\":%.3f,\"status\":\"%s\"}",
+               items[i].app_id, json_escape(items[i].title).c_str(),
+               json_escape(items[i].size_str).c_str(),
+               items[i].installed ? "true" : "false",
+               items[i].downloading ? "true" : "false",
+               items[i].download_pct,
+               json_escape(items[i].status_text).c_str());
+      out += b;
+    }
+    out += "]";
+    respond(s, "200 OK", "application/json", out);
+    return;
+  }
+  if (strcmp(method, "POST") == 0 && url_path.rfind("/api/steam/download/", 0) == 0) {
+    const uint32_t appid = (uint32_t)strtoul(url_path.substr(20).c_str(), nullptr, 10);
+    if (appid == 0) {
+      respond(s, "400 Bad Request", "text/plain", "bad appid");
+      return;
+    }
+    steam_client_download_app(appid, []() {
+      std::lock_guard<std::mutex> lk(g_mu);
+      g.rescan_requested = true;
+      g.rescan_game.clear();
+    });
+    respond(s, "202 Accepted", "application/json", "{\"ok\":true}");
+    return;
+  }
+#endif
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
     // .238 FIX: serve /api/status WITHOUT holding g_mu across
     // the response -- the .237 priority fix did NOT cure the
@@ -1337,6 +2194,7 @@ void handle_client(sock_t s) {
                running_game.c_str(), wait_ms);
       log_line(hl);
     }
+    const std::string ctrl_code = webxfer_control_code();
     char buf[1024];
     snprintf(buf, sizeof(buf),
              "{\"running\":%s,\"guest_running\":%s,\"running_game\":\"%s\",\"url\":\"%s\","
@@ -1345,6 +2203,7 @@ void handle_client(sock_t s) {
              "\"last_launch_result\":\"%s\",\"last_launch_name\":\"%s\","
              "\"autopilot_game\":\"%s\",\"autopilot_attempt\":%d,"
              "\"autopilot_result\":\"%s\","
+             "\"control_code\":\"%s\","
              "\"upload_done\":%llu,\"upload_total\":%llu}",
              running ? "true" : "false",
              // running = the server is listening; guest_running = a guest is
@@ -1358,6 +2217,7 @@ void handle_client(sock_t s) {
              json_escape(last_launch_result).c_str(),
              json_escape(last_launch_name).c_str(),
              json_escape(ap_game).c_str(), ap_attempt, ap_result.c_str(),
+             json_escape(ctrl_code).c_str(),
              upload_done, upload_total);
     respond(s, "200 OK", "application/json", buf);
     return;
@@ -1366,6 +2226,124 @@ void handle_client(sock_t s) {
     const std::string logp =
         g_local_state_dir + std::string(1, XFER_SEP) + "tiramisu.log";
     respond(s, "200 OK", "text/plain; charset=utf-8", read_log_tail(logp));
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/backup-saves") {
+    const std::string sep(1, XFER_SEP);
+    mkdirs(g_incoming);
+    const std::string tmp_zip = g_incoming + sep + "backup-saves-" +
+                                std::to_string((long long)std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                ".zip";
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_file(&zip, tmp_zip.c_str(), 0)) {
+      respond(s, "500 Server Error", "text/plain", "cannot create backup zip");
+      return;
+    }
+    std::string manifest = "Tiramisu save backup\n";
+    uint64_t total_added = 0;
+    const uint64_t kMaxFile = 64ull * 1024 * 1024;
+    const uint64_t kMaxTotal = 256ull * 1024 * 1024;
+    zip_add_dir_capped(&zip, g_local_state_dir + sep + "drive_c", "drive_c",
+                       kMaxFile, &total_added, kMaxTotal, &manifest);
+    zip_add_dir_capped(&zip, g_local_state_dir + sep + "profiles", "profiles",
+                       kMaxFile, &total_added, kMaxTotal, &manifest);
+    zip_add_file_if_present(&zip, g_local_state_dir + sep + "settings.ini",
+                            "settings.ini", 0);
+    mz_zip_writer_add_mem(&zip, "backup-manifest.txt", manifest.data(),
+                          manifest.size(), MZ_DEFAULT_COMPRESSION);
+    const bool ok = mz_zip_writer_finalize_archive(&zip);
+    mz_zip_writer_end(&zip);
+    if (!ok) {
+      remove(tmp_zip.c_str());
+      respond(s, "500 Server Error", "text/plain", "backup finalize failed");
+      return;
+    }
+    send_temp_zip_download(s, tmp_zip, "tiramisu-saves-backup.zip");
+    return;
+  }
+  if ((strcmp(method, "POST") == 0 || strcmp(method, "PUT") == 0) &&
+      url_path == "/api/restore-saves") {
+    set_upload_timeout(s);
+    if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
+    const std::string sep(1, XFER_SEP);
+    mkdirs(g_incoming);
+    const std::string tmp_zip = g_incoming + sep + "restore-saves-" +
+                                std::to_string((long long)std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                ".zip";
+    uint64_t got = 0;
+    bool upload_ok = false;
+    if (is_chunked) {
+      upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp_zip.c_str(), &got);
+    } else {
+      got = stream_to_file(s, pre, pre_len, tmp_zip.c_str(), content_len);
+      upload_ok = (got == content_len && got > 0);
+    }
+    if (!upload_ok) {
+      remove(tmp_zip.c_str());
+      respond(s, "400 Bad Request", "text/plain", "incomplete backup upload");
+      return;
+    }
+    int restored = 0;
+    std::string err;
+    const bool ok = restore_saves_zip(tmp_zip, g_local_state_dir, &restored, &err);
+    remove(tmp_zip.c_str());
+    if (!ok) {
+      respond(s, "400 Bad Request", "text/plain", err);
+      return;
+    }
+    settings_load(g_local_state_dir);
+    char rb[96];
+    snprintf(rb, sizeof(rb), "{\"ok\":true,\"restored\":%d}", restored);
+    respond(s, "200 OK", "application/json", rb);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/debug-bundle") {
+    const std::string sep(1, XFER_SEP);
+    mkdirs(g_incoming);
+    const std::string tmp_zip = g_incoming + sep + "debug-bundle-" +
+                                std::to_string((long long)std::chrono::steady_clock::now().time_since_epoch().count()) +
+                                ".zip";
+    mz_zip_archive zip{};
+    if (!mz_zip_writer_init_file(&zip, tmp_zip.c_str(), 0)) {
+      respond(s, "500 Server Error", "text/plain", "cannot create debug zip");
+      return;
+    }
+    zip_add_file_if_present(&zip, g_local_state_dir + sep + "tiramisu.log",
+                            "tiramisu.log", 512ull * 1024);
+    zip_add_file_if_present(&zip, g_local_state_dir + sep + "settings.ini",
+                            "settings.ini", 64ull * 1024);
+    std::vector<dir_ent> root_ents;
+    list_dir_entries(g_local_state_dir, &root_ents);
+    for (const auto& e : root_ents) {
+      if (e.is_dir) continue;
+      const std::string low = xfer_lower(e.name);
+      if (low.find("crash") != std::string::npos) {
+        zip_add_file_if_present(&zip, g_local_state_dir + sep + e.name,
+                                e.name.c_str(), 256ull * 1024);
+      }
+    }
+    std::string run_game, last_res, last_err;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      run_game = g.running_game;
+      last_res = g.last_launch_result;
+      last_err = g.last_error;
+    }
+    const std::string summary =
+        std::string("{\"running_game\":\"") + json_escape(run_game) +
+        "\",\"last_launch_result\":\"" + json_escape(last_res) +
+        "\",\"last_error\":\"" + json_escape(last_err) +
+        "\",\"games\":" + games_json() + "}";
+    mz_zip_writer_add_mem(&zip, "bundle-summary.json", summary.data(),
+                          summary.size(), MZ_DEFAULT_COMPRESSION);
+    const bool ok = mz_zip_writer_finalize_archive(&zip);
+    mz_zip_writer_end(&zip);
+    if (!ok) {
+      remove(tmp_zip.c_str());
+      respond(s, "500 Server Error", "text/plain", "debug finalize failed");
+      return;
+    }
+    send_temp_zip_download(s, tmp_zip, "tiramisu-debug-bundle.zip");
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/list-files") {
@@ -1587,27 +2565,41 @@ void handle_client(sock_t s) {
       }
     }
     inflight_guard inflight(game + "\x1f" + rel);
+    set_upload_timeout(s);
     if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     const std::string sep(1, XFER_SEP);
     const std::string gdir = g_games_dir + sep + game;
     const std::string out_path = gdir + sep + rel;
     const size_t sl = out_path.rfind(XFER_SEP);
     if (sl != std::string::npos) mkdirs(out_path.substr(0, sl));
-    g_upload_total += content_len;
-    uint64_t got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
-    if (got != content_len) {
+    set_upload_label(game);
+    uint64_t got = 0;
+    bool upload_ok = false;
+    if (is_chunked) {
+      upload_ok = stream_chunked_to_file(s, pre, pre_len, out_path.c_str(), &got);
+    } else {
+      g_upload_total += content_len;
+      got = stream_to_file(s, pre, pre_len, out_path.c_str(), content_len);
+      upload_ok = (got == content_len);
+    }
+    if (!upload_ok) {
       remove(out_path.c_str());
       respond(s, "500 Server Error", "text/plain", "incomplete file");
       return;
     }
+    const bool is_batch = (query_param(query, "batch") == "1");
     {
       std::lock_guard<std::mutex> lk(g_mu);
       g.last_upload = game + " -> " + rel;
       g.last_error.clear();
-      g.rescan_requested = true;
-      g.rescan_game = game;  // scoped: only this game's dir changed
+      if (!is_batch) {
+        g.rescan_requested = true;
+        g.rescan_game = game;
+      }
     }
-    webxfer_autopilot_begin(game);  // arm the in-console fix loop
+    if (!is_batch) {
+      webxfer_autopilot_begin(game);
+    }
     {
       // got == content_len here AND the on-disk size was verified equal
       char okj[64];
@@ -1617,7 +2609,8 @@ void handle_client(sock_t s) {
     }
     return;
   }
-  if (strcmp(method, "PUT") == 0 && url_path.rfind("/upload/", 0) == 0) {
+  if ((strcmp(method, "PUT") == 0 || strcmp(method, "POST") == 0) &&
+      url_path.rfind("/upload/", 0) == 0) {
     std::string fname = url_decode(url_path.substr(8), false);
     for (auto& c : fname) if (c == '/' || c == '\\' || c == ':') c = '_';
     if (fname.find("..") != std::string::npos || fname.empty()) {
@@ -1634,13 +2627,22 @@ void handle_client(sock_t s) {
       }
     }
     inflight_guard inflight("zip:" + fname);
+    set_upload_timeout(s);
     if (expect_100) send_all(s, "HTTP/1.1 100 Continue\r\n\r\n", 25);
     const std::string sep(1, XFER_SEP);
     const std::string tmp = g_incoming + sep + fname;
     g_upload_total = content_len;
     g_upload_done = 0;
-    const uint64_t got = stream_to_file(s, pre, pre_len, tmp.c_str(), content_len);
-    if (got != content_len) {
+    set_upload_label(fname);
+    uint64_t got = 0;
+    bool upload_ok = false;
+    if (is_chunked) {
+      upload_ok = stream_chunked_to_file(s, pre, pre_len, tmp.c_str(), &got);
+    } else {
+      got = stream_to_file(s, pre, pre_len, tmp.c_str(), content_len);
+      upload_ok = (got == content_len);
+    }
+    if (!upload_ok) {
       remove(tmp.c_str());
       {
         std::lock_guard<std::mutex> lk(g_mu);
@@ -1649,6 +2651,7 @@ void handle_client(sock_t s) {
       respond(s, "500 Server Error", "text/plain", "incomplete");
       g_upload_total = 0;
       g_upload_done = 0;
+      set_upload_label("");
       return;
     }
     char mb[32];
@@ -2128,6 +3131,16 @@ std::string webxfer_status_line() {
   if (!g.last_upload.empty()) return "xfer: " + g.last_upload + "  |  " + g.url;
   if (!g.last_error.empty()) return "xfer ERR: " + g.last_error + "  |  " + g.url;
   return g.running ? ("LAN Dashboard: " + g.url) : "transfer: offline";
+}
+
+void webxfer_upload_progress(uint64_t* out_done, uint64_t* out_total,
+                             std::string* out_label) {
+  if (out_done) *out_done = g_upload_done.load();
+  if (out_total) *out_total = g_upload_total.load();
+  if (out_label) {
+    std::lock_guard<std::mutex> lk(g_upload_label_mu);
+    *out_label = g_upload_label;
+  }
 }
 
 std::string webxfer_url() {

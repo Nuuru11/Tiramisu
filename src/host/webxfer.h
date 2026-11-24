@@ -6,6 +6,7 @@
 #ifndef TIRAMISU_WEBXFER_H
 #define TIRAMISU_WEBXFER_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -71,6 +72,10 @@ void webxfer_autopilot_state(std::string* game, int* attempt,
 
 // One-line status for the TV overlay ("transfer: http://...", last upload, err).
 std::string webxfer_status_line();
+
+// Live upload/download progress for the Xbox TV Transfer UI.
+void webxfer_upload_progress(uint64_t* out_done, uint64_t* out_total,
+                             std::string* out_label);
 
 // Current transfer URL shown in the QR (empty until started).
 std::string webxfer_url();

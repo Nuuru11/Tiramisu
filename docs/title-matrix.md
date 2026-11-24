@@ -37,6 +37,7 @@ not quote the clip rate as the game's.
 |---|---|---|
 | Factorio 2.0 (x64, D3D11) | The reference title another loader runs at 60 UPS with audio — the bar to match | Untested here. Needs `game-stage.py` + `console.py proof` |
 | Any pre-2015 x86-32 title | Most of the PC catalogue | **W1**: Tiramisu executes PE32+ only. `game-stage.py` refuses to stage a PE32 game rather than upload 1.5 GB that cannot run |
+| Xbox GDK / GameOS console builds | Often x64, but they import `xgameruntime`/`gamingservices` and ship `MicrosoftGame.Config` + `gameos.xvd`; they are console packages, not Win32 desktop games | **Not a target.** The dashboard now flags them `Xbox GDK / GameOS build (Unsupported)`; Tiramisu does not bypass platform or DRM checks |
 
 ## Adding a row
 

@@ -77,7 +77,8 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   -I third_party/faudio-src/src \
   src/host/main.cpp src/host/host_log.cpp src/host/swapchain.cpp \
   src/host/ui.cpp src/host/webxfer.cpp src/host/audio.cpp src/host/settings.cpp \
-  src/host/crash_report.cpp src/host/steam_client.cpp \
+  src/host/crash_report.cpp src/host/steam_client.cpp src/host/cover_art.cpp \
+  src/host/boot_anim.cpp \
   src/trt/pe_loader.cpp src/trt/module_table.cpp src/trt/vfs.cpp src/trt/iso.cpp \
   src/trt/dynamic_api.cpp src/trt/engine_synthesizer.cpp \
   src/trt/bridge_res.cpp \
@@ -210,6 +211,18 @@ mkdir -p "$out/layout/mono" "$out/layout/etc/mono"
 cp -r "$MONO_FW/4.5" "$out/layout/mono/"
 [[ -d "$MONO_FW/gac" ]] && cp -r "$MONO_FW/gac" "$out/layout/mono/"
 [[ -f /etc/mono/config ]] && cp /etc/mono/config "$out/layout/etc/mono/config"
+# FNA substitutes for XNA 4.0 (Celeste and other managed XNA titles). The
+# offline gate sets mono_host.cfg.assemblies_path to third_party/fna/out;
+# the host falls back to <install>/fna, so ship the same DLLs there.
+FNA_OUT="$here/third_party/fna/out"
+[[ -f "$FNA_OUT/Microsoft.Xna.Framework.dll" &&
+   -f "$FNA_OUT/Microsoft.Xna.Framework.Game.dll" &&
+   -f "$FNA_OUT/Microsoft.Xna.Framework.Graphics.dll" ]] \
+  || { echo "ERROR: FNA assemblies missing in $FNA_OUT (run third_party/build-fna-stack.sh)" >&2; exit 6; }
+rm -rf "$out/layout/fna"
+mkdir -p "$out/layout/fna"
+cp "$FNA_OUT"/Microsoft.Xna.Framework*.dll "$FNA_OUT/Microsoft.Xna.Framework.dll.config" "$out/layout/fna/"
+echo "FNA XNA assemblies packaged in $out/layout/fna"
 # Tiramisu UWP: map every managed P/Invoke library to the host exe's
 # exports. Programmatic dllmaps (assembly_load_hook) do not apply to all
 # resolution paths on this Mono build; the config file is read at init.

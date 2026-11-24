@@ -2,6 +2,8 @@
 
 <img src="docs/banner-chrome.png" alt="Tiramisu UWP — PC games on Xbox Series X|S" width="100%"/>
 
+# Tiramisu UWP
+
 ### Run PC games on Xbox Series X|S — natively.
 
 **A Windows PE64 application runtime for Xbox Dev Mode.**
@@ -14,11 +16,18 @@ Wine's job, targeting UWP instead of POSIX.
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![DRM](https://img.shields.io/badge/DRM%20bypass-none%2C%20ever-red)
 
-[How it works](#-how-it-works) · [Console proof](#console-proof-2026-11-19) · [What boots](#-what-boots-today) · [Build](#-build-linux-all-cross) · [Status](#-status) · [Evidence](docs/03-evidence.md) · [Gap map](GAP-MAP.md)
+[Install](#-quick-start-xbox-dev-mode) · [What Works](#-before-you-download-what-works-today) · [Console proof](#console-proof-2026-11-19) · [What boots](#-what-boots-today) · [Build](#-build-from-source-linux) · [Issues](https://github.com/xanstomper/Tiramisu/issues/new/choose)
 
-**[⬇ Download the release](https://github.com/xanstomper/tiramisu/releases)** · **[🎮 Compatibility](#-what-boots-today)**
+**[⬇ Download Latest Release](https://github.com/xanstomper/Tiramisu/releases)** · **[🎮 Compatibility Matrix](docs/title-matrix.md)**
 
 </div>
+
+> [!IMPORTANT]
+> **Before you download — what works today:**
+> - **64-bit (`x64` PE32+) Windows games only.** 32-bit `x86` games, kernel anti-cheat (EasyAntiCheat/BattlEye), Xbox GDK/GameOS packages (for example a `MicrosoftGame.Config` + `gameos.xvd` console build), and heavy desktop productivity suites (After Effects, DaVinci Resolve) are **not** supported yet.
+> - **APIs today:** D3D11, D3D9/D3D8, Vulkan (via SPIR-V→HLSL→D3D11), and OpenGL. **D3D12 execution, Bink video cutscenes, and Wwise audio** are still incomplete/experimental.
+> - **Celeste v1.4.0.0 is playable but silent.** FSB5 Vorbis decode is disabled on console after it heap-corrupted on a Series S; `fsb_decode=1` is test-only. See [known issues](docs/known-issues.md).
+> - **Set Dev Home to Game mode (5 GB RAM)** and **back up your saves** via the LAN dashboard (`Saves & Support → Backup Saves (.zip)`) before uninstalling or updating Tiramisu — Xbox Dev Mode wipes `LocalState` on uninstall.
 
 ---
 
@@ -589,22 +598,30 @@ exe**, per-game args/appid/input, launch/stop/delete), the live log, and the
 **same settings editor** (`GET/POST /api/settings`) — all offline-gated in
 `tests/test_webxfer.cpp`.
 
-## 🚀 Quick start (console)
+## 🚀 Quick start (Xbox Dev Mode)
 
-```sh
-# 1. install the runtime (from a PC on the same LAN)
-DP_HOST=<console-ip> DP_PASS=<portal-pass> \
-  tools/deploy.sh install out/Tiramisu.msix out/dev.cer
+No Linux or coding tools required to install a release on your Xbox.
 
-# 2. open the dashboard shown on the TV (or scan the QR) and upload
-#    your game as a folder or .zip — pick its .exe — press launch
+### 1. Install Tiramisu on your console
 
-# 3. watch the TV
-tools/deploy.sh screenshot tv.png
-```
+1. Enable **Xbox Dev Mode** and open **Dev Home**.
+2. Go to **Settings → Dev Home** and turn **ON** `"Treat UWP apps as games by default"` *(this gives Tiramisu **5 GB RAM** instead of 1 GB)*.
+3. Download **`Tiramisu.msix`** + **`dev.cer`** (normal build) **or** **`Tiramisu-EdgeSpoof.msix`** + **`edge-dev.cer`** (KBM edition, below) from the [latest GitHub Release](https://github.com/xanstomper/Tiramisu/releases).
+4. Open your Xbox **Device Portal** in any Windows, Mac, or phone browser (`https://<your-xbox-ip>:11443`).
+5. Under **My games & apps → Add**, upload the `.msix` you chose. When prompted for the signing certificate (or under Dev Home certificate management), import the matching `.cer` into **TrustedPeople**.
+   *(From a Linux dev PC you can also deploy with `DP_HOST=<console-ip> DP_PASS=<portal-pass> tools/deploy.sh install out/Tiramisu.msix out/dev.cer`.)*
 
-To push a game straight from the PC instead of the phone page — and to record
-proof for the title matrix:
+### 2. Transfer games & play
+
+- **Over Wi-Fi / LAN:** Launch **Tiramisu** on Xbox, scan the **QR code** (or open `http://<xbox-ip>:9127` on PC/phone):
+  - **On PC:** Drag & drop a game folder or `.zip`, or select an uncompressed folder.
+  - **On iPhone / mobile:** Mobile browsers don't allow folder selection — compress your game folder to a **`.zip`** first and tap **Upload .zip** (or use **Pick Files** / a direct `.zip` URL).
+  - **Large games (10+ GB) via USB:** Put your game folder on an NTFS/exFAT USB drive formatted for Xbox media/games; Tiramisu scans external drives automatically.
+- **Mouse games on Xbox (normal build):** use your **Xbox controller (`pad2kbm` right stick = mouse, triggers = click)** or the **Phone Remote Trackpad (`/controls` link on the LAN dashboard)**.
+- **Keyboard & mouse (KBM) edition:** the same release ships **`Tiramisu-EdgeSpoof.msix` + `edge-dev.cer`**. It is the experimental Microsoft Edge-identity build that asks the Xbox shell for real hardware pointer input; install it *instead of* the normal package on your own Dev Mode console. It is unsupported and unverified — read [XBOX-MOUSE.md](XBOX-MOUSE.md) before installing. The Edge identity has its own package family name, so games/saves start in a fresh `LocalState`; use `tools/migrate-localstate.py --from-pfn <old> --to-pfn <new>` to move an existing library across.
+- **Back up saves before updating:** Open the LAN dashboard → **Saves & Support → Backup Saves (.zip)** before uninstalling/reinstalling Tiramisu, since Dev Mode wipes `LocalState` when a package is removed.
+
+### For developers / maintainers (CLI staging & proof)
 
 ```sh
 python3 tools/game-stage.py "~/Games/<Title>" --out staging/<Title> --exe <rel.exe>
@@ -629,12 +646,15 @@ Prereqs on the console: Device Portal enabled and **"Treat UWP apps as games
 by default" ON** (5 GB limit, not 1 GB). Games you **own**; DRM-free builds
 or your own Steam account auth. **No DRM bypass, ever.**
 
-## 🔨 Build (Linux, all cross)
+## 🔨 Build from source (Linux)
 
 ```sh
 tools/build-test.sh    # full offline gate: 78 stages, real PE guests executed
 tools/build-host.sh    # the UWP host cross-build (clang-cl + lld-link)
-tools/pack.sh          # makemsix pack + sign + verify → out/Tiramisu.msix
+tools/release.sh       # host once, then BOTH packages:
+                       #   out/release/Tiramisu.msix + dev.cer
+                       #   out/release/Tiramisu-EdgeSpoof.msix + edge-dev.cer
+tools/pack.sh          # one flavor only; EDGE_SPOOF=1 for the KBM package
 ```
 
 Needs: LLVM 19 (`clang-cl`, `lld-link`), xwin splat at
@@ -749,6 +769,12 @@ failure is a red gate, never a skipped test.
 - MIT for our code; vendored third-party keeps its licenses
   (see `THIRD-PARTY.md` and vendored dirs).
 
+## 💬 Community & Reporting Issues
+
+- **Setup help, compatibility reports, clips, dev bridges:** use [GitHub Discussions](https://github.com/xanstomper/Tiramisu/discussions).
+- **Game doesn't boot or crashes?** On the LAN dashboard open **Saves & Support → Download Debug Bundle (.zip)** and attach it to a [Game Compatibility Report](https://github.com/xanstomper/Tiramisu/issues/new?template=game-compatibility.yml) or [Bug Report](https://github.com/xanstomper/Tiramisu/issues/new?template=bug-report.yml).
+- **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md) and [GAP-MAP.md](GAP-MAP.md) for active bridge & runtime work items.
+
 ## 📚 Documentation
 
 | Doc | Contents |
@@ -758,6 +784,7 @@ failure is a red gate, never a skipped test.
 | [docs/support-matrix.md](docs/support-matrix.md) | auto-generated, measured per-title `real / recorded / named-silent` import coverage |
 | [docs/gap-worklist.md](docs/gap-worklist.md) | auto-generated gap list (currently empty) — the next thing to implement if it is not |
 | [docs/title-matrix.md](docs/title-matrix.md) | evidence-backed title matrix, checked against on-disk artifacts |
+| [docs/promo-reel.md](docs/promo-reel.md) | 60-second setup/promo shot list and capture recipe |
 | [docs/known-issues.md](docs/known-issues.md) · [docs/troubleshooting.md](docs/troubleshooting.md) | measured limitations, and how to get unstuck |
 | [docs/proof/](docs/proof/) | console captures: RACCOIN menu, run and clip; four God of War boots; Celeste title, menu, greyscale test and gameplay |
 | [GAP-MAP.md](GAP-MAP.md) | live gap table, W-lanes, dependency order, triggers |

@@ -121,6 +121,24 @@ int b64_val(unsigned char c) {
   return -1;
 }
 
+std::string b64_encode(const uint8_t* data, size_t len) {
+  static const char k_tbl[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((len + 2) / 3) * 4);
+  for (size_t i = 0; i < len; i += 3) {
+    const uint32_t a = data[i];
+    const uint32_t b = (i + 1 < len) ? data[i + 1] : 0;
+    const uint32_t c = (i + 2 < len) ? data[i + 2] : 0;
+    const uint32_t tri = (a << 16) | (b << 8) | c;
+    out.push_back(k_tbl[(tri >> 18) & 0x3F]);
+    out.push_back(k_tbl[(tri >> 12) & 0x3F]);
+    out.push_back((i + 1 < len) ? k_tbl[(tri >> 6) & 0x3F] : '=');
+    out.push_back((i + 2 < len) ? k_tbl[tri & 0x3F] : '=');
+  }
+  return out;
+}
+
 std::vector<uint8_t> b64_decode(const std::string& in) {
   std::vector<uint8_t> out;
   uint32_t val = 0;
@@ -254,6 +272,43 @@ bool http_get_bytes(const std::string& url, std::vector<uint8_t>* out,
     return false;
   } catch (...) {
     if (err) *err = "HTTP download failed";
+    return false;
+  }
+}
+
+bool http_post_protobuf_steam(const std::string& endpoint,
+                              const std::vector<uint8_t>& pb_in,
+                              std::vector<uint8_t>* pb_out,
+                              std::string* err) {
+  try {
+    using namespace winrt::Windows::Web::Http;
+    using namespace winrt::Windows::Storage::Streams;
+    HttpClient http;
+    const std::string b64 = b64_encode(pb_in.data(), pb_in.size());
+    const std::wstring body = L"input_protobuf_encoded=" + uri_escape(u8to16(b64));
+    HttpStringContent content(body, UnicodeEncoding::Utf8,
+                              L"application/x-www-form-urlencoded");
+    auto resp =
+        http.PostAsync(winrt::Windows::Foundation::Uri(u8to16(endpoint)), content)
+            .get();
+    if (!resp.IsSuccessStatusCode()) {
+      if (err) {
+        char b[64];
+        snprintf(b, sizeof(b), "HTTP %d", (int)resp.StatusCode());
+        *err = b;
+      }
+      return false;
+    }
+    IBuffer buf = resp.Content().ReadAsBufferAsync().get();
+    DataReader dr = DataReader::FromBuffer(buf);
+    pb_out->resize(buf.Length());
+    if (!pb_out->empty()) dr.ReadBytes(*pb_out);
+    return true;
+  } catch (winrt::hresult_error const& e) {
+    if (err) *err = u16to8(std::wstring(e.message().c_str()));
+    return false;
+  } catch (...) {
+    if (err) *err = "HTTP POST protobuf failed";
     return false;
   }
 }
@@ -1203,30 +1258,47 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   }
   if (sid == 0 && refresh_tok.empty()) return;
 
-  // Refresh access token if needed
-  if (access_tok.empty() && !refresh_tok.empty() && sid != 0) {
-    std::string body = "{\"refresh_token\":\"" + refresh_tok +
-                       "\",\"steamid\":\"" + std::to_string(sid) +
-                       "\",\"renewal_type\":0}";
-    std::string resp, err;
-    if (http_post_form_steam(
+  // Refresh access token via protobuf GenerateAccessTokenForApp/v1 if needed
+  auto refresh_access_token = [&]() -> bool {
+    if (refresh_tok.empty() || sid == 0) return false;
+    pb_writer req;
+    req.write_string(1, refresh_tok);
+    req.write_fixed64(2, sid);
+    req.write_uint32(3, 0);  // renewal_type = k_ETokenRenewalType_None
+    std::vector<uint8_t> resp;
+    std::string err;
+    if (!http_post_protobuf_steam(
             "https://api.steampowered.com/IAuthenticationService/GenerateAccessTokenForApp/v1/",
-            body, &resp, &err)) {
-      try {
-        auto j = winrt::Windows::Data::Json::JsonObject::Parse(
-            winrt::hstring(u8to16(resp)));
-        auto r = j.GetNamedObject(L"response");
-        if (r.HasKey(L"access_token")) {
-          access_tok = u16to8(std::wstring(r.GetNamedString(L"access_token").c_str()));
-          std::lock_guard<std::mutex> lk(g_mu);
-          g_access_token = access_tok;
-          save_credentials(state_dir, sid, acct_name, g_acct.persona, refresh_tok,
-                           access_tok);
-        }
-      } catch (...) {
+            req.buf, &resp, &err)) {
+      log_line(("steam: GenerateAccessTokenForApp failed: " + err).c_str());
+      return false;
+    }
+    pb_reader rd{resp.data(), resp.size()};
+    uint32_t f = 0, wt = 0;
+    std::string new_acc, new_ref;
+    while (rd.next(&f, &wt)) {
+      if (f == 1 && wt == 2) {
+        const uint8_t* p = nullptr; size_t l = 0;
+        if (rd.read_bytes(&p, &l)) new_acc.assign((const char*)p, l);
+      } else if (f == 2 && wt == 2) {
+        const uint8_t* p = nullptr; size_t l = 0;
+        if (rd.read_bytes(&p, &l)) new_ref.assign((const char*)p, l);
+      } else {
+        rd.skip(wt);
       }
     }
-  }
+    if (new_acc.empty()) return false;
+    access_tok = new_acc;
+    if (!new_ref.empty()) refresh_tok = new_ref;
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_access_token = access_tok;
+    g_refresh_token = refresh_tok;
+    save_credentials(state_dir, sid, acct_name, g_acct.persona, refresh_tok,
+                     access_tok);
+    log_line("steam: refreshed access_token via protobuf GenerateAccessTokenForApp");
+    return true;
+  };
+  if (access_tok.empty()) refresh_access_token();
 
   // 1) Player summary (public Steam persona)
   std::string persona = acct_name;
@@ -1261,44 +1333,57 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
                      access_tok);
   }
 
-  // 2) Owned Games (requires access_token)
+  // 2) Owned Games (requires valid access_token; auto-refresh & retry once if stale)
   std::vector<steam_library_item> fetched_items;
-  if (!access_tok.empty()) {
+  for (int attempt = 0; attempt < 2 && !access_tok.empty(); ++attempt) {
     std::string resp, err;
     std::string url =
         "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/?"
         "access_token=" +
         access_tok + "&steamid=" + std::to_string(sid) +
-        "&include_appinfo=1&include_played_free_games=1";
-    if (http_get_text(url, &resp, &err)) {
-      try {
-        auto j = winrt::Windows::Data::Json::JsonObject::Parse(
-            winrt::hstring(u8to16(resp)));
-        auto r = j.GetNamedObject(L"response");
-        if (r.HasKey(L"games")) {
-          auto games = r.GetNamedArray(L"games");
-          for (uint32_t i = 0; i < games.Size(); ++i) {
-            auto g = games.GetObjectAt(i);
-            steam_library_item it;
-            it.app_id = (uint32_t)g.GetNamedNumber(L"appid");
-            it.title = g.HasKey(L"name")
-                           ? u16to8(std::wstring(g.GetNamedString(L"name").c_str()))
-                           : ("App " + std::to_string(it.app_id));
-            int mins = g.HasKey(L"playtime_forever")
-                           ? (int)g.GetNamedNumber(L"playtime_forever")
-                           : 0;
-            it.size_str = mins > 0 ? (std::to_string(mins / 60) + "h played")
-                                   : "Steam Purchase";
-            fetched_items.push_back(std::move(it));
-          }
-          std::sort(fetched_items.begin(), fetched_items.end(),
-                    [](const steam_library_item& a, const steam_library_item& b) {
-                      return a.title < b.title;
-                    });
-        }
-      } catch (...) {
-      }
+        "&include_appinfo=1&include_played_free_games=1&include_free_sub=1"
+        "&skip_unvetted_apps=false";
+    if (!http_get_text(url, &resp, &err)) {
+      log_line(("steam: GetOwnedGames failed (" + err + "), retrying token refresh").c_str());
+      if (attempt == 0 && refresh_access_token()) continue;
+      break;
     }
+    try {
+      auto j = winrt::Windows::Data::Json::JsonObject::Parse(
+          winrt::hstring(u8to16(resp)));
+      auto r = j.GetNamedObject(L"response");
+      if (r.HasKey(L"games")) {
+        auto games = r.GetNamedArray(L"games");
+        for (uint32_t i = 0; i < games.Size(); ++i) {
+          auto g = games.GetObjectAt(i);
+          steam_library_item it;
+          it.app_id = (uint32_t)g.GetNamedNumber(L"appid");
+          it.title = g.HasKey(L"name")
+                         ? u16to8(std::wstring(g.GetNamedString(L"name").c_str()))
+                         : ("App " + std::to_string(it.app_id));
+          int mins = g.HasKey(L"playtime_forever")
+                         ? (int)g.GetNamedNumber(L"playtime_forever")
+                         : 0;
+          it.size_str = mins > 0 ? (std::to_string(mins / 60) + "h played")
+                                 : "Steam Purchase";
+          fetched_items.push_back(std::move(it));
+        }
+        std::sort(fetched_items.begin(), fetched_items.end(),
+                  [](const steam_library_item& a, const steam_library_item& b) {
+                    return a.title < b.title;
+                  });
+        char msg[128];
+        snprintf(msg, sizeof(msg),
+                 "steam: loaded %zu owned games for SteamID %llu",
+                 fetched_items.size(), (unsigned long long)sid);
+        log_line(msg);
+      } else {
+        log_line("steam: GetOwnedGames returned empty response.games");
+      }
+    } catch (...) {
+      log_line("steam: GetOwnedGames JSON parse exception");
+    }
+    break;
   }
 
   // 3) Friends List + Friend Summaries
@@ -1505,58 +1590,121 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
   std::thread([cb = std::move(on_library_updated)]() {
     try {
       winrt::init_apartment(winrt::apartment_type::multi_threaded);
-      std::string resp, err;
-      std::string begin_json =
-          "{\"client_id\":\"2654200164598180\",\"device_id\":\"tiramisu-xbox\"}";
-      if (!http_post_form_steam(
+
+      // CAuthentication_BeginAuthSessionViaQR_Request (binary protobuf)
+      pb_writer dev;
+      dev.write_string(1, "Tiramisu Xbox");
+      dev.write_uint32(2, 1);   // platform_type = SteamClient
+      dev.write_uint32(3, 16);  // os_type = Win10/11
+      pb_writer req;
+      req.write_string(1, "Tiramisu Xbox");
+      req.write_uint32(2, 1);   // platform_type = SteamClient
+      req.write_bytes(3, dev.buf.data(), dev.buf.size());
+
+      std::vector<uint8_t> resp;
+      std::string err;
+      if (!http_post_protobuf_steam(
               "https://api.steampowered.com/IAuthenticationService/BeginAuthSessionViaQR/v1/",
-              begin_json, &resp, &err)) {
+              req.buf, &resp, &err)) {
+        log_line(("steam: BeginAuthSessionViaQR failed: " + err).c_str());
         std::lock_guard<std::mutex> lk(g_mu);
         g_acct.status_line = "steam QR request failed: " + err;
         g_acct.busy = false;
         g_auth_busy = false;
         return;
       }
-      auto j = winrt::Windows::Data::Json::JsonObject::Parse(
-          winrt::hstring(u8to16(resp)));
-      auto r2 = j.GetNamedObject(L"response");
-      std::string challenge =
-          u16to8(std::wstring(r2.GetNamedString(L"challenge_url").c_str()));
-      std::string client_id =
-          u16to8(std::wstring(r2.GetNamedString(L"client_id").c_str()));
-      std::string request_id =
-          u16to8(std::wstring(r2.GetNamedString(L"request_id").c_str()));
+
+      uint64_t client_id = 0;
+      std::string challenge;
+      std::vector<uint8_t> request_id;
+      float interval_sec = 5.0f;
       {
+        pb_reader rd{resp.data(), resp.size()};
+        uint32_t f = 0, wt = 0;
+        while (rd.next(&f, &wt)) {
+          if (f == 1 && wt == 0) {
+            rd.read_varint(&client_id);
+          } else if (f == 2 && wt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (rd.read_bytes(&p, &l)) challenge.assign((const char*)p, l);
+          } else if (f == 3 && wt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (rd.read_bytes(&p, &l)) request_id.assign(p, p + l);
+          } else if (f == 4 && wt == 5 && rd.pos + 4 <= rd.len) {
+            std::memcpy(&interval_sec, rd.p + rd.pos, 4);
+            rd.pos += 4;
+          } else {
+            rd.skip(wt);
+          }
+        }
+      }
+      if (client_id == 0 || challenge.empty() || request_id.empty()) {
+        log_line("steam: BeginAuthSessionViaQR returned incomplete protobuf");
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_acct.status_line = "steam QR decode error — press Y to retry";
+        g_acct.busy = false;
+        g_auth_busy = false;
+        return;
+      }
+      {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "steam: QR ready (%s)", challenge.c_str());
+        log_line(msg);
         std::lock_guard<std::mutex> lk(g_mu);
         g_acct.qr_url = challenge;
-        g_acct.status_line = "steam: scan QR with the Steam mobile app";
+        g_acct.status_line = "Scan QR with the Steam Mobile app to sign in";
       }
-      for (int i = 0; i < 36; ++i) {
-        Sleep(4000);
-        std::string presp, perr;
-        std::string pjson = "{\"client_id\":\"" + client_id +
-                            "\",\"request_id\":\"" + request_id + "\"}";
-        if (!http_post_form_steam(
+
+      const DWORD poll_ms =
+          (DWORD)std::clamp((int)(interval_sec * 1000.0f), 3000, 7000);
+      for (int i = 0; i < 45; ++i) {
+        Sleep(poll_ms);
+        pb_writer preq;
+        preq.write_uint64(1, client_id);
+        preq.write_bytes(2, request_id.data(), request_id.size());
+        std::vector<uint8_t> presp;
+        std::string perr;
+        if (!http_post_protobuf_steam(
                 "https://api.steampowered.com/IAuthenticationService/PollAuthSessionStatus/v1/",
-                pjson, &presp, &perr)) {
+                preq.buf, &presp, &perr)) {
           continue;
         }
-        auto pj = winrt::Windows::Data::Json::JsonObject::Parse(
-            winrt::hstring(u8to16(presp)));
-        auto pr2 = pj.GetNamedObject(L"response");
-        if (pr2.HasKey(L"refresh_token")) {
-          std::string ref = u16to8(
-              std::wstring(pr2.GetNamedString(L"refresh_token").c_str()));
-          std::string acc = pr2.HasKey(L"access_token")
-                                ? u16to8(std::wstring(
-                                      pr2.GetNamedString(L"access_token").c_str()))
-                                : "";
-          std::string aname = pr2.HasKey(L"account_name")
-                                  ? u16to8(std::wstring(
-                                        pr2.GetNamedString(L"account_name").c_str()))
-                                  : "";
+        uint64_t new_cid = 0;
+        std::string new_url, ref, acc, aname;
+        pb_reader prd{presp.data(), presp.size()};
+        uint32_t pf = 0, pwt = 0;
+        while (prd.next(&pf, &pwt)) {
+          if (pf == 1 && pwt == 0) {
+            prd.read_varint(&new_cid);
+          } else if (pf == 2 && pwt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (prd.read_bytes(&p, &l)) new_url.assign((const char*)p, l);
+          } else if (pf == 3 && pwt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (prd.read_bytes(&p, &l)) ref.assign((const char*)p, l);
+          } else if (pf == 4 && pwt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (prd.read_bytes(&p, &l)) acc.assign((const char*)p, l);
+          } else if (pf == 6 && pwt == 2) {
+            const uint8_t* p = nullptr; size_t l = 0;
+            if (prd.read_bytes(&p, &l)) aname.assign((const char*)p, l);
+          } else {
+            prd.skip(pwt);
+          }
+        }
+        if (new_cid != 0) client_id = new_cid;
+        if (!new_url.empty()) {
+          std::lock_guard<std::mutex> lk(g_mu);
+          g_acct.qr_url = new_url;
+        }
+        if (!ref.empty()) {
           uint64_t sid = extract_steamid_from_jwt(acc.empty() ? ref : acc);
           if (sid == 0) sid = extract_steamid_from_jwt(ref);
+          char okmsg[192];
+          snprintf(okmsg, sizeof(okmsg),
+                   "steam: signed in! account=%s steamid=%llu",
+                   aname.c_str(), (unsigned long long)sid);
+          log_line(okmsg);
           {
             std::lock_guard<std::mutex> lk(g_mu);
             g_refresh_token = ref;
@@ -1566,7 +1714,7 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
             if (g_acct.persona.empty()) g_acct.persona = aname;
             g_acct.signed_in = (sid != 0);
             g_acct.qr_url.clear();
-            g_acct.status_line = "steam: signed in — loading library & friends…";
+            g_acct.status_line = "Signed in — loading your Steam library…";
             save_credentials(g_state_dir, sid, aname, g_acct.persona, ref, acc);
           }
           fetch_remote_account_data(cb);
@@ -1575,15 +1723,10 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           g_auth_busy = false;
           return;
         }
-        if (pr2.HasKey(L"new_challenge_url")) {
-          std::lock_guard<std::mutex> lk(g_mu);
-          g_acct.qr_url = u16to8(
-              std::wstring(pr2.GetNamedString(L"new_challenge_url").c_str()));
-        }
       }
       std::lock_guard<std::mutex> lk(g_mu);
       g_acct.qr_url.clear();
-      g_acct.status_line = "steam: QR expired — press Y to retry";
+      g_acct.status_line = "Steam QR expired — press Y to generate a new code";
     } catch (winrt::hresult_error const& e) {
       std::lock_guard<std::mutex> lk(g_mu);
       g_acct.qr_url.clear();

@@ -346,6 +346,17 @@ void audio_status(char* out, unsigned cap) {
            g_voices.size(), g_submitted, g_dropped);
 }
 
+void audio_play_pcm_chunk(uint64_t voice_id, const void* pcm, uint32_t bytes,
+                          uint32_t rate, uint32_t channels, uint32_t bps,
+                          float volume) {
+  push_voice_pcm(voice_id, pcm, bytes, rate, channels, bps, 0u, volume);
+}
+
+void audio_stop_voice(uint64_t voice_id) {
+  std::lock_guard<std::mutex> lk(g_mix_mu);
+  g_voices.erase(voice_id);
+}
+
 void audio_shutdown() {
   g_mix_stop.store(true, std::memory_order_release);
   if (g_mix_thread.joinable()) g_mix_thread.join();

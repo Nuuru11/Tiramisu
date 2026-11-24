@@ -1,0 +1,40 @@
+name: Bug Report
+description: Report a bug with Tiramisu UI, game transfers, controller/audio, or crashes
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - LAN Upload / Folder / .zip Transfer
+        - Game Launch / Crash
+        - Xbox UI / Covers / Saves Backup
+        - Controller / Trackpad / Audio
+        - Steam QR / Depot Download
+        - Documentation / Setup
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Tiramisu Version
+      placeholder: e.g. v0.2.4.0
+    validations:
+      required: true
+  - type: input
+    id: client
+    attributes:
+      label: Console & Companion Device/Browser
+      placeholder: e.g. Xbox Series S + iPhone Safari / Windows Chrome
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce & Debug Bundle
+      description: Drag and drop `tiramisu-debug-bundle.zip` from the LAN dashboard (Saves & Support card) if available.
+      placeholder: 1. Opened... 2. Tapped... 3. Expected vs Actual...
+    validations:
+      required: true

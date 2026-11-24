@@ -5,13 +5,13 @@ static constexpr char k_controls_page[] = R"HTML(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Tiramisu Controls</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:#15100d;color:#f3dbc4;font:16px system-ui}
-main{max-width:740px;margin:6vh auto;padding:24px}h1{font-size:2rem;margin:0 0 18px}
-a{color:#91d4c9}input,button{font:inherit;padding:.65em;border-radius:8px;border:1px solid #8c5c3e}
-input{background:#261b16;color:inherit;width:12ch}button{background:#b2754a;color:#160c05;cursor:pointer}
-#pad{margin-top:18px;aspect-ratio:16/9;background:#261b16;border:1px solid #8c5c3e;
-border-radius:14px;display:grid;place-items:center;text-align:center;padding:20px;touch-action:none}
-#pad:focus{outline:2px solid #91d4c9}#pad[hidden]{display:none}
+*{box-sizing:border-box}body{margin:0;background:#08070a;color:#f5f3f2;font:16px system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
+main{max-width:780px;margin:5vh auto;padding:24px}h1{font-size:1.9rem;margin:8px 0 14px;font-weight:700}
+a{color:#cbbab5;text-decoration:none}input,button{font:inherit;padding:.65em 1em;border-radius:999px;border:1px solid rgba(255,255,255,.14)}
+input{background:rgba(0,0,0,.45);color:#fff;width:14ch;text-align:center;letter-spacing:2px}button{background:linear-gradient(135deg,#cbbab5,#b39f9a);color:#121011;font-weight:700;cursor:pointer;border:none}
+#pad{margin-top:18px;aspect-ratio:16/9;background:rgba(255,255,255,.05);border:1px solid rgba(203,186,181,.35);
+border-radius:20px;display:grid;place-items:center;text-align:center;padding:24px;touch-action:none;color:#d5cecc}
+#pad:focus{outline:2px solid #cbbab5}#pad[hidden]{display:none}
 </style>
 <main><a href="/">Tiramisu dashboard</a><h1>Keyboard and mouse</h1>
 <p>Watch the Xbox screen while you play. Enter the code shown on Tiramisu’s Home or Setup screen.</p>
@@ -120,6 +120,8 @@ setInterval(async()=>{
   } catch {status.textContent='Connection lost. Waiting for the Xbox.';release();}
   finally{busy=false;}
 },33);
+const qp=new URLSearchParams(location.search).get('pin');
+if(qp&&/^[0-9]{8}$/.test(qp)){pin.value=qp;pair.requestSubmit();}
 </script>
 </html>
 )HTML";

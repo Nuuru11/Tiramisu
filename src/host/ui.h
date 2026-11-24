@@ -1,7 +1,9 @@
 // tiramisu/src/host/ui.h
+// Obsidian & Champagne Glassmorphic Xbox Series X|S Dashboard UI.
 #ifndef TIRAMISU_UI_H
 #define TIRAMISU_UI_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 #include "vendor/qrcodegen.h"
@@ -11,19 +13,24 @@ namespace longan {
 struct ui_game {
   std::wstring name;
   std::wstring exe;
-  std::wstring meta;
-  std::wstring engine_type;  // UNIVERSAL | Custom Native | Unity (IL2CPP) | ...
+  std::wstring meta;         // e.g. input mode / appid
+  std::wstring engine_type;  // Direct3D 11 | Vulkan | Unity | Mono / FNA | ...
+  std::string key_utf8;      // UTF-8 game key for cover_art lookup
 };
 
-// which dashboard screen is up (host loop drives; controller/keyboard nav)
+// 5 primary capsule tabs matching the Tiramisu Series X|S dashboard design:
+// Home | Library | Steam | Tools (Transfer & Logs) | Settings
 enum ui_screen {
-  UI_SHELF = 0,    // game shelf + status
-  UI_SETTINGS = 1, // settings editor
-  UI_LOG = 2,      // live log tail
-  UI_SETUP = 3,    // pairing and system checks
-  UI_STEAM = 4,    // on-console Steam library & downloader
+  UI_SHELF = 0,     // Home (Hero spotlight + Library/Storage cards + Continue Playing)
+  UI_LIBRARY = 1,   // Full cover-art library grid & inspector
+  UI_STEAM = 2,     // On-console Steam library, QR auth & native depot downloader
+  UI_TOOLS = 3,     // LAN File Transfer + QR Code + System Health + Live Log
+  UI_SETTINGS = 4,  // Xbox Console & Runtime Settings
   UI_TAB_COUNT = 5,
-  UI_QUICKMENU = UI_TAB_COUNT // in-game Steam social & quick overlay
+  UI_QUICKMENU = UI_TAB_COUNT,  // In-game Steam Community & Quick Overlay
+  // Legacy aliases kept so older callers stay readable:
+  UI_SETUP = UI_TOOLS,
+  UI_LOG = UI_TOOLS
 };
 
 struct ui_steam_item {
@@ -62,13 +69,44 @@ void ui_quick_menu_nav_up();
 void ui_quick_menu_nav_down();
 int ui_quick_menu_selected();
 
-// one editable setting row on the settings screen
+// Adaptive input mode: when controller_active == true, Xbox controller button
+// badges (A/B/X/Y/LB/RB) are drawn on screen; when KBM input is detected,
+// controller badges are hidden until controller input resumes.
+void ui_set_input_mode(bool controller_active, bool pad_connected);
+
+// Live mouse/pointer position & visibility for crisp D2D vector cursor
+void ui_set_pointer_pos(int x, int y);
+void ui_set_cursor_visible(bool visible);
+
+// Sleek top-center glassmorphic toast banner (auto-fades after duration_sec)
+void ui_toast(std::wstring message, float duration_sec = 3.2f);
+
+// Real Xbox storage telemetry (from GetDiskFreeSpaceExA)
+void ui_set_storage(double used_gb, double total_gb);
+
+// Live LAN file transfer progress bar telemetry
+void ui_set_upload_progress(uint64_t done_bytes, uint64_t total_bytes,
+                            std::wstring label);
+
+// Interactive tools on the Tools screen
+struct ui_tool_item {
+  std::wstring title;
+  std::wstring desc;
+  std::wstring badge;
+};
+void ui_set_tools(const std::vector<ui_tool_item>& tools, int selected,
+                  std::wstring last_result);
+void ui_tools_nav_up();
+void ui_tools_nav_down();
+int ui_tools_selected();
+
+// One editable setting row on the Settings screen
 struct ui_setting {
-  wchar_t label[64];      // left column
-  wchar_t value[64];      // editable value (utf-16, host keeps the buffer)
-  bool is_bool;           // rendered as ON/OFF, A toggles
-  bool is_choice;         // value is one of choices (LR cycles)
-  bool is_int;            // numeric, up/down edits
+  wchar_t label[64];
+  wchar_t value[64];
+  bool is_bool;
+  bool is_choice;
+  bool is_int;
 };
 
 void ui_init(unsigned width, unsigned height, void* d2d_factory_v,
@@ -82,14 +120,37 @@ void ui_set_setup(const std::vector<std::wstring>& steps, int done_count,
 void ui_dismiss_first_run();
 void ui_set_transfer(std::wstring url, std::wstring status);
 void ui_set_control_hint(std::wstring hint);
-void ui_set_screen(ui_screen s);                 // shelf | settings | log
+void ui_set_screen(ui_screen s);
 void ui_set_settings(const ui_setting* rows, int count, int selected);
-void ui_set_quick_menu(bool visible);            // RetroArch-style in-game menu
-void ui_set_fps(float fps);                      // FPS counter for overlay
-void ui_set_sysinfo(const std::wstring& info);   // CPU/GPU/RAM string
+void ui_set_quick_menu(bool visible);
+void ui_set_fps(float fps);
+void ui_set_sysinfo(const std::wstring& info);
 void ui_set_log_tail(const std::vector<std::wstring>& lines);
-enum class ui_click_type { none, tab, open_home, play, select_game, select_setting };
-struct ui_click { ui_click_type type; int index; };
+void ui_log_scroll(int delta);
+void ui_set_delete_confirm(int game_index);
+
+enum class ui_click_type {
+  none,
+  tab,
+  open_home,
+  play,
+  select_game,
+  cycle_exe,
+  cycle_input,
+  delete_game,
+  open_transfer,
+  select_setting,
+  reset_settings,
+  select_steam,
+  steam_action,
+  steam_qr,
+  run_tool,
+  quick_menu_item
+};
+struct ui_click {
+  ui_click_type type;
+  int index;
+};
 ui_click ui_hit_test(int x, int y);
 void ui_render();
 

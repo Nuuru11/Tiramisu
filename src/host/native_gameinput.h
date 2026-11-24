@@ -36,6 +36,9 @@ class native_gameinput {
     using create_fn = HRESULT (WINAPI*)(IGameInput**);
     const auto create = reinterpret_cast<create_fn>(GetProcAddress(module, "GameInputCreate"));
     if (create && SUCCEEDED(create(input_.put())) && input_) {
+      // Request exclusive foreground focus policy so Xbox GameInput delivers
+      // raw USB mouse & keyboard readings to this foreground window.
+      input_->SetFocusPolicy(GameInputExclusiveForegroundInput);
       char rline[96];
       std::snprintf(rline, sizeof(rline),
                     "input: native GameInput ready (hasInit=%u)", has_init ? 1u : 0u);
@@ -51,7 +54,7 @@ class native_gameinput {
       for (const auto& p : probes) {
         GameInputCallbackToken tok = GAMEINPUT_INVALID_CALLBACK_TOKEN_VALUE;
         const HRESULT dev_hr = input_->RegisterDeviceCallback(
-            nullptr, p.kind, GameInputDeviceConnected,
+            nullptr, p.kind, GameInputDeviceAnyStatus,
             GameInputBlockingEnumeration, this, &native_gameinput::device_callback,
             &tok);
         if (p.kind == GameInputKindMouse) device_callback_token_ = tok;
@@ -83,6 +86,18 @@ class native_gameinput {
 
   bool keyboard_active() const { return keyboard_active_.load(); }
   bool mouse_active() const { return mouse_active_.load(); }
+  // True only while GameInput actually produced mouse data this recently.
+  // mouse_active() latches on the first delta and then stays true even if the
+  // device stops reporting (or the reading callback never fires again), which
+  // used to be read as "GameInput owns the mouse" and silently discarded every
+  // CoreWindow pointer event for the rest of the session.
+  bool mouse_active_recent(ULONGLONG within_ms) const {
+    if (!mouse_active_.load()) return false;
+    const ULONGLONG last = last_mouse_ms_.load();
+    return last != 0 && (GetTickCount64() - last) < within_ms;
+  }
+  bool mouse_connected() const { return mouse_connected_.load(); }
+  bool keyboard_connected() const { return keyboard_connected_.load(); }
 
   using host_key_fn = bool (*)(u16 vk, u16 scan, bool ext, bool down);
 
@@ -183,6 +198,15 @@ class native_gameinput {
         (info->supportedInput & GameInputKindMouse) != 0 ||
         (info->usage.page == 0x0001u && info->usage.id == 0x0002u) ||
         info->mouseInfo != nullptr;
+    const bool is_kbd =
+        (info->supportedInput & GameInputKindKeyboard) != 0 ||
+        (info->usage.page == 0x0001u && info->usage.id == 0x0006u);
+    if (is_kbd) {
+      self->keyboard_connected_.store((currentStatus & GameInputDeviceConnected) != 0);
+    }
+    if (is_mouse) {
+      self->mouse_connected_.store((currentStatus & GameInputDeviceConnected) != 0);
+    }
     if (is_mouse && (currentStatus & GameInputDeviceConnected)) {
       std::lock_guard<std::mutex> lock(self->dev_mu_);
       bool dup = false;
@@ -337,6 +361,7 @@ class native_gameinput {
     dev_mouse_ = {};
     dev_mouse_baseline_ = false;
     mouse_active_.store(false);
+    last_mouse_ms_.store(0);
   }
 
   template<class Apply>
@@ -492,6 +517,7 @@ class native_gameinput {
       const auto dy = delta(next.positionY, prev.positionY);
       if (dx || dy) {
         mouse_active_.store(true);
+        last_mouse_ms_.store(GetTickCount64());
         if (!mouse_motion_seen_) {
           mouse_motion_seen_ = true;
           log_line("input: native GameInput mouse movement applied");
@@ -501,6 +527,7 @@ class native_gameinput {
       const auto wheel = delta(next.wheelY, prev.wheelY);
       if (wheel) {
         mouse_active_.store(true);
+        last_mouse_ms_.store(GetTickCount64());
         trt_input_wheel(wheel);
       }
     }
@@ -509,6 +536,7 @@ class native_gameinput {
       const unsigned mask = 1u << button;
       if (!(changed & mask)) continue;
       mouse_active_.store(true);
+      last_mouse_ms_.store(GetTickCount64());
       if (!mouse_button_seen_) {
         mouse_button_seen_ = true;
         log_line("input: native GameInput mouse button applied");
@@ -567,6 +595,9 @@ class native_gameinput {
   host_key_fn host_key_fn_ = nullptr;
   std::atomic<bool> keyboard_active_{false};
   std::atomic<bool> mouse_active_{false};
+  std::atomic<ULONGLONG> last_mouse_ms_{0};
+  std::atomic<bool> mouse_connected_{false};
+  std::atomic<bool> keyboard_connected_{false};
 };
 
 }  // namespace longan

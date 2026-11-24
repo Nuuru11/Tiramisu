@@ -237,6 +237,14 @@ def main():
         print('WARNING: Anti-cheat DLLs detected: %s' % ', '.join(found_ac))
         print('         Multiplayer will not work. Single-player may work if anti-cheat is optional.')
         print()
+    gdk_dlls = [d[0] for d in imps if d[0].lower().startswith(
+        ('xgameruntime', 'gamingservices', 'gameos', 'libhttpclient.gdk'))]
+    gdk_dlls = sorted(set(gdk_dlls))
+    if gdk_dlls:
+        print('WARNING: Xbox GDK / GameOS imports detected: %s' % ', '.join(gdk_dlls))
+        print('         This is a console GDK payload, not a Win32 desktop game;')
+        print('         Tiramisu cannot run it even though the PE is x86-64.')
+        print()
     impl, impl_dlls, aliases = build_impl_set(args.src)
 
     by_dll = {}

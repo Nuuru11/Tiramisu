@@ -4,7 +4,7 @@
   xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap rescap">
-  <Identity Name="Xan.Tiramisu" Publisher="CN=TiramisuDev" Version="0.2.2.208" ProcessorArchitecture="x64" />
+  <Identity Name="Xan.Tiramisu" Publisher="CN=TiramisuDev" Version="0.2.4.0" ProcessorArchitecture="x64" />
   <Properties>
     <DisplayName>Tiramisu</DisplayName>
     <PublisherDisplayName>TiramisuDev</PublisherDisplayName>
@@ -19,8 +19,8 @@
   <Applications>
     <Application Id="App" Executable="tiramisu.exe" EntryPoint="tiramisu.App">
       <uap:VisualElements DisplayName="Tiramisu" Description="Windows PE runtime for Xbox Dev Mode"
-        BackgroundColor="#0E1116" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
-        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#0E1116" />
+        BackgroundColor="transparent" Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" BackgroundColor="#000000" />
       </uap:VisualElements>
     </Application>
   </Applications>

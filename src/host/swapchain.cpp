@@ -45,24 +45,115 @@ winrt::com_ptr<ID3D12Device> g_d3d12_device;
 winrt::com_ptr<IDXGISwapChain3> g_d3d12_swap;
 bool g_in_d3d12 = false;
 std::atomic<bool> g_pointer_kbm_active{false};
+std::atomic<bool> g_launcher_cursor_visible{false};
 unsigned g_w = 1280, g_h = 720;
 unsigned g_fl = D3D_FEATURE_LEVEL_11_0;
 
 const char* k_vs = R"(struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
 VSOut main(uint id : SV_VertexID) {
   VSOut o;
-  float2 quad[3] = { float2(-1,-1), float2(3,-1), float2(-1,3) };
-  float2 uv[3]   = { float2(0,1), float2(2,1), float2(0,-1) };
+  // Clockwise winding in D3D11 NDC (+Y up) so default CULL_BACK never culls!
+  float2 quad[3] = { float2(-1,-1), float2(-1,3), float2(3,-1) };
+  float2 uv[3]   = { float2(0,1),   float2(0,-1), float2(2,1) };
   o.p = float4(quad[id], 0, 1);
   o.uv = uv[id];
   return o;
 })";
-const char* k_ps = R"(struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
+
+// Ultra-Crisp 60 FPS Sony PSP / PS3 XMB Silk Wave Shader.
+// Lifted neutral studio matte-black canvas (#0F1013 -> #191B1F — true neutral
+// black, NOT crushed pitch-black, ZERO pink/purple/navy) with 5 high-definition
+// layered translucent silver-white silk ribbons, crisp luminous crests, caustic
+// fold sheen, and zero-banding dithering.
+const char* k_ps = R"(
+cbuffer BgParams : register(b0) {
+  float4 uTimeRes; // x = time (sec), y = width, z = height, w = 0
+};
+struct VSOut { float4 p : SV_POSITION; float2 uv : UV; };
+
+// Compute one high-definition PSP XMB silk ribbon:
+// returns (translucent silk veil, razor-sharp luminous crest, caustic sheen)
+float3 pspRibbon(float2 uv, float t, float baseY, float amp, float freq,
+                 float speed, float phase, float thickness) {
+  float x = uv.x * 6.2831853;
+  // Multi-harmonic organic wave with gentle phase modulation
+  float ph = phase + 0.35 * sin(t * (speed * 0.37) + uv.x * 1.4);
+  float y0 = baseY
+           + amp * 0.54 * sin(x * freq + t * speed + ph)
+           + amp * 0.28 * sin(x * (freq * 1.68) - t * (speed * 0.64) + phase * 1.8)
+           + amp * 0.12 * cos(x * (freq * 2.55) + t * (speed * 1.18) - phase * 0.7)
+           + amp * 0.06 * sin(x * (freq * 3.80) - t * (speed * 1.55) + phase * 2.3);
+  float d = uv.y - y0;
+
+  // Translucent layered silk drapery flowing below the wave crest
+  float downVeil = exp(-pow(max(d, 0.0) / thickness, 1.85)) * smoothstep(-0.016, 0.014, d);
+  // Soft volumetric glow hugging both sides of the ribbon spine
+  float softGlow = exp(-abs(d) / (thickness * 0.26)) * 0.52;
+  // Razor-sharp anti-aliased PSP pearlescent crest filament
+  float crest = exp(-pow(d / 0.0028, 2.0));
+  // Secondary ultra-fine mirror highlight slightly offset beneath crest
+  float subCrest = exp(-pow((d - 0.009) / 0.0045, 2.0)) * 0.42;
+
+  // Flowing specular light traveling along the folds of the silk
+  float caustic = 0.65 + 0.35 * pow(0.5 + 0.5 * sin(x * (freq * 1.45) + t * (speed * 0.92) + phase), 2.0);
+  float body = (downVeil * 0.68 + softGlow * 0.32) * caustic;
+  float edge = (crest + subCrest) * (0.76 + 0.24 * caustic);
+  return float3(body, edge, caustic * downVeil);
+}
+
 float4 main(VSOut i) : SV_Target {
-  float3 a = float3(0.055, 0.067, 0.086);   // #0E1116 canvas
-  float3 b = float3(0.125, 0.502, 0.553);   // Tiramisu teal
-  float3 c = lerp(a, b, i.uv.x * i.uv.y);
-  return float4(c, 1);
+  float t = uTimeRes.x * 0.58;
+  float2 uv = i.uv;
+
+  // Neutral lifted studio matte-black gradient (black, NOT pitch-crushed dark black!)
+  float3 colTop = float3(0.058, 0.060, 0.066);  // #0F0F11 soft studio black
+  float3 colMid = float3(0.102, 0.106, 0.116);  // #1A1B1E elevated neutral charcoal
+  float3 colBot = float3(0.052, 0.054, 0.060);  // #0D0E0F matte obsidian
+  float midBand = exp(-pow((uv.y - 0.56) / 0.38, 2.0));
+  float3 col = lerp(lerp(colTop, colBot, uv.y), colMid, midBand);
+
+  // Subtle neutral silver studio key-light breathing behind the ribbons
+  float keyGlow = exp(-pow((uv.y - 0.58) / 0.26, 2.0)) *
+                  (0.78 + 0.22 * sin(uv.x * 3.14159 + t * 0.32));
+  col += float3(0.048, 0.050, 0.056) * keyGlow;
+
+  // Ribbon 1 (Deep background atmospheric mist — cool neutral silver)
+  float3 w1 = pspRibbon(uv, t, 0.44, 0.080, 0.62, 0.36, 0.3, 0.19);
+  col += float3(0.28, 0.29, 0.32) * w1.x * 0.28;
+  col += float3(0.62, 0.64, 0.68) * w1.y * 0.16;
+
+  // Ribbon 2 (Upper-mid drifting silk — brushed titanium-silver)
+  float3 w2 = pspRibbon(uv, t, 0.53, 0.088, 0.78, -0.48, 1.9, 0.15);
+  col += float3(0.38, 0.39, 0.42) * w2.x * 0.32;
+  col += float3(0.82, 0.84, 0.87) * w2.y * 0.28;
+
+  // Ribbon 3 (Primary iconic PSP hero silk wave — brilliant liquid pearl-white)
+  float3 w3 = pspRibbon(uv, t, 0.61, 0.074, 0.92, 0.62, 4.1, 0.12);
+  col += float3(0.50, 0.51, 0.54) * w3.x * 0.38;
+  col += float3(0.96, 0.97, 0.99) * w3.y * 0.50;
+  col += float3(0.22, 0.23, 0.26) * w3.z * 0.16;
+
+  // Ribbon 4 (Foreground counter-wave — crisp platinum filament)
+  float3 w4 = pspRibbon(uv, t, 0.70, 0.058, 1.10, -0.74, 0.9, 0.092);
+  col += float3(0.46, 0.47, 0.49) * w4.x * 0.30;
+  col += float3(0.90, 0.91, 0.93) * w4.y * 0.38;
+
+  // Ribbon 5 (Fine lower-screen whisper ribbon for full-frame balance)
+  float3 w5 = pspRibbon(uv, t, 0.82, 0.040, 1.32, 0.85, 2.7, 0.070);
+  col += float3(0.36, 0.37, 0.39) * w5.x * 0.22;
+  col += float3(0.78, 0.79, 0.82) * w5.y * 0.24;
+
+  // Gentle studio edge falloff (keeps corners rich matte-black, never crushed)
+  float2 vp = uv - 0.5;
+  float vig = 1.0 - dot(vp * float2(0.46, 0.58), vp * float2(0.46, 0.58));
+  col *= saturate(0.80 + 0.24 * vig);
+
+  // Interleaved gradient noise dither (eliminates 8-bit dark-gradient banding)
+  float2 px = uv * uTimeRes.yz;
+  float ign = frac(52.9829189 * frac(dot(px, float2(0.06711056, 0.00583715))));
+  col += (ign - 0.5) / 255.0;
+
+  return float4(saturate(col), 1.0);
 })";
 
 int TRT_GUEST_ABI host_d3d12_create_device(void* adapter, u32 min_fl,
@@ -222,6 +313,7 @@ int TRT_GUEST_ABI get_d3d11_backbuffer(u32 index, const void* iid, void** out) {
 // these rectangles and leaves the guest's shaders and bindings intact.
 void draw_pointer_impl(bool launcher) {
   if (!g_ctx || !g_rtv || !g_w || !g_h) return;
+  if (launcher && !g_launcher_cursor_visible.load()) return;
   int x, y;
   if (!trt_cursor_snapshot(&x, &y) && !launcher) return;
   const int scale = g_h >= 900 ? 2 : 1;
@@ -370,6 +462,9 @@ void draw_pointer(bool launcher) { draw_pointer_impl(launcher); }
 void set_pointer_cursor_mode(bool kbm_active) {
   g_pointer_kbm_active.store(kbm_active);
 }
+void set_launcher_cursor_visible(bool visible) {
+  g_launcher_cursor_visible.store(visible);
+}
 
 swapchain_result swapchain_create(winrt::Windows::UI::Core::CoreWindow const& w) {
   swapchain_result r{};
@@ -511,6 +606,7 @@ void swapchain_render_frame(float t) {
   if (!g_ctx || !g_rtv || g_in_d3d12) return;
   static winrt::com_ptr<ID3D11VertexShader> vs;
   static winrt::com_ptr<ID3D11PixelShader> ps;
+  static winrt::com_ptr<ID3D11Buffer> cb;
   static bool compiled = false;
   if (!compiled) {
     compiled = true;
@@ -520,14 +616,31 @@ void swapchain_render_frame(float t) {
       g_device->CreateVertexShader(vb->GetBufferPointer(), vb->GetBufferSize(),
                                    nullptr, vs.put());
     if (SUCCEEDED(D3DCompile(k_ps, strlen(k_ps), nullptr, nullptr, nullptr,
-                             "main", "ps_5_0", 0, 0, pb.put(), err.put())))
+                             "main", "ps_5_0", 0, 0, pb.put(), err.put()))) {
       g_device->CreatePixelShader(pb->GetBufferPointer(), pb->GetBufferSize(),
                                   nullptr, ps.put());
+      log_line("swapchain: liquid-silk background shader compiled OK");
+    } else if (err && err->GetBufferPointer()) {
+      char em[256];
+      snprintf(em, sizeof(em), "swapchain: bg PS compile error: %.200s",
+               (const char*)err->GetBufferPointer());
+      log_line(em);
+    }
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = 16;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    g_device->CreateBuffer(&bd, nullptr, cb.put());
   }
-  const float tealtint = 0.10f + 0.05f * (t * 6.2831853f);
-  const float clear[4] = {0.055f + tealtint * 0.3f, 0.067f, 0.086f + tealtint, 1.0f};
+  const float clear[4] = {0.026f, 0.023f, 0.034f, 1.0f};
   g_ctx->ClearRenderTargetView(g_rtv.get(), clear);
   if (vs && ps) {
+    if (cb) {
+      float params[4] = {t, (float)g_w, (float)g_h, 0.0f};
+      g_ctx->UpdateSubresource(cb.get(), 0, nullptr, params, 0, 0);
+      ID3D11Buffer* cbs[1] = {cb.get()};
+      g_ctx->PSSetConstantBuffers(0, 1, cbs);
+    }
     ID3D11RenderTargetView* rtv = g_rtv.get();
     D3D11_VIEWPORT vp{0.f, 0.f, (float)g_w, (float)g_h, 0.f, 1.f};
     g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
