@@ -5,7 +5,6 @@ tests/out/
 logs/
 out_verify/
 out253/
-.codebuff/
 *.obj
 *.msix
 *.pfx
