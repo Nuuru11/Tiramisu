@@ -609,6 +609,8 @@ No Linux or coding tools required to install a release on your Xbox.
 
 ### 1. Install Tiramisu on your console
 
+**New to Dev Mode? Use the [beginner guide](docs/BEGINNER-INSTALL.md) — it explains every click, including the certificate.**
+
 1. Enable **Xbox Dev Mode** and open **Dev Home**.
 2. Go to **Settings → Dev Home** and turn **ON** `"Treat UWP apps as games by default"` *(this gives Tiramisu **5 GB RAM** instead of 1 GB)*.
 3. Download **`Tiramisu.msix`** + **`dev.cer`** (normal build) **or** **`Tiramisu-EdgeSpoof.msix`** + **`edge-dev.cer`** (KBM edition, below) from the [latest GitHub Release](https://github.com/xanstomper/Tiramisu/releases).
