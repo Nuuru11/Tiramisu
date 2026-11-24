@@ -28,6 +28,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -452,24 +453,7 @@ struct pb_reader {
   }
 };
 
-// ---- BCrypt AES-256 & SHA-1 ----
-bool bcrypt_sha1(const uint8_t* data, size_t len, uint8_t out[20]) {
-  BCRYPT_ALG_HANDLE hAlg = nullptr;
-  BCRYPT_HASH_HANDLE hHash = nullptr;
-  if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA1_ALGORITHM, nullptr, 0) < 0)
-    return false;
-  bool ok = false;
-  if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) >= 0) {
-    if (BCryptHashData(hHash, (PUCHAR)data, (ULONG)len, 0) >= 0 &&
-        BCryptFinishHash(hHash, out, 20, 0) >= 0) {
-      ok = true;
-    }
-    BCryptDestroyHash(hHash);
-  }
-  BCryptCloseAlgorithmProvider(hAlg, 0);
-  return ok;
-}
-
+// ---- BCrypt AES-256 ----
 bool bcrypt_aes256_decrypt_steam(const uint8_t* cipher, size_t cipher_len,
                                  const uint8_t key[32],
                                  std::vector<uint8_t>* plain) {
@@ -560,8 +544,31 @@ bool gzip_decompress(const uint8_t* in, size_t in_len,
   return true;
 }
 
-// Minimal LZMA1 decoder for Valve VZ depot chunks:
-// Header: 'V' 'Z' [version byte 'a'] [4B CRC/timestamp] [5B LZMA props (lc/lp/pb + dict)] [compressed...] [4B CRC32] [4B size LE]
+// Steam's depot manifest stores an Adler-32 of the decompressed chunk with a
+// zero initial seed (zlib's default seed is 1). SteamKit's DepotChunk uses the
+// same zero seed, so a chunk Steam considers valid checksums to this value.
+uint32_t adler32_steam(const uint8_t* data, size_t len) {
+  constexpr uint32_t kBase = 65521;
+  constexpr size_t kNmax = 5552;  // largest n before the sums need reducing
+  uint32_t a = 0, b = 0;
+  while (len > 0) {
+    const size_t n = len < kNmax ? len : kNmax;
+    len -= n;
+    for (size_t i = 0; i < n; ++i) {
+      a += data[i];
+      b += a;
+    }
+    data += n;
+    a %= kBase;
+    b %= kBase;
+  }
+  return (b << 16) | a;
+}
+
+// Minimal LZMA1 decoder for Valve VZ depot chunks.
+// Header: 'V' 'Z' 'a' [4B CRC/timestamp] [5B LZMA props (lc/lp/pb + dict)]
+// Body: compressed LZMA1 stream
+// Footer: [4B CRC32 of decompressed data] [4B size LE] 'z' 'v'
 bool lzma1_decode_raw(const uint8_t props[5], const uint8_t* src, size_t src_len,
                       uint32_t out_size, std::vector<uint8_t>* out) {
   uint8_t p0 = props[0];
@@ -777,12 +784,23 @@ bool decompress_steam_payload(const uint8_t* raw, size_t len,
     if (!ok && err) *err = "zip extract failed";
     return ok;
   }
-  if (len >= 22 && raw[0] == 'V' && raw[1] == 'Z') {
-    // Valve VZ: 'V','Z',ver(1),timestamp/crc(4),props(5),data...,crc32(4),size(4)
-    uint32_t sz = (uint32_t)raw[len - 4] | ((uint32_t)raw[len - 3] << 8) |
-                  ((uint32_t)raw[len - 2] << 16) | ((uint32_t)raw[len - 1] << 24);
-    if (expected_size > 0 && sz != expected_size) sz = expected_size;
-    if (!lzma1_decode_raw(raw + 7, raw + 12, len - 12 - 8, sz, out)) {
+  if (len >= 22 && raw[0] == 'V' && raw[1] == 'Z' && raw[2] == 'a' &&
+      raw[len - 2] == 'z' && raw[len - 1] == 'v') {
+    // Valve VZ: 'V','Z','a',timestamp/crc(4),props(5),data...,
+    // crc32(4),size(4),'z','v'. The decompressed size is the four bytes at
+    // len-6, not the last four bytes (those are size high bytes + 'z','v').
+    uint32_t sz = (uint32_t)raw[len - 6] | ((uint32_t)raw[len - 5] << 8) |
+                  ((uint32_t)raw[len - 4] << 16) |
+                  ((uint32_t)raw[len - 3] << 24);
+    if (sz == 0) sz = expected_size;
+    if (expected_size > 0 && sz != expected_size) {
+      if (err) *err = "VZ size " + std::to_string(sz) +
+                      " does not match manifest " +
+                      std::to_string(expected_size);
+      return false;
+    }
+    // Header is 12 bytes (7-byte VZ prefix + 5 LZMA props); footer is 10.
+    if (!lzma1_decode_raw(raw + 7, raw + 12, len - 22, sz, out)) {
       if (err) *err = "VZ LZMA1 decode failed";
       return false;
     }
@@ -796,8 +814,12 @@ bool decompress_steam_payload(const uint8_t* raw, size_t len,
   return false;
 }
 
-// ---- WebSocket Steam CM session ----
-class cm_session {
+// The WinRT MessageWebSocket callbacks capture `this`. A stack-allocated
+// session died before the Closed/MessageReceived delegates did on the console
+// (HoloCure 2420510: FAIL then HOST UNHANDLED 0xC0000005). Keep the session
+// shared and have callbacks hold a strong reference so the delegate cannot
+// outlive the object it touches.
+class cm_session : public std::enable_shared_from_this<cm_session> {
  public:
   winrt::Windows::Networking::Sockets::MessageWebSocket ws{nullptr};
   std::mutex rx_mu;
@@ -807,6 +829,7 @@ class cm_session {
   uint32_t session_id = 0;
   uint64_t steamid = 0;
   uint64_t job_seq = 1;
+  int32_t last_eresult = 2;
 
   ~cm_session() {
     if (ws) {
@@ -822,23 +845,24 @@ class cm_session {
       using namespace winrt::Windows::Networking::Sockets;
       ws = MessageWebSocket();
       ws.Control().MessageType(SocketMessageType::Binary);
-      ws.MessageReceived([this](MessageWebSocket const&,
+      auto self = shared_from_this();
+      ws.MessageReceived([self](MessageWebSocket const&,
                                 MessageWebSocketMessageReceivedEventArgs const& a) {
         try {
           auto dr = a.GetDataReader();
           uint32_t n = dr.UnconsumedBufferLength();
           std::vector<uint8_t> pkt(n);
           if (n > 0) dr.ReadBytes(pkt);
-          std::lock_guard<std::mutex> lk(rx_mu);
-          rx_msgs.push_back(std::move(pkt));
-          rx_cv.notify_all();
+          std::lock_guard<std::mutex> lk(self->rx_mu);
+          self->rx_msgs.push_back(std::move(pkt));
+          self->rx_cv.notify_all();
         } catch (...) {
         }
       });
-      ws.Closed([this](auto const&, auto const&) {
-        std::lock_guard<std::mutex> lk(rx_mu);
-        closed = true;
-        rx_cv.notify_all();
+      ws.Closed([self](auto const&, auto const&) {
+        std::lock_guard<std::mutex> lk(self->rx_mu);
+        self->closed = true;
+        self->rx_cv.notify_all();
       });
       std::string url = "wss://" + host + "/cmsocket/";
       ws.ConnectAsync(winrt::Windows::Foundation::Uri(u8to16(url))).get();
@@ -853,12 +877,14 @@ class cm_session {
   }
 
   bool send_proto(uint32_t emsg, const pb_writer& header_fields,
-                  const pb_writer& body, uint64_t job_id = 0) {
+                  const pb_writer& body, uint64_t job_id = 0,
+                  const std::string& target_job_name = std::string()) {
     try {
       pb_writer hdr;
       if (steamid != 0) hdr.write_fixed64(1, steamid);
       if (session_id != 0) hdr.write_uint32(2, session_id);
       if (job_id != 0) hdr.write_fixed64(10, job_id);
+      if (!target_job_name.empty()) hdr.write_string(12, target_job_name);
       hdr.buf.insert(hdr.buf.end(), header_fields.buf.begin(),
                      header_fields.buf.end());
 
@@ -908,6 +934,60 @@ class cm_session {
     }
   }
 
+  // Steam's modern service RPCs (e.g. ContentServerDirectory) are sent as
+  // EMsg.ServiceMethodCallFromClient (151) with target_job_name set to the
+  // method, and answered with EMsg.ServiceMethodResponse (147). The response
+  // body is CMsgClientServiceMethodLegacyResponse, whose field 2 contains the
+  // serialized service response.
+  bool unified_call(const std::string& method, const pb_writer& request,
+                    std::vector<uint8_t>* response, std::string* err) {
+    last_eresult = 2;
+    const uint64_t job = job_seq++;
+    if (!send_proto(151 /* ServiceMethodCallFromClient */, {}, request, job,
+                    method)) {
+      if (err) *err = "service request send failed";
+      return false;
+    }
+    std::vector<uint8_t> pkt_body;
+    if (!recv_emsg(147 /* ServiceMethodResponse */, &pkt_body)) {
+      if (err) *err = "service response timeout";
+      return false;
+    }
+
+    pb_reader r{pkt_body.data(), pkt_body.size()};
+    uint32_t f = 0, wt = 0;
+    bool got = false, saw_method_name = false;
+    while (r.next(&f, &wt)) {
+      if (f == 1 && wt == 2) {
+        saw_method_name = true;
+        r.skip(wt);
+      } else if (f == 2 && wt == 2) {
+        const uint8_t* p = nullptr;
+        size_t n = 0;
+        if (r.read_bytes(&p, &n)) {
+          response->assign(p, p + n);
+          got = true;
+        }
+      } else {
+        r.skip(wt);
+      }
+    }
+    // Older CM builds send the service response directly instead of wrapping
+    // it in CMsgClientServiceMethodLegacyResponse.
+    if (!got && !saw_method_name && !pkt_body.empty()) {
+      response->assign(pkt_body.begin(), pkt_body.end());
+      got = true;
+    }
+    if (!got) {
+      if (err) {
+        *err = "service response missing (eresult=" +
+               std::to_string(last_eresult) + ")";
+      }
+      return false;
+    }
+    return true;
+  }
+
   bool dispatch_pkt(const std::vector<uint8_t>& pkt, uint32_t want_emsg,
                     std::vector<uint8_t>* out_body) {
     if (pkt.size() < 8) return false;
@@ -927,6 +1007,17 @@ class cm_session {
         uint64_t s = 0;
         hr.read_varint(&s);
         if (s != 0) session_id = (uint32_t)s;
+      } else if (f == 13 && wt == 0) {
+        uint64_t e = 0;
+        hr.read_varint(&e);
+        last_eresult = (int32_t)e;
+      } else if (f == 12 && wt == 2) {
+        const uint8_t* np = nullptr;
+        size_t nl = 0;
+        if (hr.read_bytes(&np, &nl)) {
+          (void)np;
+          (void)nl;
+        }
       } else {
         hr.skip(wt);
       }
@@ -975,7 +1066,11 @@ class cm_session {
   }
 };
 
-// Parse Steam VDF text sections for depot_id, manifest_id, launch executable
+// Parse Steam VDF text sections for depot_id, manifest_id, launch executable.
+// The PICS appinfo blob is a binary KeyValue tree: it has a small type/name
+// prefix before the first '"', and "depots" contains many numeric child
+// blocks. Scan the depots block by brace depth instead of doing a global
+// substring search, which picked the first redist manifest for every title.
 void parse_appinfo_vdf(const std::string& vdf, uint32_t* out_depot,
                        uint64_t* out_manifest, uint64_t* out_size,
                        std::string* out_exe) {
@@ -986,46 +1081,72 @@ void parse_appinfo_vdf(const std::string& vdf, uint32_t* out_depot,
     if (ep != std::string::npos) {
       size_t q1 = vdf.find('"', ep + 12);
       size_t q2 = (q1 != std::string::npos) ? vdf.find('"', q1 + 1) : std::string::npos;
-      if (q1 != std::string::npos && q2 != std::string::npos) {
+      if (q1 != std::string::npos && q2 != std::string::npos)
         *out_exe = vdf.substr(q1 + 1, q2 - q1 - 1);
-      }
     }
   }
-  // Find depots section: scan numeric quoted keys with "manifests" -> "public" -> "gid"
+
   size_t dpos = vdf.find("\"depots\"");
+  if (dpos == std::string::npos) dpos = vdf.find("\"Depots\"");
   if (dpos == std::string::npos) return;
+  size_t brace = vdf.find('{', dpos);
+  if (brace == std::string::npos) return;
+
+  // Matching brace for the depots section.
+  auto matching = [&](size_t open) -> size_t {
+    int depth = 0;
+    for (size_t i = open; i < vdf.size(); ++i) {
+      if (vdf[i] == '{') ++depth;
+      else if (vdf[i] == '}') {
+        if (--depth == 0) return i;
+      }
+    }
+    return std::string::npos;
+  };
+  size_t depots_end = matching(brace);
+  if (depots_end == std::string::npos) return;
+
   uint32_t best_depot = 0;
   uint64_t best_manifest = 0;
   uint64_t best_sz = 0;
-  size_t pos = dpos + 8;
-  while (pos < vdf.size()) {
+  size_t pos = brace + 1;
+  while (pos < depots_end) {
     size_t q1 = vdf.find('"', pos);
-    if (q1 == std::string::npos) break;
+    if (q1 == std::string::npos || q1 >= depots_end) break;
     size_t q2 = vdf.find('"', q1 + 1);
-    if (q2 == std::string::npos) break;
+    if (q2 == std::string::npos || q2 >= depots_end) break;
     std::string key = vdf.substr(q1 + 1, q2 - q1 - 1);
     pos = q2 + 1;
+
     bool all_digits = !key.empty();
     for (char c : key)
       if (!std::isdigit((unsigned char)c)) all_digits = false;
     if (!all_digits) continue;
+
+    // The value block must follow the key (allow whitespace only).
+    size_t b = pos;
+    while (b < depots_end && std::isspace((unsigned char)vdf[b])) ++b;
+    if (b >= depots_end || vdf[b] != '{') continue;
+    size_t e = matching(b);
+    if (e == std::string::npos || e > depots_end) continue;
+    pos = e + 1;
+
     uint32_t did = (uint32_t)strtoul(key.c_str(), nullptr, 10);
-    if (did < 10 || did == 228980 || did == 228990) continue; // skip shared redist
-    // Bound lookahead before next depot block or brace end
-    size_t brace = vdf.find('{', pos);
-    if (brace == std::string::npos || brace > pos + 32) continue;
-    int depth = 1;
-    size_t end = brace + 1;
-    while (end < vdf.size() && depth > 0) {
-      if (vdf[end] == '{') ++depth;
-      else if (vdf[end] == '}') --depth;
-      ++end;
-    }
-    std::string blk = vdf.substr(brace, end - brace);
-    // Check oslist if present (accept windows or empty)
-    if (blk.find("\"oslist\"") != std::string::npos &&
-        blk.find("\"windows\"") == std::string::npos) {
-      continue;
+    if (did < 10 || did == 228980 || did == 228990) continue; // shared redist
+
+    std::string blk = vdf.substr(b, e - b + 1);
+    // oslist is a quoted CSV; accept only blocks that allow Windows.
+    size_t ol = blk.find("\"oslist\"");
+    if (ol != std::string::npos) {
+      size_t value_start = blk.find('"', ol + 8);
+      size_t value_end = (value_start != std::string::npos)
+                             ? blk.find('"', value_start + 1)
+                             : std::string::npos;
+      std::string oslist = (value_start != std::string::npos &&
+                            value_end != std::string::npos)
+                               ? blk.substr(value_start + 1, value_end - value_start - 1)
+                               : "";
+      if (oslist.find("windows") == std::string::npos) continue;
     }
     size_t mp = blk.find("\"public\"");
     if (mp == std::string::npos) continue;
@@ -1037,12 +1158,11 @@ void parse_appinfo_vdf(const std::string& vdf, uint32_t* out_depot,
     uint64_t mid = strtoull(blk.substr(gq1 + 1, gq2 - gq1 - 1).c_str(), nullptr, 10);
     uint64_t msz = 0;
     size_t sp = blk.find("\"size\"", mp);
-    if (sp != std::string::npos && sp < gp + 80) {
+    if (sp != std::string::npos) {
       size_t sq1 = blk.find('"', sp + 6);
       size_t sq2 = (sq1 != std::string::npos) ? blk.find('"', sq1 + 1) : std::string::npos;
-      if (sq1 != std::string::npos && sq2 != std::string::npos) {
+      if (sq1 != std::string::npos && sq2 != std::string::npos)
         msz = strtoull(blk.substr(sq1 + 1, sq2 - sq1 - 1).c_str(), nullptr, 10);
-      }
     }
     if (mid != 0 && (best_depot == 0 || msz > best_sz)) {
       best_depot = did;
@@ -1057,6 +1177,7 @@ void parse_appinfo_vdf(const std::string& vdf, uint32_t* out_depot,
 
 struct depot_chunk_t {
   uint8_t sha[20];
+  uint32_t crc = 0;      // Adler-32 of the decompressed bytes (zero seed)
   uint64_t offset = 0;
   uint32_t cb_orig = 0;
   uint32_t cb_comp = 0;
@@ -1149,6 +1270,10 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
               size_t shl = 0;
               cr.read_bytes(&shp, &shl);
               if (shl == 20) std::memcpy(ck.sha, shp, 20);
+            } else if (cf == 2 && cwt == 5) {
+              uint32_t v = 0;
+              cr.read_fixed32(&v);
+              ck.crc = v;
             } else if (cf == 3 && cwt == 0) {
               cr.read_varint(&ck.offset);
             } else if (cf == 4 && cwt == 0) {
@@ -1828,11 +1953,11 @@ void steam_client_download_app(uint32_t app_id,
       }
 
       // 2) Connect CM WebSocket
-      cm_session cm;
+      auto cm = std::make_shared<cm_session>();
       bool connected = false;
       std::string cm_err;
       for (const auto& h : cm_hosts) {
-        if (cm.connect(h, &cm_err)) {
+        if (cm->connect(h, &cm_err)) {
           connected = true;
           break;
         }
@@ -1842,21 +1967,24 @@ void steam_client_download_app(uint32_t app_id,
       // 3) ClientHello + ClientLogon
       {
         pb_writer hello;
-        hello.write_uint32(1, 65580); // protocol_version
-        cm.send_proto(9805 /* ClientHello */, {}, hello);
+        hello.write_uint32(1, 65581); // protocol_version
+        cm->send_proto(9805 /* ClientHello */, {}, hello);
 
         pb_writer logon;
-        logon.write_uint32(1, 65580);              // protocol_version
-        logon.write_uint32(5, 16);                 // client_os_type = Win10/11
-        logon.write_string(41, "tiramisu-xbox");   // machine_name
+        logon.write_uint32(1, 65581);              // protocol_version
+        logon.write_uint32(5, 1771);               // client_package_version
+        logon.write_string(6, "english");          // client_language
+        logon.write_uint32(7, 16);                 // client_os_type = Win10/11
         logon.write_string(50, acct_name);         // account_name
+        logon.write_string(96, "tiramisu-xbox");   // machine_name
+        logon.write_uint32(102, 1);                // supports_rate_limit_response
         logon.write_string(108, ref_tok);          // access_token = refresh token
         pb_writer hdr;
-        cm.steamid = sid;
-        cm.send_proto(5514 /* ClientLogon */, hdr, logon);
+        cm->steamid = sid;
+        cm->send_proto(5514 /* ClientLogon */, hdr, logon);
 
         std::vector<uint8_t> resp;
-        if (!cm.recv_emsg(751 /* ClientLogOnResponse */, &resp)) {
+        if (!cm->recv_emsg(751 /* ClientLogOnResponse */, &resp)) {
           return fail("Steam CM logon timeout");
         }
         uint32_t eresult = 0;
@@ -1885,29 +2013,54 @@ void steam_client_download_app(uint32_t app_id,
         pb_writer app_msg;
         app_msg.write_uint32(1, app_id);
         pb_writer req;
+        // ClientPICSProductInfoRequest: field 2 is `apps` (field 1 is
+        // `packages` per SteamKit's CMsgClientPICSProductInfoRequest).
         req.write_bytes(2, app_msg.buf.data(), app_msg.buf.size());
-        cm.send_proto(8903 /* ClientPICSProductInfoRequest */, {}, req);
+        // SteamKit sets SourceJobID on PICS requests; without it the CM
+        // answers with the appid in unknown_appids instead of appinfo.
+        cm->send_proto(8903 /* ClientPICSProductInfoRequest */, {}, req, 1);
 
         std::vector<uint8_t> resp;
-        if (!cm.recv_emsg(8904 /* ClientPICSProductInfoResponse */, &resp)) {
+        if (!cm->recv_emsg(8904 /* ClientPICSProductInfoResponse */, &resp)) {
           return fail("appinfo query timeout");
+        }
+        {
+          std::string hex;
+          char b[4];
+          for (size_t i = 0; i < resp.size() && i < 24; ++i) {
+            snprintf(b, sizeof(b), "%02x", resp[i]);
+            hex += b;
+          }
+          log_line(("steam_dl[" + std::to_string(app_id) +
+                    "]: PICS resp bytes=" + std::to_string(resp.size()) +
+                    " head=" + hex).c_str());
         }
         pb_reader rr{resp.data(), resp.size()};
         uint32_t f, wt;
         while (rr.next(&f, &wt)) {
+          log_line(("steam_dl[" + std::to_string(app_id) +
+                    "]: PICS field=" + std::to_string(f) +
+                    " wt=" + std::to_string(wt)).c_str());
           if (f == 1 && wt == 2) {
             const uint8_t* ap = nullptr;
             size_t al = 0;
             rr.read_bytes(&ap, &al);
+            log_line(("steam_dl[" + std::to_string(app_id) +
+                      "]: PICS app msg bytes=" + std::to_string(al)).c_str());
             pb_reader ar{ap, al};
             uint32_t af, awt;
             while (ar.next(&af, &awt)) {
-              if (af == 6 && awt == 2) {
+              // SteamKit response AppInfo: field 4 = sha, field 5 = buffer
+              // (the appinfo VDF). Older docs list it as field 6; accept both.
+              if ((af == 5 || af == 6) && awt == 2) {
                 const uint8_t* bv = nullptr;
                 size_t bl = 0;
                 ar.read_bytes(&bv, &bl);
                 appinfo_vdf.assign((const char*)bv, bl);
               } else {
+                log_line(("steam_dl[" + std::to_string(app_id) +
+                          "]: PICS app field=" + std::to_string(af) +
+                          " wt=" + std::to_string(awt)).c_str());
                 ar.skip(awt);
               }
             }
@@ -1921,6 +2074,10 @@ void steam_client_download_app(uint32_t app_id,
       uint64_t manifest_id = 0;
       uint64_t depot_sz = 0;
       std::string main_exe_rel;
+      log_line(("steam_dl[" + std::to_string(app_id) + "]: appinfo bytes=" +
+                std::to_string(appinfo_vdf.size()) +
+                " depots=" + (appinfo_vdf.find("\"depots\"") != std::string::npos ? "yes" : "no"))
+                   .c_str());
       parse_appinfo_vdf(appinfo_vdf, &depot_id, &manifest_id, &depot_sz,
                         &main_exe_rel);
       if (depot_id == 0 || manifest_id == 0) {
@@ -1935,10 +2092,10 @@ void steam_client_download_app(uint32_t app_id,
         pb_writer kreq;
         kreq.write_uint32(1, depot_id);
         kreq.write_uint32(2, app_id);
-        cm.send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
+        cm->send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
 
         std::vector<uint8_t> resp;
-        if (!cm.recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
+        if (!cm->recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
                           &resp)) {
           return fail("depot decryption key timeout");
         }
@@ -1969,8 +2126,9 @@ void steam_client_download_app(uint32_t app_id,
         }
       }
 
-      // 6) CDN hosts + Manifest Request Code
+      // 6) CDN hosts, manifest request code, and per-host auth tokens
       std::vector<std::string> cdn_hosts;
+      std::vector<std::string> cdn_vhosts;
       {
         std::string resp, err;
         if (http_get_text(
@@ -1984,53 +2142,117 @@ void steam_client_download_app(uint32_t app_id,
             for (uint32_t i = 0; i < svs.Size() && cdn_hosts.size() < 4; ++i) {
               auto s = svs.GetObjectAt(i);
               if (s.HasKey(L"host")) {
-                cdn_hosts.push_back(
-                    u16to8(std::wstring(s.GetNamedString(L"host").c_str())));
+                std::string h =
+                    u16to8(std::wstring(s.GetNamedString(L"host").c_str()));
+                std::string vh = h;
+                if (s.HasKey(L"vhost")) {
+                  vh = u16to8(
+                      std::wstring(s.GetNamedString(L"vhost").c_str()));
+                }
+                cdn_hosts.push_back(h);
+                cdn_vhosts.push_back(vh);
               }
             }
           } catch (...) {
           }
         }
       }
-      if (cdn_hosts.empty()) cdn_hosts.push_back("cache1-iad1.steamcontent.com");
+      if (cdn_hosts.empty()) {
+        cdn_hosts.push_back("cache1-iad1.steamcontent.com");
+        cdn_vhosts.push_back(cdn_hosts.back());
+      }
 
+      // The manifest request code is granted by the CM against the logged-on
+      // session. The old WebAPI GET returned an empty code, which is why the
+      // CDN answered 401.
       uint64_t manifest_code = 0;
       {
-        std::string resp, err;
-        std::string url =
-            "https://api.steampowered.com/IContentServerDirectoryService/GetManifestRequestCode/v1/?"
-            "app_id=" +
-            std::to_string(app_id) + "&depot_id=" + std::to_string(depot_id) +
-            "&manifest_id=" + std::to_string(manifest_id) +
-            "&app_branch=public";
-        if (!acc_tok.empty()) url += "&access_token=" + acc_tok;
-        if (http_get_text(url, &resp, &err)) {
-          try {
-            auto j = winrt::Windows::Data::Json::JsonObject::Parse(
-                winrt::hstring(u8to16(resp)));
-            auto r = j.GetNamedObject(L"response");
-            if (r.HasKey(L"manifest_request_code")) {
-              manifest_code = strtoull(
-                  u16to8(std::wstring(
-                             r.GetNamedString(L"manifest_request_code").c_str()))
-                      .c_str(),
-                  nullptr, 10);
+        pb_writer mreq;
+        mreq.write_uint32(1, app_id);
+        mreq.write_uint32(2, depot_id);
+        mreq.write_uint64(3, manifest_id);
+        // Public branch is represented by omitting app_branch; SteamKit
+        // explicitly clears "public" because the CM expects it absent.
+        std::vector<uint8_t> mresp;
+        std::string merr;
+        if (cm->unified_call(
+                "ContentServerDirectory.GetManifestRequestCode#1", mreq,
+                &mresp, &merr)) {
+          pb_reader mr{mresp.data(), mresp.size()};
+          uint32_t f = 0, wt = 0;
+          while (mr.next(&f, &wt)) {
+            if (f == 1 && wt == 0) {
+              uint64_t v = 0;
+              mr.read_varint(&v);
+              manifest_code = v;
+            } else {
+              mr.skip(wt);
             }
-          } catch (...) {
           }
+        } else {
+          log_line(("steam_dl[" + std::to_string(app_id) +
+                    "]: manifest request code failed: " + merr)
+                       .c_str());
         }
       }
 
+      // Tokens are per depot and per CDN host. They are often empty, but
+      // requesting one also tells the cache this session is authorized.
+      std::vector<std::string> cdn_tokens;
+      for (size_t i = 0; i < cdn_hosts.size(); ++i) {
+        std::string token, terr;
+        pb_writer treq;
+        treq.write_uint32(1, depot_id);
+        treq.write_string(2, cdn_vhosts[i]);
+        treq.write_uint32(3, app_id);
+        std::vector<uint8_t> tresp;
+        if (cm->unified_call("ContentServerDirectory.GetCDNAuthToken#1",
+                             treq, &tresp, &terr)) {
+          pb_reader tr{tresp.data(), tresp.size()};
+          uint32_t f = 0, wt = 0;
+          while (tr.next(&f, &wt)) {
+            if (f == 1 && wt == 2) {
+              const uint8_t* p = nullptr;
+              size_t n = 0;
+              if (tr.read_bytes(&p, &n)) token.assign((const char*)p, n);
+            } else {
+              tr.skip(wt);
+            }
+          }
+        }
+        cdn_tokens.push_back(token);
+        std::string tstat = token.empty() ? "none" : "ok";
+        if (token.empty() && !terr.empty()) tstat += " (" + terr + ")";
+        log_line(("steam_dl[" + std::to_string(app_id) + "]: cdn token " +
+                  cdn_vhosts[i] + " -> " + tstat)
+                     .c_str());
+      }
+
+      log_line(("steam_dl[" + std::to_string(app_id) +
+                "]: manifest_code=" + std::to_string(manifest_code) +
+                " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
+
+      log_line(("steam_dl[" + std::to_string(app_id) +
+                "]: depot=" + std::to_string(depot_id) +
+                " manifest=" + std::to_string(manifest_id) +
+                " size=" + std::to_string(depot_sz) +
+                " main=" + main_exe_rel).c_str());
       // 7) Download + parse depot manifest
       set_item_state(true, 0.14f, "steam: downloading depot manifest…");
       std::vector<uint8_t> manifest_blob;
       std::string dl_err;
-      for (const auto& host : cdn_hosts) {
-        std::string url = "https://" + host + "/depot/" +
+      for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+        std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
                           std::to_string(depot_id) + "/manifest/" +
                           std::to_string(manifest_id) + "/5";
         if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
+        if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+          url += "?token=" +
+                 u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+        }
         if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
+          log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
+                  cdn_hosts[hi] + " " + url + " -> " + dl_err).c_str());
       }
       if (manifest_blob.empty()) return fail("manifest CDN failed: " + dl_err);
 
@@ -2047,7 +2269,7 @@ void steam_client_download_app(uint32_t app_id,
       std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
       ensure_dir_recursive(install_dir);
 
-      // 8) Stream every chunk, AES-decrypt, decompress, SHA-1 verify, write
+      // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
       uint64_t done_bytes = 0;
       for (const auto& f : files) {
         if (f.flags & 0x40 /* directory flag */) {
@@ -2069,9 +2291,13 @@ void steam_client_download_app(uint32_t app_id,
           std::vector<uint8_t> enc_chunk;
           std::string cerr;
           bool got = false;
-          for (const auto& host : cdn_hosts) {
-            std::string url = "https://" + host + "/depot/" +
+          for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+            std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
                               std::to_string(depot_id) + "/chunk/" + hex_sha;
+            if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+              url += "?token=" +
+                     u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+            }
             if (http_get_bytes(url, &enc_chunk, &cerr)) {
               got = true;
               break;
@@ -2081,6 +2307,13 @@ void steam_client_download_app(uint32_t app_id,
             fclose(fp);
             return fail("chunk CDN failed (" + std::string(hex_sha) + "): " +
                         cerr);
+          }
+
+          if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
+            fclose(fp);
+            return fail("chunk size mismatch (" + std::string(hex_sha) +
+                        "): got " + std::to_string(enc_chunk.size()) +
+                        ", manifest says " + std::to_string(ck.cb_comp));
           }
 
           std::vector<uint8_t> comp_chunk;
@@ -2098,11 +2331,21 @@ void steam_client_download_app(uint32_t app_id,
             return fail("chunk decompress failed: " + derr);
           }
 
-          uint8_t digest[20] = {};
-          if (!bcrypt_sha1(plain_chunk.data(), plain_chunk.size(), digest) ||
-              std::memcmp(digest, ck.sha, 20) != 0) {
+          // The manifest's `sha` is the CDN chunk ID, not a hash of the
+          // plaintext. Steam's integrity contract is an Adler-32 of the
+          // decompressed bytes plus the uncompressed length (DepotChunk).
+          if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
             fclose(fp);
-            return fail("chunk SHA-1 verification mismatch");
+            return fail("chunk decompressed to " +
+                        std::to_string(plain_chunk.size()) +
+                        " bytes, manifest says " +
+                        std::to_string(ck.cb_orig));
+          }
+          if (ck.crc != 0 &&
+              adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
+            fclose(fp);
+            return fail("chunk Adler-32 mismatch (" + std::string(hex_sha) +
+                        "): corrupt data or wrong depot key");
           }
 
           if (!plain_chunk.empty()) {

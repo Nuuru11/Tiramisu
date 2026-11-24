@@ -760,9 +760,10 @@ failure is a red gate, never a skipped test.
 - **M1 front end + sustained play — in progress.** God of War's normal
   front-end/menu path; RACCOIN soak test and frame-time capture; audio and
   save validation.
-- **M6 Steam library — built, console verification pending.** QR sign-in,
-  WebAPI library, CM/CDN depot download exist; the next step is proving a
-  full download → install → launch on hardware.
+- **M6 Steam library — console-verified 2026-11-24.** QR sign-in, WebAPI
+  library, CM/CDN depot download all worked on Xbox Series S: HoloCure
+  (2420510) downloaded through PICS appinfo + per-CDN auth token and appeared
+  on the shelf ready to play.
 - **Any-game breadth** — x86-32 PE32 loader + translator ladder; streaming
   maps; IOCP/dstorage; D3D12 hardware verification (see [GAP-MAP.md](GAP-MAP.md))
 - **Audio breadth** — MP3/ADPCM/FSB decoders for FMOD; Wwise; Miles

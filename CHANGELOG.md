@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.2.4.11] — console verification
+- **Steam depot download now works on Xbox Series S (live hardware proof).**
+  HoloCure - Save the Fans! (app 2420510, depot 2420511) downloaded
+  350,567,919 bytes (334.3 MiB) through CM PICS + per-CDN token, extracted to
+  `LocalState\games`, and appeared on the TV shelf as `x64 D3D11 Ready` with
+  status `Ready to Play`. Peggle Extreme (app 3483, depot 3484) also
+  downloaded its 23,356,380-byte depot and reported `Ready to Play`; both logs
+  show nonzero manifest request codes and no CDN 401.
+- **Steam manifest authorization fixed:** the manifest request code is now
+  requested from the CM with the unified
+  `ContentServerDirectory.GetManifestRequestCode#1` service call instead of
+  the WebAPI GET that returned an empty code. The public branch omits
+  `app_branch`, matching SteamKit, because sending `"public"` is treated as a
+  branch mismatch. Without a valid code the CDN returns HTTP 401.
+- **Per-host CDN auth tokens:** each selected content server now gets a
+  `ContentServerDirectory.GetCDNAuthToken#1` token, which is appended to
+  manifest and chunk URLs as `?token=`. CDN URLs use the server's `vhost`
+  (the host SteamKit uses for content requests) instead of the edge `host`,
+  and manifest/chunk failures now log the token state.
+- Prior fixes landed on the way: stack-lifetime crash in CM WebSocket
+  callbacks, PICS appinfo field numbers, brace-depth depot parsing, CM unified
+  manifest-request-code + per-host CDN auth token, vhost URLs, and Adler-32
+  chunk verification. No DRM bypass; games you own only.
+
+## [0.2.4.8]
+- **Steam depot chunk verification fixed:** the downloader compared a SHA-1 of
+  the decrypted plaintext with the manifest's chunk ID, but that ID is the CDN
+  address and does not hash the plaintext, so every title failed at its first
+  chunk with "chunk SHA-1 verification mismatch". Chunks are now checked against
+  the manifest's Adler-32 (zero seed) and uncompressed length, matching Steam's
+  `DepotChunk` contract, with the compressed length checked before decryption.
+- **VZ chunk footer parsing fixed:** the decompressed size is the four bytes
+  before the trailing `zv` marker, not the last four bytes, and the LZMA stream
+  ends before the 10-byte footer.
+- **Manifest request code parsing:** accept the code as either a JSON string or
+  a number.
+
+## [0.2.4.2]
+- **Steam depot discovery fixed:** `ClientPICSProductInfoRequest` supplies a
+  source job ID so the CM associates the response with the request, and reads
+  appinfo from the response `apps` message. (`apps` is field 2; field 1 is
+  `packages`, so the previous "wrong field" diagnosis was backwards.)
+
+## [0.2.4.1]
+- **Steam download crash fixed on console:** the CM WebSocket `MessageWebSocket`
+  callbacks captured a stack-allocated session that was destroyed before the
+  delegates were; the session is now shared and keept alive by its callbacks.
+- **Steam appinfo parsing rewritten:** scan the `depots` block by brace depth,
+  keep only Windows-eligible depots (ignore Linux/macOS-only and redist), and
+  choose the largest public manifest. Console test with HoloCure (2420510) no
+  longer crashes and no longer reports "no Windows depot found" for every title.
+
 ## [0.2.4.0]
 - **Pre-launch PE compatibility badges (`/games` & TV UI):** Dashboard scans every game executable (`x64` vs unsupported `32-bit x86`, D3D11/D3D9/Vulkan/OpenGL/D3D12, EasyAntiCheat/BattlEye detection) and flags unsupported builds clearly before launch. Xbox GDK/GameOS console payloads (`MicrosoftGame.Config`, `gameos.xvd`, `xgameruntime`) are now flagged as unsupported instead of looking like D3D11 games.
 - **One-click Save Backups & Restore (`/api/backup-saves`, `/api/restore-saves`):** Download or restore `drive_c`, `profiles`, and `settings.ini` as a `.zip` directly from the LAN dashboard before Dev Mode package updates wipe `LocalState`.

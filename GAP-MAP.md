@@ -821,7 +821,7 @@ No console claim without a TV screenshot + the log pull.
 | 6 | Perf: pump/present pacing, guest-on-render-thread | session-2 Wave-1 plan | first-frame stutter |
 | 7 | D3D12 | not started | an engine that refuses D3D11 (RACCOIN negotiated D3D11 fine — UE-class is the trigger) |
 | 8 | x86-32 (G8) | **in-tree JIT, hardware proof pending** | a real PE32 title runs through the x86-32 JIT; ARM64 stays open |
-| 9 | Steam depot downloader | `tools/steam_depot.py` exists (auth-only) | sideloading real GB-sized games |
+| 9 | Steam depot downloader | **CONSOLE-VERIFIED v0.2.4.11** — HoloCure (2420510) downloaded 334 MB through CM PICS + per-CDN token to `LocalState\games` and appears on the shelf as `x64 D3D11 Ready`; no DRM bypass | — |
 
 ## NOT needed yet (scope discipline — cut from any plan)
 
