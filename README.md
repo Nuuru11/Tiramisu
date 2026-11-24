@@ -1,6 +1,7 @@
 <div align="center">
 
-<img src="docs/banner.png" alt="Tiramisu — PC games on Xbox Series X|S" width="100%"/>
+<img src="docs/banner.png" alt="Tiramisu UWP — PC games on Xbox Series X|S" width="100%"/>
+# Tiramisu UWP
 
 ### Run PC games on Xbox Series X|S — natively.
 
