@@ -1,314 +1,170 @@
-# Tiramisu — full beginner install guide
+# Tiramisu — Setup Guide
 
-This is the complete guide for installing Tiramisu on an Xbox in Developer Mode,
-transferring games, and fixing the common problems. It assumes you have never
-used Dev Mode before.
+Get Tiramisu running on your Xbox in Developer Mode, install it, and put games
+on it. No coding needed.
 
----
-
-## Contents
-
-1. [What you need](#what-you-need)
-2. [Step 1 — Put the Xbox into Developer Mode](#step-1--put-the-xbox-into-developer-mode)
-3. [Step 2 — Find the Xbox IP address](#step-2--find-the-xbox-ip-address)
-4. [Step 3 — Turn on the memory setting](#step-3--turn-on-the-memory-setting)
-5. [Step 4 — Download the files](#step-4--download-the-files)
-6. [Step 5 — Open the Xbox website](#step-5--open-the-xbox-website)
-7. [Step 6 — Install from the website](#step-6--install-from-the-website)
-8. [Step 7 — Command-line installer (if the website fails)](#step-7--command-line-installer-if-the-website-fails)
-9. [Step 8 — Launch Tiramisu](#step-8--launch-tiramisu)
-10. [Step 9 — Put games on the Xbox](#step-9--put-games-on-the-xbox)
-11. [Why is there a `dev.cer` file?](#why-is-there-a-devcer-file)
-12. [Updates and saves](#updates-and-saves)
-13. [Keyboard and mouse](#keyboard-and-mouse)
-14. [Troubleshooting](#troubleshooting)
-15. [Getting help](#getting-help)
-
----
+> **New here?** This is the only guide you need. Follow the steps in order.
 
 ## What you need
 
-- Xbox One, One S, One X, Series S or Series X.
+- An Xbox One, One S, One X, Series S, or Series X.
 - The Xbox and your phone/computer on the **same Wi-Fi**.
-- A Microsoft account for Dev Mode.
-- A browser (Edge, Chrome or Safari).
-- Optional: a terminal with `curl` and `python3` (Git Bash/WSL on Windows) for
-  the command-line installer.
+- A Microsoft account (for Dev Mode activation).
+- A browser (Edge, Chrome, or Safari).
+- About $19 (one time) for a Microsoft Partner Center developer account —
+  required to turn on Dev Mode.
 
----
+## Step 1 — Turn on Developer Mode
 
-## Step 1 — Put the Xbox into Developer Mode
+1. On the Xbox, open the **Microsoft Store**. Search for **Xbox Dev Mode** and
+   install it.
+2. Open the app. It shows an **activation code** — write it down.
+3. On your phone or computer, register a developer account at Partner Center:
+   <https://developer.microsoft.com/en-us/microsoft-store/register/>
+   (one-time fee, about $19 for an individual account).
+4. In Partner Center, go to **Xbox configuration → Devices**
+   (<https://partner.microsoft.com/xboxconfig/devices>), enter the activation
+   code, and click **Agree and activate**.
+5. Back on the Xbox, open the **Xbox Dev Mode** app and choose **Switch to Dev
+   Mode** (or **Switch and restart**). The console restarts.
+6. After the restart, open **Dev Home**. This is your Dev Mode home screen.
 
-1. On the Xbox, open the **Microsoft Store**.
-2. Search for and install **Dev Mode** (sometimes called Xbox Dev Mode).
-3. Open the app, sign in with a Microsoft account.
-4. Choose **Switch to Dev Mode**. The console restarts.
-5. After the restart, open **Dev Home**. This is your Dev Mode home screen.
+## Step 2 — Turn on the Device Portal and the memory setting
 
----
+1. In **Dev Home**, go to **Home → Remote Access → Remote Access Settings**.
+2. Turn ON **Enable Xbox Device Portal**.
+3. Turn ON **Require authentication**, set a username and password, and save.
+   You will use these to sign into the portal website.
+4. Note the portal address shown (it looks like `https://10.0.0.23:11443`).
+   That IP address is your Xbox's address — you will need it.
+5. In **Dev Home**, go to **Settings** and turn ON **"Treat UWP apps as games
+   by default"**. This gives Tiramisu 5 GB of memory. Without it, the app can
+   close right after opening.
 
-## Step 2 — Find the Xbox IP address
-
-1. In **Dev Home**, look at the home screen or the **Network** page.
-2. Write down the IP address, for example `10.0.0.23`.
-3. The Device Portal address is `https://<your-ip>:11443`.
-
-If you cannot find it, press the Xbox button → **Settings → Network →
-Advanced settings** (wording varies by OS build) and look for the IP address.
-
----
-
-## Step 3 — Turn on the memory setting
-
-1. In **Dev Home**, open **Settings**.
-2. Turn **ON** — **"Treat UWP apps as games by default"**.
-3. This gives Tiramisu 5 GB of memory. Without it, the app can close straight
-   away, especially on Xbox One S.
-
----
-
-## Step 4 — Download the files
+## Step 3 — Download the release
 
 On your phone or computer, open:
 
-https://github.com/xanstomper/Tiramisu/releases
+<https://github.com/xanstomper/Tiramisu/releases>
 
-Under the newest release (v0.2.4.12 or later), download:
+Under the newest release, download these two files and keep them together in
+one folder:
 
 | File | What it is |
 |---|---|
 | `Tiramisu.msix` | The app itself |
 | `dev.cer` | The signing certificate |
 
-Keep them together in one folder (for example a folder called `Tiramisu`).
+### The `dev.cer` file — just leave it alone
 
-For keyboard/mouse (optional), download instead:
+**Do nothing with `dev.cer`.** Do not open it. Do not double-click it. Do not
+install it on your computer. Do not put it in the Dependencies box. Just leave
+it in the same folder as `Tiramisu.msix` and forget about it.
 
-| File | What it is |
-|---|---|
-| `Tiramisu-EdgeSpoof.msix` | Experimental KBM version of the app |
-| `edge-dev.cer` | Its matching certificate |
+The installer uses it automatically when it needs it. You never have to touch
+it.
 
-Do not mix the two pairs.
+(For the experimental keyboard/mouse edition, download
+`Tiramisu-EdgeSpoof.msix` + `edge-dev.cer` instead. Do not mix the two pairs —
+the normal app needs `dev.cer`, the KBM app needs `edge-dev.cer`.)
 
----
+## Step 4 — Install Tiramisu
 
-## Step 5 — Open the Xbox website
+### Try the website first
 
-1. In your browser, type the address from Step 2, e.g.:
-
-   `https://10.0.0.23:11443`
-
-2. The browser warns that the connection is not secure. This is normal. Choose
+1. In your browser, open the portal address from Step 2 (for example
+   `https://10.0.0.23:11443`).
+2. The browser warns the connection is not secure. This is normal — choose
    **Advanced → Continue** (or **Proceed anyway**).
-3. Sign in using the Dev Home / Device Portal account. It is the account you
-   set in **Dev Home → Settings → Device Portal**.
+3. Sign in with the username and password you set in Step 2.
+4. Go to **My games & apps → Add**.
+5. In **App package**, choose `Tiramisu.msix`. Leave **Dependencies** empty.
+   Click **Add**.
+6. Wait for the page to say the install finished.
 
----
+**There is no Certificate box on the current Xbox Device Portal.** Do not look
+for one. If the install works, you are done — skip to Step 5.
 
-## Step 6 — Install from the website
+### If the website install fails — use the command-line installer
 
-Try this first. It works on many consoles.
+This is the reliable method. It uploads the `.msix` and the `.cer` together,
+so the certificate is handled for you.
 
-1. On the Device Portal website, go to **My games & apps → Add**.
-2. In **App package**, choose `Tiramisu.msix`.
-3. Leave **Dependencies** empty.
-4. Click **Add**.
-5. Wait for the page to say the install finished.
+1. Install a terminal (one time):
+   - **Windows:** install **Git for Windows** from <https://git-scm.com> (gives
+     you "Git Bash"), or run `wsl --install` and use Ubuntu.
+   - **Mac/Linux:** use the normal Terminal app.
+2. Get the installer:
 
-**There is no Certificate box on current Xbox Device Portal.** Do not look for
-one and do not put `dev.cer` in Dependencies. If the install fails, go to
-Step 7.
+   ```sh
+   git clone https://github.com/xanstomper/Tiramisu.git
+   cd Tiramisu
+   ```
 
----
+3. Copy `Tiramisu.msix` and `dev.cer` into this folder.
+4. Run the installer (replace the IP, username, and password with yours):
 
-## Step 7 — Command-line installer (if the website fails)
+   ```sh
+   export DP_HOST=10.0.0.23
+   export DP_USER=your_portal_user
+   export DP_PASS=your_portal_pass
+   bash tools/deploy.sh install ./Tiramisu.msix ./dev.cer
+   ```
 
-This is the reliable method. The script `tools/deploy.sh` logs into Device
-Portal, uploads `Tiramisu.msix` **and** `dev.cer` together, and waits for the
-result. The certificate is handled for you.
+   A good result ends with `INSTALL OK`.
 
-### 7.1 Install a terminal (one time)
+## Step 5 — Launch Tiramisu
 
-- **Windows:** install **Git for Windows** from https://git-scm.com (gives you
-  "Git Bash"), or run `wsl --install` and use Ubuntu.
-- **Mac/Linux:** use the normal Terminal app.
+1. On the Xbox, open **Dev Home → My games & apps**.
+2. Find **Tiramisu** and press **A**.
+3. You should see the Tiramisu menu with a QR code and a web address.
 
-Check the tools exist:
+## Step 6 — Put games on the Xbox
 
-```sh
-curl --version
-python3 --version
-```
-
-### 7.2 Get the installer
-
-```sh
-git clone https://github.com/xanstomper/Tiramisu.git
-cd Tiramisu
-```
-
-Copy `Tiramisu.msix` and `dev.cer` into this folder (or remember their full
-paths).
-
-### 7.3 Find your Device Portal login
-
-On the Xbox: **Dev Home → Settings → Device Portal**. It shows the username
-and password used to sign into the website. Set them if you have not already.
-
-### 7.4 Run the installer
-
-```sh
-export DP_HOST=10.0.0.23          # your Xbox IP
-export DP_USER=your_portal_user
-export DP_PASS=your_portal_pass
-
-bash tools/deploy.sh install ./Tiramisu.msix ./dev.cer
-```
-
-If the files are elsewhere:
-
-```sh
-bash tools/deploy.sh install /path/to/Tiramisu.msix /path/to/dev.cer
-```
-
-A good result looks like:
-
-```text
-upload HTTP 202
-{"Reason" : "Deploy request accepted and being processed"}
-state: {"Code" : 0, "CodeText" : "The operation completed successfully.", "Success" : true}
-INSTALL OK
-```
-
-Optional: test the connection first with
-`bash tools/deploy.sh info`.
-
----
-
-## Step 8 — Launch Tiramisu
-
-1. On the Xbox, open **Dev Home**.
-2. Open **My games & apps**.
-3. Find **Tiramisu** and press **A**.
-4. You should see the Tiramisu menu with a QR code and a web address.
-
-Check that the dashboard is alive by opening `http://<xbox-ip>:9127/api/status`
-on your PC/phone. It should show `"running":true`.
-
----
-
-## Step 9 — Put games on the Xbox
-
-1. Scan the QR code on the TV with your phone, or open the address shown on the
-   TV (`http://<xbox-ip>:9127`) on your computer.
+1. Scan the QR code on the TV with your phone, or open
+   `http://<xbox-ip>:9127` on your computer (use `http`, not `https`).
 2. Add your game:
-   - **Phone:** zip the game folder first, then tap **Upload .zip**. Phone
-     browsers cannot choose whole folders.
-   - **Computer:** drag the game folder onto the page, or use Upload .zip.
-3. Wait for the upload to finish.
-4. In the game list, choose the `.exe` if asked, then press **Launch** (or A on
-   the controller).
+   - **Computer:** drag the game folder onto the page, or upload a `.zip` of it.
+   - **Phone:** zip the game folder first (phone browsers cannot choose whole
+     folders), then tap **Upload .zip**.
+3. Wait for the upload to finish, then press **Launch** (or A on the
+   controller).
 
-### How to make a .zip
-
-- **Windows:** right-click the game folder → **Send to → Compressed (zipped)
-  folder**.
-- **Mac:** right-click → **Compress**.
-- **iPhone/Android:** use a file manager app to compress the folder, or upload
-  the individual files with **Pick Files** instead.
-
----
+To make a `.zip`: on Windows, right-click the game folder → **Send to →
+Compressed (zipped) folder**. On Mac, right-click → **Compress**.
 
 ## Why is there a `dev.cer` file?
 
-Xbox Dev Mode apps must be **signed**. We do not have a Microsoft Store signing
-key, so Tiramisu is signed with our own **self-signed certificate**. `dev.cer`
-is that certificate. It means "trust the signature on this app".
+Xbox apps must be signed. Tiramisu is signed with its own self-signed
+certificate because it is not a Store app. `dev.cer` is that certificate — it
+tells the Xbox "trust the signature on this app."
 
-It is **not** a game, **not** a dependency and **not** an app you open. The
-command-line installer sends it with the `.msix`, which is why Step 7 works
-even though the web page has no Certificate box.
-
-### Why do other MSIX apps not have a `.cer`?
-
-Every MSIX app **is** signed — otherwise Windows/Xbox refuses to install it.
-The difference is *who signed it and whether the console already trusts that
-signature*:
-
-- **Store apps:** signed by Microsoft/the developer with a Store certificate.
-  The Xbox already trusts it, so nothing extra is needed.
-- **Sideloaded apps made by other people/tools:** often signed with a
-  self-signed certificate too, but the tool that installs them creates the
-  certificate and trusts it automatically, or the `.cer` is already installed
-  on your console from an earlier app. You just don't see a separate file.
-- **Tiramisu:** signed with our own self-signed certificate and shipped as a
-  public release. We include `dev.cer` so you (or `tools/deploy.sh`) can trust
-  that exact signature once. After that, updates signed with the same
-  certificate install without needing to trust it again.
-
-So it is not unusual — it is just visible in our release. The `.cer` is the
-"trust this publisher" file for our self-signed build.
-
----
+It is not a game, not a dependency, and not something you open. The
+command-line installer sends it with the `.msix`, which is why that method
+works even though the portal website has no Certificate box. After the
+certificate is trusted once, updates signed with the same certificate install
+without needing it again.
 
 ## Updates and saves
 
-- Back up saves **before** updating: open the LAN dashboard → **Saves & Support
-  → Backup Saves (.zip)**. Uninstalling a Dev Mode app wipes its LocalState.
-- To update: install the new `Tiramisu.msix` (Step 6 or 7). If the portal says
+- **Back up saves before updating:** open the LAN dashboard → **Saves &
+  Support → Backup Saves (.zip)**. Uninstalling a Dev Mode app wipes its saved
+  data.
+- **To update:** install the new `Tiramisu.msix` (Step 4). If the portal says
   the same version is already installed, uninstall the old app first, then
   install the new one.
-- Restoring saves: **Saves & Support → Restore Saves (.zip)**.
-
----
-
-## Keyboard and mouse
-
-The normal build uses the controller (`pad2kbm`: right stick moves the mouse,
-triggers click) or the phone trackpad at `/controls`.
-
-The experimental **KBM edition** (`Tiramisu-EdgeSpoof.msix` + `edge-dev.cer`)
-tries to enable real hardware mouse passthrough. Install it with:
-
-```sh
-bash tools/deploy.sh install ./Tiramisu-EdgeSpoof.msix ./edge-dev.cer
-```
-
-It uses a different package identity, so its games/saves start in a fresh
-LocalState. Read `XBOX-MOUSE.md` before using it.
-
----
 
 ## Troubleshooting
 
 | Problem | What to do |
 |---|---|
 | Browser warns about the site | Normal. Advanced → Continue. |
-| Web install fails with signature error | Use Step 7, the command-line installer. |
+| Web install fails with a signature error | Use the command-line installer (Step 4). |
 | Error `0x8007000B` | Wrong pair. `Tiramisu.msix` needs `dev.cer`; KBM needs `edge-dev.cer`. |
-| Error `0x80073CF3` | A package with that identity is already registered. Uninstall the old app first. |
-| Tiramisu opens then closes instantly | Make sure "Treat UWP apps as games by default" is ON (Step 3). |
-| Phone will not upload a folder | Zip it first and use Upload .zip. |
-| Game does not start | Check the compatibility badge. 32-bit x86 and D3D12-only games may not work yet. |
-| LAN page does not load | Make sure the phone/PC is on the same Wi-Fi and use `http://<xbox-ip>:9127` (not https). |
+| Tiramisu opens then closes instantly | Make sure "Treat UWP apps as games by default" is ON (Step 2). |
+| LAN page (`:9127`) does not load | Same Wi-Fi as the Xbox, and use `http://` (not `https://`). |
 
----
-
-## Getting help
-
-1. Open the LAN dashboard (`http://<xbox-ip>:9127`) → **Saves & Support →
-   Download Debug Bundle (.zip)**. This gathers the log, settings and crash
-   info.
-2. Or pull the log with:
-
-   ```sh
-   bash tools/deploy.sh info-file '<full-package-name>' 'LocalState/tiramisu.log'
-   ```
-
-3. Post the last 50 lines of the log when asking for help.
-
----
+More problems: see [troubleshooting.md](troubleshooting.md).
 
 ## Quick reference
 
@@ -318,5 +174,5 @@ LAN dashboard:  http://<xbox-ip>:9127
 Normal pair:    Tiramisu.msix  + dev.cer
 KBM pair:       Tiramisu-EdgeSpoof.msix + edge-dev.cer
 Installer:      bash tools/deploy.sh install <msix> <cer>
-Required setting: Dev Home → Settings → "Treat UWP apps as games by default" = ON
+Memory setting: Dev Home → Settings → "Treat UWP apps as games by default" = ON
 ```

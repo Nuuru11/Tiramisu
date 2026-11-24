@@ -607,39 +607,28 @@ Autodetect the console family (`series_x`, `series_s`, `one_x`, `one_s`) with
 
 No Linux or coding tools required to install a release on your Xbox.
 
+> **New here? Start with the [setup guide](docs/BEGINNER-INSTALL.md) — it walks through every step (Dev Mode, Device Portal, install, game transfer), including what to do with the `dev.cer` file.**
+
 ### 1. Install Tiramisu on your console
 
-**New to Dev Mode? Use the [beginner guide](docs/BEGINNER-INSTALL.md) — it explains every click, including the certificate.**
 
 1. Enable **Xbox Dev Mode** and open **Dev Home**.
 2. Go to **Settings → Dev Home** and turn **ON** `"Treat UWP apps as games by default"` *(this gives Tiramisu **5 GB RAM** instead of 1 GB)*.
 3. Download **`Tiramisu.msix`** + **`dev.cer`** (normal build) **or** **`Tiramisu-EdgeSpoof.msix`** + **`edge-dev.cer`** (KBM edition, below) from the [latest GitHub Release](https://github.com/xanstomper/Tiramisu/releases).
 4. Open your Xbox **Device Portal** in any Windows, Mac, or phone browser (`https://<your-xbox-ip>:11443`).
-5. Under **My games & apps → Add**, upload the `.msix` you chose. When prompted for the signing certificate (or under Dev Home certificate management), import the matching `.cer` into **TrustedPeople**.
+5. Under **My games & apps → Add**, upload **only** the `.msix` you chose. Do not upload the `.cer` — the current portal has no certificate box. (If the install fails with a signature error, use the command-line installer in the [setup guide](docs/BEGINNER-INSTALL.md), which sends the certificate automatically.)
    *(From a Linux dev PC you can also deploy with `DP_HOST=<console-ip> DP_PASS=<portal-pass> tools/deploy.sh install out/Tiramisu.msix out/dev.cer`.)*
 
-#### The `.cer` file — what it is and how to add it
+#### The `.cer` file — just leave it alone
 
 The `.cer` is the **signing certificate**, not a dependency or an app. It tells
-Xbox to trust the signature on the `.msix`. Never put it in the Dependencies
-list; upload **only the `.msix`** as the app.
+Xbox to trust the signature on the `.msix`.
 
-1. Find the console IP in **Dev Home → Network** (or the Device Portal URL shown
-   there). It looks like `10.0.0.23`, so the portal is `https://10.0.0.23:11443`.
-2. On a PC or phone on the same network, open that URL in Edge or Chrome. The
-   browser will warn about a self-signed certificate — choose **Advanced →
-   Continue** (this is normal for a Dev Mode console).
-3. Sign in with the Dev Home account if prompted.
-4. Trust the matching certificate:
-   - **My games & apps → Add** often shows a certificate field during the
-     install — select `dev.cer` there (or `edge-dev.cer` for the KBM build).
-   - Alternatively, use Dev Home / Device Portal's **certificate management**
-     screen and install it into **TrustedPeople**. The exact menu name varies
-     slightly between Xbox OS builds; look for "Certificate", "Trusted
-     certificates" or "Manage certificates".
-5. Still under **My games & apps → Add**, choose **only** `Tiramisu.msix` (or
-   `Tiramisu-EdgeSpoof.msix`). Wait for the status to show success, then launch
-   the app from Dev Home / My games & apps.
+**Do nothing with it.** Do not open it. Do not double-click it. Do not install
+it on your computer. Do not put it in the Dependencies list. Just leave it in
+the same folder as the `.msix`. The command-line installer (`tools/deploy.sh`)
+sends it automatically when needed; the portal website does not ask for it.
+See the [setup guide](docs/BEGINNER-INSTALL.md) for the full steps.
 
 Correct pairs:
 
