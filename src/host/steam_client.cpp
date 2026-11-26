@@ -309,7 +309,7 @@ bool http_get_bytes(const std::string& url, std::vector<uint8_t>* out,
     if (!out->empty()) dr.ReadBytes(*out);
     return true;
   } catch (winrt::hresult_error const& e) {
-    if (err) *err = u16to8(std::wstring(e.message().c_str()));
+    if (err) *err = "HTTP transport error " + std::to_string(static_cast<int32_t>(e.code()));
     return false;
   } catch (...) {
     if (err) *err = "HTTP download failed";
@@ -1390,7 +1390,14 @@ struct depot_file_t {
   std::vector<depot_chunk_t> chunks;
 };
 
+// Steam supplies the complete signed query, including its parameter names.
+std::string cdn_query(const std::string& token) {
+  if (token.empty() || token.front() == '?') return token;
+  return "?" + token;
+}
+
 bool parse_manifest_blob(const std::vector<uint8_t>& blob,
+                         uint32_t expected_depot, uint64_t expected_manifest,
                          const uint8_t depot_key[32],
                          std::vector<depot_file_t>* files, std::string* err) {
   std::vector<uint8_t> inner;
@@ -1403,6 +1410,7 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
   // Valve manifest container: magic(4) + len(4) + bytes
   const uint8_t* payload = nullptr;
   size_t payload_len = 0;
+  uint64_t actual_depot = 0, actual_manifest = 0;
   bool filenames_encrypted = false;
   size_t off = 0;
   while (off + 8 <= inner.size()) {
@@ -1411,7 +1419,10 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
     std::memcpy(&blen, inner.data() + off + 4, 4);
     off += 8;
     if (magic == 0x32C415ABu) break; // EOF
-    if (off + blen > inner.size()) break;
+    if (blen > inner.size() - off) {
+      if (err) *err = "truncated manifest section";
+      return false;
+    }
     if (magic == 0x71F617D0u) {
       payload = inner.data() + off;
       payload_len = blen;
@@ -1419,16 +1430,24 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
       pb_reader mr{inner.data() + off, blen};
       uint32_t f, wt;
       while (mr.next(&f, &wt)) {
-        if (f == 4 && wt == 0) {
+        if (f == 1 && wt == 0) {
+          if (!mr.read_varint(&actual_depot)) return false;
+        } else if (f == 2 && wt == 0) {
+          if (!mr.read_varint(&actual_manifest)) return false;
+        } else if (f == 4 && wt == 0) {
           uint64_t v = 0;
-          mr.read_varint(&v);
+          if (!mr.read_varint(&v)) return false;
           filenames_encrypted = (v != 0);
         } else {
-          mr.skip(wt);
+          if (!mr.skip(wt)) return false;
         }
       }
     }
     off += blen;
+  }
+  if (actual_depot != expected_depot || actual_manifest != expected_manifest) {
+    if (err) *err = "depot or manifest ID differs from requested version";
+    return false;
   }
   if (!payload || payload_len == 0) {
     if (err) *err = "manifest missing protobuf payload";
@@ -1441,7 +1460,7 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
     if (f == 1 && wt == 2) {
       const uint8_t* fp = nullptr;
       size_t fl = 0;
-      if (!pr.read_bytes(&fp, &fl)) break;
+      if (!pr.read_bytes(&fp, &fl)) return false;
       pb_reader fr{fp, fl};
       depot_file_t df;
       uint32_t ff, fwt;
@@ -1449,13 +1468,13 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
         if (ff == 1 && fwt == 2) {
           const uint8_t* sp = nullptr;
           size_t sl = 0;
-          fr.read_bytes(&sp, &sl);
+          if (!fr.read_bytes(&sp, &sl)) return false;
           df.filename.assign((const char*)sp, sl);
         } else if (ff == 2 && fwt == 0) {
-          fr.read_varint(&df.size);
+          if (!fr.read_varint(&df.size)) return false;
         } else if (ff == 3 && fwt == 0) {
           uint64_t v = 0;
-          fr.read_varint(&v);
+          if (!fr.read_varint(&v)) return false;
           df.flags = (uint32_t)v;
         } else if (ff == 5 && fwt == 2) {
           const uint8_t* hash = nullptr;
@@ -1468,7 +1487,7 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
         } else if (ff == 6 && fwt == 2) {
           const uint8_t* cp = nullptr;
           size_t cl = 0;
-          fr.read_bytes(&cp, &cl);
+          if (!fr.read_bytes(&cp, &cl)) return false;
           pb_reader cr{cp, cl};
           depot_chunk_t ck{};
           uint32_t cf, cwt;
@@ -1476,24 +1495,24 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
             if (cf == 1 && cwt == 2) {
               const uint8_t* shp = nullptr;
               size_t shl = 0;
-              cr.read_bytes(&shp, &shl);
+              if (!cr.read_bytes(&shp, &shl)) return false;
               if (shl == 20) std::memcpy(ck.sha, shp, 20);
             } else if (cf == 2 && cwt == 5) {
               uint32_t v = 0;
-              cr.read_fixed32(&v);
+              if (!cr.read_fixed32(&v)) return false;
               ck.crc = v;
             } else if (cf == 3 && cwt == 0) {
-              cr.read_varint(&ck.offset);
+              if (!cr.read_varint(&ck.offset)) return false;
             } else if (cf == 4 && cwt == 0) {
               uint64_t v = 0;
-              cr.read_varint(&v);
+              if (!cr.read_varint(&v)) return false;
               ck.cb_orig = (uint32_t)v;
             } else if (cf == 5 && cwt == 0) {
               uint64_t v = 0;
-              cr.read_varint(&v);
+              if (!cr.read_varint(&v)) return false;
               ck.cb_comp = (uint32_t)v;
             } else {
-              cr.skip(cwt);
+              if (!cr.skip(cwt)) return false;
             }
           }
           df.chunks.push_back(ck);
@@ -1503,23 +1522,26 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
           if (!fr.read_bytes(&target, &size)) return false;
           df.linked_path = size != 0;
         } else {
-          fr.skip(fwt);
+          if (!fr.skip(fwt)) return false;
         }
       }
       if (filenames_encrypted && !df.filename.empty()) {
         auto enc = b64_decode(df.filename);
         std::vector<uint8_t> dec;
-        if (bcrypt_aes256_decrypt_steam(enc.data(), enc.size(), depot_key, &dec)) {
-          while (!dec.empty() && dec.back() == 0) dec.pop_back();
-          df.filename.assign((const char*)dec.data(), dec.size());
+        if (!bcrypt_aes256_decrypt_steam(enc.data(), enc.size(), depot_key, &dec)) {
+          if (err) *err = "manifest filename decryption failed";
+          return false;
         }
+        while (!dec.empty() && dec.back() == 0) dec.pop_back();
+        if (dec.empty()) return false;
+        df.filename.assign((const char*)dec.data(), dec.size());
       }
       // Normalize path separators to backslash and strip trailing whitespace
       for (char& c : df.filename)
         if (c == '/') c = '\\';
       files->push_back(std::move(df));
     } else {
-      pr.skip(wt);
+      if (!pr.skip(wt)) return false;
     }
   }
   return !files->empty();
@@ -2400,6 +2422,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
             return fail("depot decryption key timeout");
           }
           uint32_t eresult = 0;
+          uint64_t key_depot = 0;
           bool got_key = false;
           pb_reader kr{resp.data(), resp.size()};
           uint32_t f, wt;
@@ -2408,6 +2431,8 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
               uint64_t v = 0;
               kr.read_varint(&v);
               eresult = (uint32_t)v;
+            } else if (f == 2 && wt == 0) {
+              if (!kr.read_varint(&key_depot)) return fail("Invalid depot key response");
             } else if (f == 3 && wt == 2) {
               const uint8_t* kp = nullptr;
               size_t kl = 0;
@@ -2420,6 +2445,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
               kr.skip(wt);
             }
           }
+          if (eresult == 1 && key_depot != depot_id) return fail("Depot key response ID mismatch");
           if (eresult != 1 || !got_key) {
             return fail("Steam denied depot key (eresult=" +
                         std::to_string(eresult) + " — verify license)");
@@ -2552,8 +2578,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
                             std::to_string(manifest_id) + "/5";
           if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
           if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-            url += "?token=" +
-                   u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+            url += cdn_query(cdn_tokens[hi]);
           }
           if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
             log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
@@ -2563,7 +2588,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
 
         std::vector<depot_file_t> files;
         std::string perr;
-        if (!parse_manifest_blob(manifest_blob, depot_key, &files, &perr)) {
+        if (!parse_manifest_blob(manifest_blob, depot_id, manifest_id, depot_key, &files, &perr)) {
           return fail("manifest parse failed: " + perr);
         }
 
@@ -2652,8 +2677,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
               std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
                                 std::to_string(depot_id) + "/chunk/" + hex_sha;
               if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-                url += "?token=" +
-                       u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+                url += cdn_query(cdn_tokens[hi]);
               }
               if (http_get_bytes(url, &enc_chunk, &cerr)) {
                 got = true;
