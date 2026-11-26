@@ -683,12 +683,14 @@ static bool paint_probe() {
 }
 
 std::string swapchain_triangle_test() {
-  auto error = probe.render();
+  auto error = probe.render(g_factory.get());
   if (!error.empty()) return error;
-  if (!paint_probe() || g_swap->Present(1,0) != S_OK)
-    return "DX12 device, submit and pixels OK / launcher present failed";
-  probe.preview_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-  return "DX12 device, submit and pixels OK / launcher present OK";
+  const bool shown = paint_probe() && g_swap->Present(1,0) == S_OK;
+  if (shown) probe.preview_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  char result[160];
+  snprintf(result, sizeof(result), "DX12 device, submit, pixels OK / DX12 Present 0x%08X / TV preview %s",
+           static_cast<unsigned>(probe.present_hr), shown ? "OK" : "unavailable");
+  return result;
 }
 
 void swapchain_present() {

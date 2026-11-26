@@ -2,6 +2,7 @@
 #pragma once
 #include <d3d12.h>
 #include <d3dcompiler.h>
+#include <dxgi1_3.h>
 #include <array>
 #include <chrono>
 #include <string>
@@ -13,8 +14,11 @@ struct triangle_probe {
   std::array<uint32_t, size * size> pixels{};
   std::chrono::steady_clock::time_point preview_until{};
 
-  std::string render() {
+  HRESULT present_hr = E_PENDING;
+
+  std::string render(IDXGIFactory2* factory) {
     preview_until = {};
+    present_hr = E_PENDING;
     const char* stage = "Create device";
     try {
       using winrt::com_ptr;
@@ -66,7 +70,25 @@ struct triangle_probe {
       heap.Type = D3D12_HEAP_TYPE_DEFAULT;
       heap.CreationNodeMask = heap.VisibleNodeMask = 1;
       com_ptr<ID3D12Resource> texture, buffer;
-      check_hresult(device->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&target,D3D12_RESOURCE_STATE_RENDER_TARGET,nullptr,IID_PPV_ARGS(texture.put())));
+      // A separate queue-backed composition chain lets us exercise DX12 Present
+      // without destroying the CoreWindow chain used by the launcher.
+      com_ptr<IDXGISwapChain1> test_chain;
+      DXGI_SWAP_CHAIN_DESC1 swap_desc{};
+      swap_desc.Width = swap_desc.Height = size;
+      swap_desc.Format = target.Format;
+      swap_desc.SampleDesc.Count = 1;
+      swap_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+      swap_desc.BufferCount = 2;
+      swap_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+      swap_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+      present_hr = factory ? factory->CreateSwapChainForComposition(queue.get(), &swap_desc,
+          nullptr, test_chain.put()) : E_NOINTERFACE;
+      if (SUCCEEDED(present_hr)) {
+        check_hresult(test_chain->GetBuffer(0, IID_PPV_ARGS(texture.put())));
+      } else {
+        check_hresult(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &target,
+            D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(texture.put())));
+      }
       D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
       UINT64 bytes;
       device->GetCopyableFootprints(&target,0,1,0,&footprint,nullptr,nullptr,&bytes);
@@ -91,6 +113,12 @@ struct triangle_probe {
       float black[4] = {0,0,0,1};
       D3D12_VIEWPORT viewport{0,0,size,size,0,1};
       D3D12_RECT rect{0,0,size,size};
+      D3D12_RESOURCE_BARRIER barrier{};
+      if (test_chain) {
+        barrier.Transition = {texture.get(), 0, D3D12_RESOURCE_STATE_PRESENT,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET};
+        list->ResourceBarrier(1, &barrier);
+      }
       list->RSSetViewports(1,&viewport);
       list->RSSetScissorRects(1,&rect);
       list->OMSetRenderTargets(1,&handle,FALSE,nullptr);
@@ -98,7 +126,6 @@ struct triangle_probe {
       list->SetGraphicsRootSignature(root.get());
       list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
       list->DrawInstanced(3,1,0,0);
-      D3D12_RESOURCE_BARRIER barrier{};
       barrier.Transition = {texture.get(),0,D3D12_RESOURCE_STATE_RENDER_TARGET,D3D12_RESOURCE_STATE_COPY_SOURCE};
       list->ResourceBarrier(1,&barrier);
       D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
@@ -107,6 +134,11 @@ struct triangle_probe {
       dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
       dst.PlacedFootprint = footprint;
       list->CopyTextureRegion(&dst,0,0,0,&src,nullptr);
+      if (test_chain) {
+        barrier.Transition = {texture.get(), 0, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                              D3D12_RESOURCE_STATE_PRESENT};
+        list->ResourceBarrier(1, &barrier);
+      }
       check_hresult(list->Close());
       com_ptr<ID3D12Fence> fence;
       check_hresult(device->CreateFence(0,D3D12_FENCE_FLAG_NONE,IID_PPV_ARGS(fence.put())));
@@ -126,6 +158,7 @@ struct triangle_probe {
       buffer->Unmap(0,&written);
       if (pixels[size*size/2+size/2] != 0xff00ff00 || pixels.front() != 0xff000000)
         return "Device OK / submitted / triangle pixel check failed";
+      if (test_chain) present_hr = test_chain->Present(0, 0);
       return {};
     } catch (const winrt::hresult_error& error) {
       char text[128];
