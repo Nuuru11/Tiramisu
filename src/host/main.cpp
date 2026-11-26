@@ -6,6 +6,7 @@
 //     including gamepad-as-mouse for KBM-only games
 //   * optional Steam QR login (own account; depot pipeline is M6)
 #include "../trt/limbus_report.h"
+#include "epic_install.h"
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
@@ -645,7 +646,7 @@ void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
     const std::string rel = rel_dir.empty() ? fn : (rel_dir + "\\" + fn);
     if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
       const std::string fn_low = lower_ascii(fn);
-      if (fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs") {
+      if (fn_low == ".egstore" || fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs") {
         continue;
       }
       collect_exes_rec(base_dir, rel, game_name, depth + 1, out);
@@ -694,7 +695,7 @@ void collect_iso_exes_rec(trt_iso* iso, const std::string& rel_dir,
     const std::string rel = rel_dir.empty() ? fn : (rel_dir + "\\" + fn);
     if (r.dirs[i]) {
       const std::string fn_low = lower_ascii(fn);
-      if (fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs" ||
+      if (fn_low == ".egstore" || fn_low == "thirdparty" || fn_low == "extras" || fn_low == "prereqs" ||
           fn_low == "directx" || fn_low == "redist")
         continue;
       collect_iso_exes_rec(iso, rel, game_name, depth + 1, out);
@@ -952,7 +953,7 @@ void scan_game_entry(
   ge.name = disp;
   ge.dir = gdir;
   for (const auto& c : cands) ge.exes.push_back(c.rel);
-  ge.exe_idx = 0;
+  ge.exe_idx = static_cast<int>(longan::epic_exe_index(ge.exes, longan::read_epic_install(gdir).executable));
   {
     std::ifstream ef(gdir + "\\tiramisu_exe.txt");
     std::string cfg_exe;

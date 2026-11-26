@@ -19,6 +19,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "epic_install.h"
 #include "../trt/limbus_report.h"
 #include "web_controls_page.h"
 #include "host_log.h"
@@ -627,7 +628,7 @@ void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
   list_dir_entries(dir, &ents);
   const std::string g_low = xfer_lower(game_name);
   for (const auto& e : ents) {
-    if (e.name == "__MACOSX") continue;
+    if (e.name == "__MACOSX" || (e.is_dir && xfer_ieq(e.name, ".egstore"))) continue;
     const std::string rel = rel_dir.empty() ? e.name : (rel_dir + sep + e.name);
     if (e.is_dir) {
       collect_exes_rec(base_dir, rel, game_name, depth + 1, out);
@@ -646,7 +647,7 @@ void collect_exes_rec(const std::string& base_dir, const std::string& rel_dir,
 }
 
 void scan_game_exes(const std::string& game_dir, const std::string& game_name,
-                    std::vector<std::string>* out_exes, std::string* selected) {
+                    std::vector<std::string>* out_exes, std::string* selected, bool* epic = nullptr) {
   out_exes->clear();
   selected->clear();
   std::vector<exe_item> items;
@@ -658,7 +659,9 @@ void scan_game_exes(const std::string& game_dir, const std::string& game_name,
   });
   for (const auto& it : items) out_exes->push_back(it.rel);
   if (out_exes->empty()) return;
-  *selected = (*out_exes)[0];
+  const auto install = read_epic_install(game_dir);
+  if (epic) *epic = install.detected;
+  *selected = (*out_exes)[epic_exe_index(*out_exes, install.executable)];
   const std::string cfg_exe =
       read_small_text(game_dir + std::string(1, XFER_SEP) + "tiramisu_exe.txt");
   if (!cfg_exe.empty()) {
@@ -1094,7 +1097,8 @@ std::string games_json() {
     const std::string gdir = g_games_dir + sep + d.name;
     std::vector<std::string> exes;
     std::string exe;
-    scan_game_exes(gdir, d.name, &exes, &exe);
+    bool epic = false;
+    scan_game_exes(gdir, d.name, &exes, &exe, &epic);
     if (exe.empty()) continue;
     const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
     const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
@@ -1103,7 +1107,7 @@ std::string games_json() {
     const pe_compat_info compat = inspect_pe_compat(gdir, exe);
     if (!first) j += ",";
     first = false;
-    j += "{\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
+    j += std::string("{\"epic_install\":") + (epic ? "true" : "false") + ",\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
          json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
          "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
          json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
@@ -1320,7 +1324,7 @@ const char* k_upload_page =
   "const cbadge=x.compat?('<span class=pill style=\"color:'+ccol+';border-color:rgba(255,255,255,.16)\">'+esc(x.compat)+'</span>'):'';"
   "return '<div class=game><div class=game-top><div class=game-head>'"
   "+'<img class=cover-thumb src=\"/api/cover/'+encodeURIComponent(x.name)+'?t='+Date.now()+'\" onerror=\"this.style.opacity=0.2\">'"
-  "+'<b>'+esc(x.name)+'</b> '+cbadge+'</div><div class=row>'"
+  "+'<b>'+esc(x.name)+'</b> '+(x.epic_install?'<span class=pill>Epic Games</span> ':'')+cbadge+'</div><div class=row>'"
   "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>'"
   "+'<button class=\"btn btn-sec\" onclick=\"E(\\'cov'+i+'\\').click()\">Cover</button>'"
   "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover(\\''+esc(x.name)+'\\',this)\">'"
