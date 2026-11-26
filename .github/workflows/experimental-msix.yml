@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang-19 lld-19 llvm-19 cmake ninja-build mono-devel \
+            clang-19 lld-19 llvm-19 cmake ninja-build mono-devel mono-utils \
             libsdl2-dev libgl1-mesa-dev libgl1-mesa-dri libicu-dev \
             libssl-dev libcurl4-openssl-dev zlib1g-dev python3-pil xvfb xauth
           echo "$LLVM_BIN" >> "$GITHUB_PATH"

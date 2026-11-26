@@ -7,9 +7,11 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$here"
 out=tests/out
 mkdir -p "$out"
-CLANG="${CLANG:-/usr/lib/llvm-19/bin/clang}"
+LLVM_BIN="${LLVM_BIN:-/usr/lib/llvm-19/bin}"
+CLANG="${CLANG:-$LLVM_BIN/clang}"
 [[ -x "$CLANG" ]] || CLANG="$HOME/.local/bin/clang-19"
-LLD_LINK="$HOME/.local/bin/lld-link"
+LLD_LINK="${LLD_LINK:-$LLVM_BIN/lld-link}"
+[[ -x "$LLD_LINK" ]] || LLD_LINK="$HOME/.local/bin/lld-link"
 
 python3 tools/gen_guest_res.py "$out/guest_res_rsrc.s" "$out/guest_res_rsrc.o"
 "$CLANG" --target=x86_64-pc-windows-msvc -O2 -c "$out/guest_res_rsrc.s" \

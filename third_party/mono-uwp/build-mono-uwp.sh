@@ -125,7 +125,7 @@ if [[ ! -f "$SRC/.tiramisu-staged" || "$(cat "$SRC/.tiramisu-staged" 2>/dev/null
   for p in "$UWP_DIR"/patches/*.patch; do
     [[ -f "$p" ]] || continue
     log "applying patch $(basename "$p")"
-    patch -p1 -d "$SRC" --forward < "$p" || die "patch failed: $p"
+    patch -p1 -d "$SRC" --forward < "$p" >&2 || die "patch failed: $p"
   done
 
   # config.h: replicate mono.winconfig.targets (RunWinConfigSetup) — the
@@ -212,7 +212,7 @@ done
 # asm/win64.S is a mechanical GNU as translation (see its header); it
 # assembles to the same instruction stream (verified by disassembly).
 log "assembling asm/win64.S"
-clang-cl -target x86_64-pc-windows-msvc -c "$UWP_DIR/asm/win64.S" \
+clang --target=x86_64-pc-windows-msvc -c "$UWP_DIR/asm/win64.S" \
   -o "$CACHE/obj/win64.obj" || die "win64.S assembly failed"
 
 log "merging ${#part_libs[@]} per-library archives + win64.obj into $LIB"

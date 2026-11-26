@@ -1581,16 +1581,32 @@ int main() {
         void* addrs[8] = {};
         u32 gran = 0;
         const u32 rc = pGww(0 /*no reset*/, gc, 1 << 20, addrs, &n, &gran);
-        CHECK(rc == 0, "GetWriteWatch answers success (host passthrough or soft-dirty)");
-        CHECK(n == 2 && addrs[0] == gc &&
-                  addrs[1] == (void*)((u8*)gc + 3 * 4096),
-              "GetWriteWatch reports exactly the 2 written pages, page-granular");
-        // reset then re-query: clean means n == 0
-        if (pRww) pRww(gc, 1 << 20);
-        u64 n2 = 8;
-        void* addrs2[8] = {};
-        const u32 rc2 = pGww(0, gc, 1 << 20, addrs2, &n2, &gran);
-        CHECK(rc2 == 0 && n2 == 0, "after ResetWriteWatch the region reports clean");
+        const u32 err = trt_GetLastError();
+        // Some Linux runners do not expose PAGE_IS_SOFT_DIRTY in pagemap.
+        // Verify the fallback only when the host cannot track this write.
+        u64 page = 0;
+        FILE* pagemap = fopen("/proc/self/pagemap", "rb");
+        bool tracked = false;
+        if (pagemap) {
+          const auto offset = (uintptr_t)gc / 4096 * sizeof(page);
+          tracked = pread(fileno(pagemap), &page, sizeof(page), offset) ==
+                        sizeof(page) &&
+                    (page & (1ull << 55)) != 0;
+          fclose(pagemap);
+        }
+        if (tracked) {
+          CHECK(rc == 0, "GetWriteWatch succeeds when the host tracks writes");
+          CHECK(n == 2 && gran == 4096 && addrs[0] == gc &&
+                    addrs[1] == (void*)((u8*)gc + 3 * 4096),
+                "GetWriteWatch reports exactly the 2 written pages, page-granular");
+          if (pRww) pRww(gc, 1 << 20);
+          u64 n2 = 8;
+          const u32 rc2 = pGww(0, gc, 1 << 20, addrs, &n2, &gran);
+          CHECK(rc2 == 0 && n2 == 0, "after ResetWriteWatch the region reports clean");
+        } else {
+          CHECK(rc == (u32)-1 && err == 87 && n == 0,
+                "GetWriteWatch reports unavailable host tracking for GC fallback");
+        }
         pValloc(gc, 0, 0x8000u /*MEM_RELEASE*/, 0);
       }
     }
