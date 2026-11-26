@@ -11,7 +11,7 @@ out="${1:-out}"; mkdir -p "$out/layout" "$out/obj"
 CB="${UWP_CROSSBUILD:-$here/../gow-uwp/ref/uwp-crossbuild}"
 [[ -x "$CB/scripts/build.sh" ]] || CB="$HOME/gow-uwp/ref/uwp-crossbuild"
 [[ -x "$CB/scripts/build.sh" ]] || { echo "ERROR: uwp-crossbuild wrapper not found (set UWP_CROSSBUILD)" >&2; exit 2; }
-[[ -d "$HOME/.cache/uwp-crossbuild/xwin/sdk" ]] || { echo "ERROR: no SDK — run: xwin --accept-license --arch x86_64 splat --output ~/.cache/uwp-crossbuild/xwin" >&2; exit 2; }
+[[ -d "${UWP_XWIN_ROOT:-$HOME/.cache/uwp-crossbuild/xwin}/sdk" ]] || { echo "ERROR: no SDK — run: xwin --accept-license --arch x86_64 splat --output ~/.cache/uwp-crossbuild/xwin" >&2; exit 2; }
 command -v makemsix >/dev/null || { echo "ERROR: makemsix not in PATH" >&2; exit 2; }
 
 # --- 1. build the offline test first: loader core must be green on host ------
@@ -101,7 +101,7 @@ UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   src/trt/bridge_nvapi.cpp src/trt/bridge_gdiplus.cpp src/trt/bridge_fmod.cpp \
   src/trt/bridge_wldap32.cpp src/trt/bridge_ktmw32.cpp \
   src/trt/bridge_fmod_studio.cpp \
-  src/trt/x86_exec.cpp src/trt/x86_bridge.cpp src/trt/x86_image.cpp src/trt/x86_32.cpp src/trt/x86_jit.cpp src/trt/x86_heap.cpp \
+  src/trt/x86_exec.cpp src/trt/x86_bridge.cpp src/trt/x86_jit.cpp src/trt/x86_heap.cpp \
   src/trt/bridge_membudget.cpp src/trt/mono_host.cpp src/trt/fna_platform.cpp \
   src/trt/trt_trace.cpp \
   third_party/mono-bridges/mono_steam_door.cpp \

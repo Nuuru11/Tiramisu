@@ -40,6 +40,26 @@ constexpr int E_FAIL_ = 0x80004005;
 // ---- the app context ----
 u32 g_app_id = 0;
 int g_initialized = 0;
+constexpr u32 k_limbus_app_id = 1973530;
+
+// The host QR/CM session handles account and library services. It does not
+// provide the desktop Steamworks client interface used by this application.
+bool requires_desktop_steam_client() { return g_app_id == k_limbus_app_id; }
+
+bool init_steam_bridge(char* out_err_msg) {
+  if (requires_desktop_steam_client()) {
+    constexpr char message[] =
+        "Limbus Company (1973530) requires a Steamworks client session "
+        "(steamclient64.dll); the Xbox host account session cannot provide one.";
+    g_initialized = 0;
+    if (out_err_msg) memcpy(out_err_msg, message, sizeof(message));
+    trt_core_log(message);
+    return false;
+  }
+  g_initialized = 1;
+  if (out_err_msg) out_err_msg[0] = 0;
+  return true;
+}
 
 // The signed-in Steam account (0 = nobody signed in). Filled by
 // trt_steam_load_account() from steam_auth's OpenID identity file, so
@@ -84,18 +104,14 @@ extern "C" {
 
 // SteamAPI_Init() / SteamAPI_InitEx(ctx)
 int TRT_GUEST_ABI trt_SteamAPI_Init(void) {
-  g_initialized = 1;
-  return 1;  // true: the auth layer is live
+  return init_steam_bridge(nullptr);
 }
 int TRT_GUEST_ABI trt_SteamAPI_InitEx(void* ctx) {
   (void)ctx;
-  g_initialized = 1;
-  return 1;
+  return init_steam_bridge(nullptr);
 }
 int TRT_GUEST_ABI trt_SteamAPI_InitFlat(char* out_err_msg) {
-  g_initialized = 1;
-  if (out_err_msg) out_err_msg[0] = 0;
-  return 0;  // k_ESteamAPIInitResult_OK
+  return init_steam_bridge(out_err_msg) ? 0 : 2;  // OK / NoSteamClient
 }
 void TRT_GUEST_ABI trt_SteamAPI_Shutdown(void) { g_initialized = 0; }
 void trt_steam_set_appid(u32 app_id) { g_app_id = app_id; }
@@ -224,7 +240,9 @@ int TRT_GUEST_ABI trt_SteamAPI_RestartAppIfNecessary(u32 app_id) {
 }
 
 // SteamAPI_IsSteamRunning()
-int TRT_GUEST_ABI trt_SteamAPI_IsSteamRunning(void) { return 1; }
+int TRT_GUEST_ABI trt_SteamAPI_IsSteamRunning(void) {
+  return !requires_desktop_steam_client();
+}
 
 // ---- user ----
 
@@ -2151,9 +2169,7 @@ static void* TRT_GUEST_ABI steam_client_obj_ptr(void) {
 }
 
 static int TRT_GUEST_ABI steam_internal_init(const char* /*ver*/, char* pOutErrMsg) {
-  if (pOutErrMsg) pOutErrMsg[0] = '\0';
-  g_initialized = 1;
-  return 0; // k_ESteamAPIInitResult_OK
+  return trt_SteamAPI_InitFlat(pOutErrMsg);
 }
 static void TRT_GUEST_ABI steam_release_current_thread_memory(void) {}
 

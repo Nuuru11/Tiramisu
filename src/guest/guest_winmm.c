@@ -7,6 +7,7 @@
 //   0x08 waveOutGetNumDevs answers 1 (one real output device)
 //   0x10 timeGetDevCaps returns sane min/max
 //   0x20 mciSendStringW fails visibly (263), no crash
+//   0x40 joyGetPos reports controller state and WinMM errors
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef unsigned char u8;
@@ -24,6 +25,7 @@ __attribute__((dllimport)) u32 GSTD timeGetTime(void);
 __attribute__((dllimport)) u32 GSTD timeBeginPeriod(u32 ms);
 __attribute__((dllimport)) u32 GSTD timeEndPeriod(u32 ms);
 __attribute__((dllimport)) u32 GSTD timeGetDevCaps(void* caps, u32 size);
+__attribute__((dllimport)) u32 GSTD joyGetPos(u32 id, void* info);
 __attribute__((dllimport)) u32 GSTD waveOutGetNumDevs(void);
 __attribute__((dllimport)) u32 GSTD mciSendStringW(const u16* cmd, u16* ret,
                                                     u32 ret_len, void* hwnd);
@@ -58,6 +60,12 @@ u32 GSTD guest_winmm_main(u64 a, u64 b, u64 c) {
                       'o', 0 };
   u16 ret[32];
   if (mciSendStringW(cmd, ret, 32, 0) == 263) bits |= 0x20u;
+
+  u32 joy[4] = {0, 0, 0, 0};
+  if (joyGetPos(1, joy) == 167 && joyGetPos(4, joy) == 2 &&
+      joyGetPos(0, 0) == 165 && joyGetPos(0, joy) == 0 &&
+      joy[0] == 65535 && joy[1] == 65535 && joy[2] == 32768 && joy[3] == 5)
+    bits |= 0x40u;
 
   timeEndPeriod(1);
   return bits;

@@ -19,6 +19,7 @@ EXPORTS
     midiOutGetVolume
     midiOutSetVolume
     joyGetNumDevs
+    joyGetPos
     joyGetPosEx
     mciSendStringW
     GetProfileStringW

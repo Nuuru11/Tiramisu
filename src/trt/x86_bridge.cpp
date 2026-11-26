@@ -366,6 +366,7 @@ static int lookup_arg_count(const char* module, const char* symbol) {
         // winmm / ws2_32
         {"winmm","timeBeginPeriod",1},{"winmm","timeEndPeriod",1},
         {"winmm","timeGetTime",0},{"winmm","PlaySoundA",3},
+        {"winmm","joyGetPos",2},
         {"winmm","PlaySoundW",3},{"winmm","mciSendStringA",4},
         {"ws2_32","WSAStartup",2},{"ws2_32","WSACleanup",0},
         {"ws2_32","socket",3},{"ws2_32","closesocket",1},

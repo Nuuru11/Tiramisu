@@ -14,6 +14,7 @@
 #include "trt.h"
 #include "thunk.h"
 #include "images.h"
+#include "input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -248,6 +249,31 @@ u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64 dev, void* caps, u32 size) {
 }
 
 u32 TRT_GUEST_ABI trt_joyGetNumDevs(void) { return 0; }
+
+// JOYINFO has four UINT fields on both Windows guest architectures.
+u32 TRT_GUEST_ABI trt_joyGetPos(u32 id, void* info_out) {
+  if (id >= 4) return 2;  // MMSYSERR_BADDEVICEID
+  if (!info_out) return 165;  // JOYERR_PARMS
+  if (!trt_pad_connected(id)) return 167;  // JOYERR_UNPLUGGED
+
+  // WinMM coordinates increase rightwards and downwards, unlike XInput Y.
+  u32 info[4] = {
+      static_cast<u32>(32768 + trt_pad_thumb_n(id, 0)),
+      static_cast<u32>(32767 - trt_pad_thumb_n(id, 1)),
+      static_cast<u32>(32768 + trt_pad_thumb_n(id, 3)),
+      0,
+  };
+  constexpr u16 buttons[] = {
+      0x1000, 0x2000, 0x4000, 0x8000,  // A, B, X, Y
+      0x0100, 0x0200, 0x0020, 0x0010,  // LB, RB, Back, Start
+      0x0040, 0x0080, 0x0001, 0x0002, 0x0004, 0x0008,
+  };
+  for (u32 i = 0; i < sizeof(buttons) / sizeof(buttons[0]); ++i) {
+    if (trt_pad_down_n(id, buttons[i])) info[3] |= 1u << i;
+  }
+  memcpy(info_out, info, sizeof(info));
+  return 0;
+}
 
 u32 TRT_GUEST_ABI trt_joyGetPosEx(u32, void*) { return 167 /* JOYERR_UNPLUGGED */; }
 
@@ -835,6 +861,7 @@ int trt_bridge_register_winmm(void) {
       {"midiInGetDevCapsW", (void*)&trt_midiInGetDevCapsA},
       {"midiInGetErrorTextA", (void*)&trt_midiInGetErrorTextA},
       {"joyGetNumDevs", (void*)&trt_joyGetNumDevs},
+      {"joyGetPos", (void*)&trt_joyGetPos},
       {"joyGetPosEx", (void*)&trt_joyGetPosEx},
       {"mciSendStringW", (void*)&trt_mciSendStringW},
       {"mciSendCommandA", (void*)&trt_mciSendCommandA},

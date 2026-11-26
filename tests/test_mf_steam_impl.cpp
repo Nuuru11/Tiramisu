@@ -21,6 +21,7 @@
 // SteamNetworking, SteamUserStats, mfplat MFShutdown, shell32 ExtractIconExW)
 // must keep reading named-silent. A blanket module-level REAL flip would break
 // the second half.
+#include "../src/trt/bridge_steam.h"
 #include "../src/trt/trt.h"
 
 #include <stdio.h>
@@ -282,6 +283,21 @@ void test_steam() {
             p_unreg_cr && p_restart && p_apps && p_user && p_utils && p_friends &&
             p_client,
         "steam_api64 resolves the lifecycle, registration and interface exports");
+
+  using init_flat_fn = int(TRT_GUEST_ABI*)(char*);
+  using init_internal_fn = int(TRT_GUEST_ABI*)(const char*, char*);
+  auto p_flat = (init_flat_fn)resolve("steam_api64.dll", "SteamAPI_InitFlat");
+  auto p_internal = (init_internal_fn)resolve("steam_api64.dll", "SteamInternal_SteamAPI_Init");
+  auto p_running = (init_fn)resolve("steam_api64.dll", "SteamAPI_IsSteamRunning");
+  char steam_error[1024] = {};
+  trt_steam_set_appid(1973530);
+  CHECK(p_init && p_init() == 0 && p_running && p_running() == 0,
+        "Limbus Company requires a desktop Steamworks session");
+  CHECK(p_flat && p_flat(steam_error) == 2 && strstr(steam_error, "steamclient64.dll"),
+        "Limbus Company InitFlat reports NoSteamClient and a diagnostic");
+  CHECK(p_internal && p_internal("", nullptr) == 2,
+        "Limbus Company internal init also reports NoSteamClient");
+  trt_steam_set_appid(0);
 
   CHECK(p_init && p_init() == 1, "SteamAPI_Init -> 1 (auth layer live)");
   CHECK(p_restart && p_restart(480) == 0,

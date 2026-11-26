@@ -695,6 +695,20 @@ with `UWP_CROSSBUILD`). Python + Pillow for the branding assets
 (`package/branding/` is the source of every packaged logo; regenerate with
 `python3 tools/gen-assets.py`).
 
+On `steam-compat-experimental`, the **Experimental Xbox MSIX** workflow builds
+and tests on GitHub-hosted Linux runners. A successful run publishes
+`Tiramisu-experimental-x64` with `Tiramisu.msix` and `dev.cer`. The workflow
+generates a self-signed development certificate per run and verifies the
+signature before upload. Use the certificate from the same artifact when
+installing through Xbox Device Portal in Dev Mode.
+
+The host Steam QR sign-in is used for account and library services. It does
+not provide a desktop Steamworks session or the `steamclient64.dll` interface.
+For Limbus Company (App ID 1973530), the guest bridge reports this gap at
+initialization. The offline test covers that result. The WINMM PE guest test
+covers `joyGetPos` import binding, controller state, and device errors. Neither
+test is a console launch of the corresponding game.
+
 The gate is the contract: it builds `src/trt/*.cpp` into `libtrt.a`, links
 every suite against it, and executes real PE images through the loader. A
 failure is a red gate, never a skipped test.

@@ -2,6 +2,7 @@
 // winmm: the frame-timing clock. The guest busy-spins and requires the
 // clock to advance — a frozen or backwards timeGetTime deadlocks games.
 #include "../src/trt/trt.h"
+#include "../src/trt/input.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,8 +139,10 @@ int main(int argc, char** argv) {
   }
   CHECK(trt_seal_image(&be, img) == TRT_OK, "image sealed (W^X)");
 
+  trt_input_pad_state_n(0, true, 32767, -32768, 0, 0, 0x5000, 0, 0);
+  trt_input_pad_state_n(1, false, 0, 0, 0, 0, 0, 0, 0);
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x3f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0x7f)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x01u, "timeBeginPeriod(1) accepted");
   CHECK(ret & 0x02u, "clock nondecreasing");
@@ -147,6 +150,8 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x08u, "waveOutGetNumDevs -> 1 real output device");
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
   CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
+
+  CHECK(ret & 0x40u, "joyGetPos -> live JOYINFO and real error codes");
 
   free(file);
   if (failures == 0) {

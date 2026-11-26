@@ -70,7 +70,7 @@ command -v llvm-nm >/dev/null || die "llvm-nm not found (ships with LLVM)"
 CB="${UWP_CROSSBUILD:-$here/../gow-uwp/ref/uwp-crossbuild}"
 [[ -x "$CB/scripts/build.sh" ]] || CB="$HOME/gow-uwp/ref/uwp-crossbuild"
 [[ -x "$CB/scripts/build.sh" ]] || die "uwp-crossbuild wrapper not found (set UWP_CROSSBUILD)"
-[[ -d "$HOME/.cache/uwp-crossbuild/xwin/sdk" ]] || die "no xwin SDK — run: xwin --accept-license --arch x86_64 splat --output ~/.cache/uwp-crossbuild/xwin"
+[[ -d "${UWP_XWIN_ROOT:-$HOME/.cache/uwp-crossbuild/xwin}/sdk" ]] || die "no xwin SDK — run: xwin --accept-license --arch x86_64 splat --output ~/.cache/uwp-crossbuild/xwin"
 
 # --- stamp: rebuild when any build input changes ---------------------------
 stamp_inputs=("$UWP_DIR/build-mono-uwp.sh" "$UWP_DIR/mono-sources.txt"

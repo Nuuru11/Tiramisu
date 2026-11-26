@@ -1,0 +1,102 @@
+name: Experimental Xbox MSIX
+
+on:
+  push:
+    branches: [steam-compat-experimental]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experimental-msix-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/steam-compat-experimental'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      LLVM_BIN: /usr/lib/llvm-19/bin
+      TRT_JOBS: '4'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang-19 lld-19 llvm-19 cmake ninja-build mono-devel \
+            libsdl2-dev libgl1-mesa-dev libgl1-mesa-dri libicu-dev \
+            libssl-dev libcurl4-openssl-dev zlib1g-dev python3-pil xvfb xauth
+          echo "$LLVM_BIN" >> "$GITHUB_PATH"
+          mkdir -p /tmp/opencode
+
+      - name: Set up the Windows SDK and UWP cross-build tools
+        run: |
+          crossbuild="$RUNNER_TEMP/uwp-crossbuild"
+          git init "$crossbuild"
+          git -C "$crossbuild" fetch --depth 1 \
+            https://github.com/gianlucamazza/uwp-crossbuild.git e692f28ea613bba9bc08715ef111ad48992bf6a3
+          git -C "$crossbuild" checkout --detach FETCH_HEAD
+          echo "UWP_CROSSBUILD=$crossbuild" >> "$GITHUB_ENV"
+
+          mkdir -p "$RUNNER_TEMP/xwin"
+          archive="$RUNNER_TEMP/xwin/xwin.tar.gz"
+          curl --fail --silent --show-error --location --retry 3 -o "$archive" \
+            https://github.com/Jake-Shadle/xwin/releases/download/0.10.0/xwin-0.10.0-x86_64-unknown-linux-musl.tar.gz
+          echo "d870eb4b2f390878af6da1ccd3cf321d22fcb72720984853b4be732ae597fc88  $archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP/xwin" --strip-components=1
+          sdk="$HOME/.cache/uwp-crossbuild/xwin"
+          "$RUNNER_TEMP/xwin/xwin" --accept-license --arch x86_64 --http-retry 3 \
+            --cache-dir "$RUNNER_TEMP/xwin-cache" splat --output "$sdk"
+          "$crossbuild/scripts/fix-header-case.sh" "$sdk/sdk/include/cppwinrt/winrt" --canonical
+
+      - name: Build MSIX packaging and signature tools
+        run: |
+          msix="$RUNNER_TEMP/msix-packaging"
+          git init "$msix"
+          git -C "$msix" fetch --depth 1 \
+            https://github.com/microsoft/msix-packaging.git 25a65f5c1690930813bcc10cdf1d59fa865f2bb1
+          git -C "$msix" checkout --detach FETCH_HEAD
+          cmake -G Ninja -S "$msix" -B "$msix/build" \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$msix/cmake/linux.cmake" \
+            -DLINUX=ON -DMSIX_PACK=ON -DUSE_VALIDATION_PARSER=ON \
+            -DSKIP_BUNDLES=ON -DMSIX_SAMPLES=OFF -DMSIX_TESTS=OFF
+          cmake --build "$msix/build" --parallel "$TRT_JOBS" --target makemsix
+          echo "$msix/build/bin" >> "$GITHUB_PATH"
+
+          signcode="$RUNNER_TEMP/osslsigncode"
+          git init "$signcode"
+          git -C "$signcode" fetch --depth 1 \
+            https://github.com/mtrojnar/osslsigncode.git 04c9aa7e50a6f7d0ccf0bfc1c657aa1054c6c798
+          git -C "$signcode" checkout --detach FETCH_HEAD
+          cmake -G Ninja -S "$signcode" -B "$signcode/build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$signcode/build" --parallel "$TRT_JOBS" --target osslsigncode
+          echo "$signcode/build" >> "$GITHUB_PATH"
+
+      - name: Test and build the UWP host
+        run: tools/build-host.sh
+
+      - name: Sign and verify the development package
+        run: tools/pack.sh --no-spoof
+
+      - name: Upload MSIX and public development certificate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Tiramisu-experimental-x64
+          path: |
+            out/Tiramisu.msix
+            out/dev.cer
+          if-no-files-found: error
+
+      - name: Upload build diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: build-diagnostics
+          path: out/obj/test.log
+          if-no-files-found: ignore

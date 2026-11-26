@@ -10,9 +10,10 @@ out=tests/out
 mkdir -p "$out"
 
 # --- pick the LLVM 19 toolchain (STL/loader parity with the console build) ---
-LLVM_BIN="/usr/lib/llvm-19/bin"
+LLVM_BIN="${LLVM_BIN:-/usr/lib/llvm-19/bin}"
 CLANG="$LLVM_BIN/clang"
-LLD_LINK="$HOME/.local/bin/lld-link"
+LLD_LINK="${LLD_LINK:-$LLVM_BIN/lld-link}"
+[[ -x "$LLD_LINK" ]] || LLD_LINK="$HOME/.local/bin/lld-link"
 LLVM_DLLTOOL="$LLVM_BIN/llvm-dlltool"
 [[ -x "$CLANG" ]] || CLANG="$HOME/.local/bin/clang-19"
 [[ -x "$CLANG" ]] || { echo "ERROR: clang 19 not found" >&2; exit 1; }
@@ -219,8 +220,9 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 "$out/test_libload" "$out/guest_libload.exe" "$out"
 
 # --- 8. the graphics bridge: the guest's D3D11 calls must reach the host's GPU ---
-SDK="$HOME/.cache/uwp-crossbuild/xwin/sdk/include"
-XCRT="$HOME/.cache/uwp-crossbuild/xwin/crt/include"
+XWIN_ROOT="${UWP_XWIN_ROOT:-$HOME/.cache/uwp-crossbuild/xwin}"
+SDK="$XWIN_ROOT/sdk/include"
+XCRT="$XWIN_ROOT/crt/include"
 if [[ -d "$SDK/um" && -d "$XCRT" ]]; then
 cat > "$out/d3d11.def" <<'DEOF'
 LIBRARY d3d11
