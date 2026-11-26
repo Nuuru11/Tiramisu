@@ -40,8 +40,9 @@ u32 GSTD guest_winmm_main(u64 a, u64 b, u64 c) {
   // 2. clock nondecreasing across a busy window, and actually advances
   const u32 t0 = timeGetTime();
   u32 t1 = t0;
-  for (volatile int i = 0; i < 3000000; ++i) {}
-  t1 = timeGetTime();
+  // Poll until a millisecond boundary rather than assuming a fixed number
+  // of empty iterations takes at least a millisecond on the runner.
+  for (u32 i = 0; i < 1000000 && t1 == t0; ++i) t1 = timeGetTime();
   if (t1 >= t0) bits |= 0x02u;
   if (t1 > t0) bits |= 0x04u;
 
