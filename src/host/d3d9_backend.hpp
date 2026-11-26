@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <vector>
 
 namespace longan {
@@ -371,30 +372,34 @@ inline void submit_verts_and_draw(uint32_t prim_type,
                                   int32_t base_vertex,
                                   uint32_t prim_count) {
   if (g_rt.vscratch.empty() || !prim_count) return;
-  // Convert triangle fan cleanly to triangle list since D3D11 has no fan topology
-  if (prim_type == 6 && !indices) {
-    std::vector<norm_vert> fan;
-    fan.reserve(prim_count * 3);
-    const size_t nv = g_rt.vscratch.size();
-    for (uint32_t i = 0; i < prim_count; ++i) {
-      const size_t i1 = i + 1, i2 = i + 2;
-      if (i2 >= nv) break;
-      fan.push_back(g_rt.vscratch[0]);
-      fan.push_back(g_rt.vscratch[i1]);
-      fan.push_back(g_rt.vscratch[i2]);
-    }
-    g_rt.vscratch.swap(fan);
+  const bool expand_fan = prim_type == 6 && !indices;
+  size_t vertex_count = g_rt.vscratch.size();
+  if (expand_fan) {
+    if (vertex_count < 3) return;
+    const auto triangles = std::min<size_t>(prim_count, vertex_count - 2);
+    if (triangles > UINT32_MAX / sizeof(norm_vert) / 3) return;
+    vertex_count = triangles * 3;
     prim_type = 4;
     g_rt.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   }
-
-  const uint32_t vbytes = (uint32_t)(g_rt.vscratch.size() * sizeof(norm_vert));
+  if (vertex_count > UINT32_MAX / sizeof(norm_vert)) return;
+  const uint32_t vbytes = static_cast<uint32_t>(vertex_count * sizeof(norm_vert));
   ensure_dyn_vb(vbytes);
   if (!g_rt.dyn_vb) return;
   D3D11_MAPPED_SUBRESOURCE mv{};
   if (FAILED(g_rt.ctx->Map(g_rt.dyn_vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mv)))
     return;
-  memcpy(mv.pData, g_rt.vscratch.data(), vbytes);
+  if (expand_fan) {
+    // Expand directly into the mapped upload buffer, in triangle winding order.
+    auto* dst = static_cast<norm_vert*>(mv.pData);
+    for (size_t i = 0; i < vertex_count / 3; ++i) {
+      dst[3 * i] = g_rt.vscratch[0];
+      dst[3 * i + 1] = g_rt.vscratch[i + 1];
+      dst[3 * i + 2] = g_rt.vscratch[i + 2];
+    }
+  } else {
+    memcpy(mv.pData, g_rt.vscratch.data(), vbytes);
+  }
   g_rt.ctx->Unmap(g_rt.dyn_vb, 0);
 
   const UINT stride = (UINT)sizeof(norm_vert), offset = 0;
@@ -415,7 +420,7 @@ inline void submit_verts_and_draw(uint32_t prim_type,
         g_rt.dyn_ib, idx32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT, 0);
     g_rt.ctx->DrawIndexed(icount, start_idx, base_vertex);
   } else {
-    g_rt.ctx->Draw((UINT)g_rt.vscratch.size(), 0);
+    g_rt.ctx->Draw(static_cast<UINT>(vertex_count), 0);
   }
 }
 
