@@ -2308,365 +2308,373 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
         }
       }
 
-      uint32_t depot_id = 0;
-      uint64_t manifest_id = 0;
-      uint64_t depot_sz = 0;
       std::string main_exe_rel;
-      log_line(("steam_dl[" + std::to_string(app_id) + "]: appinfo bytes=" +
-                std::to_string(appinfo_vdf.size()) +
-                " depots=" + (appinfo_vdf.find("\"depots\"") != std::string::npos ? "yes" : "no"))
-                   .c_str());
-      parse_appinfo_vdf(appinfo_vdf, &depot_id, &manifest_id, &depot_sz,
-                        &main_exe_rel);
-      if (depot_id == 0 || manifest_id == 0) {
-        return fail("no Windows depot found in appinfo for " +
-                    std::to_string(app_id));
+      std::vector<trt_steam_depot> depots;
+      if (family_shared) {
+        depots = trt_steam_family_depots(appinfo_vdf);
+      } else {
+        trt_steam_depot selected{};
+        parse_appinfo_vdf(appinfo_vdf, &selected.id, &selected.manifest,
+                          &selected.size, &main_exe_rel);
+        if (selected.id && selected.manifest) depots.push_back(selected);
       }
+      if (depots.empty()) return fail("No supported Windows depot for " + title);
+      std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
+      for (size_t index = 0; index < depots.size(); ++index) {
+        const auto& depot = depots[index];
+        const auto depot_id = depot.id;
+        const auto manifest_id = depot.manifest;
+        const auto depot_sz = depot.size;
+        const auto report = [&](float progress, const std::string& message) {
+          const auto prefix = depots.size() > 1
+              ? "Depot " + std::to_string(index + 1) + "/" + std::to_string(depots.size()) + ": "
+              : std::string();
+          set_item_state(true, 0.06f + 0.91f * (index + progress) / depots.size(), prefix + message);
+        };
+        // 5) Depot decryption key (proves ownership!)
+        report(0.10f, "steam: requesting depot license key…");
+        uint8_t depot_key[32] = {};
+        {
+          pb_writer kreq;
+          kreq.write_uint32(1, depot_id);
+          kreq.write_uint32(2, app_id);
+          cm->send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
 
-      // 5) Depot decryption key (proves ownership!)
-      set_item_state(true, 0.10f, "steam: requesting depot license key…");
-      uint8_t depot_key[32] = {};
-      {
-        pb_writer kreq;
-        kreq.write_uint32(1, depot_id);
-        kreq.write_uint32(2, app_id);
-        cm->send_proto(5438 /* ClientGetDepotDecryptionKey */, {}, kreq);
-
-        std::vector<uint8_t> resp;
-        if (!cm->recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
-                          &resp)) {
-          return fail("depot decryption key timeout");
-        }
-        uint32_t eresult = 0;
-        bool got_key = false;
-        pb_reader kr{resp.data(), resp.size()};
-        uint32_t f, wt;
-        while (kr.next(&f, &wt)) {
-          if (f == 1 && wt == 0) {
-            uint64_t v = 0;
-            kr.read_varint(&v);
-            eresult = (uint32_t)v;
-          } else if (f == 3 && wt == 2) {
-            const uint8_t* kp = nullptr;
-            size_t kl = 0;
-            kr.read_bytes(&kp, &kl);
-            if (kl == 32) {
-              std::memcpy(depot_key, kp, 32);
-              got_key = true;
-            }
-          } else {
-            kr.skip(wt);
+          std::vector<uint8_t> resp;
+          if (!cm->recv_emsg(5439 /* ClientGetDepotDecryptionKeyResponse */,
+                            &resp)) {
+            return fail("depot decryption key timeout");
           }
-        }
-        if (eresult != 1 || !got_key) {
-          return fail("Steam denied depot key (eresult=" +
-                      std::to_string(eresult) + " — verify license)");
-        }
-      }
-
-      // 6) CDN hosts, manifest request code, and per-host auth tokens
-      std::vector<std::string> cdn_hosts;
-      std::vector<std::string> cdn_vhosts;
-      {
-        std::string resp, err;
-        if (http_get_text(
-                "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=0",
-                &resp, &err)) {
-          try {
-            auto j = winrt::Windows::Data::Json::JsonObject::Parse(
-                winrt::hstring(u8to16(resp)));
-            auto svs =
-                j.GetNamedObject(L"response").GetNamedArray(L"servers");
-            for (uint32_t i = 0; i < svs.Size() && cdn_hosts.size() < 4; ++i) {
-              auto s = svs.GetObjectAt(i);
-              if (s.HasKey(L"host")) {
-                std::string h =
-                    u16to8(std::wstring(s.GetNamedString(L"host").c_str()));
-                std::string vh = h;
-                if (s.HasKey(L"vhost")) {
-                  vh = u16to8(
-                      std::wstring(s.GetNamedString(L"vhost").c_str()));
-                }
-                cdn_hosts.push_back(h);
-                cdn_vhosts.push_back(vh);
-              }
-            }
-          } catch (...) {
-          }
-        }
-      }
-      if (cdn_hosts.empty()) {
-        cdn_hosts.push_back("cache1-iad1.steamcontent.com");
-        cdn_vhosts.push_back(cdn_hosts.back());
-      }
-
-      // The manifest request code is granted by the CM against the logged-on
-      // session. The old WebAPI GET returned an empty code, which is why the
-      // CDN answered 401.
-      uint64_t manifest_code = 0;
-      {
-        pb_writer mreq;
-        mreq.write_uint32(1, app_id);
-        mreq.write_uint32(2, depot_id);
-        mreq.write_uint64(3, manifest_id);
-        // Public branch is represented by omitting app_branch; SteamKit
-        // explicitly clears "public" because the CM expects it absent.
-        std::vector<uint8_t> mresp;
-        std::string merr;
-        if (cm->unified_call(
-                "ContentServerDirectory.GetManifestRequestCode#1", mreq,
-                &mresp, &merr, family_shared)) {
-          pb_reader mr{mresp.data(), mresp.size()};
-          uint32_t f = 0, wt = 0;
-          while (mr.next(&f, &wt)) {
+          uint32_t eresult = 0;
+          bool got_key = false;
+          pb_reader kr{resp.data(), resp.size()};
+          uint32_t f, wt;
+          while (kr.next(&f, &wt)) {
             if (f == 1 && wt == 0) {
               uint64_t v = 0;
-              mr.read_varint(&v);
-              manifest_code = v;
+              kr.read_varint(&v);
+              eresult = (uint32_t)v;
+            } else if (f == 3 && wt == 2) {
+              const uint8_t* kp = nullptr;
+              size_t kl = 0;
+              kr.read_bytes(&kp, &kl);
+              if (kl == 32) {
+                std::memcpy(depot_key, kp, 32);
+                got_key = true;
+              }
             } else {
-              mr.skip(wt);
+              kr.skip(wt);
             }
           }
-        } else {
-          log_line(("steam_dl[" + std::to_string(app_id) +
-                    "]: manifest request code failed: " + merr)
+          if (eresult != 1 || !got_key) {
+            return fail("Steam denied depot key (eresult=" +
+                        std::to_string(eresult) + " — verify license)");
+          }
+        }
+
+        // 6) CDN hosts, manifest request code, and per-host auth tokens
+        std::vector<std::string> cdn_hosts;
+        std::vector<std::string> cdn_vhosts;
+        {
+          std::string resp, err;
+          if (http_get_text(
+                  "https://api.steampowered.com/IContentServerDirectoryService/GetServersForSteamPipe/v1/?cell_id=0",
+                  &resp, &err)) {
+            try {
+              auto j = winrt::Windows::Data::Json::JsonObject::Parse(
+                  winrt::hstring(u8to16(resp)));
+              auto svs =
+                  j.GetNamedObject(L"response").GetNamedArray(L"servers");
+              for (uint32_t i = 0; i < svs.Size() && cdn_hosts.size() < 4; ++i) {
+                auto s = svs.GetObjectAt(i);
+                if (s.HasKey(L"host")) {
+                  std::string h =
+                      u16to8(std::wstring(s.GetNamedString(L"host").c_str()));
+                  std::string vh = h;
+                  if (s.HasKey(L"vhost")) {
+                    vh = u16to8(
+                        std::wstring(s.GetNamedString(L"vhost").c_str()));
+                  }
+                  cdn_hosts.push_back(h);
+                  cdn_vhosts.push_back(vh);
+                }
+              }
+            } catch (...) {
+            }
+          }
+        }
+        if (cdn_hosts.empty()) {
+          cdn_hosts.push_back("cache1-iad1.steamcontent.com");
+          cdn_vhosts.push_back(cdn_hosts.back());
+        }
+
+        // The manifest request code is granted by the CM against the logged-on
+        // session. The old WebAPI GET returned an empty code, which is why the
+        // CDN answered 401.
+        uint64_t manifest_code = 0;
+        {
+          pb_writer mreq;
+          mreq.write_uint32(1, app_id);
+          mreq.write_uint32(2, depot_id);
+          mreq.write_uint64(3, manifest_id);
+          // Public branch is represented by omitting app_branch; SteamKit
+          // explicitly clears "public" because the CM expects it absent.
+          std::vector<uint8_t> mresp;
+          std::string merr;
+          if (cm->unified_call(
+                  "ContentServerDirectory.GetManifestRequestCode#1", mreq,
+                  &mresp, &merr, family_shared)) {
+            pb_reader mr{mresp.data(), mresp.size()};
+            uint32_t f = 0, wt = 0;
+            while (mr.next(&f, &wt)) {
+              if (f == 1 && wt == 0) {
+                uint64_t v = 0;
+                mr.read_varint(&v);
+                manifest_code = v;
+              } else {
+                mr.skip(wt);
+              }
+            }
+          } else {
+            log_line(("steam_dl[" + std::to_string(app_id) +
+                      "]: manifest request code failed: " + merr)
+                         .c_str());
+          }
+        }
+
+        if (family_shared && manifest_code == 0)
+          return fail("Steam did not authorize a manifest for this family copy");
+        if (!family_account_active())
+          return fail("Steam Families access changed during the download");
+
+        // Tokens are per depot and per CDN host. They are often empty, but
+        // requesting one also tells the cache this session is authorized.
+        std::vector<std::string> cdn_tokens;
+        for (size_t i = 0; i < cdn_hosts.size(); ++i) {
+          std::string token, terr;
+          pb_writer treq;
+          treq.write_uint32(1, depot_id);
+          treq.write_string(2, cdn_vhosts[i]);
+          treq.write_uint32(3, app_id);
+          std::vector<uint8_t> tresp;
+          if (cm->unified_call("ContentServerDirectory.GetCDNAuthToken#1",
+                               treq, &tresp, &terr)) {
+            pb_reader tr{tresp.data(), tresp.size()};
+            uint32_t f = 0, wt = 0;
+            while (tr.next(&f, &wt)) {
+              if (f == 1 && wt == 2) {
+                const uint8_t* p = nullptr;
+                size_t n = 0;
+                if (tr.read_bytes(&p, &n)) token.assign((const char*)p, n);
+              } else {
+                tr.skip(wt);
+              }
+            }
+          }
+          cdn_tokens.push_back(token);
+          std::string tstat = token.empty() ? "none" : "ok";
+          if (token.empty() && !terr.empty()) tstat += " (" + terr + ")";
+          log_line(("steam_dl[" + std::to_string(app_id) + "]: cdn token " +
+                    cdn_vhosts[i] + " -> " + tstat)
                        .c_str());
         }
-      }
 
-      if (family_shared && manifest_code == 0)
-        return fail("Steam did not authorize a manifest for this family copy");
-      if (!family_account_active())
-        return fail("Steam Families access changed during the download");
+        log_line(("steam_dl[" + std::to_string(app_id) +
+                  "]: manifest authorized=" + (manifest_code ? "yes" : "no") +
+                  " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
 
-      // Tokens are per depot and per CDN host. They are often empty, but
-      // requesting one also tells the cache this session is authorized.
-      std::vector<std::string> cdn_tokens;
-      for (size_t i = 0; i < cdn_hosts.size(); ++i) {
-        std::string token, terr;
-        pb_writer treq;
-        treq.write_uint32(1, depot_id);
-        treq.write_string(2, cdn_vhosts[i]);
-        treq.write_uint32(3, app_id);
-        std::vector<uint8_t> tresp;
-        if (cm->unified_call("ContentServerDirectory.GetCDNAuthToken#1",
-                             treq, &tresp, &terr)) {
-          pb_reader tr{tresp.data(), tresp.size()};
-          uint32_t f = 0, wt = 0;
-          while (tr.next(&f, &wt)) {
-            if (f == 1 && wt == 2) {
-              const uint8_t* p = nullptr;
-              size_t n = 0;
-              if (tr.read_bytes(&p, &n)) token.assign((const char*)p, n);
-            } else {
-              tr.skip(wt);
+        log_line(("steam_dl[" + std::to_string(app_id) +
+                  "]: depot=" + std::to_string(depot_id) +
+                  " manifest=" + std::to_string(manifest_id) +
+                  " size=" + std::to_string(depot_sz) +
+                  " main=" + main_exe_rel).c_str());
+        // 7) Download + parse depot manifest
+        report(0.14f, "steam: downloading depot manifest…");
+        std::vector<uint8_t> manifest_blob;
+        std::string dl_err;
+        for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+          std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
+                            std::to_string(depot_id) + "/manifest/" +
+                            std::to_string(manifest_id) + "/5";
+          if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
+          if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+            url += "?token=" +
+                   u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+          }
+          if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
+            log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
+                    cdn_hosts[hi] + " -> " + dl_err).c_str());
+        }
+        if (manifest_blob.empty()) return fail("manifest CDN failed: " + dl_err);
+
+        std::vector<depot_file_t> files;
+        std::string perr;
+        if (!parse_manifest_blob(manifest_blob, depot_key, &files, &perr)) {
+          return fail("manifest parse failed: " + perr);
+        }
+
+        uint64_t total_bytes = 0;
+        for (const auto& f : files) total_bytes += f.size;
+        if (total_bytes == 0) total_bytes = 1;
+
+        std::filesystem::path family_final;
+        if (family_shared) {
+          if (state_dir.empty()) return fail("Steam Families staging storage unavailable");
+          for (auto& file : files) {
+            if (file.linked_path || !valid_family_depot_path(file.filename))
+              return fail("Steam Families depot contains an unsupported file path");
+            if (file.flags & 0x40) continue;
+            std::sort(file.chunks.begin(), file.chunks.end(),
+                      [](const auto& a, const auto& b) { return a.offset < b.offset; });
+            uint64_t next_offset = 0;
+            for (const auto& chunk : file.chunks) {
+              if (chunk.offset != next_offset || !chunk.cb_orig ||
+                  chunk.cb_orig > file.size - next_offset)
+                return fail("Steam Families depot contains an invalid file layout");
+              next_offset += chunk.cb_orig;
             }
+            if (next_offset != file.size)
+              return fail("Steam Families depot contains an incomplete file");
           }
-        }
-        cdn_tokens.push_back(token);
-        std::string tstat = token.empty() ? "none" : "ok";
-        if (token.empty() && !terr.empty()) tstat += " (" + terr + ")";
-        log_line(("steam_dl[" + std::to_string(app_id) + "]: cdn token " +
-                  cdn_vhosts[i] + " -> " + tstat)
-                     .c_str());
-      }
-
-      log_line(("steam_dl[" + std::to_string(app_id) +
-                "]: manifest authorized=" + (manifest_code ? "yes" : "no") +
-                " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
-
-      log_line(("steam_dl[" + std::to_string(app_id) +
-                "]: depot=" + std::to_string(depot_id) +
-                " manifest=" + std::to_string(manifest_id) +
-                " size=" + std::to_string(depot_sz) +
-                " main=" + main_exe_rel).c_str());
-      // 7) Download + parse depot manifest
-      set_item_state(true, 0.14f, "steam: downloading depot manifest…");
-      std::vector<uint8_t> manifest_blob;
-      std::string dl_err;
-      for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
-        std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
-                          std::to_string(depot_id) + "/manifest/" +
-                          std::to_string(manifest_id) + "/5";
-        if (manifest_code != 0) url += "/" + std::to_string(manifest_code);
-        if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-          url += "?token=" +
-                 u16to8(uri_escape(u8to16(cdn_tokens[hi])));
-        }
-        if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
-          log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
-                  cdn_hosts[hi] + " -> " + dl_err).c_str());
-      }
-      if (manifest_blob.empty()) return fail("manifest CDN failed: " + dl_err);
-
-      std::vector<depot_file_t> files;
-      std::string perr;
-      if (!parse_manifest_blob(manifest_blob, depot_key, &files, &perr)) {
-        return fail("manifest parse failed: " + perr);
-      }
-
-      uint64_t total_bytes = 0;
-      for (const auto& f : files) total_bytes += f.size;
-      if (total_bytes == 0) total_bytes = 1;
-
-      std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
-      std::filesystem::path family_final;
-      if (family_shared) {
-        if (state_dir.empty()) return fail("Steam Families staging storage unavailable");
-        for (auto& file : files) {
-          if (file.linked_path || !valid_family_depot_path(file.filename))
-            return fail("Steam Families depot contains an unsupported file path");
-          if (file.flags & 0x40) continue;
-          std::sort(file.chunks.begin(), file.chunks.end(),
-                    [](const auto& a, const auto& b) { return a.offset < b.offset; });
-          uint64_t next_offset = 0;
-          for (const auto& chunk : file.chunks) {
-            if (chunk.offset != next_offset || !chunk.cb_orig ||
-                chunk.cb_orig > file.size - next_offset)
-              return fail("Steam Families depot contains an invalid file layout");
-            next_offset += chunk.cb_orig;
+          family_final = std::filesystem::path(u8to16(state_dir)) / "steam-family" /
+                         std::to_string(sid) / std::to_string(app_id) /
+                         (std::to_string(depot_id) + "-" + std::to_string(manifest_id));
+          if (std::filesystem::is_directory(family_final)) {
+            if (!family_account_active())
+              return fail("Steam Families access changed during the download");
+            continue;
           }
-          if (next_offset != file.size)
-            return fail("Steam Families depot contains an incomplete file");
+          family_partial = family_final;
+          family_partial += ".partial";
+          std::filesystem::remove_all(family_partial);
+          std::filesystem::create_directories(family_partial);
+        } else {
+          ensure_dir_recursive(install_dir);
         }
-        family_final = std::filesystem::path(u8to16(state_dir)) / "steam-family" /
-                       std::to_string(sid) / std::to_string(app_id) /
-                       (std::to_string(depot_id) + "-" + std::to_string(manifest_id));
-        if (std::filesystem::is_directory(family_final)) {
+
+        // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
+        uint64_t done_bytes = 0;
+        for (const auto& f : files) {
           if (!family_account_active())
             return fail("Steam Families access changed during the download");
-          set_item_state(false, 1.0f, "Downloaded — requires a Steamworks play session");
-          g_dl_busy = false;
-          if (on_complete) on_complete();
-          return;
-        }
-        family_partial = family_final;
-        family_partial += ".partial";
-        std::filesystem::remove_all(family_partial);
-        std::filesystem::create_directories(family_partial);
-      } else {
-        ensure_dir_recursive(install_dir);
-      }
-
-      // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
-      uint64_t done_bytes = 0;
-      for (const auto& f : files) {
-        if (!family_account_active())
-          return fail("Steam Families access changed during the download");
-        std::filesystem::path family_file;
-        if (family_shared) family_file = family_partial / u8to16(f.filename);
-        std::string fpath = install_dir + "\\" + f.filename;
-        if (f.flags & 0x40 /* directory flag */) {
-          if (family_shared) std::filesystem::create_directories(family_file);
-          else ensure_dir_recursive(fpath);
-          continue;
-        }
-        if (family_shared) {
-          std::filesystem::create_directories(family_file.parent_path());
-        } else {
-          const size_t sl = fpath.rfind('\\');
-          if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
-        }
-
-        std::unique_ptr<FILE, decltype(&fclose)> fp(
-            family_shared ? _wfopen(family_file.c_str(), L"wb") : fopen(fpath.c_str(), "wb"),
-            &fclose);
-        if (!fp) return fail("cannot create file: " + f.filename);
-
-        for (const auto& ck : f.chunks) {
-          if (!family_account_active()) {
-            fp.reset();
-            return fail("Steam Families access changed during the download");
+          std::filesystem::path family_file;
+          if (family_shared) family_file = family_partial / u8to16(f.filename);
+          std::string fpath = install_dir + "\\" + f.filename;
+          if (f.flags & 0x40 /* directory flag */) {
+            if (family_shared) std::filesystem::create_directories(family_file);
+            else ensure_dir_recursive(fpath);
+            continue;
           }
-          char hex_sha[41];
-          for (int i = 0; i < 20; ++i)
-            snprintf(hex_sha + i * 2, 3, "%02x", ck.sha[i]);
-
-          std::vector<uint8_t> enc_chunk;
-          std::string cerr;
-          bool got = false;
-          for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
-            std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
-                              std::to_string(depot_id) + "/chunk/" + hex_sha;
-            if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
-              url += "?token=" +
-                     u16to8(uri_escape(u8to16(cdn_tokens[hi])));
-            }
-            if (http_get_bytes(url, &enc_chunk, &cerr)) {
-              got = true;
-              break;
-            }
-          }
-          if (!got) {
-            fp.reset();
-            return fail("chunk CDN failed (" + std::string(hex_sha) + "): " +
-                        cerr);
+          if (family_shared) {
+            std::filesystem::create_directories(family_file.parent_path());
+          } else {
+            const size_t sl = fpath.rfind('\\');
+            if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
           }
 
-          if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
-            fp.reset();
-            return fail("chunk size mismatch (" + std::string(hex_sha) +
-                        "): got " + std::to_string(enc_chunk.size()) +
-                        ", manifest says " + std::to_string(ck.cb_comp));
-          }
+          std::unique_ptr<FILE, decltype(&fclose)> fp(
+              family_shared ? _wfopen(family_file.c_str(), L"wb") : fopen(fpath.c_str(), "wb"),
+              &fclose);
+          if (!fp) return fail("cannot create file: " + f.filename);
 
-          std::vector<uint8_t> comp_chunk;
-          if (!bcrypt_aes256_decrypt_steam(enc_chunk.data(), enc_chunk.size(),
-                                           depot_key, &comp_chunk)) {
-            fp.reset();
-            return fail("chunk AES-256 decrypt failed");
-          }
-
-          std::vector<uint8_t> plain_chunk;
-          std::string derr;
-          if (!decompress_steam_payload(comp_chunk.data(), comp_chunk.size(),
-                                        ck.cb_orig, &plain_chunk, &derr)) {
-            fp.reset();
-            return fail("chunk decompress failed: " + derr);
-          }
-
-          // The manifest's `sha` is the CDN chunk ID, not a hash of the
-          // plaintext. Steam's integrity contract is an Adler-32 of the
-          // decompressed bytes plus the uncompressed length (DepotChunk).
-          if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
-            fp.reset();
-            return fail("chunk decompressed to " +
-                        std::to_string(plain_chunk.size()) +
-                        " bytes, manifest says " +
-                        std::to_string(ck.cb_orig));
-          }
-          if (ck.crc != 0 &&
-              adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
-            fp.reset();
-            return fail("chunk Adler-32 mismatch (" + std::string(hex_sha) +
-                        "): corrupt data or wrong depot key");
-          }
-
-          if (!plain_chunk.empty()) {
-            if (ck.offset > f.size || plain_chunk.size() > f.size - ck.offset ||
-                _fseeki64(fp.get(), static_cast<long long>(ck.offset), SEEK_SET) != 0 ||
-                fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp.get()) != plain_chunk.size()) {
+          for (const auto& ck : f.chunks) {
+            if (!family_account_active()) {
               fp.reset();
-              return fail("cannot write depot file: " + f.filename);
+              return fail("Steam Families access changed during the download");
             }
-            done_bytes += plain_chunk.size();
-          }
-          float pct = 0.15f + 0.82f * ((float)done_bytes / (float)total_bytes);
-          if (pct > 0.97f) pct = 0.97f;
-          set_item_state(true, pct,
-                         "downloading " + title + ": " +
-                             format_bytes(done_bytes) + " / " +
-                             format_bytes(total_bytes));
-        }
-        if (fclose(fp.release()) != 0) return fail("cannot finish depot file: " + f.filename);
-      }
+            char hex_sha[41];
+            for (int i = 0; i < 20; ++i)
+              snprintf(hex_sha + i * 2, 3, "%02x", ck.sha[i]);
 
+            std::vector<uint8_t> enc_chunk;
+            std::string cerr;
+            bool got = false;
+            for (size_t hi = 0; hi < cdn_hosts.size(); ++hi) {
+              std::string url = "https://" + cdn_vhosts[hi] + "/depot/" +
+                                std::to_string(depot_id) + "/chunk/" + hex_sha;
+              if (hi < cdn_tokens.size() && !cdn_tokens[hi].empty()) {
+                url += "?token=" +
+                       u16to8(uri_escape(u8to16(cdn_tokens[hi])));
+              }
+              if (http_get_bytes(url, &enc_chunk, &cerr)) {
+                got = true;
+                break;
+              }
+            }
+            if (!got) {
+              fp.reset();
+              return fail("chunk CDN failed (" + std::string(hex_sha) + "): " +
+                          cerr);
+            }
+
+            if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
+              fp.reset();
+              return fail("chunk size mismatch (" + std::string(hex_sha) +
+                          "): got " + std::to_string(enc_chunk.size()) +
+                          ", manifest says " + std::to_string(ck.cb_comp));
+            }
+
+            std::vector<uint8_t> comp_chunk;
+            if (!bcrypt_aes256_decrypt_steam(enc_chunk.data(), enc_chunk.size(),
+                                             depot_key, &comp_chunk)) {
+              fp.reset();
+              return fail("chunk AES-256 decrypt failed");
+            }
+
+            std::vector<uint8_t> plain_chunk;
+            std::string derr;
+            if (!decompress_steam_payload(comp_chunk.data(), comp_chunk.size(),
+                                          ck.cb_orig, &plain_chunk, &derr)) {
+              fp.reset();
+              return fail("chunk decompress failed: " + derr);
+            }
+
+            // The manifest's `sha` is the CDN chunk ID, not a hash of the
+            // plaintext. Steam's integrity contract is an Adler-32 of the
+            // decompressed bytes plus the uncompressed length (DepotChunk).
+            if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
+              fp.reset();
+              return fail("chunk decompressed to " +
+                          std::to_string(plain_chunk.size()) +
+                          " bytes, manifest says " +
+                          std::to_string(ck.cb_orig));
+            }
+            if (ck.crc != 0 &&
+                adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
+              fp.reset();
+              return fail("chunk Adler-32 mismatch (" + std::string(hex_sha) +
+                          "): corrupt data or wrong depot key");
+            }
+
+            if (!plain_chunk.empty()) {
+              if (ck.offset > f.size || plain_chunk.size() > f.size - ck.offset ||
+                  _fseeki64(fp.get(), static_cast<long long>(ck.offset), SEEK_SET) != 0 ||
+                  fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp.get()) != plain_chunk.size()) {
+                fp.reset();
+                return fail("cannot write depot file: " + f.filename);
+              }
+              done_bytes += plain_chunk.size();
+            }
+            float pct = 0.15f + 0.82f * ((float)done_bytes / (float)total_bytes);
+            if (pct > 0.97f) pct = 0.97f;
+            report(pct,
+                           "downloading " + title + ": " +
+                               format_bytes(done_bytes) + " / " +
+                               format_bytes(total_bytes));
+          }
+          if (fclose(fp.release()) != 0) return fail("cannot finish depot file: " + f.filename);
+        }
+
+        if (family_shared) {
+          if (!family_account_active())
+            return fail("Steam Families access changed during the download");
+          std::filesystem::rename(family_partial, family_final);
+          family_partial.clear();
+        }
+      }
       if (family_shared) {
-        if (!family_account_active())
-          return fail("Steam Families access changed during the download");
-        std::filesystem::rename(family_partial, family_final);
-        family_partial.clear();
-        set_item_state(false, 1.0f, "Downloaded — requires a Steamworks play session");
+        if (!family_account_active()) return fail("Steam Families access changed during the download");
+        set_item_state(false, 1.0f, "Base depots downloaded — requires a Steamworks play session");
         g_dl_busy = false;
         if (on_complete) on_complete();
         return;

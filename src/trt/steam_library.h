@@ -10,6 +10,7 @@
 #ifndef TIRAMISU_STEAM_LIBRARY_H
 #define TIRAMISU_STEAM_LIBRARY_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,15 @@ std::string trt_steam_libraryfolders_path(const std::string& root);
 // Returns the number of paths appended, or -1 when the text is not VDF.
 int trt_steam_parse_library_paths(const std::string& text,
                                   std::vector<std::string>* out);
+
+struct trt_steam_depot {
+  uint32_t id;
+  uint64_t manifest;
+  uint64_t size;
+};
+
+// Public, base-game depots for Windows with neutral or English content.
+std::vector<trt_steam_depot> trt_steam_family_depots(const std::string& appinfo);
 
 // Parse one appmanifest_<id>.acf. Returns 0 on success, -1 when the text has no
 // AppState block or no usable appid.

@@ -280,7 +280,54 @@ bool looks_like_path(const std::string& s) {
   return false;
 }
 
+std::string field_value(const vdf_node& block, const char* key) {
+  const auto* child = find_child(block.kids, key);
+  return child ? child->value : "";
+}
+
+uint64_t decimal_id(const std::string& value) {
+  uint64_t result = 0;
+  for (char c : value) {
+    if (c < '0' || c > '9' || result > (UINT64_MAX - (c - '0')) / 10)
+      return 0;
+    result = result * 10 + (c - '0');
+  }
+  return result;
+}
+
 }  // namespace
+
+std::vector<trt_steam_depot> trt_steam_family_depots(const std::string& appinfo) {
+  std::vector<trt_steam_depot> result;
+  const auto start = appinfo.find('"');
+  if (start == std::string::npos) return result;
+  std::vector<vdf_node> roots;
+  if (!vdf_parse_document(appinfo.substr(start, appinfo.find(char(0), start) - start), &roots))
+    return result;
+  const auto* depots = find_root(roots, "depots");
+  if (!depots) return result;
+  for (const auto& depot : depots->kids) {
+    const auto id = decimal_id(depot.key);
+    if (id < 10 || id > UINT32_MAX || id == 228980 || id == 228990 ||
+        find_child(depot.kids, "dlcappid") || find_child(depot.kids, "depotfromapp"))
+      continue;
+    if (const auto* config = find_child(depot.kids, "config")) {
+      const auto os = "," + lower(field_value(*config, "oslist")) + ",";
+      const auto language = lower(field_value(*config, "language"));
+      if ((os != ",," && os.find(",windows,") == std::string::npos) ||
+          (!language.empty() && language != "english"))
+        continue;
+    }
+    const auto* manifests = find_child(depot.kids, "manifests");
+    const auto* branch = manifests ? find_child(manifests->kids, "public") : nullptr;
+    if (!branch) continue;
+    const auto gid = decimal_id(field_value(*branch, "gid"));
+    if (gid) result.push_back({static_cast<uint32_t>(id), gid,
+                               decimal_id(field_value(*branch, "size"))});
+  }
+  return result;
+}
+
 
 // ---------------------------------------------------------------------------
 
