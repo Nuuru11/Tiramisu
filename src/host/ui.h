@@ -42,6 +42,7 @@ struct ui_steam_item {
   float download_pct;
   std::wstring status_str;
   std::wstring install_dir;
+  bool family_shared = false;
 };
 
 struct ui_steam_friend {

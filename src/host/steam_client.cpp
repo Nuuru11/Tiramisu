@@ -34,6 +34,7 @@
 #include <sstream>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace longan {
 
@@ -46,6 +47,7 @@ steam_account_snapshot g_acct;
 std::string g_refresh_token;
 std::string g_access_token;
 std::vector<steam_library_item> g_items;
+std::vector<steam_library_item> g_family_items;
 std::atomic<bool> g_auth_busy{false};
 std::atomic<bool> g_dl_busy{false};
 
@@ -250,7 +252,7 @@ bool http_get_text(const std::string& url, std::string* out, std::string* err) {
 }
 
 bool http_get_bytes(const std::string& url, std::vector<uint8_t>* out,
-                    std::string* err) {
+                    std::string* err, bool check_steam_result = false) {
   try {
     using namespace winrt::Windows::Web::Http;
     using namespace winrt::Windows::Storage::Streams;
@@ -262,6 +264,10 @@ bool http_get_bytes(const std::string& url, std::vector<uint8_t>* out,
         snprintf(b, sizeof(b), "HTTP %d", (int)resp.StatusCode());
         *err = b;
       }
+      return false;
+    }
+    if (check_steam_result && resp.Headers().HasKey(L"x-eresult") &&
+        resp.Headers().Lookup(L"x-eresult") != L"1") {
       return false;
     }
     IBuffer buf = resp.Content().ReadAsBufferAsync().get();
@@ -397,6 +403,7 @@ struct pb_reader {
     int shift = 0;
     while (pos < len) {
       uint8_t b = p[pos++];
+      if (shift == 63 && b > 1) return false;
       v |= (uint64_t)(b & 0x7F) << shift;
       if ((b & 0x80) == 0) {
         *out = v;
@@ -433,7 +440,7 @@ struct pb_reader {
   }
   bool read_bytes(const uint8_t** out_p, size_t* out_len) {
     uint64_t l = 0;
-    if (!read_varint(&l) || pos + l > len) return false;
+    if (!read_varint(&l) || l > len - pos) return false;
     *out_p = p + pos;
     *out_len = (size_t)l;
     pos += (size_t)l;
@@ -453,6 +460,100 @@ struct pb_reader {
     return false;
   }
 };
+
+// Family catalog reads use the account's existing access token. They do
+// not reserve a copy or grant a license to the guest Steamworks bridge.
+bool get_family_protobuf(const char* method, const std::string& access_token,
+                         const pb_writer& request, std::vector<uint8_t>* response) {
+  const auto encode = [](const std::string& value) {
+    return u16to8(uri_escape(u8to16(value)));
+  };
+  const std::string url =
+      std::string("https://api.steampowered.com/IFamilyGroupsService/") + method +
+      "/v1?access_token=" + encode(access_token) +
+      "&input_protobuf_encoded=" + encode(b64_encode(request.buf.data(), request.buf.size()));
+  return http_get_bytes(url, response, nullptr, true);
+}
+
+bool parse_family_membership(const std::vector<uint8_t>& response, uint64_t* group) {
+  pb_reader reader{response.data(), response.size()};
+  uint64_t group_id = 0;
+  uint64_t not_a_member = 0;
+  while (reader.pos < reader.len) {
+    uint32_t field, wire;
+    if (!reader.next(&field, &wire) || field == 0) return false;
+    if (wire == 0 && (field == 1 || field == 2)) {
+      if (!reader.read_varint(field == 1 ? &group_id : &not_a_member)) return false;
+    } else if (!reader.skip(wire)) {
+      return false;
+    }
+  }
+  *group = not_a_member ? 0 : group_id;
+  return not_a_member || group_id != 0;
+}
+
+bool parse_family_apps(const std::vector<uint8_t>& response,
+                       std::vector<steam_library_item>* items) {
+  pb_reader reader{response.data(), response.size()};
+  std::vector<steam_library_item> catalog;
+  while (reader.pos < reader.len) {
+    uint32_t field, wire;
+    if (!reader.next(&field, &wire) || field == 0) return false;
+    if (field != 1 || wire != 2) {
+      if (!reader.skip(wire)) return false;
+      continue;
+    }
+    const uint8_t* data;
+    size_t size;
+    if (!reader.read_bytes(&data, &size)) return false;
+    pb_reader app{data, size};
+    uint64_t id = 0, excluded = 0;
+    steam_library_item item;
+    while (app.pos < app.len) {
+      if (!app.next(&field, &wire) || field == 0) return false;
+      if ((field == 1 || field == 10) && wire == 0) {
+        if (!app.read_varint(field == 1 ? &id : &excluded)) return false;
+      } else if (field == 6 && wire == 2) {
+        if (!app.read_bytes(&data, &size)) return false;
+        item.title.assign(reinterpret_cast<const char*>(data), size);
+      } else if (!app.skip(wire)) {
+        return false;
+      }
+    }
+    if (!id || id > UINT32_MAX || excluded) continue;
+    item.app_id = static_cast<uint32_t>(id);
+    if (item.title.empty()) item.title = "App " + std::to_string(id);
+    item.family_shared = true;
+    item.size_str = "Steam Families";
+    item.status_text = "Shared library";
+    catalog.push_back(std::move(item));
+  }
+  std::sort(catalog.begin(), catalog.end(),
+            [](const steam_library_item& a, const steam_library_item& b) {
+              return a.title < b.title || (a.title == b.title && a.app_id < b.app_id);
+            });
+  *items = std::move(catalog);
+  return true;
+}
+
+bool fetch_family_apps(uint64_t sid, const std::string& access_token,
+                       std::vector<steam_library_item>* items) {
+  pb_writer membership;
+  membership.write_uint64(1, sid);
+  std::vector<uint8_t> response;
+  uint64_t group = 0;
+  if (!get_family_protobuf("GetFamilyGroupForUser", access_token, membership, &response) ||
+      !parse_family_membership(response, &group)) return false;
+  if (group == 0) return true;
+
+  pb_writer request;
+  request.write_fixed64(1, group);
+  request.write_uint32(2, 0);  // exclude titles owned by this account
+  request.write_uint32(3, 0);  // exclude titles Steam does not share
+  request.write_fixed64(8, sid);
+  return get_family_protobuf("GetSharedLibraryApps", access_token, request, &response) &&
+         parse_family_apps(response, items);
+}
 
 // ---- BCrypt AES-256 ----
 bool bcrypt_aes256_decrypt_steam(const uint8_t* cipher, size_t cipher_len,
@@ -1465,6 +1566,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
     access_tok = new_acc;
     if (!new_ref.empty()) refresh_tok = new_ref;
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_acct.steamid64 != sid) return false;
     g_access_token = access_tok;
     g_refresh_token = refresh_tok;
     save_credentials(state_dir, sid, acct_name, g_acct.persona, refresh_tok,
@@ -1500,6 +1602,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   }
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_acct.steamid64 != sid) return;
     if (!persona.empty()) g_acct.persona = persona;
     g_acct.signed_in = true;
     trt_steam_set_identity(std::to_string(sid).c_str(), g_acct.persona.c_str());
@@ -1559,6 +1662,12 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
     }
     break;
   }
+
+  std::vector<steam_library_item> family_items;
+  const bool family_loaded =
+      !access_tok.empty() && fetch_family_apps(sid, access_tok, &family_items);
+  if (!family_loaded && !access_tok.empty())
+    log_line("steam: Steam Families catalog unavailable");
 
   // 3) Friends List + Friend Summaries
   if (!access_tok.empty()) {
@@ -1630,6 +1739,8 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
 
   {
     std::lock_guard<std::mutex> lk(g_mu);
+    if (g_acct.steamid64 != sid || !g_acct.signed_in) return;
+    g_family_items = std::move(family_items);
     scan_installed_into_items(games_dir, &fetched_items);
     if (!fetched_items.empty()) g_items = std::move(fetched_items);
     else scan_installed_into_items(games_dir, &g_items);
@@ -1637,6 +1748,8 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
                          (g_acct.persona.empty() ? g_acct.account_name
                                                  : g_acct.persona) +
                          " (" + std::to_string(g_items.size()) + " titles)";
+    if (!family_loaded && !access_tok.empty())
+      g_acct.status_line += " · Steam Families unavailable";
   }
   if (on_library_updated) on_library_updated();
 }
@@ -1739,6 +1852,7 @@ void steam_client_sign_out() {
   g_acct = {};
   g_acct.status_line = "steam: signed out — press Y to sign in";
   g_items.clear();
+  g_family_items.clear();
   scan_installed_into_items(g_games_dir, &g_items);
 }
 
@@ -1881,6 +1995,10 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           log_line(okmsg);
           {
             std::lock_guard<std::mutex> lk(g_mu);
+            if (g_acct.steamid64 != sid) {
+              g_items.clear();
+              g_family_items.clear();
+            }
             g_refresh_token = ref;
             g_access_token = acc;
             g_acct.steamid64 = sid;
@@ -1938,6 +2056,17 @@ void steam_client_download_app(uint32_t app_id,
     g_acct.status_line = st;
   };
 
+  {
+    std::lock_guard<std::mutex> lk(g_mu);
+    const auto matches = [app_id](const steam_library_item& item) {
+      return item.app_id == app_id;
+    };
+    if (std::any_of(g_family_items.begin(), g_family_items.end(), matches) &&
+        std::none_of(g_items.begin(), g_items.end(), matches)) {
+      g_acct.status_line = "Steam Families titles require a Steamworks play session";
+      return;
+    }
+  }
   if (g_dl_busy.exchange(true)) {
     set_item_state(false, 0.0f, "steam: another download is already active");
     return;
@@ -2451,7 +2580,13 @@ steam_account_snapshot steam_client_account() {
 
 std::vector<steam_library_item> steam_client_items() {
   std::lock_guard<std::mutex> lk(g_mu);
-  return g_items;
+  auto items = g_items;
+  std::unordered_set<uint32_t> seen;
+  for (const auto& item : items) seen.insert(item.app_id);
+  for (const auto& item : g_family_items) {
+    if (seen.insert(item.app_id).second) items.push_back(item);
+  }
+  return items;
 }
 
 } // namespace longan

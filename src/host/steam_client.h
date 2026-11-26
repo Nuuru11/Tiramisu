@@ -25,6 +25,7 @@ struct steam_library_item {
   std::string status_text;
   std::string install_dir;
   std::string main_exe;
+  bool family_shared = false;
 };
 
 struct steam_account_snapshot {

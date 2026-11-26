@@ -2098,6 +2098,7 @@ void sync_steam_to_ui() {
     u.app_id = r.app_id;
     u.size_str = u82ws(r.size_str);
     u.installed = r.installed;
+    u.family_shared = r.family_shared;
     u.downloading = r.downloading;
     u.download_pct = r.download_pct;
     u.status_str = u82ws(r.status_text);
@@ -2658,6 +2659,7 @@ struct tiramisu_host
     const auto items = longan::steam_client_items();
     if (idx < 0 || idx >= static_cast<int>(items.size())) return;
     const auto& it = items[idx];
+    if (it.family_shared) return;
     if (it.installed) {
       std::string launch_name;
       for (const auto& ge : g_games) {
