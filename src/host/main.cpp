@@ -2930,18 +2930,11 @@ struct tiramisu_host
       MEMORYSTATUSEX ms{};
       ms.dwLength = sizeof(ms);
       GlobalMemoryStatusEx(&ms);
-      HKEY hkey;
-      wchar_t cpuName[128] = L"Unknown CPU";
-      if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                        L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", 0,
-                        KEY_READ, &hkey) == ERROR_SUCCESS) {
-        DWORD sz = sizeof(cpuName);
-        RegQueryValueExW(hkey, L"ProcessorNameString", nullptr, nullptr,
-                         (LPBYTE)cpuName, &sz);
-        RegCloseKey(hkey);
-      }
+      SYSTEM_INFO system{};
+      GetNativeSystemInfo(&system);
       wchar_t info[256];
-      swprintf(info, 256, L"%s | %.0f GB RAM", cpuName,
+      swprintf(info, 256, L"%lu logical CPUs | %.0f GB RAM",
+               static_cast<unsigned long>(system.dwNumberOfProcessors),
                (double)ms.ullTotalPhys / (1024.0 * 1024.0 * 1024.0));
       longan::ui_set_sysinfo(info);
     }
