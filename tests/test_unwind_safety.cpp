@@ -21,6 +21,7 @@
 //
 // Host-driven, offline, no guest exe needed.
 #include "../src/trt/trt.h"
+#include "../src/trt/images.h"
 #include "../src/trt/bridge_ntdll.h"
 
 #include <stdio.h>
@@ -101,39 +102,39 @@ int main() {
 
   // ---- test 4: valid minimal unwind still works (correctness preserved) ----
   printf("  [t4 valid minimal unwind]\n");
-  // This requires the metadata to be inside a REGISTERED guest image —
-  // register one via trt_load_pe on a tiny PE? Too heavy for offline.
-  // Instead: the unwinder's rejection path also accepts wide host ranges;
-  // metadata on our own (host) heap within the accepted window unwinds.
-  // NOTE: ptr_in_guest_image accepts any pointer above 0x10000 (no image
-  // registered in this test binary), so static fake pdata above that line
-  // exercises the real unwind path.
+  // Register the metadata as a guest image, just as the loader does for a
+  // normal PE. This keeps the positive test independent of the host probe
+  // used for metadata outside registered images.
+  struct runtime_function {
+    u32 begin;
+    u32 end;
+    u32 unwind;
+  };
+  struct unwind_image {
+    runtime_function function;
+    u8 info[8];
+  };
+  static unwind_image metadata = {
+      {0, 0x100, 12},
+      {0x01, 0x01, 0x01, 0x00, 0x01, 0x50, 0x00, 0x00},
+  };
+  static trt_image image{};
+  image.base = reinterpret_cast<u8*>(&metadata);
+  image.size_of_image = sizeof(metadata);
+  trt_images_register_main(&image, "unwind-fixture.exe");
+  const u64 base = (u64)(uintptr_t)image.base;
+
   memset(g_ctx, 0, sizeof(g_ctx));
-  // unwind info: version=1 flags=0 prolog=2 count=1 frame=0, one
-  // UWOP_PUSH_NONVOL(rbp=5) code. UNWIND_CODE layout: byte0 = code offset,
-  // byte1 = (Info<<4)|Op -> {0x00, 0x50} = op 0 (PUSH_NONVOL), reg 5 (rbp).
-  static u8 ui[8] = {0x08, 0x02, 0x01, 0x00, 0x00, 0x50, 0x00, 0x00};
-  // runtime fn: begin=0, unwind = RVA of ui relative to image base. We can't
-  // register an image, so pass image_base = (u64)(uintptr_t)ui - 0x1000 and
-  // fn->unwind = 0x1000 — the metadata pointer is (image_base+0x1000)=ui.
-  const u64 base = (u64)(uintptr_t)ui - 0x1000ull;
-  static u8 rf[16] = {0x00, 0x00, 0x00, 0x00,  // begin rva 0
-                      0xFF, 0xFF, 0x00, 0x00,  // end   rva 0xFFFF
-                      0x00, 0x10, 0x00, 0x00,  // unwind rva 0x1000 -> ui
-                      0x00, 0x00, 0x00, 0x00}; // pad past struct end
-  // rsp slot holds a return address; PUSH_NONVOL rbp pops [rsp] into rbp.
-  // ctx_gpr layout: gpr N at 0x78 + N*8 → rsp(4)=0x98, rbp(5)=0xA0.
-  u64 rsp2_slot = 0x180009999ull;
-  *(u64*)(g_ctx + 0x98) = (u64)(uintptr_t)&rsp2_slot;
+  const u64 stack[] = {0x11112222ull, 0x180009999ull};
+  *(u64*)(g_ctx + 0x98) = (u64)(uintptr_t)stack;
   *(u64*)(g_ctx + 0xA0) = 0x11111111ull;
   establisher = 0;
-  rc = trt_RtlVirtualUnwind(0, base, base + 0x800, rf, g_ctx, nullptr,
-                            &establisher, nullptr);
+  rc = trt_RtlVirtualUnwind(0, base, base + 8, &metadata.function,
+                            g_ctx, nullptr, &establisher, nullptr);
   CHECK(rc == 0, "valid minimal unwind: no handler flag -> 0");
-  CHECK(*(u64*)(g_ctx + 0xA0) == rsp2_slot, "PUSH_NONVOL rbp restored from [rsp]");
-  // After the push-undo (rsp +8) the epilogue emulation pops RIP from the
-  // advanced rsp (another +8): total +16 from the faulting rsp.
-  CHECK(*(u64*)(g_ctx + 0x98) == (u64)(uintptr_t)&rsp2_slot + 16,
+  CHECK(*(u64*)(g_ctx + 0xA0) == stack[0], "PUSH_NONVOL rbp restored from [rsp]");
+  CHECK(*(u64*)(g_ctx + 0xF8) == stack[1], "RIP restored from the return slot");
+  CHECK(*(u64*)(g_ctx + 0x98) == (u64)(uintptr_t)(stack + 2),
         "rsp advanced by 16 (push-undo + RIP pop)");
 
   // ---- test 5: unmapped address inside the wide host range -> rejected by

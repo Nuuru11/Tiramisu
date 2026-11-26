@@ -33,6 +33,11 @@ jobs:
             libsdl2-dev libgl1-mesa-dev libgl1-mesa-dri libicu-dev \
             libssl-dev libcurl4-openssl-dev zlib1g-dev python3-pil xvfb xauth
           echo "$LLVM_BIN" >> "$GITHUB_PATH"
+          if [[ ! -x "$LLVM_BIN/clang-cl" ]]; then
+            mkdir -p "$RUNNER_TEMP/llvm-shims"
+            ln -s "$LLVM_BIN/clang" "$RUNNER_TEMP/llvm-shims/clang-cl"
+            echo "$RUNNER_TEMP/llvm-shims" >> "$GITHUB_PATH"
+          fi
           mkdir -p /tmp/opencode
 
       - name: Set up the Windows SDK and UWP cross-build tools
