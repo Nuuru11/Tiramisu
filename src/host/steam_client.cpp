@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -51,6 +52,11 @@ std::vector<steam_library_item> g_items;
 std::vector<steam_library_item> g_family_items;
 std::atomic<bool> g_auth_busy{false};
 std::atomic<bool> g_dl_busy{false};
+
+// Accessed only by the worker holding g_dl_busy.
+std::string pending_space_plan;
+std::filesystem::path pending_removal;
+std::chrono::steady_clock::time_point removal_deadline;
 
 // ---- UTF helpers ----
 std::wstring u8to16(const std::string& s) {
@@ -2320,6 +2326,39 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
       }
       if (depots.empty()) return fail("No supported Windows depot for " + title);
       std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
+      std::filesystem::path family_root;
+      if (family_shared) {
+        pending_removal.clear();
+        if (state_dir.empty()) return fail("Steam Families storage unavailable");
+        family_root = std::filesystem::path(u8to16(state_dir)) / "steam-family" /
+                      std::to_string(sid) / std::to_string(app_id);
+        uint64_t required = 0;
+        std::string plan = std::to_string(sid) + "/" + std::to_string(app_id);
+        for (const auto& depot : depots) {
+          auto name = std::to_string(depot.id) + "-" + std::to_string(depot.manifest);
+          if (std::filesystem::is_directory(family_root / name)) continue;
+          if (!depot.size || depot.size > UINT64_MAX - required)
+            return fail("Steam did not provide a usable installed size");
+          required += depot.size;
+          plan += "/" + name;
+        }
+        ULARGE_INTEGER available{};
+        if (!GetDiskFreeSpaceExW(u8to16(state_dir).c_str(), &available, nullptr, nullptr))
+          return fail("Cannot read available internal storage");
+        if (required > available.QuadPart) {
+          pending_space_plan.clear();
+          return fail("Storage short by " + format_bytes(required - available.QuadPart) +
+                      " — required " + format_bytes(required));
+        }
+        if (required && pending_space_plan != plan) {
+          pending_space_plan = plan;
+          set_item_state(false, 0, "Required " + format_bytes(required) + ", free " +
+                         format_bytes(available.QuadPart) + ". Select Download again to start.");
+          g_dl_busy = false;
+          return;
+        }
+        pending_space_plan.clear();
+      }
       for (size_t index = 0; index < depots.size(); ++index) {
         const auto& depot = depots[index];
         const auto depot_id = depot.id;
@@ -2536,9 +2575,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
             if (next_offset != file.size)
               return fail("Steam Families depot contains an incomplete file");
           }
-          family_final = std::filesystem::path(u8to16(state_dir)) / "steam-family" /
-                         std::to_string(sid) / std::to_string(app_id) /
-                         (std::to_string(depot_id) + "-" + std::to_string(manifest_id));
+          family_final = family_root / (std::to_string(depot_id) + "-" + std::to_string(manifest_id));
           if (std::filesystem::is_directory(family_final)) {
             if (!family_account_active())
               return fail("Steam Families access changed during the download");
@@ -2709,6 +2746,53 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
     } catch (...) {
       fail("unexpected error during Steam depot download");
     }
+  }).detach();
+}
+
+void steam_client_family_storage(uint32_t app_id) {
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (!g_acct.signed_in || g_state_dir.empty() || !app_id ||
+      std::none_of(g_family_items.begin(), g_family_items.end(),
+                   [app_id](const auto& item) { return item.app_id == app_id; })) return;
+  if (g_dl_busy.exchange(true)) {
+    g_acct.status_line = "Steam storage is busy";
+    return;
+  }
+  const auto sid = g_acct.steamid64;
+  const auto root = std::filesystem::path(u8to16(g_state_dir)) / "steam-family" /
+                    std::to_string(sid) / std::to_string(app_id);
+  const bool confirmed = root == pending_removal &&
+                         std::chrono::steady_clock::now() < removal_deadline;
+  pending_removal.clear();
+  g_acct.status_line = confirmed ? "Removing downloaded packages…" : "Measuring packages…";
+  std::thread([root, sid, app_id, confirmed]() {
+    std::string status;
+    try {
+      if (!std::filesystem::exists(root)) {
+        status = "No downloaded packages for this game";
+      } else if (confirmed) {
+        std::filesystem::remove_all(root);
+        pending_space_plan.clear();
+        status = "Downloaded packages removed";
+      } else {
+        uint64_t bytes = 0;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(root))
+          if (entry.is_regular_file()) bytes += entry.file_size();
+        status = "Stored: " + (bytes ? format_bytes(bytes) : "0 B") +
+                 ". Press Storage again within 10 seconds to delete.";
+        pending_removal = root;
+        removal_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      }
+    } catch (...) {
+      status = "Storage operation failed. Open Storage to check remaining files.";
+    }
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_acct.signed_in && g_acct.steamid64 == sid) {
+      g_acct.status_line = status;
+      if (confirmed) for (auto& item : g_family_items)
+        if (item.app_id == app_id) item.status_text = status;
+    }
+    g_dl_busy = false;
   }).detach();
 }
 

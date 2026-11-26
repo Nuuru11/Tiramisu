@@ -58,6 +58,8 @@ void steam_client_rescan_local();
 void steam_client_download_app(uint32_t app_id, bool family_shared,
                                std::function<void()> on_complete = nullptr);
 
+void steam_client_family_storage(uint32_t app_id);
+
 // Snapshot current account + library items for UI/main loop (thread-safe).
 steam_account_snapshot steam_client_account();
 std::vector<steam_library_item> steam_client_items();

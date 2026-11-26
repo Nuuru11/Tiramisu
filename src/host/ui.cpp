@@ -1491,7 +1491,7 @@ void draw_steam_screen() {
 
   draw_controller_footer({{L'A', L"Download / Play"},
                           {L'Y', L"Steam QR Login"},
-                          {L'X', L"Refresh Library"},
+                          {L'X', (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() && g_steam_items[g_steam_selected].family_shared) ? L"Storage" : L"Refresh Library"},
                           {L'B', L"Back to Home"}});
 }
 

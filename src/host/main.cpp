@@ -3780,9 +3780,15 @@ struct tiramisu_host
           const bool want_ref = want_x || (!km_lock && launcher_key('R'));
           if (want_ref && !x_btn) {
             x_btn = true;
-            longan::steam_client_refresh_remote(
-                []() { g_steam_needs_rescan.store(true); });
-            longan::ui_toast(L"Refreshing Steam library…", 2.4f);
+            const auto items = longan::steam_client_items();
+            const int idx = longan::ui_steam_selected_index();
+            if (want_x && idx >= 0 && idx < static_cast<int>(items.size()) && items[idx].family_shared) {
+              longan::steam_client_family_storage(items[idx].app_id);
+            } else {
+              longan::steam_client_refresh_remote(
+                  []() { g_steam_needs_rescan.store(true); });
+              longan::ui_toast(L"Refreshing Steam library…", 2.4f);
+            }
           } else if (!want_ref) {
             x_btn = false;
           }
