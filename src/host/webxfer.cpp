@@ -25,6 +25,7 @@
 #include "host_log.h"
 #include "settings.h"
 #ifdef TIRAMISU_UWP_HOST
+  #include "epic_library.h"
   #include "cover_art.h"
   #include "steam_client.h"
   #include "vendor/qrcodegen.h"
@@ -1191,6 +1192,9 @@ const char* k_upload_page =
   "<div id=bar><div id=fill></div></div>"
   "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
   "<div class=card id=games><h2>Installed Games on Xbox</h2><div id=list><span style='color:#9e9699'>loading...</span></div></div>"
+  "<div class=card><h2>Epic Games Library</h2><button class=btn onclick='epicLibrary(true)'>Connect Epic account</button>"
+  "<div id=epicprompt hidden>Enter <b id=epiccode></b> at <a href='https://www.epicgames.com/activate' target='_blank' rel='noopener'>Epic Games</a>, then "
+  "<button class='btn btn-sec' onclick='epicLibrary(false)'>Load my library</button></div><div id=epicresult aria-live=polite></div></div>"
   "<div class=card id=steam><div class=game-top><h2 style='margin:0'>Steam Account &amp; Direct Downloads</h2>"
   "<div class=row><button class=btn onclick=startSteamQr()>Sign in with Steam QR</button>"
   "<button class='btn btn-sec' onclick=refreshSteam()>Refresh Steam</button>"
@@ -1337,6 +1341,11 @@ const char* k_upload_page =
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
+  "let epicHandle='',epicBusy=false;async function epicLibrary(start){if(epicBusy)return;epicBusy=true;const box=E('epicresult');box.textContent='Contacting Epic…';"
+  "try{if(start){epicHandle='';E('epicprompt').hidden=true;}const r=await fetch('/api/epic/library',{method:'POST',headers:{'X-Tiramisu-Epic':'library'},body:start?'':epicHandle});"
+  "if(!r.ok)throw Error(await r.text());const j=await r.json();if(start){epicHandle=j.handle;E('epiccode').textContent=j.code;E('epicprompt').hidden=false;box.textContent='';}"
+  "else{E('epicprompt').hidden=true;epicHandle='';box.textContent=j.titles.length+' library entries';for(const title of j.titles){const row=document.createElement('div');row.textContent=title;box.appendChild(row);}}}"
+  "catch(e){box.textContent=e.message;}finally{epicBusy=false;}}"
   "async function loadSteam(){try{const st=await(await fetch('/api/steam/status')).json();"
   "E('steaminfo').textContent=(st.signed_in?('Signed in as '+(st.persona||st.steamid64)+' · '):'')+(st.status||'Ready');"
   "E('limbusreport').textContent=st.limbus_report||'No report available';"
@@ -2052,6 +2061,25 @@ void handle_client(sock_t s) {
     return;
   }
 #ifdef TIRAMISU_UWP_HOST
+  if (strcmp(method, "POST") == 0 && url_path == "/api/epic/library") {
+    if (content_len > 48 || hdrs_low.find("\r\nx-tiramisu-epic: library\r\n") == std::string::npos) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid Epic request");
+      return;
+    }
+    auto handle = read_control_body(s, pre, pre_len, static_cast<size_t>(content_len));
+    if (handle.size() != content_len || (!handle.empty() && handle.size() != 48)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid sign-in handle");
+      return;
+    }
+    try {
+      respond(s, "200 OK", "application/json", epic_library::run(g_local_state_dir, handle));
+    } catch (const std::runtime_error& e) {
+      respond(s, "409 Conflict", "text/plain", e.what());
+    } catch (...) {
+      respond(s, "502 Bad Gateway", "text/plain", "Check Epic client configuration and network access.");
+    }
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/status") {
     const auto acct = steam_client_account();
     const auto items = steam_client_items();
