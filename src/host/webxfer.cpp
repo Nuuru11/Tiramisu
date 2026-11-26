@@ -1342,7 +1342,7 @@ const char* k_upload_page =
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
   "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
-  "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
+  "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';E('frameperf').textContent='';}}"
   "let epicHandle='',epicBusy=false;async function epicLibrary(start){if(epicBusy)return;epicBusy=true;const box=E('epicresult');box.textContent='Contacting Epic…';"
   "try{if(start){epicHandle='';E('epicprompt').hidden=true;}const r=await fetch('/api/epic/library',{method:'POST',headers:{'X-Tiramisu-Epic':'library'},body:start?'':epicHandle});"
   "if(!r.ok)throw Error(await r.text());const j=await r.json();if(start){epicHandle=j.handle;E('epiccode').textContent=j.code;E('epicprompt').hidden=false;box.textContent='';}"

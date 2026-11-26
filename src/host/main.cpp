@@ -1312,7 +1312,10 @@ void force_kill_guest(const char* reason) {
            "host: FORCE-KILL guest thread (%s) — TerminateThread, budget reset",
            reason ? reason : "?");
   longan::log_line(line);
-  ::TerminateThread(g_guest_thread.native_handle(), 1);
+  {
+    auto frame_lock = longan::game_frames().lock_for_guest_termination();
+    ::TerminateThread(g_guest_thread.native_handle(), 1);
+  }
   g_guest_thread.join();
   longan::game_frames().reset(false);
   g_guest_running.store(false);

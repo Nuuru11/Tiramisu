@@ -21,6 +21,10 @@ public:
     active = running;
     start = now;
   }
+  // A forcibly stopped guest cannot be allowed to die holding the sample lock.
+  std::unique_lock<std::mutex> lock_for_guest_termination() {
+    return std::unique_lock<std::mutex>(mutex);
+  }
   void record() {
     std::lock_guard<std::mutex> guard(mutex);
     if (!active) return;
