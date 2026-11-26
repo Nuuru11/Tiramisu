@@ -1194,6 +1194,7 @@ const char* k_upload_page =
   "<div id=steaminfo style='margin:10px 0;font-size:13px;color:#d5cecc'>Checking Steam account...</div>"
   "<details><summary>Limbus Company · Steam launch report</summary><pre id=limbusreport style='white-space:pre-wrap'></pre></details>"
   "<div id=steamqrwrap style='display:none;margin:10px 0'><img id=steamqrimg style='width:180px;height:180px;background:#fff;padding:8px;border-radius:14px' alt='Steam QR'></div>"
+  "<button class='btn btn-sec' onclick='showStorage()'>Xbox storage</button><div id=storageresult aria-live=polite></div>"
   "<div id=steamlist></div></div>"
   "<div class=card id=support><h2>Save Backups &amp; Support Bundle</h2>"
   "<div style='font-size:13px;color:#d5cecc;margin-bottom:10px'>Dev Mode uninstalls wipe <code>LocalState</code>. Back up saves before updating Tiramisu, or download a debug zip for bug reports.</div>"
@@ -1343,6 +1344,18 @@ const char* k_upload_page =
   ":x.installed?'<span class=pill>Installed</span>'"
   ":'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>')+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
   "}catch{}}"
+  "async function showStorage(){ "
+  " const box=E('storageresult');box.textContent='Measuring storage…'; "
+  " const fmt=n=>n>=1073741824?(n/1073741824).toFixed(2)+' GiB':Math.ceil(n/1048576)+' MiB'; "
+  " try{const r=await fetch('/api/steam/storage',{cache:'no-store'});if(!r.ok)throw Error(await r.text()); "
+  " const s=await r.json();box.textContent=fmt(s.available)+' free on Xbox'; "
+  " for(const game of s.games){const row=document.createElement('div'),btn=document.createElement('button'); "
+  " row.className='setrow';row.textContent=game.title+' · '+fmt(game.bytes);btn.textContent='Delete packages';btn.className='btn btn-sec'; "
+  " btn.onclick=async()=>{if(!confirm('Delete downloaded packages for '+game.title+' ('+fmt(game.bytes)+')?'))return; "
+  " btn.disabled=true;try{const d=await fetch('/api/steam/storage/'+s.account+'/'+game.appid,{method:'DELETE'}); "
+  " if(!d.ok)throw Error(await d.text());await showStorage();}catch(e){box.textContent=e.message;}}; "
+  " row.appendChild(btn);box.appendChild(row);}if(!s.games.length)box.append(' · No family packages stored'); "
+  " }catch(e){box.textContent=e.message;}} "
   "async function startSteamQr(){await fetch('/api/steam/qr',{method:'POST'});setTimeout(loadSteam,1200);}"
   "async function refreshSteam(){await fetch('/api/steam/refresh',{method:'POST'});setTimeout(loadSteam,1200);}"
   "async function steamSignOut(){await fetch('/api/steam/signout',{method:'POST'});loadSteam();}"
@@ -2124,6 +2137,40 @@ void handle_client(sock_t s) {
     }
     out += "]";
     respond(s, "200 OK", "application/json", out);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/steam/storage") {
+    uint64_t account = 0, free = 0;
+    std::vector<steam_stored_game> games;
+    std::string error;
+    if (!steam_family_storage_snapshot(account, free, games, error)) {
+      respond(s, "409 Conflict", "text/plain", error);
+      return;
+    }
+    std::string out = "{\"account\":\"" + std::to_string(account) +
+        "\",\"available\":" + std::to_string(free) + ",\"games\":[";
+    for (const auto& game : games) {
+      if (out.back() != '[') out += ",";
+      out += "{\"appid\":" + std::to_string(game.app_id) + ",\"title\":\"" +
+             json_escape(game.title) + "\",\"bytes\":" + std::to_string(game.bytes) + "}";
+    }
+    respond(s, "200 OK", "application/json", out + "]}");
+    return;
+  }
+  const std::string storage_prefix = "/api/steam/storage/";
+  if (strcmp(method, "DELETE") == 0 && url_path.rfind(storage_prefix, 0) == 0) {
+    auto ids = url_path.substr(storage_prefix.size());
+    auto slash = ids.find('/');
+    auto digits = ids.substr(slash + 1);
+    uint32_t app = static_cast<uint32_t>(strtoull(digits.c_str(), nullptr, 10));
+    if (slash == std::string::npos || !app || digits != std::to_string(app)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid game");
+      return;
+    }
+    std::string error;
+    if (!steam_family_remove_files(ids.substr(0, slash), app, error))
+      respond(s, "409 Conflict", "text/plain", error);
+    else respond(s, "200 OK", "text/plain", "Removed");
     return;
   }
   if (strcmp(method, "POST") == 0 && url_path.rfind("/api/steam/download/", 0) == 0) {

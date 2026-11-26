@@ -2776,6 +2776,74 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
   }).detach();
 }
 
+static uint64_t family_package_bytes(const std::filesystem::path& root) {
+  uint64_t bytes = 0;
+  for (const auto& entry : std::filesystem::recursive_directory_iterator(root))
+    if (entry.is_regular_file()) bytes += entry.file_size();
+  return bytes;
+}
+
+// Storage scans and deletions share the download worker's exclusion flag.
+struct family_storage_unlock {
+  ~family_storage_unlock() { g_dl_busy = false; }
+};
+
+bool steam_family_storage_snapshot(uint64_t& account, uint64_t& available,
+                                   std::vector<steam_stored_game>& games, std::string& error) {
+  std::wstring state;
+  std::unordered_map<uint32_t, std::string> titles;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_acct.signed_in || g_state_dir.empty()) { error = "Sign in to view storage"; return false; }
+    state = u8to16(g_state_dir);
+    account = g_acct.steamid64;
+    for (const auto& item : g_family_items) titles.emplace(item.app_id, item.title);
+    if (g_dl_busy.exchange(true)) { error = "Steam storage is busy"; return false; }
+  }
+  family_storage_unlock unlock;
+  try {
+    ULARGE_INTEGER free{};
+    if (!GetDiskFreeSpaceExW(state.c_str(), &free, nullptr, nullptr)) {
+      error = "Cannot measure Xbox storage"; return false;
+    }
+    available = free.QuadPart;
+    auto root = std::filesystem::path(state) / "steam-family" / std::to_string(account);
+    if (std::filesystem::exists(root)) {
+      for (const auto& entry : std::filesystem::directory_iterator(root)) {
+        if (!entry.is_directory()) continue;
+        auto name = entry.path().filename().string();
+        uint32_t app = static_cast<uint32_t>(strtoull(name.c_str(), nullptr, 10));
+        if (!app || std::to_string(app) != name) continue;
+        games.push_back({app, titles.count(app) ? titles.at(app) : "App " + name,
+                         family_package_bytes(entry.path())});
+      }
+    }
+    return true;
+  } catch (...) { error = "Cannot measure downloaded packages"; return false; }
+}
+
+bool steam_family_remove_files(const std::string& account, uint32_t app, std::string& error) {
+  std::filesystem::path root;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_acct.signed_in || account != std::to_string(g_acct.steamid64) ||
+        !app || g_state_dir.empty()) { error = "Steam account changed"; return false; }
+    root = std::filesystem::path(u8to16(g_state_dir)) / "steam-family" / account / std::to_string(app);
+    if (g_dl_busy.exchange(true)) { error = "Steam storage is busy"; return false; }
+  }
+  family_storage_unlock unlock;
+  std::error_code ec;
+  std::filesystem::remove_all(root, ec);
+  pending_removal.clear();
+  pending_space_plan.clear();
+  if (ec) { error = "Could not remove all downloaded packages"; return false; }
+  std::lock_guard<std::mutex> lock(g_mu);
+  if (account == std::to_string(g_acct.steamid64))
+    for (auto& item : g_family_items)
+      if (item.app_id == app) item.status_text = "Downloaded packages removed";
+  return true;
+}
+
 void steam_client_family_storage(uint32_t app_id) {
   std::lock_guard<std::mutex> lock(g_mu);
   if (!g_acct.signed_in || g_state_dir.empty() || !app_id ||
@@ -2802,9 +2870,7 @@ void steam_client_family_storage(uint32_t app_id) {
         pending_space_plan.clear();
         status = "Downloaded packages removed";
       } else {
-        uint64_t bytes = 0;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(root))
-          if (entry.is_regular_file()) bytes += entry.file_size();
+        const auto bytes = family_package_bytes(root);
         status = "Stored: " + (bytes ? format_bytes(bytes) : "0 B") +
                  ". Press Storage again within 10 seconds to delete.";
         pending_removal = root;

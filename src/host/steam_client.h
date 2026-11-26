@@ -59,6 +59,14 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
                                std::function<void()> on_complete = nullptr);
 
 void steam_client_family_storage(uint32_t app_id);
+struct steam_stored_game {
+  uint32_t app_id;
+  std::string title;
+  uint64_t bytes;
+};
+bool steam_family_storage_snapshot(uint64_t& account, uint64_t& available,
+                                   std::vector<steam_stored_game>& games, std::string& error);
+bool steam_family_remove_files(const std::string& account, uint32_t app, std::string& error);
 
 // Snapshot current account + library items for UI/main loop (thread-safe).
 steam_account_snapshot steam_client_account();
