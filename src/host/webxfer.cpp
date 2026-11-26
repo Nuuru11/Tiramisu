@@ -1335,7 +1335,10 @@ const char* k_upload_page =
   "if(st.qr_url){E('steamqrwrap').style.display='block';E('steamqrimg').src='/api/steam/qr.svg?t='+Date.now();}else{E('steamqrwrap').style.display='none';}"
   "const items=await(await fetch('/api/steam/library')).json();"
   "E('steamlist').innerHTML=items.length?items.slice(0,40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
-  "+(x.installed?'<span class=pill>Installed</span>':(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>':'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>'))+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
+  "+(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>'"
+  ":x.family_shared?'<span class=pill>Download from the Xbox Steam tab</span>'"
+  ":x.installed?'<span class=pill>Installed</span>'"
+  ":'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>')+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
   "}catch{}}"
   "async function startSteamQr(){await fetch('/api/steam/qr',{method:'POST'});setTimeout(loadSteam,1200);}"
   "async function refreshSteam(){await fetch('/api/steam/refresh',{method:'POST'});setTimeout(loadSteam,1200);}"
@@ -2108,11 +2111,12 @@ void handle_client(sock_t s) {
       char b[512];
       snprintf(b, sizeof(b),
                "{\"appid\":%u,\"title\":\"%s\",\"size\":\"%s\","
-               "\"installed\":%s,\"downloading\":%s,\"pct\":%.3f,\"status\":\"%s\"}",
+               "\"installed\":%s,\"downloading\":%s,\"family_shared\":%s,\"pct\":%.3f,\"status\":\"%s\"}",
                items[i].app_id, json_escape(items[i].title).c_str(),
                json_escape(items[i].size_str).c_str(),
                items[i].installed ? "true" : "false",
                items[i].downloading ? "true" : "false",
+               items[i].family_shared ? "true" : "false",
                items[i].download_pct,
                json_escape(items[i].status_text).c_str());
       out += b;
@@ -2127,7 +2131,7 @@ void handle_client(sock_t s) {
       respond(s, "400 Bad Request", "text/plain", "bad appid");
       return;
     }
-    steam_client_download_app(appid, []() {
+    steam_client_download_app(appid, false, []() {
       std::lock_guard<std::mutex> lk(g_mu);
       g.rescan_requested = true;
       g.rescan_game.clear();

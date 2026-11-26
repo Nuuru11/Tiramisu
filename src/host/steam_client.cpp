@@ -29,6 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -113,6 +114,31 @@ void ensure_dir_recursive(const std::string& path) {
     }
   }
   if (!cur.empty()) CreateDirectoryA(cur.c_str(), nullptr);
+}
+
+// Steam depot filenames are relative Windows paths. A family depot must
+// stay inside its staging directory, including when opened through the CRT.
+bool valid_family_depot_path(const std::string& name) {
+  size_t start = 0;
+  do {
+    const size_t end = name.find_first_of("\\/", start);
+    const auto part = name.substr(start, end - start);
+    if (part.empty() || part.back() == '.' || part.back() == ' ') return false;
+    for (unsigned char ch : part) {
+      if (ch < 32 || strchr(":*?\"<>|", ch)) return false;
+    }
+    std::string base = part.substr(0, part.find('.'));
+    while (!base.empty() && base.back() == ' ') base.pop_back();
+    for (char& ch : base) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    if (base == "CON" || base == "PRN" || base == "AUX" || base == "NUL" ||
+        (base.size() == 4 && (base.compare(0, 3, "COM") == 0 ||
+                              base.compare(0, 3, "LPT") == 0) &&
+         base[3] >= '0' && base[3] <= '9'))
+      return false;
+    if (end == std::string::npos) return true;
+    start = end + 1;
+  } while (start <= name.size());
+  return false;
 }
 
 // ---- Base64 + Base64URL ----
@@ -1060,7 +1086,7 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
 
   // Wait for a specific EMsg (automatically unpacks EMsgMulti = 1)
   bool recv_emsg(uint32_t want_emsg, std::vector<uint8_t>* out_body,
-                 int timeout_ms = 12000) {
+                 int timeout_ms = 12000, uint64_t expected_job = 0) {
     auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
     while (true) {
@@ -1080,7 +1106,7 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
         pkt = std::move(rx_msgs.front());
         rx_msgs.pop_front();
       }
-      if (dispatch_pkt(pkt, want_emsg, out_body)) return true;
+      if (dispatch_pkt(pkt, want_emsg, out_body, expected_job)) return true;
     }
   }
 
@@ -1090,7 +1116,8 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
   // body is CMsgClientServiceMethodLegacyResponse, whose field 2 contains the
   // serialized service response.
   bool unified_call(const std::string& method, const pb_writer& request,
-                    std::vector<uint8_t>* response, std::string* err) {
+                    std::vector<uint8_t>* response, std::string* err,
+                    bool require_success = false) {
     last_eresult = 2;
     const uint64_t job = job_seq++;
     if (!send_proto(151 /* ServiceMethodCallFromClient */, {}, request, job,
@@ -1099,8 +1126,15 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
       return false;
     }
     std::vector<uint8_t> pkt_body;
-    if (!recv_emsg(147 /* ServiceMethodResponse */, &pkt_body)) {
+    if (!recv_emsg(147 /* ServiceMethodResponse */, &pkt_body, 12000,
+                   require_success ? job : 0)) {
       if (err) *err = "service response timeout";
+      return false;
+    }
+
+    if (require_success && last_eresult != 1) {
+      if (err) *err = "Steam service denied the request (eresult=" +
+                      std::to_string(last_eresult) + ")";
       return false;
     }
 
@@ -1139,7 +1173,7 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
   }
 
   bool dispatch_pkt(const std::vector<uint8_t>& pkt, uint32_t want_emsg,
-                    std::vector<uint8_t>* out_body) {
+                    std::vector<uint8_t>* out_body, uint64_t expected_job) {
     if (pkt.size() < 8) return false;
     uint32_t raw_emsg = 0, hlen = 0;
     std::memcpy(&raw_emsg, pkt.data(), 4);
@@ -1147,6 +1181,8 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
     if (8 + (size_t)hlen > pkt.size()) return false;
     uint32_t emsg = raw_emsg & 0x7FFFFFFFu;
     pb_reader hr{pkt.data() + 8, hlen};
+    uint64_t response_job = 0;
+    int response_result = 2;
     uint32_t f, wt;
     while (hr.next(&f, &wt)) {
       if (f == 1 && wt == 1) {
@@ -1157,10 +1193,13 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
         uint64_t s = 0;
         hr.read_varint(&s);
         if (s != 0) session_id = (uint32_t)s;
+      } else if (f == 11 && wt == 1) {
+        if (!hr.read_fixed64(&response_job)) return false;
       } else if (f == 13 && wt == 0) {
         uint64_t e = 0;
-        hr.read_varint(&e);
-        last_eresult = (int32_t)e;
+        if (!hr.read_varint(&e)) return false;
+        response_result = (int32_t)e;
+        if (!expected_job) last_eresult = response_result;
       } else if (f == 12 && wt == 2) {
         const uint8_t* np = nullptr;
         size_t nl = 0;
@@ -1204,11 +1243,12 @@ class cm_session : public std::enable_shared_from_this<cm_session> {
         if (off + sub_len > flat.size()) break;
         std::vector<uint8_t> sub(flat.begin() + off, flat.begin() + off + sub_len);
         off += sub_len;
-        if (dispatch_pkt(sub, want_emsg, out_body)) return true;
+        if (dispatch_pkt(sub, want_emsg, out_body, expected_job)) return true;
       }
       return false;
     }
-    if (emsg == want_emsg) {
+    if (emsg == want_emsg && (!expected_job || response_job == expected_job)) {
+      if (expected_job) last_eresult = response_result;
       out_body->assign(b, b + blen);
       return true;
     }
@@ -1337,6 +1377,7 @@ struct depot_file_t {
   std::string filename;
   uint64_t size = 0;
   uint32_t flags = 0;
+  bool linked_path = false;
   std::vector<depot_chunk_t> chunks;
 };
 
@@ -1439,6 +1480,11 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
             }
           }
           df.chunks.push_back(ck);
+        } else if (ff == 7 && fwt == 2) {
+          const uint8_t* target = nullptr;
+          size_t size = 0;
+          if (!fr.read_bytes(&target, &size)) return false;
+          df.linked_path = size != 0;
         } else {
           fr.skip(fwt);
         }
@@ -1740,6 +1786,14 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   {
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_acct.steamid64 != sid || !g_acct.signed_in) return;
+    for (auto& item : family_items) {
+      const auto prior = std::find_if(g_family_items.begin(), g_family_items.end(),
+                                     [&item](const auto& row) { return row.app_id == item.app_id; });
+      if (prior == g_family_items.end()) continue;
+      item.downloading = prior->downloading;
+      item.download_pct = prior->download_pct;
+      item.status_text = prior->status_text;
+    }
     g_family_items = std::move(family_items);
     scan_installed_into_items(games_dir, &fetched_items);
     if (!fetched_items.empty()) g_items = std::move(fetched_items);
@@ -2035,68 +2089,74 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
   }).detach();
 }
 
-void steam_client_download_app(uint32_t app_id,
+void steam_client_download_app(uint32_t app_id, bool family_shared,
                                std::function<void()> on_complete) {
-  auto set_item_state = [app_id](bool downloading, float pct,
-                                 const std::string& st, bool installed = false,
-                                 const std::string& idir = "") {
+  std::string ref_tok, acc_tok, acct_name, games_dir, state_dir, title;
+  uint64_t sid = 0;
+  {
     std::lock_guard<std::mutex> lk(g_mu);
-    for (auto& it : g_items) {
-      if (it.app_id == app_id) {
-        it.downloading = downloading;
-        it.download_pct = pct;
-        it.status_text = st;
-        if (installed) {
-          it.installed = true;
-          if (!idir.empty()) it.install_dir = idir;
-        }
-        break;
+    sid = g_acct.steamid64;
+    if (!g_acct.signed_in || g_refresh_token.empty() || sid == 0) {
+      g_acct.status_line = "download blocked: sign in with Steam (Y) first";
+      return;
+    }
+    const auto& items = family_shared ? g_family_items : g_items;
+    const auto found = std::find_if(items.begin(), items.end(), [app_id](const auto& item) {
+      return item.app_id == app_id;
+    });
+    if (found == items.end()) {
+      g_acct.status_line = "Steam library changed — refresh and select the game again";
+      return;
+    }
+    if (g_dl_busy.exchange(true)) {
+      g_acct.status_line = "steam: another download is already active";
+      return;
+    }
+    ref_tok = g_refresh_token;
+    acc_tok = g_access_token;
+    acct_name = g_acct.account_name;
+    games_dir = g_games_dir;
+    state_dir = g_state_dir;
+    title = found->title;
+  }
+  if (title.empty()) title = "SteamApp_" + std::to_string(app_id);
+
+  auto set_item_state = [app_id, family_shared, sid](
+                            bool downloading, float pct, const std::string& st,
+                            bool installed = false, const std::string& idir = "") {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (!g_acct.signed_in || g_acct.steamid64 != sid) return;
+    auto& items = family_shared ? g_family_items : g_items;
+    for (auto& it : items) {
+      if (it.app_id != app_id) continue;
+      it.downloading = downloading;
+      it.download_pct = pct;
+      it.status_text = st;
+      if (installed) {
+        it.installed = true;
+        if (!idir.empty()) it.install_dir = idir;
       }
+      break;
     }
     g_acct.status_line = st;
   };
 
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    const auto matches = [app_id](const steam_library_item& item) {
-      return item.app_id == app_id;
-    };
-    if (std::any_of(g_family_items.begin(), g_family_items.end(), matches) &&
-        std::none_of(g_items.begin(), g_items.end(), matches)) {
-      g_acct.status_line = "Steam Families titles require a Steamworks play session";
-      return;
-    }
-  }
-  if (g_dl_busy.exchange(true)) {
-    set_item_state(false, 0.0f, "steam: another download is already active");
-    return;
-  }
-
-  std::string ref_tok, acc_tok, acct_name, games_dir, title;
-  uint64_t sid = 0;
-  {
-    std::lock_guard<std::mutex> lk(g_mu);
-    ref_tok = g_refresh_token;
-    acc_tok = g_access_token;
-    acct_name = g_acct.account_name;
-    sid = g_acct.steamid64;
-    games_dir = g_games_dir;
-    for (const auto& it : g_items) {
-      if (it.app_id == app_id) title = it.title;
-    }
-  }
-  if (ref_tok.empty() || sid == 0) {
-    g_dl_busy = false;
-    set_item_state(false, 0.0f,
-                   "download blocked: sign in with Steam (Y) first");
-    return;
-  }
-  if (title.empty()) title = "SteamApp_" + std::to_string(app_id);
-
   set_item_state(true, 0.02f, "steam: connecting to CM servers…");
   std::thread([=]() {
+    std::filesystem::path family_partial;
+    const auto family_account_active = [family_shared, sid, app_id]() {
+      if (!family_shared) return true;
+      std::lock_guard<std::mutex> lk(g_mu);
+      return g_acct.signed_in && g_acct.steamid64 == sid &&
+             std::any_of(g_family_items.begin(), g_family_items.end(),
+                         [app_id](const auto& item) { return item.app_id == app_id; });
+    };
     auto fail = [&](const std::string& msg) {
       log_line(("steam_dl[" + std::to_string(app_id) + "]: FAIL " + msg).c_str());
+      if (!family_partial.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(family_partial, ec);
+      }
       set_item_state(false, 0.0f, msg);
       g_dl_busy = false;
     };
@@ -2355,7 +2415,7 @@ void steam_client_download_app(uint32_t app_id,
         std::string merr;
         if (cm->unified_call(
                 "ContentServerDirectory.GetManifestRequestCode#1", mreq,
-                &mresp, &merr)) {
+                &mresp, &merr, family_shared)) {
           pb_reader mr{mresp.data(), mresp.size()};
           uint32_t f = 0, wt = 0;
           while (mr.next(&f, &wt)) {
@@ -2373,6 +2433,11 @@ void steam_client_download_app(uint32_t app_id,
                        .c_str());
         }
       }
+
+      if (family_shared && manifest_code == 0)
+        return fail("Steam did not authorize a manifest for this family copy");
+      if (!family_account_active())
+        return fail("Steam Families access changed during the download");
 
       // Tokens are per depot and per CDN host. They are often empty, but
       // requesting one also tells the cache this session is authorized.
@@ -2407,7 +2472,7 @@ void steam_client_download_app(uint32_t app_id,
       }
 
       log_line(("steam_dl[" + std::to_string(app_id) +
-                "]: manifest_code=" + std::to_string(manifest_code) +
+                "]: manifest authorized=" + (manifest_code ? "yes" : "no") +
                 " cdn=" + (cdn_hosts.empty() ? "none" : cdn_hosts[0])).c_str());
 
       log_line(("steam_dl[" + std::to_string(app_id) +
@@ -2430,7 +2495,7 @@ void steam_client_download_app(uint32_t app_id,
         }
         if (http_get_bytes(url, &manifest_blob, &dl_err)) break;
           log_line(("steam_dl[" + std::to_string(app_id) + "]: manifest CDN try " +
-                  cdn_hosts[hi] + " " + url + " -> " + dl_err).c_str());
+                  cdn_hosts[hi] + " -> " + dl_err).c_str());
       }
       if (manifest_blob.empty()) return fail("manifest CDN failed: " + dl_err);
 
@@ -2445,23 +2510,74 @@ void steam_client_download_app(uint32_t app_id,
       if (total_bytes == 0) total_bytes = 1;
 
       std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
-      ensure_dir_recursive(install_dir);
+      std::filesystem::path family_final;
+      if (family_shared) {
+        if (state_dir.empty()) return fail("Steam Families staging storage unavailable");
+        for (auto& file : files) {
+          if (file.linked_path || !valid_family_depot_path(file.filename))
+            return fail("Steam Families depot contains an unsupported file path");
+          if (file.flags & 0x40) continue;
+          std::sort(file.chunks.begin(), file.chunks.end(),
+                    [](const auto& a, const auto& b) { return a.offset < b.offset; });
+          uint64_t next_offset = 0;
+          for (const auto& chunk : file.chunks) {
+            if (chunk.offset != next_offset || !chunk.cb_orig ||
+                chunk.cb_orig > file.size - next_offset)
+              return fail("Steam Families depot contains an invalid file layout");
+            next_offset += chunk.cb_orig;
+          }
+          if (next_offset != file.size)
+            return fail("Steam Families depot contains an incomplete file");
+        }
+        family_final = std::filesystem::path(u8to16(state_dir)) / "steam-family" /
+                       std::to_string(sid) / std::to_string(app_id) /
+                       (std::to_string(depot_id) + "-" + std::to_string(manifest_id));
+        if (std::filesystem::is_directory(family_final)) {
+          if (!family_account_active())
+            return fail("Steam Families access changed during the download");
+          set_item_state(false, 1.0f, "Downloaded — requires a Steamworks play session");
+          g_dl_busy = false;
+          if (on_complete) on_complete();
+          return;
+        }
+        family_partial = family_final;
+        family_partial += ".partial";
+        std::filesystem::remove_all(family_partial);
+        std::filesystem::create_directories(family_partial);
+      } else {
+        ensure_dir_recursive(install_dir);
+      }
 
       // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
       uint64_t done_bytes = 0;
       for (const auto& f : files) {
+        if (!family_account_active())
+          return fail("Steam Families access changed during the download");
+        std::filesystem::path family_file;
+        if (family_shared) family_file = family_partial / u8to16(f.filename);
+        std::string fpath = install_dir + "\\" + f.filename;
         if (f.flags & 0x40 /* directory flag */) {
-          ensure_dir_recursive(install_dir + "\\" + f.filename);
+          if (family_shared) std::filesystem::create_directories(family_file);
+          else ensure_dir_recursive(fpath);
           continue;
         }
-        std::string fpath = install_dir + "\\" + f.filename;
-        size_t sl = fpath.rfind('\\');
-        if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
+        if (family_shared) {
+          std::filesystem::create_directories(family_file.parent_path());
+        } else {
+          const size_t sl = fpath.rfind('\\');
+          if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
+        }
 
-        FILE* fp = fopen(fpath.c_str(), "wb");
+        std::unique_ptr<FILE, decltype(&fclose)> fp(
+            family_shared ? _wfopen(family_file.c_str(), L"wb") : fopen(fpath.c_str(), "wb"),
+            &fclose);
         if (!fp) return fail("cannot create file: " + f.filename);
 
         for (const auto& ck : f.chunks) {
+          if (!family_account_active()) {
+            fp.reset();
+            return fail("Steam Families access changed during the download");
+          }
           char hex_sha[41];
           for (int i = 0; i < 20; ++i)
             snprintf(hex_sha + i * 2, 3, "%02x", ck.sha[i]);
@@ -2482,13 +2598,13 @@ void steam_client_download_app(uint32_t app_id,
             }
           }
           if (!got) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk CDN failed (" + std::string(hex_sha) + "): " +
                         cerr);
           }
 
           if (ck.cb_comp > 0 && enc_chunk.size() != ck.cb_comp) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk size mismatch (" + std::string(hex_sha) +
                         "): got " + std::to_string(enc_chunk.size()) +
                         ", manifest says " + std::to_string(ck.cb_comp));
@@ -2497,7 +2613,7 @@ void steam_client_download_app(uint32_t app_id,
           std::vector<uint8_t> comp_chunk;
           if (!bcrypt_aes256_decrypt_steam(enc_chunk.data(), enc_chunk.size(),
                                            depot_key, &comp_chunk)) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk AES-256 decrypt failed");
           }
 
@@ -2505,7 +2621,7 @@ void steam_client_download_app(uint32_t app_id,
           std::string derr;
           if (!decompress_steam_payload(comp_chunk.data(), comp_chunk.size(),
                                         ck.cb_orig, &plain_chunk, &derr)) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk decompress failed: " + derr);
           }
 
@@ -2513,7 +2629,7 @@ void steam_client_download_app(uint32_t app_id,
           // plaintext. Steam's integrity contract is an Adler-32 of the
           // decompressed bytes plus the uncompressed length (DepotChunk).
           if (ck.cb_orig > 0 && plain_chunk.size() != ck.cb_orig) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk decompressed to " +
                         std::to_string(plain_chunk.size()) +
                         " bytes, manifest says " +
@@ -2521,14 +2637,18 @@ void steam_client_download_app(uint32_t app_id,
           }
           if (ck.crc != 0 &&
               adler32_steam(plain_chunk.data(), plain_chunk.size()) != ck.crc) {
-            fclose(fp);
+            fp.reset();
             return fail("chunk Adler-32 mismatch (" + std::string(hex_sha) +
                         "): corrupt data or wrong depot key");
           }
 
           if (!plain_chunk.empty()) {
-            _fseeki64(fp, (long long)ck.offset, SEEK_SET);
-            fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp);
+            if (ck.offset > f.size || plain_chunk.size() > f.size - ck.offset ||
+                _fseeki64(fp.get(), static_cast<long long>(ck.offset), SEEK_SET) != 0 ||
+                fwrite(plain_chunk.data(), 1, plain_chunk.size(), fp.get()) != plain_chunk.size()) {
+              fp.reset();
+              return fail("cannot write depot file: " + f.filename);
+            }
             done_bytes += plain_chunk.size();
           }
           float pct = 0.15f + 0.82f * ((float)done_bytes / (float)total_bytes);
@@ -2538,7 +2658,18 @@ void steam_client_download_app(uint32_t app_id,
                              format_bytes(done_bytes) + " / " +
                              format_bytes(total_bytes));
         }
-        fclose(fp);
+        if (fclose(fp.release()) != 0) return fail("cannot finish depot file: " + f.filename);
+      }
+
+      if (family_shared) {
+        if (!family_account_active())
+          return fail("Steam Families access changed during the download");
+        std::filesystem::rename(family_partial, family_final);
+        family_partial.clear();
+        set_item_state(false, 1.0f, "Downloaded — requires a Steamworks play session");
+        g_dl_busy = false;
+        if (on_complete) on_complete();
+        return;
       }
 
       // 9) Write steam_appid.txt & run Engine Synthesizer + PC->Xbox translation

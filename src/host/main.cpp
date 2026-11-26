@@ -2659,8 +2659,7 @@ struct tiramisu_host
     const auto items = longan::steam_client_items();
     if (idx < 0 || idx >= static_cast<int>(items.size())) return;
     const auto& it = items[idx];
-    if (it.family_shared) return;
-    if (it.installed) {
+    if (it.installed && !it.family_shared) {
       std::string launch_name;
       for (const auto& ge : g_games) {
         if (!it.install_dir.empty() &&
@@ -2682,7 +2681,7 @@ struct tiramisu_host
       g_pending_launch = launch_name;
     } else if (!it.downloading) {
       longan::steam_client_download_app(
-          it.app_id, []() { g_steam_needs_rescan.store(true); });
+          it.app_id, it.family_shared, []() { g_steam_needs_rescan.store(true); });
     }
   }
 

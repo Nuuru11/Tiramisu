@@ -1448,9 +1448,8 @@ void draw_steam_screen() {
              sy(38.0f), sel.title.c_str(), g_br_white);
 
     const float by = top_y + sy(104.0f);
-    if (!sel.family_shared)
-      draw_champagne_pill(right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f));
-    if (g_controller_active && !sel.family_shared) {
+    draw_champagne_pill(right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f));
+    if (g_controller_active) {
       draw_xbox_btn(right_x + sx(52.0f), by + sy(24.0f), sc(11.0f), L'A',
                     g_br_xbox_a, true);
     }
@@ -1458,9 +1457,9 @@ void draw_steam_screen() {
                           ? (sel.status_str.empty() ? L"Downloading..." : sel.status_str)
                           : (sel.installed ? L"▶  Launch on Xbox"
                                            : L"Download from Steam to Xbox");
-    if (sel.family_shared) bt = L"Requires a Steamworks play session";
+    if (sel.family_shared && !sel.downloading) bt = L"Download for later";
     text_out(g_f_nav, right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f),
-             bt.c_str(), sel.family_shared ? g_br_dim : g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
+             bt.c_str(), g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
   }
 
@@ -2420,7 +2419,6 @@ ui_click ui_hit_test(int x, int y) {
       }
     }
     if (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() &&
-        !g_steam_items[g_steam_selected].family_shared &&
         hits(right_x + sx(24.0f), top_y + sy(104.0f), right_w - sx(48.0f), sy(48.0f))) {
       return {ui_click_type::steam_action, g_steam_selected};
     }

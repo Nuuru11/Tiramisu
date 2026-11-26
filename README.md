@@ -710,8 +710,10 @@ covers `joyGetPos` import binding, controller state, and device errors. Neither
 test is a console launch of the corresponding game.
 
 The Steam tab can show games Steam reports as shared with the signed-in
-account through Steam Families. Shared titles are view-only while the Xbox
-host lacks a Steamworks play session that can validate the borrowed copy.
+account through Steam Families. **Download for later** stages the selected
+Windows depot when Steam grants both its depot key and manifest request code.
+These files stay outside the playable game library. A Steamworks play
+session is still required to validate and launch a borrowed copy.
 
 The gate is the contract: it builds `src/trt/*.cpp` into `libtrt.a`, links
 every suite against it, and executes real PE images through the loader. A

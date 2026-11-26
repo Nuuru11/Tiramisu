@@ -53,9 +53,9 @@ void steam_client_refresh_remote(std::function<void()> on_library_updated = null
 // Re-scan local games_dir against known Steam items.
 void steam_client_rescan_local();
 
-// Download and install an owned Steam game natively onto the console.
-// Fails visibly with status_text if signed out, unowned, or unsupported codec.
-void steam_client_download_app(uint32_t app_id,
+// Install owned games or stage a Steam-authorized family depot for later.
+// Family staging does not grant launch access.
+void steam_client_download_app(uint32_t app_id, bool family_shared,
                                std::function<void()> on_complete = nullptr);
 
 // Snapshot current account + library items for UI/main loop (thread-safe).
