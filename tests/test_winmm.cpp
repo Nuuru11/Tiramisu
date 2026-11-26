@@ -142,7 +142,7 @@ int main(int argc, char** argv) {
   trt_input_pad_state_n(0, true, 32767, -32768, 0, 0, 0x5000, 0, 0);
   trt_input_pad_state_n(1, false, 0, 0, 0, 0, 0, 0, 0);
   const u64 ret = win64_call(img->base + img->entry_rva, 0, 0, 0);
-  printf("  guest returned 0x%llx (want 0x7f)\n", (unsigned long long)ret);
+  printf("  guest returned 0x%llx (want 0xff)\n", (unsigned long long)ret);
 
   CHECK(ret & 0x01u, "timeBeginPeriod(1) accepted");
   CHECK(ret & 0x02u, "clock nondecreasing");
@@ -151,6 +151,7 @@ int main(int argc, char** argv) {
   CHECK(ret & 0x10u, "timeGetDevCaps sane");
   CHECK(ret & 0x20u, "mciSendStringW fails visibly (263)");
 
+  CHECK(ret & 0x80u, "joyGetNumDevs and joyGetPosEx -> slots and live extended state");
   CHECK(ret & 0x40u, "joyGetPos -> live JOYINFO and real error codes");
 
   free(file);

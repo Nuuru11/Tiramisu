@@ -248,7 +248,7 @@ u32 TRT_GUEST_ABI trt_waveOutGetDevCapsA(u64 dev, void* caps, u32 size) {
   return 0;
 }
 
-u32 TRT_GUEST_ABI trt_joyGetNumDevs(void) { return 0; }
+u32 TRT_GUEST_ABI trt_joyGetNumDevs(void) { return 4; }  // WinMM reports supported slots.
 
 // JOYINFO has four UINT fields on both Windows guest architectures.
 u32 TRT_GUEST_ABI trt_joyGetPos(u32 id, void* info_out) {
@@ -275,7 +275,35 @@ u32 TRT_GUEST_ABI trt_joyGetPos(u32 id, void* info_out) {
   return 0;
 }
 
-u32 TRT_GUEST_ABI trt_joyGetPosEx(u32, void*) { return 167 /* JOYERR_UNPLUGGED */; }
+u32 TRT_GUEST_ABI trt_joyGetPosEx(u32 id, u32* info) {
+  if (id >= trt_joyGetNumDevs()) return 2;
+  if (!info || info[0] != 13 * sizeof(u32)) return 165;
+  u32 basic[4];
+  const u32 error = trt_joyGetPos(id, basic);
+  if (error) return error;
+
+  const u32 flags = info[1];
+  for (unsigned axis = 0; axis < 3; ++axis)
+    if (flags & (1u << axis)) info[2 + axis] = basic[axis];
+  if (flags & 0x08) info[5] = 32768 + trt_pad_thumb_n(id, 2);
+  if (flags & 0x10) info[6] = 257u * trt_pad_trigger_n(id, 0);
+  if (flags & 0x20) info[7] = 257u * trt_pad_trigger_n(id, 1);
+  if (flags & 0x80) {
+    info[8] = basic[3];
+    info[9] = 0;
+    for (u32 i = 0; i < 14; ++i) {
+      if (basic[3] & (1u << i)) { info[9] = i + 1; break; }
+    }
+  }
+  if (flags & (0x40 | 0x200)) {  // JOY_RETURNPOV / JOY_RETURNPOVCTS
+    const int x = int((basic[3] >> 13) & 1) - int((basic[3] >> 12) & 1);
+    const int y = int((basic[3] >> 11) & 1) - int((basic[3] >> 10) & 1);
+    constexpr u32 angles[3][3] = {{31500, 0, 4500}, {27000, 65535, 9000},
+                                  {22500, 18000, 13500}};
+    info[10] = angles[y + 1][x + 1];
+  }
+  return 0;
+}
 
 // ---- mciSendStringW: engines probe codecs with it; answer "cannot find
 // the device" (MCIERR_INVALID_DEVICE_NAME = 263) visibly rather than crash ----

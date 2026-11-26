@@ -25,6 +25,8 @@ __attribute__((dllimport)) u32 GSTD timeGetTime(void);
 __attribute__((dllimport)) u32 GSTD timeBeginPeriod(u32 ms);
 __attribute__((dllimport)) u32 GSTD timeEndPeriod(u32 ms);
 __attribute__((dllimport)) u32 GSTD timeGetDevCaps(void* caps, u32 size);
+__attribute__((dllimport)) u32 GSTD joyGetNumDevs(void);
+__attribute__((dllimport)) u32 GSTD joyGetPosEx(u32 id, void* info);
 __attribute__((dllimport)) u32 GSTD joyGetPos(u32 id, void* info);
 __attribute__((dllimport)) u32 GSTD waveOutGetNumDevs(void);
 __attribute__((dllimport)) u32 GSTD mciSendStringW(const u16* cmd, u16* ret,
@@ -67,6 +69,12 @@ u32 GSTD guest_winmm_main(u64 a, u64 b, u64 c) {
       joyGetPos(0, 0) == 165 && joyGetPos(0, joy) == 0 &&
       joy[0] == 65535 && joy[1] == 65535 && joy[2] == 32768 && joy[3] == 5)
     bits |= 0x40u;
+
+  u32 ex[13] = {sizeof(ex), 0xff};
+  if (joyGetNumDevs() == 4 && joyGetPosEx(1, ex) == 167 &&
+      joyGetPosEx(4, ex) == 2 && joyGetPosEx(0, ex) == 0 &&
+      ex[2] == joy[0] && ex[3] == joy[1] && ex[4] == joy[2] &&
+      ex[8] == 5 && ex[9] == 1 && ex[10] == 65535) bits |= 0x80u;
 
   timeEndPeriod(1);
   return bits;
