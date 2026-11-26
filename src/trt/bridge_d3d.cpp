@@ -237,6 +237,7 @@ int TRT_GUEST_ABI fake_sc_Present(void* self, u32 sync, u32 flags) {
       g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32);
     const int hr = ((fn_t)slot)(sc, sync, safe_flags);
+    if (hr == 0 && !(safe_flags & 1u) && g_hooks.frame_presented) g_hooks.frame_presented();
     if (hr == 0 && !(safe_flags & 1u /*DXGI_PRESENT_TEST*/) &&
         !g_sc_presented.exchange(true))
       trt_core_log("d3d: guest presented its first frame");
@@ -425,7 +426,9 @@ int TRT_GUEST_ABI fake_sc_Present1(void* self, u32 sync, u32 flags, const void* 
         g_hooks.prepare_d3d11_present)
       g_hooks.prepare_d3d11_present();
     using fn_t = int (TRT_GUEST_ABI *)(void*, u32, u32, const void*);
-    return ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
+    const int hr = ((fn_t)slot)(sc, sync, flags & ~0x200u, params);
+    if (hr == 0 && !(flags & 1u) && g_hooks.frame_presented) g_hooks.frame_presented();
+    return hr;
   }
   return fake_sc_Present(self, sync, flags);
 }

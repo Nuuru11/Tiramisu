@@ -7,6 +7,7 @@
 //   * optional Steam QR login (own account; depot pipeline is M6)
 #include "../trt/limbus_report.h"
 #include "epic_install.h"
+#include "frame_metrics.h"
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
@@ -1313,6 +1314,7 @@ void force_kill_guest(const char* reason) {
   longan::log_line(line);
   ::TerminateThread(g_guest_thread.native_handle(), 1);
   g_guest_thread.join();
+  longan::game_frames().reset(false);
   g_guest_running.store(false);
   longan::webxfer_set_running_game("");
   g_running_game_name.clear();
@@ -2700,6 +2702,7 @@ struct tiramisu_host
          g_kbd_mouse_mode ? L"ON" : L"OFF"},
         {L"Open On-Screen Keyboard", L"Show Xbox virtual keyboard", L"OPEN"},
         {L"Refresh Storage & Health", L"Update disk space & system diagnostics", L"RUN"},
+        {L"DirectX 12 Triangle", L"Draw on GPU, check pixels and show on TV", L"RUN"},
     };
     longan::ui_set_tools(items, longan::ui_tools_selected(), g_tool_result);
   }
@@ -2743,6 +2746,9 @@ struct tiramisu_host
         refresh_storage_stats();
         run_probes();
         g_tool_result = L"Storage & hardware probes refreshed";
+        break;
+      case 7:
+        g_tool_result = u82ws(longan::swapchain_triangle_test());
         break;
       default:
         break;
@@ -4061,6 +4067,7 @@ struct tiramisu_host
                 longan::log_line(ap_msg);
               }
               g_running_game_name = want;
+              longan::game_frames().reset(true);
               g_guest_running.store(true);
               const std::string exe = ge.exe;
               const std::string gdir = ge.dir;
@@ -4082,6 +4089,7 @@ struct tiramisu_host
                 if (stack_charged)
                   trt_mem_budget_discharge_va(1024ull * 1024ull);
                 g_running_game_name.clear();
+                longan::game_frames().reset(false);
                 g_guest_running.store(false);
               });
               break;

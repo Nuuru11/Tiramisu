@@ -3,6 +3,7 @@
 #define TIRAMISU_SWAPCHAIN_H
 
 #include <d3d11_1.h>
+#include <string>
 #include <dxgi1_2.h>
 #include <winrt/base.h>
 #include <winrt/Windows.UI.Core.h>
@@ -29,6 +30,7 @@ void swapchain_restore_launcher_format();
 void draw_pointer(bool launcher);
 void set_pointer_cursor_mode(bool kbm_active);
 void set_launcher_cursor_visible(bool visible);
+std::string swapchain_triangle_test();
 void swapchain_present();
 void swapchain_shutdown();
 

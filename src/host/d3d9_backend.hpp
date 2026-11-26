@@ -5,6 +5,7 @@
 #ifndef TIRAMISU_D3D9_BACKEND_HPP
 #define TIRAMISU_D3D9_BACKEND_HPP
 
+#include "frame_metrics.h"
 #include "../trt/bridge_d3d9.h"
 #include "../trt/bridge_d3d9_meta.h"
 
@@ -1531,7 +1532,7 @@ inline void hk_clear(u32 flags, u32 color, float z, u32 stencil, void*) {
 inline void hk_present(void*) {
   if (!g_rt.initialized || !g_rt.swap) return;
   longan::draw_pointer(false);
-  g_rt.swap->Present(1, 0);
+  if (g_rt.swap->Present(1, 0) == S_OK) longan::game_frames().record();
 }
 
 inline void hk_set_viewport(const d3d9_viewport* vp, void*) {

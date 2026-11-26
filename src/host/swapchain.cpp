@@ -22,6 +22,7 @@
 #include <dxgi1_6.h>
 
 #include "settings.h"
+#include "d3d12_probe.h"
 #include <atomic>
 #include <chrono>
 #pragma comment(lib, "d3d11.lib")
@@ -419,6 +420,7 @@ void publish_gpu_hooks() {
   hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
   hooks.configure_d3d11_swapchain = &configure_d3d11_swapchain;
   hooks.get_d3d11_backbuffer = &get_d3d11_backbuffer;
+  hooks.frame_presented = []() TRT_GUEST_ABI { game_frames().record(); };
   hooks.prepare_d3d11_present = &prepare_d3d11_present;
   hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,
                               u32 count, void* const* queues, u32 num_queues,
@@ -665,6 +667,30 @@ void swapchain_bind_d3d9() {
               g_w, g_h);
 }
 
+static triangle_probe probe;
+
+static bool paint_probe() {
+  winrt::com_ptr<ID3D11Texture2D> back;
+  if (!g_swap || !g_ctx || FAILED(g_swap->GetBuffer(0, IID_PPV_ARGS(back.put())))) return false;
+  D3D11_TEXTURE2D_DESC desc;
+  back->GetDesc(&desc);
+  const UINT size = triangle_probe::size;
+  if (desc.Width < size || desc.Height < size || desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM) return false;
+  const UINT x = (desc.Width-size)/2, y = (desc.Height-size)/2;
+  D3D11_BOX box{x,y,0,x+size,y+size,1};
+  g_ctx->UpdateSubresource(back.get(),0,&box,probe.pixels.data(),size*4,0);
+  return true;
+}
+
+std::string swapchain_triangle_test() {
+  auto error = probe.render();
+  if (!error.empty()) return error;
+  if (!paint_probe() || g_swap->Present(1,0) != S_OK)
+    return "DX12 device, submit and pixels OK / launcher present failed";
+  probe.preview_until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  return "DX12 device, submit and pixels OK / launcher present OK";
+}
+
 void swapchain_present() {
   if (!g_swap || g_in_d3d12) return;
   // Settings knobs (community wave): vsync off -> Present(0), frame-rate cap
@@ -685,6 +711,7 @@ void swapchain_present() {
     }
   }
   last_present = now;
+  if (now < probe.preview_until) paint_probe();
   draw_pointer_impl(true);
   g_swap->Present(vsync ? 1 : 0, 0);
 }

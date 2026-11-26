@@ -3,6 +3,7 @@
 // Header-only matching src/host/d3d9_backend.hpp; bound in src/host/swapchain.cpp.
 #pragma once
 
+#include "frame_metrics.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -278,7 +279,7 @@ inline void hk_clear(u32 mask, const float rgba[4], float depth, int stencil, vo
 inline void hk_swap_buffers(u64, void*) {
   if (!g_glrt.initialized || !g_glrt.swap) return;
   longan::draw_pointer(false);
-  g_glrt.swap->Present(1, 0);
+  if (g_glrt.swap->Present(1, 0) == S_OK) longan::game_frames().record();
 }
 
 inline u32 hk_compile_program(u32 gl_prog, const char* vs_hlsl, u32 vs_len,

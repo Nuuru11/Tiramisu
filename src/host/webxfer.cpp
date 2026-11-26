@@ -19,6 +19,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "frame_metrics.h"
 #include "epic_install.h"
 #include "../trt/limbus_report.h"
 #include "web_controls_page.h"
@@ -1164,7 +1165,7 @@ const char* k_upload_page =
   "nav a{color:#d5cecc;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.10);padding:9px 15px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600}"
   "@media(max-width:560px){body{padding:12px}.card{padding:14px}input,select{font-size:16px}}"
   "</style></head><body>"
-  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill role=status>Connecting…</span></div>"
+  "<header><div><h1>Tiramisu</h1><span class=pill id=runpill role=status>Connecting…</span><div id=frameperf></div></div>"
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
   "<nav aria-label=Companion><a href='#transfer'>Transfer</a><a href='#games'>Games</a>"
@@ -1339,6 +1340,7 @@ const char* k_upload_page =
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
+  "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
   "let epicHandle='',epicBusy=false;async function epicLibrary(start){if(epicBusy)return;epicBusy=true;const box=E('epicresult');box.textContent='Contacting Epic…';"
@@ -2220,6 +2222,14 @@ void handle_client(sock_t s) {
     return;
   }
 #endif
+  if (strcmp(method, "GET") == 0 && url_path == "/api/frame-metrics") {
+    const auto sample = game_frames().read();
+    char data[128];
+    snprintf(data, sizeof(data), "{\"ready\":%s,\"fps\":%.2f,\"slow\":%u}",
+             sample.ready ? "true" : "false", sample.fps, sample.slow);
+    respond(s, "200 OK", "application/json", data);
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/api/status") {
     // .238 FIX: serve /api/status WITHOUT holding g_mu across
     // the response -- the .237 priority fix did NOT cure the

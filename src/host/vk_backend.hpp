@@ -3,6 +3,7 @@
 // Header-only matching src/host/gl_backend.hpp; bound in src/host/swapchain.cpp.
 #pragma once
 
+#include "frame_metrics.h"
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
 #include <dxgi1_2.h>
@@ -1801,7 +1802,7 @@ inline void hk_present(u64, u32, void*) {
     longan::draw_pointer(false);
     ++g_d3d11c.pres_c;  // .244 DIAG: D3D11 call/ret pair (a returned Present = the D3D12 queue drained at least this far)
     d3d11_note_last("Present");
-    g_vkrt.swap->Present(1, 0);
+    if (g_vkrt.swap->Present(1, 0) == S_OK) longan::game_frames().record();
     ++g_d3d11c.pres_r;
     if (g_vkrt.ctx && g_vkrt.main_rtv) {
       ++g_d3d11c.state_c;  // .245 DIAG: D3D11 call/ret pair (draw/state)

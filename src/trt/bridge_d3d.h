@@ -47,6 +47,7 @@ typedef struct trt_gpu_hooks {
   int (TRT_GUEST_ABI *configure_d3d11_swapchain)(u32 format, u32 buffer_count);
   int (TRT_GUEST_ABI *get_d3d11_backbuffer)(u32 index, const void* iid, void** out);
   void (TRT_GUEST_ABI *prepare_d3d11_present)(void);
+  void (TRT_GUEST_ABI *frame_presented)(void);
 } trt_gpu_hooks;
 
 void trt_gpu_set_hooks(const trt_gpu_hooks* hooks);
