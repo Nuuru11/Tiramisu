@@ -67,6 +67,10 @@ echo "Mono for UWP: $MONO_LIB"
 # apply to every TU of this build (the wrapper has no per-file flags);
 # they are inert for TUs that do not use them. MF libs: the song path
 # (MFStartup/SourceReader) is APP-partition; mfuuid carries the MF GUIDs.
+# The UWP host consumes the same generated doors as the Linux Mono harness.
+# Generate them here even when the optional FNA test did not run.
+python3 "$here/third_party/mono-bridges/gen-failvisible.py"
+python3 "$here/third_party/mono-bridges/door-gen.py"
 UWP_OBJ_DIR="$out/obj" "$CB/scripts/build.sh" --uwp \
   --out "$out/layout/tiramisu.exe" --jobs "${TRT_JOBS:-2}" \
   -I third_party/fna3d-src/include \
