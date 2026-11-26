@@ -1,5 +1,6 @@
 // tiramisu/src/trt/images.cpp
 // Guest image registry, on-demand DLL loading, and the Win64 call helper.
+#include "limbus_report.h"
 #include "images.h"
 #include "pe_exports.h"
 #include "thunk.h"
@@ -471,6 +472,8 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
   (void)user;
   if (!module) return nullptr;
 
+  const bool steam_client = ieq(base_name(module), "steamclient64.dll");
+  const bool steam_module = steam_client || ieq(base_name(module), "steam_api64.dll");
   // 1. a guest image we already loaded (the game's own DLLs win over the
   //    system's, exactly like the Windows loader's search order)
   trt_image* img = trt_images_find(module);
@@ -480,14 +483,19 @@ void* trt_resolve_full(void* user, const char* module, const char* symbol,
   }
   if (img) {
     void* fn = trt_pe_find_export(g_be, &g_rs, img, symbol, ordinal);
-    if (fn) return fn;
+    if (fn) {
+      if (steam_module) limbus_report::module(steam_client, "Guest DLL export resolved");
+      return fn;
+    }
     // the image does not export it: fall through to the module table
   }
 
   // 3. system modules (builtin bridges, api-set contracts, console DLLs)
   extern void* trt_resolve_module(void* user, const char* module,
                                   const char* symbol, u16 ordinal);
-  return trt_resolve_module(nullptr, module, symbol, ordinal);
+  void* fn = trt_resolve_module(nullptr, module, symbol, ordinal);
+  if (steam_module) limbus_report::module(steam_client, fn ? "Import resolved by Tiramisu" : "Import unresolved");
+  return fn;
 }
 
 // ---------------------------------------------------------------------------

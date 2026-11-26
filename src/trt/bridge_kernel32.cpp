@@ -5,6 +5,7 @@
 #if !defined(_WIN32) && !defined(_GNU_SOURCE)
 #  define _GNU_SOURCE
 #endif
+#include "limbus_report.h"
 #include "iso.h"
 #include "trt.h"
 #include "thunk.h"
@@ -2761,9 +2762,22 @@ static void* load_library_impl(const u16* path, u32 flags) {
   return trt_images_handle(img);
 }
 
+static void report_steam_load(const u16* path, void* handle) {
+  char utf8[1024];
+  if (!path || trt_utf16_to_utf8(path, utf8, sizeof(utf8)) != 0) return;
+  const char* base = path_basename(utf8);
+  bool client = eq_ci(base, "steamclient64.dll") || eq_ci(base, "steamclient64");
+  if (client || eq_ci(base, "steam_api64.dll") || eq_ci(base, "steam_api64")) {
+    const char* result = !handle ? "LoadLibrary failed" :
+        trt_images_find(base) ? "Guest DLL mapped" : "Tiramisu module handle returned";
+    limbus_report::module(client, result);
+  }
+}
+
 void* TRT_STDCALL trt_LoadLibraryW(const u16* path) {
   gap_trace_record("LoadLibraryW");
   void* h = load_library_impl(path, 0);
+  report_steam_load(path, h);
   static u32 s_llw_log = 0;
   if (++s_llw_log <= 64) { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=%p", st_n, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryW -> \"%s\" handle=NULL", st_n); trt_core_log(st_line); }
   return h;
@@ -2773,6 +2787,7 @@ void* TRT_STDCALL trt_LoadLibraryExW(const u16* path, void* file, u32 flags) {
   gap_trace_record("LoadLibraryExW");
   (void)file;
   void* h = load_library_impl(path, flags);
+  report_steam_load(path, h);
   { char st_u8[136]; char st_line[320]; const char* st_n = "(null)"; if (path) { if (trt_utf16_to_utf8(path, st_u8, sizeof(st_u8)) == 0) st_n = st_u8; else st_n = "(unconvertible)"; } if (h) snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=%p", st_n, flags, h); else snprintf(st_line, sizeof(st_line), "modtrace: LoadLibraryExW -> \"%s\" flags=0x%x handle=NULL", st_n, flags); trt_core_log(st_line); }
   return h;
 }

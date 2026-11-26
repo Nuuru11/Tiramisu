@@ -5,6 +5,7 @@
 //   * feeds guests keyboard/mouse (CoreWindow events) + controller (XInput),
 //     including gamepad-as-mouse for KBM-only games
 //   * optional Steam QR login (own account; depot pipeline is M6)
+#include "../trt/limbus_report.h"
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
@@ -1849,6 +1850,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     std::ifstream sf(game_dir + "\\steam_appid.txt");
     if (sf) sf >> app_id;
     app_id_read = (app_id != 0);
+    limbus_report::select_app(app_id);
     trt_steam_set_appid(app_id);
   }
   g_guest_stop_req.store(false);
@@ -1917,6 +1919,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
       longan::log_line(("host: [ENGINE SYNTHESIZER] applied args: " + synth_args).c_str());
     }
     if (!app_id_read && synth_prof.has_steam) {
+      limbus_report::select_app(synth_prof.steam_appid);
       trt_steam_set_appid(synth_prof.steam_appid);
       char al[160];
       snprintf(al, sizeof(al),

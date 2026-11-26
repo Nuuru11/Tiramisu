@@ -17,6 +17,7 @@
 //     correct, VISIBLE failure, not a bypass.
 //
 // Everything is fail-visible: an unimplemented callback names itself.
+#include "limbus_report.h"
 #include "bridge_steam.h"
 #include <atomic>
 #include "input.h"
@@ -104,13 +105,16 @@ extern "C" {
 
 // SteamAPI_Init() / SteamAPI_InitEx(ctx)
 int TRT_GUEST_ABI trt_SteamAPI_Init(void) {
+  if (requires_desktop_steam_client()) limbus_report::initialization("SteamAPI_Init returned false (no Steamworks client session)");
   return init_steam_bridge(nullptr);
 }
 int TRT_GUEST_ABI trt_SteamAPI_InitEx(void* ctx) {
   (void)ctx;
+  if (requires_desktop_steam_client()) limbus_report::initialization("SteamAPI_InitEx returned false (no Steamworks client session)");
   return init_steam_bridge(nullptr);
 }
 int TRT_GUEST_ABI trt_SteamAPI_InitFlat(char* out_err_msg) {
+  if (requires_desktop_steam_client()) limbus_report::initialization("SteamAPI_InitFlat returned 2 (NoSteamClient)");
   return init_steam_bridge(out_err_msg) ? 0 : 2;  // OK / NoSteamClient
 }
 void TRT_GUEST_ABI trt_SteamAPI_Shutdown(void) { g_initialized = 0; }
@@ -2169,7 +2173,8 @@ static void* TRT_GUEST_ABI steam_client_obj_ptr(void) {
 }
 
 static int TRT_GUEST_ABI steam_internal_init(const char* /*ver*/, char* pOutErrMsg) {
-  return trt_SteamAPI_InitFlat(pOutErrMsg);
+  if (requires_desktop_steam_client()) limbus_report::initialization("SteamInternal_SteamAPI_Init returned 2 (NoSteamClient)");
+  return init_steam_bridge(pOutErrMsg) ? 0 : 2;
 }
 static void TRT_GUEST_ABI steam_release_current_thread_memory(void) {}
 

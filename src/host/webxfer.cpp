@@ -19,6 +19,7 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#include "../trt/limbus_report.h"
 #include "web_controls_page.h"
 #include "host_log.h"
 #include "settings.h"
@@ -1191,6 +1192,7 @@ const char* k_upload_page =
   "<button class='btn btn-sec' onclick=refreshSteam()>Refresh Steam</button>"
   "<button class='btn btn-danger' onclick=steamSignOut()>Sign Out</button></div></div>"
   "<div id=steaminfo style='margin:10px 0;font-size:13px;color:#d5cecc'>Checking Steam account...</div>"
+  "<details><summary>Limbus Company · Steam launch report</summary><pre id=limbusreport style='white-space:pre-wrap'></pre></details>"
   "<div id=steamqrwrap style='display:none;margin:10px 0'><img id=steamqrimg style='width:180px;height:180px;background:#fff;padding:8px;border-radius:14px' alt='Steam QR'></div>"
   "<div id=steamlist></div></div>"
   "<div class=card id=support><h2>Save Backups &amp; Support Bundle</h2>"
@@ -1332,6 +1334,7 @@ const char* k_upload_page =
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';}}"
   "async function loadSteam(){try{const st=await(await fetch('/api/steam/status')).json();"
   "E('steaminfo').textContent=(st.signed_in?('Signed in as '+(st.persona||st.steamid64)+' · '):'')+(st.status||'Ready');"
+  "E('limbusreport').textContent=st.limbus_report||'No report available';"
   "if(st.qr_url){E('steamqrwrap').style.display='block';E('steamqrimg').src='/api/steam/qr.svg?t='+Date.now();}else{E('steamqrwrap').style.display='none';}"
   "const items=await(await fetch('/api/steam/library')).json();"
   "E('steamlist').innerHTML=items.length?items.slice(0,40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
@@ -2035,17 +2038,15 @@ void handle_client(sock_t s) {
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/status") {
     const auto acct = steam_client_account();
     const auto items = steam_client_items();
-    char sb[1024];
-    snprintf(sb, sizeof(sb),
-             "{\"signed_in\":%s,\"steamid64\":\"%llu\",\"persona\":\"%s\","
-             "\"status\":\"%s\",\"qr_url\":\"%s\",\"busy\":%s,\"count\":%zu}",
-             acct.signed_in ? "true" : "false",
-             (unsigned long long)acct.steamid64,
-             json_escape(acct.persona.empty() ? acct.account_name : acct.persona).c_str(),
-             json_escape(acct.status_line).c_str(),
-             json_escape(acct.qr_url).c_str(),
-             acct.busy ? "true" : "false", items.size());
-    respond(s, "200 OK", "application/json", sb);
+    std::string status = std::string("{\"signed_in\":") + (acct.signed_in ? "true" : "false") +
+        ",\"steamid64\":\"" + std::to_string(acct.steamid64) +
+        "\",\"persona\":\"" + json_escape(acct.persona.empty() ? acct.account_name : acct.persona) +
+        "\",\"status\":\"" + json_escape(acct.status_line) +
+        "\",\"qr_url\":\"" + json_escape(acct.qr_url) +
+        "\",\"busy\":" + (acct.busy ? "true" : "false") +
+        ",\"count\":" + std::to_string(items.size()) +
+        ",\"limbus_report\":\"" + json_escape(limbus_report::read()) + "\"}";
+    respond(s, "200 OK", "application/json", status);
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/qr.svg") {
