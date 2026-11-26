@@ -1,6 +1,7 @@
 // tiramisu/src/host/steam_client.cpp
 // Native Xbox UWP Steam Client + CM/CDN Depot Downloader.
 #include "steam_client.h"
+#include "steam_file_verify.h"
 #include "host_log.h"
 #include "../trt/bridge_steam.h"
 #include "../trt/steam_auth.h"
@@ -1383,6 +1384,8 @@ struct depot_file_t {
   std::string filename;
   uint64_t size = 0;
   uint32_t flags = 0;
+  uint8_t content_sha[20]{};
+  bool has_content_sha = false;
   bool linked_path = false;
   std::vector<depot_chunk_t> chunks;
 };
@@ -1454,6 +1457,14 @@ bool parse_manifest_blob(const std::vector<uint8_t>& blob,
           uint64_t v = 0;
           fr.read_varint(&v);
           df.flags = (uint32_t)v;
+        } else if (ff == 5 && fwt == 2) {
+          const uint8_t* hash = nullptr;
+          size_t length = 0;
+          if (!fr.read_bytes(&hash, &length)) return false;
+          if (length == sizeof(df.content_sha)) {
+            std::memcpy(df.content_sha, hash, length);
+            df.has_content_sha = true;
+          }
         } else if (ff == 6 && fwt == 2) {
           const uint8_t* cp = nullptr;
           size_t cl = 0;
@@ -2159,10 +2170,6 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
     };
     auto fail = [&](const std::string& msg) {
       log_line(("steam_dl[" + std::to_string(app_id) + "]: FAIL " + msg).c_str());
-      if (!family_partial.empty()) {
-        std::error_code ec;
-        std::filesystem::remove_all(family_partial, ec);
-      }
       set_item_state(false, 0.0f, msg);
       g_dl_busy = false;
     };
@@ -2339,7 +2346,15 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
           if (std::filesystem::is_directory(family_root / name)) continue;
           if (!depot.size || depot.size > UINT64_MAX - required)
             return fail("Steam did not provide a usable installed size");
-          required += depot.size;
+          uint64_t remaining = depot.size;
+          const auto partial = family_root / (name + ".partial");
+          if (std::filesystem::is_directory(partial)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(partial)) {
+              if (entry.is_regular_file())
+                remaining -= std::min<uint64_t>(remaining, entry.file_size());
+            }
+          }
+          required += remaining;
           plan += "/" + name;
         }
         ULARGE_INTEGER available{};
@@ -2583,7 +2598,6 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
           }
           family_partial = family_final;
           family_partial += ".partial";
-          std::filesystem::remove_all(family_partial);
           std::filesystem::create_directories(family_partial);
         } else {
           ensure_dir_recursive(install_dir);
@@ -2604,6 +2618,14 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
           }
           if (family_shared) {
             std::filesystem::create_directories(family_file.parent_path());
+            if (f.has_content_sha && std::filesystem::is_regular_file(family_file) &&
+                std::filesystem::file_size(family_file) == f.size) {
+              std::ifstream saved(family_file, std::ios::binary);
+              if (saved && steam_file_matches(saved, f.size, f.content_sha)) {
+                done_bytes += f.size;
+                continue;
+              }
+            }
           } else {
             const size_t sl = fpath.rfind('\\');
             if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
@@ -2700,6 +2722,11 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
                                format_bytes(total_bytes));
           }
           if (fclose(fp.release()) != 0) return fail("cannot finish depot file: " + f.filename);
+          if (family_shared && f.has_content_sha) {
+            std::ifstream saved(family_file, std::ios::binary);
+            if (!saved || !steam_file_matches(saved, f.size, f.content_sha))
+              return fail("Downloaded file failed Steam manifest verification: " + f.filename);
+          }
         }
 
         if (family_shared) {
