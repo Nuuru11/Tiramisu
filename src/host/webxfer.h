@@ -62,6 +62,8 @@ bool webxfer_poll_rescan();
 void webxfer_set_running_game(const std::string& name);
 // Record the outcome of a launch the host loop acted on ("started",
 // "not found", ...). Surfaced in /api/status as last_launch_result.
+unsigned long long webxfer_begin_launch_report(const std::string& game, const char* stage);
+void webxfer_update_launch_report(unsigned long long attempt, const char* stage, const char* detail);
 void webxfer_set_launch_result(const std::string& name, const std::string& result);
 // In-console autopilot: a transfer arms it; the host loop's existing launch
 // outcome callback drives a match -> repair -> retry loop. Surfaced in

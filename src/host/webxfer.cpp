@@ -186,6 +186,8 @@ void reset_web_controls() {
 }
 
 std::string g_local_state_dir;
+unsigned long long g_launch_attempt = 0;
+std::string g_launch_game, g_launch_stage, g_launch_detail;
 std::string g_games_dir;
 std::string g_incoming;
 
@@ -1192,6 +1194,7 @@ const char* k_upload_page =
   "<button class='btn btn-sec' onclick=downloadFromUrl()>Download on Xbox</button></div>"
   "<div id=bar><div id=fill></div></div>"
   "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
+  "<section class=card id=launchdiag hidden><h2>Son oyun başlatması</h2><div id=launchdetail style='white-space:pre-wrap;overflow-wrap:anywhere'></div></section>"
   "<div class=card id=games><h2>Installed Games on Xbox</h2><div id=list><span style='color:#9e9699'>loading...</span></div></div>"
   "<div class=card><h2>Epic Games Library</h2><button class=btn onclick='epicLibrary(true)'>Connect Epic account</button>"
   "<div id=epicprompt hidden>Enter <b id=epiccode></b> at <a href='https://www.epicgames.com/activate' target='_blank' rel='noopener'>Epic Games</a>, then "
@@ -1343,6 +1346,7 @@ const char* k_upload_page =
   "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';E('frameperf').textContent='';}}"
+  "async function loadLaunchReport(){try{const r=await fetch('/api/launch-report',{cache:'no-store'});if(!r.ok)return;const text=await r.text();E('launchdetail').textContent=text;E('launchdiag').hidden=!text;}catch{}}"
   "let epicHandle='',epicBusy=false;async function epicLibrary(start){if(epicBusy)return;epicBusy=true;const box=E('epicresult');box.textContent='Contacting Epic…';"
   "try{if(start){epicHandle='';E('epicprompt').hidden=true;}const r=await fetch('/api/epic/library',{method:'POST',headers:{'X-Tiramisu-Epic':'library'},body:start?'':epicHandle});"
   "if(!r.ok)throw Error(await r.text());const j=await r.json();if(start){epicHandle=j.handle;E('epiccode').textContent=j.code;E('epicprompt').hidden=false;box.textContent='';}"
@@ -1410,7 +1414,7 @@ const char* k_upload_page =
   "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
   "E('connurl').textContent=location.href.split('?')[0];"
-  "loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
+  "loadLaunchReport();setInterval(loadLaunchReport,3000);loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
                     std::string* out) {
@@ -2222,6 +2226,18 @@ void handle_client(sock_t s) {
     return;
   }
 #endif
+  if (strcmp(method, "GET") == 0 && url_path == "/api/launch-report") {
+    std::string report;
+    {
+      std::lock_guard<std::mutex> lk(g_mu);
+      if (g_launch_attempt) {
+        report = g_launch_game + " — " + g_launch_stage;
+        if (!g_launch_detail.empty()) report += "\n" + g_launch_detail;
+      }
+    }
+    respond(s, "200 OK", "text/plain; charset=utf-8", report);
+    return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/api/frame-metrics") {
     const auto sample = game_frames().read();
     char data[128];
@@ -3186,6 +3202,20 @@ void webxfer_autopilot_state(std::string* game, int* attempt,
   if (game) *game = g_ap.game;
   if (attempt) *attempt = g_ap.attempt;
   if (result) *result = g_ap.result;
+}
+
+unsigned long long webxfer_begin_launch_report(const std::string& game, const char* stage) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  g_launch_game = game;
+  g_launch_stage = stage;
+  g_launch_detail.clear();
+  return ++g_launch_attempt;
+}
+void webxfer_update_launch_report(unsigned long long attempt, const char* stage, const char* detail) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (attempt != g_launch_attempt) return;
+  g_launch_stage = stage;
+  g_launch_detail = detail;
 }
 
 void webxfer_set_launch_result(const std::string& name, const std::string& result) {

@@ -267,6 +267,15 @@ int main() {
     CHECK(longan::webxfer_poll_launch(&drained) && drained == "HollowDemo",
           "queued launch drains via poll");
 
+    auto old_attempt = longan::webxfer_begin_launch_report("First game", "Opening");
+    auto current = longan::webxfer_begin_launch_report("Second game", "Opening");
+    longan::webxfer_update_launch_report(current, "Import resolution", "winmm.dll!joyGetPos");
+    longan::webxfer_update_launch_report(old_attempt, "Exited", "stale result");
+    std::string report = http_req(port, "GET", "/api/launch-report", "");
+    CHECK(report.find("Second game") != std::string::npos &&
+          report.find("winmm.dll!joyGetPos") != std::string::npos &&
+          report.find("stale result") == std::string::npos,
+          "launch report retains the stage and DLL of the current attempt");
     // the host loop's launch outcome lands in /api/status
     longan::webxfer_set_launch_result("HollowDemo", "started");
     std::string st2 = http_req(port, "GET", "/api/status", "");

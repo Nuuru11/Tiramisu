@@ -1251,6 +1251,7 @@ void log_guest_memory(const char* stage) {
 
 // ---------------- guest launch ----------------
 struct guest_run_result {
+  const char* stage = "Oyun dosyası açılıyor";
   int map_rc;
   char detail[256];
 };
@@ -1259,6 +1260,7 @@ std::jmp_buf g_exit_jmp;
 int g_exit_code = 0;
 u32 g_raise_code = 0;
 DWORD g_guest_tid = 0;
+unsigned long long g_active_launch_attempt = 0;  // Launcher thread only.
 std::atomic<bool> g_guest_stop_req{false};
 std::atomic<u64> g_guest_stop_since{0};
 
@@ -1317,6 +1319,7 @@ void force_kill_guest(const char* reason) {
     ::TerminateThread(g_guest_thread.native_handle(), 1);
   }
   g_guest_thread.join();
+  longan::webxfer_update_launch_report(g_active_launch_attempt, "Oyun zorla durduruldu", reason);
   longan::game_frames().reset(false);
   g_guest_running.store(false);
   longan::webxfer_set_running_game("");
@@ -1702,8 +1705,13 @@ static void apply_bridge_launch_settings() {
 
 guest_run_result run_game(const std::string& name, const std::string& exe,
                           const std::string& game_dir,
-                          const std::string& image = std::string()) {
+                          const std::string& image = std::string(), unsigned long long attempt = 0) {
   guest_run_result r{};
+  auto stage = [&](const char* label) {
+    r.stage = label;
+    if (attempt) longan::webxfer_update_launch_report(attempt, label, "");
+  };
+  stage(r.stage);
   char line[256];
 
   trt_images_reset();
@@ -1959,11 +1967,18 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
      // during mapping; the second read below is a separate buf).
   std::ifstream f(exe_path, std::ios::binary);
   if (!f) {
+    r.map_rc = TRT_ERR_BAD_ARGS;
     snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
     return r;
   }
-  std::vector<u8> buf((std::istreambuf_iterator<char>(f)),
-                      std::istreambuf_iterator<char>());
+  std::vector<u8> buf;
+  try {
+    buf.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+  } catch (const std::bad_alloc&) {
+    r.map_rc = TRT_ERR_ALLOC;
+    snprintf(r.detail, sizeof(r.detail), "Oyun dosyasını okumak için bellek yetersiz.");
+    return r;
+  }
 
   snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
            buf.size());
@@ -1989,6 +2004,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
     // without the attach takes the stock D3D11 path (garbage-HWND
     // swapchain -> AV).
+    stage("Grafik sistemi başlatılıyor (FNA3D)");
     trt_trace("TRACE fna3d attach enter");
     {
       int arc = trt_fna3d_attach_from_hooks(
@@ -2011,6 +2027,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     trt_trace("TRACE PrepareWindowAttributes enter");
     FNA3D_PrepareWindowAttributes();
     trt_trace("TRACE PrepareWindowAttributes ok");
+    stage("Mono oyun ortamı");
     r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
     if (r.map_rc != TRT_OK) {
       strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
@@ -2051,15 +2068,23 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
              buf.size());
     longan::log_line(line);
+    stage("Windows oyun dosyası yükleniyor");
     r.map_rc = trt_map_pe(&be, runtime_rs, buf.data(), buf.size(), &img);
+    if (r.map_rc != TRT_OK) {
+      const char* reason = trt_last_map_error_detail();
+      if (r.map_rc == TRT_ERR_IMPORT) r.stage = "DLL işlevleri yüklenemedi";
+      if (r.map_rc == TRT_ERR_IMPORT && strchr(reason, '!'))
+        snprintf(r.detail, sizeof(r.detail), "Gereken DLL işlevi bulunamadı: %s", reason);
+      else
+        snprintf(r.detail, sizeof(r.detail), "%s", reason[0] ? reason : trt_errstr(r.map_rc));
+    }
   }
   log_guest_memory("after image load");
+  if (r.map_rc != TRT_OK) return r;
+  stage("Bellek izinleri");
+  r.map_rc = trt_seal_image(&be, img);
   if (r.map_rc != TRT_OK) {
-    strncpy(r.detail, trt_errstr(r.map_rc), sizeof(r.detail) - 1);
-    return r;
-  }
-  if (trt_seal_image(&be, img) != TRT_OK) {
-    strncpy(r.detail, "seal failed", sizeof(r.detail) - 1);
+    strncpy(r.detail, trt_last_map_error_detail(), sizeof(r.detail) - 1);
     return r;
   }
   trt_images_register_main(img, exe.c_str());
@@ -2070,16 +2095,19 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     x86_context xctx = {};
     x86_cpu_init(&xctx);
     xctx.log = [](const char* s) { longan::log_line(s); };
+    stage("32 bit oyun kodu çalıştırılıyor");
     int rc = x86_run_pe32(&xctx, img->base, img->size_of_image,
                           img->guest_base, img->entry_rva, 0x00100000, 0x00100000);
     snprintf(r.detail, sizeof(r.detail), "x86 interpreter returned %d", rc);
     x86_mem_free(&xctx);
     return r;
   }
+  stage("Oyunun başlangıç işlevleri çalıştırılıyor");
   for (int i = 0; i < img->tls_callback_count; ++i) {
     trt_call_guest_img((void*)(img->base + img->tls_callback_rvas[i]), img,
                        (u64)(uintptr_t)img->base, 1, 0, 0);
   }
+  stage("Oyun kodu");
   run_guest_trapped(img, r.detail, sizeof(r.detail));
   return r;
 }
@@ -4008,6 +4036,7 @@ struct tiramisu_host
               snprintf(drop, sizeof(drop),
                        "launch %s: game not found on shelf or web list", want.c_str());
               longan::log_line(drop);
+              longan::webxfer_begin_launch_report(want, "Oyun klasörü veya çalıştırılabilir dosya bulunamadı");
               longan::webxfer_set_launch_result(want, "not found");
               longan::host_ap_on_result(want, "not found");
             }
@@ -4069,13 +4098,15 @@ struct tiramisu_host
                          g_host_ap.game.c_str());
                 longan::log_line(ap_msg);
               }
+              const auto attempt = longan::webxfer_begin_launch_report(want, "Başlatma isteği alındı");
+              g_active_launch_attempt = attempt;
               g_running_game_name = want;
               longan::game_frames().reset(true);
               g_guest_running.store(true);
               const std::string exe = ge.exe;
               const std::string gdir = ge.dir;
               const std::string img = ge.image;
-              g_guest_thread = std::thread([want, exe, gdir, img]() {
+              g_guest_thread = std::thread([want, exe, gdir, img, attempt]() {
                 // the guest main thread's stack reserve is VA for its
                 // lifetime (1 MB Windows default) — charge it here, where
                 // the thread is created, and discharge it in the tail
@@ -4083,7 +4114,9 @@ struct tiramisu_host
                 // force-kill path resets the whole budget instead)
                 const bool stack_charged =
                     trt_mem_budget_charge_va(1024ull * 1024ull) == 0;
-                const auto gr = run_game(want, exe, gdir, img);
+                const auto gr = run_game(want, exe, gdir, img, attempt);
+                longan::webxfer_update_launch_report(attempt, gr.stage,
+                    gr.detail[0] ? gr.detail : trt_errstr(gr.map_rc));
                 char line[192];
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);

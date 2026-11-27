@@ -109,6 +109,8 @@ void  trt_guest_tls_bind_host_slots(void** host_tls, void** guest_tls);
 // M7 Phase 1: a PE32 file (machine 0x014c, magic 0x10b) routes to
 // trt_map_pe32 automatically; anything else that is neither PE64 nor PE32
 // fails TRT_ERR_NOT_PE64.
+// Detail for a failed trt_map_pe on the calling thread.
+const char* trt_last_map_error_detail(void);
 int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                 const u8* file, size_t file_size, trt_image** out);
 

@@ -544,8 +544,12 @@ extern "C" void* trt_pe32_trap_host_fn(int index) {
   return g_pe32_traps[(size_t)index].host_fn;
 }
 
+static thread_local char map_error_detail[256];
+extern "C" const char* trt_last_map_error_detail(void) { return map_error_detail; }
+
 // fail: record stage detail, release mapping, return error code
 int fail(trt_image* img, const trt_backend* be, int code, const char* detail) {
+  snprintf(map_error_detail, sizeof(map_error_detail), "%s", detail ? detail : "");
   if (detail && img) {
     strncpy(img->last_detail, detail, sizeof(img->last_detail) - 1);
     img->last_detail[sizeof(img->last_detail) - 1] = 0;
@@ -572,6 +576,7 @@ unsigned section_prot(bool exec) { return exec ? (TRT_PROT_R | TRT_PROT_X)
 extern "C" const char* trt_errstr(int code) {
   switch (code) {
     case TRT_OK: return "OK";
+    case TRT_ERR_BAD_ARGS: return "Invalid input or incomplete executable";
     case TRT_ERR_BAD_DOS: return "BAD_DOS (not MZ / e_lfanew out of file)";
     case TRT_ERR_BAD_PE: return "BAD_PE (no PE signature)";
     case TRT_ERR_NOT_PE64: return "NOT_PE64 (machine/magic mismatch: neither PE64 (0x8664/0x020b) nor PE32 (0x014c/0x010b))";
@@ -595,6 +600,7 @@ extern "C" const char* trt_errstr(int code) {
 
 extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
                            const u8* file, size_t file_size, trt_image** out) {
+  map_error_detail[0] = 0;
   if (!be || !rs || !file || !out || file_size < sizeof(trt_dos_header))
     return TRT_ERR_BAD_ARGS;
   *out = nullptr;
@@ -841,8 +847,8 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
         void* fn = rs->resolve(rs->user, mod_name, sym_name, ordinal);
         if (!fn) {
           char det[224];
-          snprintf(det, sizeof(det), "%s!%s", mod_name,
-                   sym_name ? sym_name : "#ordinal");
+          if (sym_name) snprintf(det, sizeof(det), "%s!%s", mod_name, sym_name);
+          else snprintf(det, sizeof(det), "%s!#%u", mod_name, (unsigned)ordinal);
           return fail(&img, be, TRT_ERR_IMPORT, det);
         }
         memcpy(img.base + t, &fn, 8);  // bind IAT

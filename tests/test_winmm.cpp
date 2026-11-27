@@ -130,6 +130,14 @@ int main(int argc, char** argv) {
   trt_resolver rs;
   trt_resolver_default(&rs);
   trt_image* img = nullptr;
+  trt_resolver missing{&rs, [](void* user, const char* dll, const char* symbol, u16 ordinal) -> void* {
+    if (symbol && strcmp(symbol, "joyGetPos") == 0) return nullptr;
+    auto* real = static_cast<trt_resolver*>(user);
+    return real->resolve(real->user, dll, symbol, ordinal);
+  }};
+  CHECK(trt_map_pe(&be, &missing, file, size, &img) == TRT_ERR_IMPORT &&
+        strstr(trt_last_map_error_detail(), "!joyGetPos") != nullptr,
+        "failed binding preserves the exact import for the launch report");
   const int rc = trt_map_pe(&be, &rs, file, size, &img);
   CHECK(rc == TRT_OK, "guest PE maps (winmm bound)");
   if (rc != TRT_OK || !img) {
