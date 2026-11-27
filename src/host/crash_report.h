@@ -12,6 +12,7 @@
 #define TIRAMISU_HOST_CRASH_REPORT_H
 
 #include <string>
+#include <vector>
 
 namespace longan {
 
@@ -33,6 +34,7 @@ std::string crash_report_write(const std::string& local_state,
                                const crash_report_input& in, int keep = 8);
 
 // Number of report-*.txt files present (offline tests use it).
+std::vector<int> crash_report_ids(const std::string& local_state);  // newest first
 int crash_report_count(const std::string& local_state);
 
 // Delete all but the newest `keep` reports. Returns the number removed.

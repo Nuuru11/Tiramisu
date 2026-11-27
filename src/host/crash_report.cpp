@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -27,20 +29,9 @@ constexpr const char* k_sep = "/";
 #endif
 
 bool make_dirs(const std::string& path) {
-  if (path.empty()) return false;
-  std::string sofar;
-  for (size_t i = 0; i <= path.size(); ++i) {
-    const bool end = (i == path.size());
-    if (!end && path[i] != '/' && path[i] != '\\') continue;
-    sofar = path.substr(0, i);
-    if (sofar.empty()) continue;
-#if defined(_WIN32)
-    if (_mkdir(sofar.c_str()) != 0 && errno != EEXIST) return false;
-#else
-    if (mkdir(sofar.c_str(), 0755) != 0 && errno != EEXIST) return false;
-#endif
-  }
-  return true;
+  std::error_code ec;
+  std::filesystem::create_directories(path, ec);
+  return !ec;
 }
 
 // Report file names are report-<n>.txt with n starting at 1; -1 for anything
@@ -49,6 +40,7 @@ int report_index(const std::string& name) {
   if (name.size() < 12) return -1;
   if (name.compare(0, 7, "report-") != 0) return -1;
   if (name.compare(name.size() - 4, 4, ".txt") != 0) return -1;
+  if (name[7] == '0') return -1;
   int n = 0;
   for (size_t i = 7; i + 4 < name.size(); ++i) {
     if (name[i] < '0' || name[i] > '9') return -1;
@@ -66,6 +58,7 @@ std::vector<int> report_indices(const std::string& dir) {
   intptr_t h = _findfirst(pattern.c_str(), &fd);
   if (h == -1) return out;
   do {
+    if (fd.attrib & _A_SUBDIR) continue;
     const int n = report_index(fd.name);
     if (n > 0) out.push_back(n);
   } while (_findnext(h, &fd) == 0);
@@ -75,7 +68,10 @@ std::vector<int> report_indices(const std::string& dir) {
   if (!d) return out;
   while (struct dirent* e = readdir(d)) {
     const int n = report_index(e->d_name);
-    if (n > 0) out.push_back(n);
+    if (n <= 0) continue;
+    struct stat info{};
+    if (lstat((dir + k_sep + e->d_name).c_str(), &info) == 0 && S_ISREG(info.st_mode))
+      out.push_back(n);
   }
   closedir(d);
 #endif
@@ -114,6 +110,10 @@ std::string crash_report_dir(const std::string& local_state) {
 
 std::string crash_report_write(const std::string& local_state,
                                const crash_report_input& in, int keep) {
+  // A second fault must not truncate a report while it is being published.
+  static std::mutex writer;
+  std::unique_lock<std::mutex> lock(writer, std::try_to_lock);
+  if (!lock.owns_lock()) return {};
   const std::string dir = crash_report_dir(local_state);
   if (dir.empty()) return std::string();
   if (!make_dirs(dir)) return std::string();
@@ -129,16 +129,24 @@ std::string crash_report_write(const std::string& local_state,
   section(&text, "shader census", in.census_json, "(no shaders translated)");
   section(&text, "log tail", in.log_tail, "(log unavailable)");
 
-  FILE* f = fopen(path.c_str(), "wb");
+  const std::string tmp = path + ".tmp";
+  FILE* f = fopen(tmp.c_str(), "wb");
   if (!f) return std::string();
   const size_t wrote = fwrite(text.data(), 1, text.size(), f);
   const bool closed = fclose(f) == 0;
-  if (!closed || wrote != text.size()) {
-    remove(path.c_str());
+  if (!closed || wrote != text.size() || rename(tmp.c_str(), path.c_str()) != 0) {
+    remove(tmp.c_str());
     return std::string();
   }
   crash_report_trim(local_state, keep);
   return path;
+}
+
+std::vector<int> crash_report_ids(const std::string& local_state) {
+  if (local_state.empty()) return {};
+  auto ids = report_indices(crash_report_dir(local_state));
+  std::reverse(ids.begin(), ids.end());
+  return ids;
 }
 
 int crash_report_count(const std::string& local_state) {

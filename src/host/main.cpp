@@ -3239,6 +3239,7 @@ struct tiramisu_host
     while (!g_shutdown.load()) {
       if (std::chrono::steady_clock::now() >= next_queue_tick) {
         next_queue_tick = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        longan::webxfer_checkpoint_launch_report();
         longan::steam_queue_pump([]{g_steam_needs_rescan.store(true);});
       }
       // Heartbeat (item 10): a line every 60 s so a wedged app is
@@ -4039,6 +4040,7 @@ struct tiramisu_host
                        "launch %s: game not found on shelf or web list", want.c_str());
               longan::log_line(drop);
               longan::webxfer_begin_launch_report(want, "Oyun klasörü veya çalıştırılabilir dosya bulunamadı");
+              longan::webxfer_checkpoint_launch_report();
               longan::webxfer_set_launch_result(want, "not found");
               longan::host_ap_on_result(want, "not found");
             }
@@ -4104,6 +4106,7 @@ struct tiramisu_host
                 try { return winrt::Windows::System::MemoryManager::AppMemoryUsage() >> 20; }
                 catch (...) { return -1; }
               });
+              longan::webxfer_checkpoint_launch_report();
               g_active_launch_attempt = attempt;
               g_running_game_name = want;
               g_guest_running.store(true);

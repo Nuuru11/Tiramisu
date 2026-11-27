@@ -4,6 +4,7 @@
 // path traversal rejection, per-game config persistence, launch/stop/rescan/delete,
 // Expect: 100-continue handling, and live log tailing.
 #include "../src/host/webxfer.h"
+#include "../src/host/crash_report.h"
 #include "../src/host/host_log.h"
 #include "../src/host/vendor/miniz.h"
 
@@ -142,6 +143,28 @@ int main() {
   const unsigned short port = longan::webxfer_port();
   CHECK(!url.empty() && url.rfind("http://", 0) == 0 && port > 0,
         "webxfer_start_port bound OS ephemeral port cleanly");
+
+  {
+    CHECK(http_req(port, "GET", "/api/error-reports/launch.txt", "").find("404 Not Found") != std::string::npos,
+          "empty installation has no launch attachment");
+    longan::crash_report_input crash;
+    crash.reason = "guest fault 0xc0000005";
+    const auto first = longan::crash_report_write(root, crash);
+    crash.reason = "second guest fault";
+    longan::crash_report_write(root, crash);
+    const auto list = http_req(port, "GET", "/api/error-reports", "");
+    CHECK(list.find("\r\n\r\n[2,1]") != std::string::npos, "crash reports listed newest first");
+    const auto file = http_req(port, "GET", "/api/error-reports/report-1.txt", "");
+    CHECK(file.find("Content-Disposition: attachment; filename=\"tiramisu-crash-1.txt\"") != std::string::npos &&
+          file.substr(file.find("\r\n\r\n")+4) == read_str_file(first),
+          "download carries the selected saved report intact");
+    CHECK(http_req(port, "GET", "/api/error-reports/report-3.txt", "").find("404 Not Found") != std::string::npos &&
+          http_req(port, "GET", "/api/error-reports/../settings.ini", "").find("200 OK") == std::string::npos,
+          "missing reports and other files cannot be downloaded as reports");
+    http_req(port, "POST", "/api/settings", R"({"crash_report":true})");
+    CHECK(http_req(port, "GET", "/api/settings", "").find("\"crash_report\":true") != std::string::npos,
+          "dashboard can enable local crash capture");
+  }
 
   // 3. Dashboard HTML + API logs
   {
@@ -287,6 +310,12 @@ int main() {
           report.find("winmm.dll!joyGetPos") != std::string::npos &&
           report.find("stale result") == std::string::npos,
           "launch report retains the stage and DLL of the current attempt");
+    const auto live = http_req(port, "GET", "/api/error-reports/launch.txt", "");
+    longan::webxfer_checkpoint_launch_report();
+    CHECK(live.find("Content-Disposition: attachment; filename=\"tiramisu-launch.txt\"") != std::string::npos &&
+          read_str_file(root + "/last-launch.txt") == live.substr(live.find("\r\n\r\n")+4) &&
+          live.find("winmm.dll!joyGetPos") != std::string::npos,
+          "checkpoint preserves the downloadable launch diagnostic");
     // the host loop's launch outcome lands in /api/status
     longan::webxfer_set_launch_result("HollowDemo", "started");
     std::string st2 = http_req(port, "GET", "/api/status", "");
@@ -514,6 +543,16 @@ int main() {
           "named stopping point persisted in attempt history");
   }
 
+  longan::webxfer_shutdown();
+  // Open an empty state and then reopen this one, to force a disk reload.
+  const auto empty = root + "/other";
+  mkdir(empty.c_str(), 0755);
+  longan::webxfer_start_port(empty, 0);
+  CHECK(http_req(longan::webxfer_port(), "GET", "/api/error-reports/launch.txt", "").find("404 Not Found") != std::string::npos,
+        "another state directory cannot see the old launch report");
+  longan::webxfer_start_port(root, 0);
+  CHECK(http_req(longan::webxfer_port(), "GET", "/api/error-reports/launch.txt", "").find("winmm.dll!joyGetPos") != std::string::npos,
+        "saved report available on reopening the Xbox state directory");
   longan::webxfer_shutdown();
   std::string cmd = "rm -rf " + root;
   (void)system(cmd.c_str());

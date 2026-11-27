@@ -23,6 +23,10 @@
 #define TRT_ACTIONS_RUN_ID 0ULL
 #endif
 #include "frame_metrics.h"
+#include "crash_report.h"
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include "epic_install.h"
 #include "../trt/limbus_report.h"
 #include "web_controls_page.h"
@@ -190,7 +194,8 @@ void reset_web_controls() {
 
 std::string g_local_state_dir;
 unsigned long long g_launch_attempt = 0;
-std::string g_launch_game, g_launch_stage, g_launch_detail;
+std::string g_launch_game, g_launch_stage, g_launch_detail, g_launch_started;
+std::string g_saved_launch;
 std::string g_games_dir;
 std::string g_incoming;
 
@@ -1017,6 +1022,43 @@ bool restore_saves_zip(const std::string& zip_path, const std::string& root,
 
 void send_all(sock_t s, const char* data, size_t len);
 
+std::string launch_report_locked() {
+  if (!g_launch_attempt) return g_saved_launch;
+  std::string report = g_launch_game + " — " + g_launch_stage;
+  if (!g_launch_detail.empty()) report += "\n" + g_launch_detail;
+  const auto sample = game_frames().launch_info();
+  report += "\nDX12 device: ";
+  if (sample.dx_created) report += "created";
+  else if (sample.dx_attempted) {
+    char hr[32];
+    snprintf(hr, sizeof(hr), "failed (0x%08X)", static_cast<unsigned>(sample.dx_result));
+    report += hr;
+  } else report += "creation not observed";
+  report += "\nFirst guest Present: ";
+  report += sample.first_ms < 0 ? "not observed" : std::to_string(sample.first_ms) + " ms after launch";
+  if (sample.width && sample.height)
+    report += "\nDXGI backbuffer: " + std::to_string(sample.width) + " x " + std::to_string(sample.height);
+  if (sample.first_memory_mib >= 0)
+    report += "\nApp memory at first frame: " + std::to_string(sample.first_memory_mib) + " MiB";
+  else if (sample.last_memory_mib >= 0)
+    report += "\nLast app memory sample: " + std::to_string(sample.last_memory_mib) + " MiB";
+  report += "\nBaşlatma (UTC): " + g_launch_started;
+  return report;
+}
+
+std::string latest_launch_report() {
+  std::lock_guard<std::mutex> lock(g_mu);
+  return launch_report_locked();
+}
+
+void text_download_header(sock_t s, const std::string& name, uint64_t bytes) {
+  const std::string header = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n"
+      "Content-Disposition: attachment; filename=\"" + name + "\"\r\n"
+      "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nContent-Length: " +
+      std::to_string(bytes) + "\r\nConnection: close\r\n\r\n";
+  send_all(s, header.data(), header.size());
+}
+
 void send_temp_zip_download(sock_t s, const std::string& zip_path,
                             const char* dl_name) {
   FILE* f = fopen(zip_path.c_str(), "rb");
@@ -1164,6 +1206,7 @@ const char* k_upload_page =
   ".conn-info{flex:1;min-width:220px}"
   ".conn-url{font-size:18px;font-weight:700;color:#cbbab5;word-break:break-all}"
   ".conn-sub{font-size:13px;color:#9e9699;margin-top:6px}"
+  "#launchdiag .btn{display:inline-flex;align-items:center;text-decoration:none}#launchdetail,#crashfiles{margin:10px 0}"
   ".setrow{display:grid;grid-template-columns:1fr 220px;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(255,255,255,.08)}"
   ".setrow label{font-size:14px;color:#f6f3f2}.setrow input,.setrow select{width:100%}"
   "@media(max-width:560px){.setrow{grid-template-columns:1fr}}"
@@ -1175,7 +1218,7 @@ const char* k_upload_page =
   "<div class=row><button class='btn btn-sec' onclick=rescan()>Rescan</button>"
   "<button class='btn btn-danger' onclick=stopGame()>Stop Game</button></div></header>"
   "<nav aria-label=Companion><a href='#transfer'>Transfer</a><a href='#games'>Games</a>"
-  "<a href='#steam'>Steam</a><a href='#support'>Saves &amp; Support</a><a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
+  "<a href='#steam'>Steam</a><a href='#launchdiag'>Hata raporları</a><a href='#support'>Saves &amp; Support</a><a href='#settings'>Settings</a><a href='#console-logs'>Logs</a></nav>"
   "<div class=card><h2>Console connection &amp; QR</h2>"
   "<div class=connect><div id=qrx><img src='/api/qr.svg' alt='LAN QR Code' onerror=\"this.style.display='none'\"></div>"
   "<div class=conn-info><div class=conn-url id=connurl>—</div>"
@@ -1198,7 +1241,7 @@ const char* k_upload_page =
   "<button class='btn btn-sec' onclick=downloadFromUrl()>Download on Xbox</button></div>"
   "<div id=bar><div id=fill></div></div>"
   "<div id=log role=status style='font-size:13px;color:#d5cecc;min-height:18px'>Ready over LAN</div></div>"
-  "<section class=card id=launchdiag hidden><h2>Son oyun başlatması</h2><div id=launchdetail style='white-space:pre-wrap;overflow-wrap:anywhere'></div></section>"
+  "<section class=card id=launchdiag><h2>Xbox hata raporları</h2><div id=launchdetail style='white-space:pre-wrap;overflow-wrap:anywhere'></div><div id=launchsave hidden><a class=btn href='/api/error-reports/launch.txt' download='tiramisu-launch.txt'>Başlatma raporunu indir (.txt)</a></div><div class=row id=crashfiles></div><a href='#settings'>Çökme kaydı ayarları</a></section>"
   "<div class=card id=games><h2>Installed Games on Xbox</h2><div id=list><span style='color:#9e9699'>loading...</span></div></div>"
   "<div class=card><h2>Epic Games Library</h2><button class=btn onclick='epicLibrary(true)'>Connect Epic account</button>"
   "<div id=epicprompt hidden>Enter <b id=epiccode></b> at <a href='https://www.epicgames.com/activate' target='_blank' rel='noopener'>Epic Games</a>, then "
@@ -1354,7 +1397,11 @@ const char* k_upload_page =
   "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS'+(f.mean_ms>=0?' · '+f.mean_ms.toFixed(1)+' ms/frame':'')+' · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';E('frameperf').textContent='';}}"
-  "async function loadLaunchReport(){try{const r=await fetch('/api/launch-report',{cache:'no-store'});if(!r.ok)return;const text=await r.text();E('launchdetail').textContent=text;E('launchdiag').hidden=!text;}catch{}}"
+  "async function loadCrashFiles(){const box=E('crashfiles');try{const r=await fetch('/api/error-reports',{cache:'no-store'});if(!r.ok)throw Error();"
+  "const ids=await r.json();box.replaceChildren();if(!ids.length){box.textContent='Kayıtlı çökme raporu yok.';return;}"
+  "for(const id of ids){const a=document.createElement('a');a.className='btn btn-sec';a.href='/api/error-reports/report-'+id+'.txt';"
+  "a.download='tiramisu-crash-'+id+'.txt';a.textContent='Çökme raporu #'+id+' indir';box.appendChild(a);}}catch{box.textContent='Çökme raporları yüklenemedi.';}}"
+  "async function loadLaunchReport(){try{const r=await fetch('/api/launch-report',{cache:'no-store'});if(!r.ok)return;const text=await r.text();E('launchdetail').textContent=text;E('launchsave').hidden=!text;}catch{}}"
   "let epicHandle='',epicBusy=false;async function epicLibrary(start){if(epicBusy)return;epicBusy=true;const box=E('epicresult');box.textContent='Contacting Epic…';"
   "try{if(start){epicHandle='';E('epicprompt').hidden=true;}const r=await fetch('/api/epic/library',{method:'POST',headers:{'X-Tiramisu-Epic':'library'},body:start?'':epicHandle});"
   "if(!r.ok)throw Error(await r.text());const j=await r.json();if(start){epicHandle=j.handle;E('epiccode').textContent=j.code;E('epicprompt').hidden=false;box.textContent='';}"
@@ -1436,6 +1483,7 @@ const char* k_upload_page =
   "['memory_budget_mb','Memory budget MB (1024-8192)','int',null],"
   "['input_deadzone','Controller deadzone % (0-50)','int',null],"
   "['audio_buffer_ms','Audio buffer ms (10-50)','int',null],"
+  "['crash_report','Çökme raporlarını Xbox’ta sakla','bool',null],"
   "['shader_cache','Shader compile cache','bool',null],"
   "['log_lines','Dashboard log tail lines (4-40)','int',null]];"
   "async function loadSettings(){"
@@ -1451,7 +1499,7 @@ const char* k_upload_page =
   "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
   "E('connurl').textContent=location.href.split('?')[0];"
-  "refreshQueue();setInterval(refreshQueue,4000);loadLaunchReport();setInterval(loadLaunchReport,3000);loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
+  "loadCrashFiles();setInterval(loadCrashFiles,10000);refreshQueue();setInterval(refreshQueue,4000);loadLaunchReport();setInterval(loadLaunchReport,3000);loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
                     std::string* out) {
@@ -2291,31 +2339,44 @@ void handle_client(sock_t s) {
     respond(s, "200 OK", "text/plain", std::to_string(TRT_ACTIONS_RUN_ID)); return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/launch-report") {
-    std::string report;
-    {
-      std::lock_guard<std::mutex> lk(g_mu);
-      if (g_launch_attempt) {
-        report = g_launch_game + " — " + g_launch_stage;
-        if (!g_launch_detail.empty()) report += "\n" + g_launch_detail;
-        const auto sample = game_frames().launch_info();
-        report += "\nDX12 device: ";
-        if (sample.dx_created) report += "created";
-        else if (sample.dx_attempted) {
-          char hr[32];
-          snprintf(hr, sizeof(hr), "failed (0x%08X)", static_cast<unsigned>(sample.dx_result));
-          report += hr;
-        } else report += "creation not observed";
-        report += "\nFirst guest Present: ";
-        report += sample.first_ms < 0 ? "not observed" : std::to_string(sample.first_ms) + " ms after launch";
-        if (sample.width && sample.height)
-          report += "\nDXGI backbuffer: " + std::to_string(sample.width) + " x " + std::to_string(sample.height);
-        if (sample.first_memory_mib >= 0)
-          report += "\nApp memory at first frame: " + std::to_string(sample.first_memory_mib) + " MiB";
-        else if (sample.last_memory_mib >= 0)
-          report += "\nLast app memory sample: " + std::to_string(sample.last_memory_mib) + " MiB";
+    const std::string report = latest_launch_report();
+    respond(s, "200 OK", "text/plain; charset=utf-8", report);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/error-reports") {
+    std::string ids = "[";
+    for (int id : crash_report_ids(g_local_state_dir)) {
+      if (ids.size() > 1) ids += ",";
+      ids += std::to_string(id);
+    }
+    respond(s, "200 OK", "application/json", ids + "]");
+    return;
+  }
+  const std::string report_prefix = "/api/error-reports/";
+  if (strcmp(method, "GET") == 0 && url_path.rfind(report_prefix, 0) == 0) {
+    const std::string requested = url_path.substr(report_prefix.size());
+    if (requested == "launch.txt") {
+      const auto report = latest_launch_report();
+      if (!report.empty()) {
+        text_download_header(s, "tiramisu-launch.txt", report.size());
+        send_all(s, report.data(), report.size());
+        return;
+      }
+    } else {
+      for (int id : crash_report_ids(g_local_state_dir)) {
+        const std::string name = "report-" + std::to_string(id) + ".txt";
+        if (requested != name) continue;
+        std::ifstream in(std::filesystem::path(crash_report_dir(g_local_state_dir)) / name,
+                         std::ios::binary | std::ios::ate);
+        const std::streamoff size = in.tellg();
+        if (size < 0 || !in.seekg(0)) break;
+        text_download_header(s, "tiramisu-crash-" + std::to_string(id) + ".txt", size);
+        char buf[16384];
+        while (in.read(buf, sizeof(buf)) || in.gcount()) send_all(s, buf, in.gcount());
+        return;
       }
     }
-    respond(s, "200 OK", "text/plain; charset=utf-8", report);
+    respond(s, "404 Not Found", "text/plain; charset=utf-8", "Rapor bulunamadı.");
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/frame-metrics") {
@@ -2933,10 +2994,10 @@ void handle_client(sock_t s) {
     j += sbuf;
     snprintf(sbuf, sizeof(sbuf),
              "\"write_watch\":%s,\"steam_auth\":%s,\"show_qr\":%s,"
-             "\"log_lines\":%d}",
+             "\"crash_report\":%s,\"log_lines\":%d}",
              s_set.write_watch ? "true" : "false",
              s_set.steam_auth ? "true" : "false",
-             s_set.show_qr ? "true" : "false", s_set.log_lines);
+             s_set.show_qr ? "true" : "false", s_set.crash_report ? "true" : "false", s_set.log_lines);
     j += sbuf;
     respond(s, "200 OK", "application/json", j);
     return;
@@ -2971,6 +3032,7 @@ void handle_client(sock_t s) {
     get_bool("write_watch", &st.write_watch);
     get_bool("steam_auth", &st.steam_auth);
     get_bool("show_qr", &st.show_qr);
+    get_bool("crash_report", &st.crash_report);
     get_int("mouse_speed", &st.mouse_speed);
     get_int("wheel_speed", &st.wheel_speed);
     get_int("os_major", &st.os_major);
@@ -3171,6 +3233,16 @@ std::string webxfer_start_port(const std::string& local_state, unsigned short po
     std::lock_guard<std::mutex> lk(g_mu);
     g = webxfer_state{};
     reset_web_controls();
+    if (g_local_state_dir != local_state || !g_launch_attempt) {
+      g_launch_attempt = 0;
+      g_saved_launch.clear();
+      std::ifstream saved(std::filesystem::path(local_state) / "last-launch.txt", std::ios::binary | std::ios::ate);
+      const auto bytes = saved.tellg();
+      if (bytes > 0 && bytes <= 65536 && saved.seekg(0)) {
+        g_saved_launch.resize(static_cast<size_t>(bytes));
+        if (!saved.read(g_saved_launch.data(), bytes)) g_saved_launch.clear();
+      }
+    }
     g_local_state_dir = local_state;
     const std::string sep(1, XFER_SEP);
     g_games_dir = local_state + sep + "games";
@@ -3308,11 +3380,48 @@ unsigned long long webxfer_begin_launch_report(const std::string& game, const ch
     long long (*memory_mib)()) {
   std::lock_guard<std::mutex> lk(g_mu);
   game_frames().begin_report(memory_mib);
+  std::time_t t = std::time(nullptr);
+  std::tm utc{};
+#ifdef _WIN32
+  gmtime_s(&utc, &t);
+#else
+  gmtime_r(&t, &utc);
+#endif
+  char timestamp[32]{};
+  std::strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", &utc);
+  g_launch_started = timestamp;
   g_launch_game = game;
   g_launch_stage = stage;
   g_launch_detail.clear();
   return ++g_launch_attempt;
 }
+// The host UI thread is the only writer. Never do disk I/O on the guest
+// fault path or hold the dashboard mutex while the filesystem is busy.
+void webxfer_checkpoint_launch_report() {
+  std::string snapshot;
+  std::filesystem::path dest;
+  {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (!g_launch_attempt || g_local_state_dir.empty()) return;
+    snapshot = launch_report_locked();
+    if (snapshot == g_saved_launch) return;
+    dest = std::filesystem::path(g_local_state_dir) / "last-launch.txt";
+  }
+  auto tmp = dest;
+  tmp += ".tmp";
+  std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+  out << snapshot;
+  out.close();
+  std::error_code ec;
+  if (out) std::filesystem::rename(tmp, dest, ec);
+  if (!out || ec) {
+    std::filesystem::remove(tmp, ec);
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_mu);
+  g_saved_launch = std::move(snapshot);
+}
+
 void webxfer_update_launch_report(unsigned long long attempt, const char* stage, const char* detail) {
   std::lock_guard<std::mutex> lk(g_mu);
   if (attempt != g_launch_attempt) return;

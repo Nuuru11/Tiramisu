@@ -738,7 +738,7 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 "$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_tinfl.c -o "$out/wx_miniz_tinfl.o"
 "$CLANG" -O2 -Wall -fno-pie -c src/host/vendor/miniz_zip.c -o "$out/wx_miniz_zip.o"
 clang++ -std=c++20 -O2 -Wall -no-pie \
-  tests/test_webxfer.cpp src/host/webxfer.cpp src/host/settings.cpp \
+  tests/test_webxfer.cpp src/host/webxfer.cpp src/host/settings.cpp src/host/crash_report.cpp \
   "$out/wx_miniz.o" "$out/wx_miniz_tdef.o" "$out/wx_miniz_tinfl.o" "$out/wx_miniz_zip.o" \
   -lpthread -o "$out/test_webxfer"
 "$out/test_webxfer"
