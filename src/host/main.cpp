@@ -8,6 +8,7 @@
 #include "../trt/limbus_report.h"
 #include "epic_install.h"
 #include "frame_metrics.h"
+#include "game_video.h"
 #include "host_log.h"
 #include "audio.h"
 #include "boot_anim.h"
@@ -1716,7 +1717,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
 
   trt_images_reset();
   trt_backend be{&uwp_alloc,     &uwp_protect,        &uwp_release,
-                 &uwp_log,       &uwp_register_unwind};
+                 &uwp_log,       &uwp_register_unwind, 1 /* VirtualAllocFromApp zero fills */};
   trt_set_vmem_hooks(&uwp_reserve, &uwp_commit, &uwp_decommit);
   trt_bridge_boot(&be);
   trt_bridge_register_kernel32();
@@ -1775,6 +1776,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   {
     const std::string titles_dir = g_local_state + "\\profiles";
     const int stub = longan::settings_write_profile_stub(titles_dir, name);
+    longan::game_video::load(game_dir);
     const int prof = longan::settings_load_profile(game_dir, titles_dir);
     // A per-title profile may flip fsb_decode or the quality tier, so the
     // bridge knobs are re-pushed after the profile lands.
@@ -1962,114 +1964,97 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   trt_runtime_init(&be, exe_dir.c_str());
   trt_resolver* runtime_rs = trt_runtime_resolver();
 
-  {  // scope the first exe read: buf dies after the managed check
-     // (saves 409MB persistent + the 409MB transient double-buffer
-     // during mapping; the second read below is a separate buf).
-  std::ifstream f(exe_path, std::ios::binary);
-  if (!f) {
-    r.map_rc = TRT_ERR_BAD_ARGS;
-    snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
-    return r;
-  }
-  std::vector<u8> buf;
-  try {
-    buf.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-  } catch (const std::bad_alloc&) {
-    r.map_rc = TRT_ERR_ALLOC;
-    snprintf(r.detail, sizeof(r.detail), "Oyun dosyasını okumak için bellek yetersiz.");
-    return r;
-  }
-
-  snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
-           buf.size());
-  longan::log_line(line);
-
-  // Managed (.NET) games don't go through the native PE loader: their
-  // entry point is mscoree!_CorExeMain and their code is IL. Route them
-  // to the embedded Mono runtime instead (Path B). On UWP this fails
-  // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
-  // offline it runs the game under Mono + the FNA stack.
-  if (trt_pe_is_managed(buf.data(), buf.size())) {
-    longan::log_line("trt: managed exe detected, routing to Mono");
-    trt_mono_config mcfg = {};
-    mcfg.exe_path = exe_path.c_str();
-    mcfg.log = [](const char* l) { longan::log_line(l); };
-    // Console managed games use the Tiramisu FNA backend (host
-    // CoreWindow + host input), never SDL.
-    mcfg.fna_platform = "tiramisu";
-    // FNA3D device handoff (Celeste hang fix): the Tiramisu backend
-    // never calls FNA3D_PrepareWindowAttributes, so selectedDriver
-    // stays -1 and FNA3D_CreateDevice returns NULL (silent no-render
-    // spin). Attach the host D3D device + install FNA3D log hooks,
-    // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
-    // without the attach takes the stock D3D11 path (garbage-HWND
-    // swapchain -> AV).
-    stage("Grafik sistemi başlatılıyor (FNA3D)");
-    trt_trace("TRACE fna3d attach enter");
-    {
-      int arc = trt_fna3d_attach_from_hooks(
-          [](const char* l) { longan::log_line(l); });
-      char ab[128];
-      snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
-               arc, trt_fna3d_is_attached());
-      trt_trace(ab);
-      if (!trt_fna3d_is_attached()) {
-        // FATAL guard: a failed attach must stop the launch here. Without
-        // it, PrepareWindowAttributes takes the stock D3D11 probe path
-        // (which succeeds on UWP) and CreateDevice builds a swapchain
-        // against a garbage window handle -> NULL deref AV.
-        longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
-        r.map_rc = TRT_ERR_FNA3D;
-        strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
-        return r;
-      }
-    }
-    trt_trace("TRACE PrepareWindowAttributes enter");
-    FNA3D_PrepareWindowAttributes();
-    trt_trace("TRACE PrepareWindowAttributes ok");
-    stage("Mono oyun ortamı");
-    r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
-    if (r.map_rc != TRT_OK) {
-      strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
-    }
-    return r;
-  }
-  }  // end scoped first-read block; the 409MB buf is freed before the native map
-
   trt_image* img = nullptr;
   {
-    std::ifstream f(exe_path, std::ios::binary | std::ios::ate);
-    if (!f) {
+    // The PE parser reads the original file without modifying it. Let Windows
+    // page it in as needed while it creates the separate guest mapping.
+    const std::filesystem::path file_path(exe_path);
+    winrt::file_handle input(CreateFile2(file_path.c_str(), GENERIC_READ,
+                                        FILE_SHARE_READ, OPEN_EXISTING, nullptr));
+    LARGE_INTEGER length{};
+    if (!input || !GetFileSizeEx(input.get(), &length) || length.QuadPart <= 0) {
       r.map_rc = TRT_ERR_BAD_ARGS;
-      snprintf(r.detail, sizeof(r.detail), "cannot open %s", exe_path.c_str());
+      snprintf(r.detail, sizeof(r.detail), "Cannot open game executable");
       return r;
     }
-    const std::streamoff size = f.tellg();
-    if (size <= 0 || !f.seekg(0)) {
-      r.map_rc = TRT_ERR_BAD_ARGS;
-      snprintf(r.detail, sizeof(r.detail), "cannot size guest executable");
+    const size_t size = static_cast<size_t>(length.QuadPart);
+    winrt::handle mapping(CreateFileMappingFromApp(input.get(), nullptr, PAGE_READONLY, 0, nullptr));
+    std::unique_ptr<const void, decltype(&UnmapViewOfFile)> view(
+        mapping ? MapViewOfFileFromApp(mapping.get(), FILE_MAP_READ, 0, 0) : nullptr,
+        &UnmapViewOfFile);
+    std::vector<u8> fallback;
+    const u8* data = static_cast<const u8*>(view.get());
+    if (!data) {
+      std::ifstream source(file_path, std::ios::binary);
+      try { fallback.resize(size); }
+      catch (const std::bad_alloc&) {
+        r.map_rc = TRT_ERR_ALLOC;
+        snprintf(r.detail, sizeof(r.detail), "Insufficient memory to read game executable");
+        return r;
+      }
+      if (!source.read(reinterpret_cast<char*>(fallback.data()), size)) {
+        r.map_rc = TRT_ERR_BAD_ARGS;
+        snprintf(r.detail, sizeof(r.detail), "Cannot read game executable");
+        return r;
+      }
+      data = fallback.data();
+    }
+    // Managed (.NET) games don't go through the native PE loader: their
+    // entry point is mscoree!_CorExeMain and their code is IL. Route them
+    // to the embedded Mono runtime instead (Path B). On UWP this fails
+    // NAMED until the Mono-for-UWP step lands (no runtime in-tree yet);
+    // offline it runs the game under Mono + the FNA stack.
+    if (trt_pe_is_managed(data, size)) {
+      view.reset();
+      mapping.close();
+      input.close();
+      std::vector<u8>().swap(fallback);
+      longan::log_line("trt: managed exe detected, routing to Mono");
+      trt_mono_config mcfg = {};
+      mcfg.exe_path = exe_path.c_str();
+      mcfg.log = [](const char* l) { longan::log_line(l); };
+      // Console managed games use the Tiramisu FNA backend (host
+      // CoreWindow + host input), never SDL.
+      mcfg.fna_platform = "tiramisu";
+      // FNA3D device handoff (Celeste hang fix): the Tiramisu backend
+      // never calls FNA3D_PrepareWindowAttributes, so selectedDriver
+      // stays -1 and FNA3D_CreateDevice returns NULL (silent no-render
+      // spin). Attach the host D3D device + install FNA3D log hooks,
+      // THEN select the driver. Both TOGETHER: PrepareWindowAttributes
+      // without the attach takes the stock D3D11 path (garbage-HWND
+      // swapchain -> AV).
+      stage("Grafik sistemi başlatılıyor (FNA3D)");
+      trt_trace("TRACE fna3d attach enter");
+      {
+        int arc = trt_fna3d_attach_from_hooks(
+            [](const char* l) { longan::log_line(l); });
+        char ab[128];
+        snprintf(ab, sizeof(ab), "TRACE fna3d attach rc=%d attached=%d",
+                 arc, trt_fna3d_is_attached());
+        trt_trace(ab);
+        if (!trt_fna3d_is_attached()) {
+          // FATAL guard: a failed attach must stop the launch here. Without
+          // it, PrepareWindowAttributes takes the stock D3D11 probe path
+          // (which succeeds on UWP) and CreateDevice builds a swapchain
+          // against a garbage window handle -> NULL deref AV.
+          longan::log_line("trt: FATAL fna3d attach failed - refusing stock D3D11 path");
+          r.map_rc = TRT_ERR_FNA3D;
+          strncpy(r.detail, trt_fna3d_last_error(), sizeof(r.detail) - 1);
+          return r;
+        }
+      }
+      trt_trace("TRACE PrepareWindowAttributes enter");
+      FNA3D_PrepareWindowAttributes();
+      trt_trace("TRACE PrepareWindowAttributes ok");
+      stage("Mono oyun ortamı");
+      r.map_rc = trt_mono_run(&mcfg, nullptr, 0, nullptr);
+      if (r.map_rc != TRT_OK) {
+        strncpy(r.detail, trt_mono_last_error(), sizeof(r.detail) - 1);
+      }
       return r;
     }
-
-    std::vector<u8> buf;
-    try {
-      buf.resize(static_cast<size_t>(size));
-    } catch (const std::bad_alloc&) {
-      r.map_rc = TRT_ERR_ALLOC;
-      snprintf(r.detail, sizeof(r.detail), "insufficient memory to load guest executable");
-      return r;
-    }
-    if (!f.read(reinterpret_cast<char*>(buf.data()), size)) {
-      r.map_rc = TRT_ERR_BAD_ARGS;
-      snprintf(r.detail, sizeof(r.detail), "cannot read guest executable");
-      return r;
-    }
-
-    snprintf(line, sizeof(line), "trt: launching %s (%zu bytes)", exe_path.c_str(),
-             buf.size());
-    longan::log_line(line);
     stage("Windows oyun dosyası yükleniyor");
-    r.map_rc = trt_map_pe(&be, runtime_rs, buf.data(), buf.size(), &img);
+    r.map_rc = trt_map_pe(&be, runtime_rs, data, size, &img);
     if (r.map_rc != TRT_OK) {
       const char* reason = trt_last_map_error_detail();
       if (r.map_rc == TRT_ERR_IMPORT) r.stage = "DLL işlevleri yüklenemedi";
@@ -3238,7 +3223,12 @@ struct tiramisu_host
     int mouse_vx = 960, mouse_vy = 540;
     auto next_heartbeat = std::chrono::steady_clock::now();
     g_boot_ms = (ULONGLONG)GetTickCount64();
+    auto next_queue_tick = std::chrono::steady_clock::now();
     while (!g_shutdown.load()) {
+      if (std::chrono::steady_clock::now() >= next_queue_tick) {
+        next_queue_tick = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        longan::steam_queue_pump([]{g_steam_needs_rescan.store(true);});
+      }
       // Heartbeat (item 10): a line every 60 s so a wedged app is
       // distinguishable from a quiet one in tiramisu.log. Wall clock, not
       // frame count — m_frames freezes while a guest runs (Sleep(4) +

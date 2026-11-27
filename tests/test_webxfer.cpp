@@ -227,10 +227,18 @@ int main() {
               read_str_file(root + "/games/HollowDemo/tiramisu_input.txt") == "pad2kbm",
           "Config persisted steam_appid.txt, tiramisu_args.txt, tiramisu_input.txt");
 
+    const auto config_path = "/api/config/HollowDemo";
+    CHECK(http_req(port, "POST", config_path, R"({"video":"30 on"})").find("200 OK") != std::string::npos,
+          "Per-game video profile is accepted");
+    CHECK(http_req(port, "POST", config_path, R"({"video":"100 on"})").find("400 Bad Request") != std::string::npos &&
+          http_req(port, "POST", config_path, R"({"exe":"../bad.exe","video":"60 off"})").find("400 Bad Request") != std::string::npos &&
+          read_str_file(root + "/games/HollowDemo/tiramisu_video.txt") == "30 on",
+          "Invalid profile updates preserve the current settings");
     std::string rg = http_req(port, "GET", "/games", "");
     CHECK(rg.find("HollowDemo") != std::string::npos &&
               rg.find("ZipQuest") != std::string::npos &&
               rg.find("\"appid\":\"367520\"") != std::string::npos &&
+              rg.find("\"video\":\"30 on\"") != std::string::npos &&
               rg.find("\"input\":\"pad2kbm\"") != std::string::npos,
           "GET /games reflects uploaded games + persisted config");
   }

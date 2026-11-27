@@ -698,7 +698,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
     be->release(base, (size_t)size_of_image);
     return fail(&img, be, TRT_ERR_ALLOC, "memory budget refused image");
   }
-  memset(base, 0, (size_t)size_of_image);
+  if (!be->alloc_zero_filled) memset(base, 0, (size_t)size_of_image);
 
   img.base = (u8*)base;
   img.preferred_base = preferred;
@@ -742,7 +742,7 @@ extern "C" int trt_map_pe(const trt_backend* be, const trt_resolver* rs,
       if (copy_sz > size_of_image - va) copy_sz = size_of_image - va;
       memcpy(img.base + va, file + roff, (size_t)copy_sz);
     }
-    // BSS tail already zero from memset
+    // The uncopied BSS tail retains its initial zeros.
     if (va + mem_sz > max_end) max_end = va + mem_sz;
     char line[96];
     snprintf(line, sizeof(line), "trt: sec[%u] %.8s va=%llx sz=%llx%s",
@@ -1171,7 +1171,7 @@ extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
     be->release(base, (size_t)size_of_image);
     return fail(&img, be, TRT_ERR_ALLOC, "memory budget refused image");
   }
-  memset(base, 0, (size_t)size_of_image);
+  if (!be->alloc_zero_filled) memset(base, 0, (size_t)size_of_image);
 
   img.base = (u8*)base;
   img.preferred_base = preferred;
@@ -1214,7 +1214,7 @@ extern "C" int trt_map_pe32(const trt_backend* be, const trt_resolver* rs,
       if (copy_sz > size_of_image - va) copy_sz = size_of_image - va;
       memcpy(img.base + va, file + roff, (size_t)copy_sz);
     }
-    // BSS tail already zero from memset
+    // The uncopied BSS tail retains its initial zeros.
     if (va + mem_sz > max_end) max_end = va + mem_sz;
     char line[96];
     snprintf(line, sizeof(line), "trt: PE32 sec[%u] %.8s va=%llx sz=%llx%s",

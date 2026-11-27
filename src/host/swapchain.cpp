@@ -420,6 +420,7 @@ void publish_gpu_hooks() {
   hooks.restore_d3d11_swapchain = &swapchain_restore_d3d11;
   hooks.configure_d3d11_swapchain = &configure_d3d11_swapchain;
   hooks.get_d3d11_backbuffer = &get_d3d11_backbuffer;
+  hooks.present_interval = [](u32 sync) -> u32 TRT_GUEST_ABI { return game_video::present(sync); };
   hooks.frame_presented = []() TRT_GUEST_ABI { game_frames().record(); };
   hooks.prepare_d3d11_present = &prepare_d3d11_present;
   hooks.d3d11on12_create = [](void* dev, u32 flags, const void* levels,

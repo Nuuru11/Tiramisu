@@ -19,6 +19,9 @@
 //   POST /api/config/<name>                     -> Save exe / appid / args / input preset
 //   DELETE /api/game/<name> | POST /api/delete/<name> -> Delete game directory
 #include "webxfer.h"
+#ifndef TRT_ACTIONS_RUN_ID
+#define TRT_ACTIONS_RUN_ID 0ULL
+#endif
 #include "frame_metrics.h"
 #include "epic_install.h"
 #include "../trt/limbus_report.h"
@@ -484,9 +487,8 @@ bool write_or_clear_text(const std::string& p, const std::string& val) {
   }
   FILE* f = fopen(p.c_str(), "wb");
   if (!f) return false;
-  fwrite(v.data(), 1, v.size(), f);
-  fclose(f);
-  return true;
+  const size_t written = fwrite(v.data(), 1, v.size(), f);
+  return fclose(f) == 0 && written == v.size();
 }
 
 std::string read_log_tail(const std::string& p, size_t max_bytes = 16384) {
@@ -1107,6 +1109,7 @@ std::string games_json() {
     const std::string appid = read_small_text(gdir + sep + "steam_appid.txt");
     const std::string args = read_small_text(gdir + sep + "tiramisu_args.txt");
     std::string input = read_small_text(gdir + sep + "tiramisu_input.txt");
+    const auto video = read_small_text(gdir + sep + "tiramisu_video.txt");
     if (input.empty()) input = "auto";
     const pe_compat_info compat = inspect_pe_compat(gdir, exe);
     if (!first) j += ",";
@@ -1114,7 +1117,7 @@ std::string games_json() {
     j += std::string("{\"epic_install\":") + (epic ? "true" : "false") + ",\"name\":\"" + json_escape(d.name) + "\",\"exe\":\"" +
          json_escape(exe) + "\",\"appid\":\"" + json_escape(appid) +
          "\",\"args\":\"" + json_escape(args) + "\",\"input\":\"" +
-         json_escape(input) + "\",\"arch\":\"" + json_escape(compat.arch) +
+         json_escape(input) + "\",\"video\":\"" + json_escape(video) + "\",\"arch\":\"" + json_escape(compat.arch) +
          "\",\"compat\":\"" + json_escape(compat.badge) + "\",\"compat_ok\":" +
          (compat.ok ? "true" : "false") + ",\"exes\":[";
     for (size_t i = 0; i < exes.size(); ++i) {
@@ -1208,6 +1211,8 @@ const char* k_upload_page =
   "<div id=steamqrwrap style='display:none;margin:10px 0'><img id=steamqrimg style='width:180px;height:180px;background:#fff;padding:8px;border-radius:14px' alt='Steam QR'></div>"
   "<button class='btn btn-sec' onclick='showStorage()'>Xbox storage</button><div id=storageresult aria-live=polite></div>"
   "<div id=steamlist></div></div>"
+  "<div class=card><h2>Steam download queue</h2><div id=queueaction role=status></div><div id=queuefree></div><div id=queuelist></div></div>"
+  "<div class=card><button class=btn onclick='checkBuild()'>Check for Tiramisu update</button> <span id=buildupdate role=status></span></div>"
   "<div class=card id=support><h2>Save Backups &amp; Support Bundle</h2>"
   "<div style='font-size:13px;color:#d5cecc;margin-bottom:10px'>Dev Mode uninstalls wipe <code>LocalState</code>. Back up saves before updating Tiramisu, or download a debug zip for bug reports.</div>"
   "<div class=row>"
@@ -1320,25 +1325,27 @@ const char* k_upload_page =
   "async function stopGame(){setLog('Stopping active game...');await fetch('/api/stop',{method:'POST'});refreshStatus();}"
   "async function rescan(){await fetch('/api/rescan',{method:'POST'});refresh();}"
   "async function delGame(n){if(!confirm('Delete '+n+'?'))return;await fetch('/api/game/'+encodeURIComponent(n),{method:'DELETE'});refresh();}"
-  "async function saveCfg(idx,name){const p={exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
-  "await fetch('/api/config/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
-  "setLog('Saved config for '+name);refresh();}"
+  "async function saveCfg(idx,name){const p={video:E('fps'+idx).value+' '+E('sync'+idx).value,exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
+  "const saved=await fetch('/api/config/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
+  "if(!saved.ok){setLog(await saved.text());return;}setLog('Saved config for '+name);refresh();}"
   "function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
   "async function refresh(){const g=await(await fetch('/games')).json();const el=E('list');"
   "if(!g.length){el.innerHTML='<span style=\"color:#9e9699\">No games yet — drag a game folder or .zip above</span>';return;}"
   "el.innerHTML=g.map((x,i)=>{const opts=(x.exes||[x.exe]).map(e=>'<option value=\"'+esc(e)+'\"'+(e===x.exe?' selected':'')+'>'+esc(e)+'</option>').join('');"
   "const inps=['auto','controller','kbm','pad2kbm'].map(m=>'<option value=\"'+m+'\"'+(m===x.input?' selected':'')+'>Input: '+m+'</option>').join('');"
+  "const [fps,vsync]=(x.video||'default default').split(' ');const select=(values,cur)=>values.map(v=>'<option'+(v===cur?' selected':'')+'>'+v+'</option>').join('');"
   "const ccol=(x.compat_ok===false)?'#ff9aa8':'#b6e3c6';"
   "const cbadge=x.compat?('<span class=pill style=\"color:'+ccol+';border-color:rgba(255,255,255,.16)\">'+esc(x.compat)+'</span>'):'';"
   "return '<div class=game><div class=game-top><div class=game-head>'"
   "+'<img class=cover-thumb src=\"/api/cover/'+encodeURIComponent(x.name)+'?t='+Date.now()+'\" onerror=\"this.style.opacity=0.2\">'"
   "+'<b>'+esc(x.name)+'</b> '+(x.epic_install?'<span class=pill>Epic Games</span> ':'')+cbadge+'</div><div class=row>'"
-  "+'<button class=btn onclick=\"launch(\\''+esc(x.name)+'\\','+(x.compat_ok!==false)+',\\''+esc(x.compat||'')+'\\')\">Launch ▶</button>'"
+  "+'<button class=btn onclick=\"launch('+esc(JSON.stringify(x.name))+','+(x.compat_ok!==false)+','+esc(JSON.stringify(x.compat||''))+')\">Launch ▶</button>'"
   "+'<button class=\"btn btn-sec\" onclick=\"E(\\'cov'+i+'\\').click()\">Cover</button>'"
-  "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover(\\''+esc(x.name)+'\\',this)\">'"
-  "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+',\\''+esc(x.name)+'\\')\">Save</button>'"
-  "+'<button class=\"btn btn-danger\" onclick=\"delGame(\\''+esc(x.name)+'\\')\">Delete</button></div></div>'"
+  "+'<input type=file id=cov'+i+' accept=\"image/*\" style=\"display:none\" onchange=\"uploadCover('+esc(JSON.stringify(x.name))+',this)\">'"
+  "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+','+esc(JSON.stringify(x.name))+')\">Save</button>'"
+  "+'<button class=\"btn btn-danger\" onclick=\"delGame('+esc(JSON.stringify(x.name))+')\">Delete</button></div></div>'"
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
+  "+'<label>FPS cap <select id=fps'+i+'>'+select(['default','30','60','120'],fps)+'</select></label><label>VSync <select id=sync'+i+'>'+select(['default','on','off'],vsync)+'</select></label>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
@@ -1352,17 +1359,46 @@ const char* k_upload_page =
   "if(!r.ok)throw Error(await r.text());const j=await r.json();if(start){epicHandle=j.handle;E('epiccode').textContent=j.code;E('epicprompt').hidden=false;box.textContent='';}"
   "else{E('epicprompt').hidden=true;epicHandle='';box.textContent=j.titles.length+' library entries';for(const title of j.titles){const row=document.createElement('div');row.textContent=title;box.appendChild(row);}}}"
   "catch(e){box.textContent=e.message;}finally{epicBusy=false;}}"
+  "let queueAccount='',steamPage=0,libraryItems=[]; "
+  "function queueAdd(app){queueAction('add',app,queueAccount);} "
+  "async function queueAction(action,id,account){ "
+  " try{const r=await fetch('/api/steam/queue/'+account+'/'+id+'/'+action,{method:'POST',headers:{'X-Tiramisu-Queue':'1'}}); "
+  " if(!r.ok)throw Error(await r.text());E('queueaction').textContent='';await refreshQueue();} "
+  " catch(e){E('queueaction').textContent=e.message;}} "
+  "async function refreshQueue(){ "
+  " const box=E('queuelist');try{const r=await fetch('/api/steam/queue',{cache:'no-store'});if(!r.ok)throw Error('Queue unavailable'); "
+  " const q=await r.json();box.replaceChildren();E('queuefree').textContent=q.free===null?'':(q.free/1073741824).toFixed(2)+' GiB free'; "
+  " for(const [i,x] of q.jobs.entries()){const row=document.createElement('div');row.className='setrow';row.textContent=x.title+' · '+x.state+(x.left>=0?' · '+Math.ceil(x.left/1048576)+' MiB left':'')+(x.detail?' · '+x.detail:''); "
+  " const add=(a,label)=>{const b=document.createElement('button');b.className='btn btn-sec';b.textContent=label;b.onclick=()=>queueAction(a,x.app,q.account);row.appendChild(b);}; "
+  " if(i)add('up','↑');if(i+1<q.jobs.length)add('down','↓');if(['running','queued'].includes(x.state))add('pause','Pause');else add('resume',x.state==='confirm'?'Confirm download':'Resume'); "
+  " if(!['running','holding'].includes(x.state))add('remove','Remove');box.appendChild(row);} "
+  " if(!q.jobs.length)box.textContent='Queue empty';}catch(e){box.textContent=e.message;}} "
+  "async function checkBuild(){const out=E('buildupdate');out.textContent='Checking GitHub…'; "
+  " try{const local=Number(await(await fetch('/api/build-id')).text()); "
+  " const repo='https://api.github.com/repos/Nuuru11/Tiramisu/actions'; "
+  " async function github(path){const r=await fetch(repo+path,{cache:'no-store'});if(!r.ok)throw Error('GitHub HTTP '+r.status);return r.json();} "
+  " const data=await github('/workflows/experimental-msix.yml/runs?branch=steam-compat-experimental&status=success&per_page=1'); "
+  " const run=data.workflow_runs[0];if(!run)throw Error('No successful builds'); "
+  " if(local && run.id<=local){out.textContent='No newer successful build';return;} "
+  " const list=await github('/runs/'+run.id+'/artifacts');const artifact=list.artifacts.find(x=>x.name==='Tiramisu-experimental-x64'&&!x.expired); "
+  " if(!artifact)throw Error('No downloadable package in the latest build'); "
+  " const link=document.createElement('a');link.href=run.html_url+'/artifacts/'+artifact.id;link.textContent='Download signed build #'+run.run_number; "
+  " out.textContent=local?'New build available · ':'Local build · ';out.appendChild(link);}catch(e){out.textContent=e.message;}} "
   "async function loadSteam(){try{const st=await(await fetch('/api/steam/status')).json();"
   "E('steaminfo').textContent=(st.signed_in?('Signed in as '+(st.persona||st.steamid64)+' · '):'')+(st.status||'Ready');"
   "E('limbusreport').textContent=st.limbus_report||'No report available';"
   "if(st.qr_url){E('steamqrwrap').style.display='block';E('steamqrimg').src='/api/steam/qr.svg?t='+Date.now();}else{E('steamqrwrap').style.display='none';}"
   "const items=await(await fetch('/api/steam/library')).json();"
-  "E('steamlist').innerHTML=items.length?items.slice(0,40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
-  "+(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>'"
-  ":x.family_shared?'<span class=pill>Download from the Xbox Steam tab</span>'"
-  ":x.installed?'<span class=pill>Installed</span>'"
-  ":'<button class=\"btn btn-sec\" onclick=\"dlSteam('+x.appid+')\">Download to Xbox</button>')+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
+  "if(queueAccount!==st.steamid64)steamPage=0;queueAccount=st.steamid64;libraryItems=items;renderSteam();"
   "}catch{}}"
+  "function renderSteam(){const items=libraryItems;const pages=Math.ceil(items.length/40);steamPage=Math.max(0,Math.min(steamPage,pages-1));"
+  "E('steamlist').innerHTML=items.length?items.slice(steamPage*40,(steamPage+1)*40).map(x=>'<div class=setrow><div><b>'+esc(x.title)+'</b> <span style=\"color:#9e9699;font-size:12px\">(AppID '+x.appid+' · '+esc(x.status||x.size)+')</span></div>'"
+  "+(x.downloading?'<span class=pill>'+Math.round((x.pct||0)*100)+'%</span>'"
+  ":x.installed?'<span class=pill>Installed</span>'"
+  ":'<button class=\"btn btn-sec\" onclick=\"queueAdd('+x.appid+')\">Add to queue</button>')+'</div>').join(''):'<span style=\"color:#9e9699;font-size:13px\">Sign in with Steam QR above to view your real Steam library &amp; download directly to Xbox.</span>';"
+  "if(pages>1){const list=E('steamlist');for(const [delta,label] of [[-1,'Previous'],[1,'Next']]){const button=document.createElement('button');"
+  "button.className='btn btn-sec';button.textContent=label;button.disabled=steamPage+delta<0||steamPage+delta>=pages;"
+  "button.onclick=()=>{steamPage+=delta;renderSteam();};list.appendChild(button);}list.append(' '+(steamPage+1)+' / '+pages);}}"
   "async function showStorage(){ "
   " const box=E('storageresult');box.textContent='Measuring storage…'; "
   " const fmt=n=>n>=1073741824?(n/1073741824).toFixed(2)+' GiB':Math.ceil(n/1048576)+' MiB'; "
@@ -1414,7 +1450,7 @@ const char* k_upload_page =
   "const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "E('setstat').textContent=r.ok?'Saved — active immediately':'Save failed (HTTP '+r.status+')';if(r.ok)setTimeout(()=>E('setstat').textContent='',4000);}"
   "E('connurl').textContent=location.href.split('?')[0];"
-  "loadLaunchReport();setInterval(loadLaunchReport,3000);loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
+  "refreshQueue();setInterval(refreshQueue,4000);loadLaunchReport();setInterval(loadLaunchReport,3000);loadSettings();refresh();refreshStatus();loadSteam();loadLogs();setInterval(refreshStatus,2000);setInterval(loadSteam,4000);setInterval(loadLogs,5000);</script></body></html>";
 
 bool recv_exact_all(sock_t s, const char* pre, size_t pre_len, uint64_t len,
                     std::string* out) {
@@ -2160,21 +2196,45 @@ void handle_client(sock_t s) {
     std::string out = "[";
     for (size_t i = 0; i < items.size(); ++i) {
       if (i) out += ",";
-      char b[512];
-      snprintf(b, sizeof(b),
-               "{\"appid\":%u,\"title\":\"%s\",\"size\":\"%s\","
-               "\"installed\":%s,\"downloading\":%s,\"family_shared\":%s,\"pct\":%.3f,\"status\":\"%s\"}",
-               items[i].app_id, json_escape(items[i].title).c_str(),
-               json_escape(items[i].size_str).c_str(),
-               items[i].installed ? "true" : "false",
-               items[i].downloading ? "true" : "false",
-               items[i].family_shared ? "true" : "false",
-               items[i].download_pct,
-               json_escape(items[i].status_text).c_str());
-      out += b;
+      const auto& item = items[i];
+      out += "{\"appid\":" + std::to_string(item.app_id) + ",\"title\":\"" + json_escape(item.title) +
+             "\",\"size\":\"" + json_escape(item.size_str) + "\",\"installed\":" + (item.installed ? "true" : "false") +
+             ",\"downloading\":" + (item.downloading ? "true" : "false") + ",\"family_shared\":" +
+             (item.family_shared ? "true" : "false") + ",\"pct\":" + std::to_string(item.download_pct) +
+             ",\"status\":\"" + json_escape(item.status_text) + "\"}";
     }
     out += "]";
     respond(s, "200 OK", "application/json", out);
+    return;
+  }
+  if (strcmp(method, "GET") == 0 && url_path == "/api/steam/queue") {
+    uint64_t account, available;
+    const auto jobs = steam_queue_snapshot(account, available);
+    std::string out = "{\"account\":\"" + std::to_string(account) + "\",\"free\":" +
+        (available == UINT64_MAX ? "null" : std::to_string(available)) + ",\"jobs\":[";
+    for (const auto& job : jobs) {
+      if (out.back() != '[') out += ",";
+      out += "{\"app\":" + std::to_string(job.app_id) + ",\"title\":\"" + json_escape(job.title) +
+          "\",\"state\":\"" + job.state + "\",\"detail\":\"" + json_escape(job.detail) +
+          "\",\"left\":" + std::to_string(job.remaining) + "}";
+    }
+    respond(s, "200 OK", "application/json", out + "]}"); return;
+  }
+  const std::string queue_prefix = "/api/steam/queue/";
+  if (strcmp(method, "POST") == 0 && url_path.rfind(queue_prefix, 0) == 0) {
+    auto path = url_path.substr(queue_prefix.size());
+    auto a = path.find('/'), b = path.find('/', a == std::string::npos ? 0 : a+1);
+    uint64_t sid = strtoull(path.c_str(), nullptr, 10);
+    uint32_t app = static_cast<uint32_t>(strtoull(path.substr(a+1).c_str(), nullptr, 10));
+    if (hdrs_low.find("\r\nx-tiramisu-queue: 1\r\n") == std::string::npos ||
+        a == std::string::npos || b == std::string::npos || !sid || !app ||
+        path.substr(0,b) != std::to_string(sid)+"/"+std::to_string(app)) {
+      respond(s, "400 Bad Request", "text/plain", "Invalid queue request"); return;
+    }
+    std::string error;
+    if (!steam_queue_action(sid, app, path.substr(b+1), error))
+      respond(s, "409 Conflict", "text/plain", error);
+    else respond(s, "200 OK", "text/plain", "OK");
     return;
   }
   if (strcmp(method, "GET") == 0 && url_path == "/api/steam/storage") {
@@ -2226,6 +2286,9 @@ void handle_client(sock_t s) {
     return;
   }
 #endif
+  if (strcmp(method, "GET") == 0 && url_path == "/api/build-id") {
+    respond(s, "200 OK", "text/plain", std::to_string(TRT_ACTIONS_RUN_ID)); return;
+  }
   if (strcmp(method, "GET") == 0 && url_path == "/api/launch-report") {
     std::string report;
     {
@@ -2624,12 +2687,24 @@ void handle_client(sock_t s) {
     bool has_arg = parse_json_str_field(body, "args", &arg_v);
     bool has_inp = parse_json_str_field(body, "input", &inp_v);
     const std::string sep(1, XFER_SEP);
-    if (has_exe) {
-      std::string safe_exe;
-      if (!exe_v.empty() && !sanitize_rel_path(exe_v, '\\', &safe_exe)) {
-        respond(s, "400 Bad Request", "text/plain", "invalid exe path");
-        return;
+    std::string safe_exe;
+    if (has_exe && !exe_v.empty() && !sanitize_rel_path(exe_v, '\\', &safe_exe)) {
+      respond(s, "400 Bad Request", "text/plain", "invalid exe path");
+      return;
+    }
+    std::string video;
+    if (parse_json_str_field(body, "video", &video)) {
+      auto pos = video.find(' ');
+      auto fps = video.substr(0, pos), sync = video.substr(pos + 1);
+      if (pos == std::string::npos || (fps != "default" && fps != "30" && fps != "60" && fps != "120") ||
+          (sync != "default" && sync != "on" && sync != "off")) {
+        respond(s, "400 Bad Request", "text/plain", "Invalid video settings"); return;
       }
+      if (!write_or_clear_text(gdir + sep + "tiramisu_video.txt", video)) {
+        respond(s, "500 Server Error", "text/plain", "Cannot save video profile"); return;
+      }
+    }
+    if (has_exe) {
       write_or_clear_text(gdir + sep + "tiramisu_exe.txt", safe_exe);
     }
     if (has_app) {

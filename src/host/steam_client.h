@@ -53,10 +53,21 @@ void steam_client_refresh_remote(std::function<void()> on_library_updated = null
 // Re-scan local games_dir against known Steam items.
 void steam_client_rescan_local();
 
+struct steam_queue_entry {
+  uint32_t app_id = 0;
+  bool family = false;
+  std::string title, state, detail;
+  uint64_t ticket = 0;
+  int64_t remaining = -1;
+};
+bool steam_queue_action(uint64_t account, uint32_t app_id, const std::string& action, std::string& error);
+std::vector<steam_queue_entry> steam_queue_snapshot(uint64_t& account, uint64_t& free_bytes);
+void steam_queue_pump(std::function<void()> on_complete);
+
 // Install owned games or stage a Steam-authorized family depot for later.
 // Family staging does not grant launch access.
 void steam_client_download_app(uint32_t app_id, bool family_shared,
-                               std::function<void()> on_complete = nullptr);
+                               std::function<void()> on_complete = nullptr, uint64_t queue_ticket = 0);
 
 void steam_client_family_storage(uint32_t app_id);
 struct steam_stored_game {

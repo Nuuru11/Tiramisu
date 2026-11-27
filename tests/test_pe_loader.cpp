@@ -169,6 +169,7 @@ int run_case(const char* label, const u8* file, size_t size, bool ignore_preferr
   printf("case: %s\n", label);
   g_ignore_preferred = ignore_preferred;
   trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log, nullptr};
+  be.alloc_zero_filled = ignore_preferred ? 1 : 0;  // anonymous mmap returns fresh zero pages
   trt_resolver rs = {nullptr, &test_resolve};
   trt_image* img = nullptr;
   int rc = trt_map_pe(&be, &rs, file, size, &img);
@@ -197,6 +198,34 @@ int run_case(const char* label, const u8* file, size_t size, bool ignore_preferr
   return failures;
 }
 
+// Measure resident pages before reading the zero-filled tail. The fixture
+// has real headers, imports and sections but a much larger virtual image.
+void check_sparse_image(const u8* original, size_t size) {
+  std::vector<u8> file(original, original + size);
+  u32 nt_offset;
+  memcpy(&nt_offset, file.data() + 0x3c, sizeof(nt_offset));
+  auto* nt = reinterpret_cast<trt_nt_headers64*>(file.data() + nt_offset);
+  constexpr u32 image_bytes = 64 * 1024 * 1024;
+  nt->optional_header.size_of_image = image_bytes;
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  std::vector<unsigned char> pages(image_bytes / page);
+  trt_resolver rs = {nullptr, &test_resolve};
+  g_ignore_preferred = true;
+  for (int fresh : {0, 1}) {
+    trt_backend be = {&linux_alloc, &linux_protect, &linux_release, &linux_log, nullptr, fresh};
+    trt_image* img = nullptr;
+    CHECK(trt_map_pe(&be, &rs, file.data(), size, &img) == TRT_OK, "sparse PE fixture maps");
+    if (!img) return;
+    CHECK(mincore(img->base, image_bytes, pages.data()) == 0, "can sample resident image pages");
+    size_t resident = 0;
+    for (auto state : pages) if (state & 1) resident += page;
+    printf("  sparse PE: zero-filled allocator=%d, resident=%zu KiB of 65536 KiB\n", fresh, resident / 1024);
+    CHECK(!fresh || resident < image_bytes / 2, "untouched image tail stays demand-paged on fresh pages");
+    CHECK(img->base[image_bytes - 1] == 0, "untouched image tail reads as zero");
+    trt_unmap(&be, img);
+  }
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -223,6 +252,8 @@ int main(int argc, char** argv) {
   // reloc guest: linked /BASE:0x1A00000 (internally consistent fixups);
   // backend ignores preferred -> delta != 0 -> DIR64 pass must run
   run_case("relocated base (delta != 0, full reloc pass)", file2, size2, true);
+
+  check_sparse_image(file2, size2);
 
   // negative: corrupt MZ
   {

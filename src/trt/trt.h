@@ -48,6 +48,8 @@ typedef struct trt_backend {
   // REQUIRED for C++ exceptions in guest code (x64: RtlAddFunctionTable).
   // Return 0 on success. NULL = unsupported (test backend).
   int   (*register_unwind)(void* image_base, const void* pdata, u32 count);
+  // Set only when every successful alloc returns fresh, zero-filled pages.
+  int alloc_zero_filled;
 } trt_backend;
 
 // ---- import resolver: module+symbol -> callable address ----
