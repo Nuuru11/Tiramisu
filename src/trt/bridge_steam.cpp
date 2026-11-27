@@ -446,6 +446,109 @@ static u64 TRT_GUEST_ABI steam_noop_zero(void) { return 0; }
 
 static const void* g_steam_safe_vtbl[64] = {Z16, Z16, Z16, Z16};
 
+// Steamworks SDK 1.60, ISteamUGC020 (Windows x64). Overloaded slots
+// share a diagnostic name. Unsupported requests return their failure sentinel.
+#define UGC_TRACE(slot, method, result) (const void*)+[]() -> u64 TRT_GUEST_ABI { \
+  trt_core_log("SteamUGC020[" #slot "] " #method ": unsupported"); return result; }
+static const void* ugc020_slots[] = {
+    UGC_TRACE(0, CreateQueryUserUGCRequest, ~u64{0}),
+    UGC_TRACE(1, CreateQueryAllUGCRequest, ~u64{0}),
+    UGC_TRACE(2, CreateQueryAllUGCRequest, ~u64{0}),
+    UGC_TRACE(3, CreateQueryUGCDetailsRequest, ~u64{0}),
+    UGC_TRACE(4, SendQueryUGCRequest, 0),
+    UGC_TRACE(5, GetQueryUGCResult, 0),
+    UGC_TRACE(6, GetQueryUGCNumTags, 0),
+    UGC_TRACE(7, GetQueryUGCTag, 0),
+    UGC_TRACE(8, GetQueryUGCTagDisplayName, 0),
+    UGC_TRACE(9, GetQueryUGCPreviewURL, 0),
+    UGC_TRACE(10, GetQueryUGCMetadata, 0),
+    UGC_TRACE(11, GetQueryUGCChildren, 0),
+    UGC_TRACE(12, GetQueryUGCStatistic, 0),
+    UGC_TRACE(13, GetQueryUGCNumAdditionalPreviews, 0),
+    UGC_TRACE(14, GetQueryUGCAdditionalPreview, 0),
+    UGC_TRACE(15, GetQueryUGCNumKeyValueTags, 0),
+    UGC_TRACE(16, GetQueryUGCKeyValueTag, 0),
+    UGC_TRACE(17, GetQueryUGCKeyValueTag, 0),
+    UGC_TRACE(18, GetNumSupportedGameVersions, 0),
+    UGC_TRACE(19, GetSupportedGameVersionData, 0),
+    UGC_TRACE(20, GetQueryUGCContentDescriptors, 0),
+    UGC_TRACE(21, ReleaseQueryUGCRequest, 0),
+    UGC_TRACE(22, AddRequiredTag, 0),
+    UGC_TRACE(23, AddRequiredTagGroup, 0),
+    UGC_TRACE(24, AddExcludedTag, 0),
+    UGC_TRACE(25, SetReturnOnlyIDs, 0),
+    UGC_TRACE(26, SetReturnKeyValueTags, 0),
+    UGC_TRACE(27, SetReturnLongDescription, 0),
+    UGC_TRACE(28, SetReturnMetadata, 0),
+    UGC_TRACE(29, SetReturnChildren, 0),
+    UGC_TRACE(30, SetReturnAdditionalPreviews, 0),
+    UGC_TRACE(31, SetReturnTotalOnly, 0),
+    UGC_TRACE(32, SetReturnPlaytimeStats, 0),
+    UGC_TRACE(33, SetLanguage, 0),
+    UGC_TRACE(34, SetAllowCachedResponse, 0),
+    UGC_TRACE(35, SetAdminQuery, 0),
+    UGC_TRACE(36, SetCloudFileNameFilter, 0),
+    UGC_TRACE(37, SetMatchAnyTag, 0),
+    UGC_TRACE(38, SetSearchText, 0),
+    UGC_TRACE(39, SetRankedByTrendDays, 0),
+    UGC_TRACE(40, SetTimeCreatedDateRange, 0),
+    UGC_TRACE(41, SetTimeUpdatedDateRange, 0),
+    UGC_TRACE(42, AddRequiredKeyValueTag, 0),
+    UGC_TRACE(43, RequestUGCDetails, 0),
+    UGC_TRACE(44, CreateItem, 0),
+    UGC_TRACE(45, StartItemUpdate, ~u64{0}),
+    UGC_TRACE(46, SetItemTitle, 0),
+    UGC_TRACE(47, SetItemDescription, 0),
+    UGC_TRACE(48, SetItemUpdateLanguage, 0),
+    UGC_TRACE(49, SetItemMetadata, 0),
+    UGC_TRACE(50, SetItemVisibility, 0),
+    UGC_TRACE(51, SetItemTags, 0),
+    UGC_TRACE(52, SetItemContent, 0),
+    UGC_TRACE(53, SetItemPreview, 0),
+    UGC_TRACE(54, SetAllowLegacyUpload, 0),
+    UGC_TRACE(55, RemoveAllItemKeyValueTags, 0),
+    UGC_TRACE(56, RemoveItemKeyValueTags, 0),
+    UGC_TRACE(57, AddItemKeyValueTag, 0),
+    UGC_TRACE(58, AddItemPreviewFile, 0),
+    UGC_TRACE(59, AddItemPreviewVideo, 0),
+    UGC_TRACE(60, UpdateItemPreviewFile, 0),
+    UGC_TRACE(61, UpdateItemPreviewVideo, 0),
+    UGC_TRACE(62, RemoveItemPreview, 0),
+    UGC_TRACE(63, AddContentDescriptor, 0),
+    UGC_TRACE(64, RemoveContentDescriptor, 0),
+    UGC_TRACE(65, SetRequiredGameVersions, 0),
+    UGC_TRACE(66, SubmitItemUpdate, 0),
+    UGC_TRACE(67, GetItemUpdateProgress, 0),
+    UGC_TRACE(68, SetUserItemVote, 0),
+    UGC_TRACE(69, GetUserItemVote, 0),
+    UGC_TRACE(70, AddItemToFavorites, 0),
+    UGC_TRACE(71, RemoveItemFromFavorites, 0),
+    UGC_TRACE(72, SubscribeItem, 0),
+    UGC_TRACE(73, UnsubscribeItem, 0),
+    UGC_TRACE(74, GetNumSubscribedItems, 0),
+    UGC_TRACE(75, GetSubscribedItems, 0),
+    UGC_TRACE(76, GetItemState, 0),
+    UGC_TRACE(77, GetItemInstallInfo, 0),
+    UGC_TRACE(78, GetItemDownloadInfo, 0),
+    UGC_TRACE(79, DownloadItem, 0),
+    UGC_TRACE(80, BInitWorkshopForGameServer, 0),
+    UGC_TRACE(81, SuspendDownloads, 0),
+    UGC_TRACE(82, StartPlaytimeTracking, 0),
+    UGC_TRACE(83, StopPlaytimeTracking, 0),
+    UGC_TRACE(84, StopPlaytimeTrackingForAllItems, 0),
+    UGC_TRACE(85, AddDependency, 0),
+    UGC_TRACE(86, RemoveDependency, 0),
+    UGC_TRACE(87, AddAppDependency, 0),
+    UGC_TRACE(88, RemoveAppDependency, 0),
+    UGC_TRACE(89, GetAppDependencies, 0),
+    UGC_TRACE(90, DeleteItem, 0),
+    UGC_TRACE(91, ShowWorkshopEULA, 0),
+    UGC_TRACE(92, GetWorkshopEULAStatus, 0),
+    UGC_TRACE(93, GetUserContentDescriptorPreferences, 0),
+};
+#undef UGC_TRACE
+static fake_steam_iface ugc020 = {ugc020_slots};
+
 static unsigned char g_steam_ifaces[25][64] = {};
 static void* steam_get_iface(int idx) {
   if (idx < 0 || idx >= 25) idx = 0;
@@ -1949,7 +2052,8 @@ void* TRT_GUEST_ABI st_client_GetISteamUnifiedMessages(void*, int, int, const ch
 void* TRT_GUEST_ABI st_client_GetISteamController(void*, int, int, const char*) {
   return &g_steam_input_obj;
 }
-void* TRT_GUEST_ABI st_client_GetISteamUGC(void*, int, int, const char*) {
+void* TRT_GUEST_ABI st_client_GetISteamUGC(void*, int, int, const char* version) {
+  if (version && strcmp(version, "STEAMUGC_INTERFACE_VERSION020") == 0) return &ugc020;
   return steam_get_iface(11);
 }
 void* TRT_GUEST_ABI st_client_GetISteamAppList(void*, int, int, const char*) {
@@ -2043,6 +2147,10 @@ fake_steam_iface g_steam_client_obj = {g_steam_client_vtbl};
 
 void* TRT_GUEST_ABI trt_SteamInternal_CreateInterface(const char* version) {
   if (!version) return steam_get_iface(20);
+  if (strcmp(version, "STEAMUGC_INTERFACE_VERSION020") == 0) {
+    trt_core_log("SteamUGC020 interface requested");
+    return &ugc020;
+  }
   if (strncmp(version, "SteamClient", 11) == 0 ||
       strncmp(version, "STEAMCLIENT_INTERFACE_VERSION", 29) == 0)
     return &g_steam_client_obj;
