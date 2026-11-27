@@ -29,6 +29,9 @@
 #ifdef __linux__
 #include <sys/mman.h>
 #include <unistd.h>
+#elif defined(TIRAMISU_UWP_HOST)
+#include <io.h>
+#include <windows.h>
 #endif
 
 extern "C" void TRT_STDCALL trt_SetLastError(u32 e);
@@ -313,6 +316,7 @@ bool file_view_mode_enabled() {
   return enabled;
 }
 
+#ifdef __linux__
 bool file_view_readahead_enabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("TRT_MAP_READAHEAD");
@@ -320,6 +324,40 @@ bool file_view_readahead_enabled() {
   }();
   return enabled;
 }
+#endif
+
+#if defined(__linux__) || defined(TIRAMISU_UWP_HOST)
+size_t file_mapping_granularity() {
+#ifdef TIRAMISU_UWP_HOST
+  static const size_t value = [] {
+    SYSTEM_INFO info{};
+    GetNativeSystemInfo(&info);
+    return static_cast<size_t>(info.dwAllocationGranularity);
+  }();
+#else
+  static const size_t value = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+  return value;
+}
+
+void* map_read_only_file(int fd, u64 aligned_offset, size_t span) {
+#ifdef TIRAMISU_UWP_HOST
+  const auto handle = _get_osfhandle(fd);
+  if (handle == -1) return nullptr;
+  HANDLE mapping = CreateFileMappingFromApp(reinterpret_cast<HANDLE>(handle), nullptr,
+                                            PAGE_READONLY, 0, nullptr);
+  if (!mapping) return nullptr;
+  void* base = MapViewOfFileFromApp(mapping, FILE_MAP_READ, aligned_offset, span);
+  CloseHandle(mapping);  // Windows keeps the section alive until the last view closes.
+  return base;
+#else
+  void* base = mmap(nullptr, span, PROT_READ, MAP_PRIVATE, fd, static_cast<off_t>(aligned_offset));
+  if (base == MAP_FAILED) return nullptr;
+  if (file_view_readahead_enabled()) (void)madvise(base, span, MADV_WILLNEED);
+  return base;
+#endif
+}
+#endif
 
 void log_file_view_once() {
   static bool done = false;
@@ -345,6 +383,8 @@ void release_view_backing_locked(const mapped_view& mv) {
   if (mv.file_backed) {
 #ifdef __linux__
     if (mv.map_base && mv.map_span) munmap(mv.map_base, mv.map_span);
+#elif defined(TIRAMISU_UWP_HOST)
+    UnmapViewOfFile(mv.map_base);
 #endif
     return;
   }
@@ -608,7 +648,7 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
     return nullptr;
   }
   u64 req_len = bytes ? bytes : (core->size > offset ? core->size - offset : 0);
-  if (core->size > 0 && offset + req_len > core->size) {
+  if (core->size > 0 && req_len > core->size - offset) {
     req_len = core->size - offset;
   }
   if (req_len == 0) req_len = 0x1000ull;
@@ -643,7 +683,7 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   // write-back, and FILE_MAP_EXECUTE (0x20) needs executable protection.
   // Handing any of them a PROT_READ mapping would fault the guest on its first
   // store (or instruction fetch), so they keep the private-copy path.
-  const bool read_only_view = (access & (0x01u | 0x02u | 0x20u)) == 0;
+  const bool read_only_view = map_access_to_prot_bits(access, core->protect) == PROT_READ_;
   const bool flush_back =
       ((access & 0x02u) != 0 || access == 0xF001Fu) && (access != 0x01u);
   bool file_backed = false;
@@ -653,7 +693,7 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
   u64 charge_span = 0;
   if (read_only_view && !flush_back && core->file_handle &&
       file_view_mode_enabled()) {
-#ifdef __linux__
+#if defined(__linux__) || defined(TIRAMISU_UWP_HOST)
     u64 fsz = 0;
     const int fd = trt_file_host_fd(core->file_handle, &fsz);
     // Only a view that lies entirely inside the file can be mapped. A view
@@ -661,18 +701,13 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
     // copy, so the tail stays zero-filled instead of faulting on a page the
     // file does not have.
     if (fd >= 0 && fsz > 0 && offset < fsz && req_len <= fsz - offset) {
-      const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+      const size_t page = file_mapping_granularity();
       const u64 base_off = offset & ~(u64)(page - 1);
       const size_t delta = (size_t)(offset - base_off);
       const size_t span = delta + (size_t)req_len;
       if (trt_mem_budget_charge_file_view((u64)span) == 0) {
-        void* m = mmap(nullptr, span, PROT_READ, MAP_PRIVATE, fd,
-                       (off_t)base_off);
-        if (m != MAP_FAILED) {
-          // async SSD -> page-cache readahead; the fault path stays lazy
-          if (file_view_readahead_enabled()) {
-            (void)madvise(m, span, MADV_WILLNEED);
-          }
+        void* m = map_read_only_file(fd, base_off, span);
+        if (m) {
           view_ptr = (u8*)m + delta;
           file_backed = true;
           map_base = m;
@@ -699,23 +734,6 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
       trt_mem_budget_discharge_map((u64)req_len);
       trt_SetLastError(8 /*ERROR_NOT_ENOUGH_MEMORY*/);
       return nullptr;
-    }
-
-    // The backend may hand back the SAME address an evicted view used to have
-    // (the pages were released). Any evicted-range record overlapping this
-    // live view is stale from this instant — purge it, or every later
-    // unmap/flush of this live view would be falsely named use-after-evict and
-    // refused.
-    for (size_t i = 0; i < g_evicted.size();) {
-      const uintptr_t s = g_evicted[i].ptr;
-      const uintptr_t e = s + g_evicted[i].bytes;
-      const uintptr_t vs = (uintptr_t)view_ptr;
-      const uintptr_t ve = vs + (size_t)req_len;
-      if (s < ve && vs < e) {
-        g_evicted.erase(g_evicted.begin() + (ptrdiff_t)i);
-      } else {
-        ++i;
-      }
     }
 
     if (core->file_handle) {
@@ -765,6 +783,23 @@ void* TRT_STDCALL trt_MapViewOfFileEx(u64 h, u32 access, u32 off_high,
       }
     }
   }  // if (!file_backed)
+
+  // The backend may hand back the SAME address an evicted view used to have
+  // (the pages were released). Any evicted-range record overlapping this
+  // live view is stale from this instant — purge it, or every later
+  // unmap/flush of this live view would be falsely named use-after-evict and
+  // refused.
+  for (size_t i = 0; i < g_evicted.size();) {
+    const uintptr_t s = g_evicted[i].ptr;
+    const uintptr_t e = s + g_evicted[i].bytes;
+    const uintptr_t vs = (uintptr_t)view_ptr;
+    const uintptr_t ve = vs + (size_t)req_len;
+    if (s < ve && vs < e) {
+      g_evicted.erase(g_evicted.begin() + (ptrdiff_t)i);
+    } else {
+      ++i;
+    }
+  }
 
   // A file-backed mapping is already PROT_READ; only the copy path needs a
   // host re-protect.

@@ -92,6 +92,9 @@ extern "C" int trt_sync_parked_count(void);
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef TIRAMISU_UWP_HOST
+#  include <io.h>
+#endif
 #if !defined(_WIN32)
 #  include <pthread.h>
 #  include <signal.h>
@@ -2210,19 +2213,25 @@ int trt_file_stat_size(void* handle, u64* size_out) {
 // this to FILE-BACK read-only views: the view's pages become the file's clean
 // page cache (mapped, not copied), so an asset archive costs address space
 // instead of committed RAM and evicted pages re-fault from the SSD. -1 for
-// anything that is not a regular host file (pipes, devices, non-Linux hosts).
+// anything that is not a regular host file (pipes, devices, unsupported hosts).
 int trt_file_host_fd(void* handle, u64* size_out) {
   if (size_out) *size_out = 0;
-#ifdef __linux__
+#if defined(__linux__) || defined(TIRAMISU_UWP_HOST)
   std::lock_guard<std::mutex> lk(g_files_mu);
   file_rec* rec = file_at_locked(handle);
-  if (!rec || !rec->os) return -1;
+  if (!rec || !rec->os || rec->mode == 'd') return -1;
   FILE* os = (FILE*)rec->os;
-  fflush(os);  // pending guest writes must be visible to the mapped pages
+  if (fflush(os) != 0) return -1;  // pending guest writes must be visible to the mapped pages
+#ifdef TIRAMISU_UWP_HOST
+  const int fd = _fileno(os);
+  struct _stat64 st{};
+  if (fd < 0 || _fstat64(fd, &st) != 0 || (st.st_mode & _S_IFMT) != _S_IFREG) return -1;
+#else
   const int fd = fileno(os);
   if (fd < 0) return -1;
   struct stat st{};
   if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+#endif
   if (size_out) *size_out = (u64)st.st_size;
   return fd;
 #else

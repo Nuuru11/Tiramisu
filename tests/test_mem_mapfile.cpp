@@ -333,6 +333,27 @@ int run_default() {
   trt_CloseHandle((void*)(uintptr_t)mh2);
   trt_CloseHandle((void*)(uintptr_t)mh);
   trt_CloseHandle(fh);
+  // A small window beyond the 32-bit boundary in a sparse asset archive.
+  // Closing both handles before reading also exercises view lifetime.
+  constexpr u64 marker_offset = (1ULL << 32) + 0x12345;
+  constexpr char marker[] = "archive window";
+  FILE* sparse = fopen(host, "wb");
+  bool wrote = sparse && fseeko(sparse, static_cast<off_t>(marker_offset), SEEK_SET) == 0 &&
+               fwrite(marker, 1, sizeof(marker), sparse) == sizeof(marker);
+  if (sparse && fclose(sparse) != 0) wrote = false;
+  CHECK(wrote, "created sparse archive larger than 4 GiB");
+  if (wrote) {
+    fh = trt_CreateFileW(wpath, 0x80000000u, 1, nullptr, 3, 0, nullptr);
+    const u64 mapping = trt_CreateFileMappingW((u64)(uintptr_t)fh, nullptr, 0x02, 0, 0, nullptr);
+    trt_CloseHandle(fh);
+    void* window = trt_MapViewOfFile(mapping, 0x04, 1, 0x12345, sizeof(marker));
+    trt_CloseHandle((void*)(uintptr_t)mapping);
+    CHECK(window && memcmp(window, marker, sizeof(marker)) == 0, "64-bit archive offset and view lifetime");
+    CHECK(window && trt_mem_budget_committed() == base_committed && trt_mem_budget_file_mapped() > 0,
+          "high-offset window uses file-backed pages");
+    CHECK(window && trt_UnmapViewOfFile(window) && trt_mem_budget_reserved() == base_reserved,
+          "high-offset view releases its reservation");
+  }
   unlink(host);
   rmdir(tmpdir);
 
