@@ -8,11 +8,13 @@
 namespace longan {
 struct game_video {
   inline static std::atomic<int> cap{0}, sync{-1};
+  inline static std::atomic<bool> hd720{false};
   static void load(const std::string& dir) {
     std::ifstream file(dir + "/tiramisu_video.txt");
-    std::string fps, vsync;
-    file >> fps >> vsync;
-    cap = fps == "30" ? 30 : fps == "60" ? 60 : fps == "120" ? 120 : 0;
+    std::string fps, vsync, profile;
+    file >> fps >> vsync >> profile;
+    hd720 = profile == "720p";
+    cap = fps == "30" ? 30 : fps == "60" ? 60 : fps == "120" ? 120 : hd720 ? 30 : 0;
     sync = vsync == "on" ? 1 : vsync == "off" ? 0 : -1;
   }
   static unsigned present(unsigned requested) {

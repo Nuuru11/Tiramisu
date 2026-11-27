@@ -309,7 +309,7 @@ int TRT_GUEST_ABI fake_sc_GetDesc(void* self, void* desc) {
 int TRT_GUEST_ABI fake_sc_ResizeBuffers(void* self, u32 count, u32 w, u32 h, u32 fmt, u32 flags) {
   (void)self;
   if (!g_sc_is_d3d12 && g_hooks.configure_d3d11_swapchain)
-    return g_hooks.configure_d3d11_swapchain(fmt, count);
+    return g_hooks.configure_d3d11_swapchain(fmt, count, w, h);
   void* sc = active_sc();
   void* slot = real_sc_slot(13);
   int hr = 0;
@@ -1092,7 +1092,7 @@ int create_swapchain_impl(void* device, u32 w, u32 h, u32 fmt, u32 count,
   }
   if (!g_hooks.swapchain) return TRT_E_NOTIMPL;
   if (g_hooks.configure_d3d11_swapchain) {
-    const int hr = g_hooks.configure_d3d11_swapchain(fmt, count);
+    const int hr = g_hooks.configure_d3d11_swapchain(fmt, count, w, h);
     if (hr < 0) {
       *swapchain = nullptr;
       return hr;

@@ -1,6 +1,7 @@
 // tiramisu/src/host/steam_client.cpp
 // Native Xbox UWP Steam Client + CM/CDN Depot Downloader.
 #include "steam_client.h"
+#include "steam_queue_store.h"
 #include "steam_file_verify.h"
 #include "host_log.h"
 #include "../trt/bridge_steam.h"
@@ -86,6 +87,28 @@ std::string u16to8(const std::wstring& w) {
   WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr,
                       nullptr);
   return s;
+}
+
+bool owned_catalog_ready = false, family_catalog_ready = false;
+
+std::filesystem::path queue_path_locked() {
+  return std::filesystem::path(u8to16(g_state_dir)) /
+         ("steam-queue-" + std::to_string(g_acct.steamid64) + ".txt");
+}
+
+void restore_queue_locked() {
+  owned_catalog_ready = family_catalog_ready = false;
+  g_queue.clear();
+  if (!g_acct.steamid64 || !g_acct.signed_in) return;
+  if (!steam_queue_store::load(queue_path_locked(), g_queue))
+    log_line("steam: saved queue could not be read");
+  for (auto& job : g_queue) job.ticket = ++g_queue_serial;
+}
+
+bool save_queue_locked() {
+  if (steam_queue_store::save(queue_path_locked(), g_queue)) return true;
+  log_line("steam: queue could not be saved to LocalState");
+  return false;
 }
 
 std::string sanitize_dirname(const std::string& s) {
@@ -1561,6 +1584,7 @@ void scan_installed_into_items(const std::string& games_dir,
       if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
       if (fd.cFileName[0] == '.') continue;
       std::string gdir = games_dir + "\\" + fd.cFileName;
+      if (GetFileAttributesA((gdir + "\\.tiramisu-steam-partial").c_str()) != INVALID_FILE_ATTRIBUTES) continue;
       std::string appid_path = gdir + "\\steam_appid.txt";
       FILE* f = fopen(appid_path.c_str(), "rb");
       if (f) {
@@ -1700,6 +1724,7 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
   }
 
   // 2) Owned Games (requires valid access_token; auto-refresh & retry once if stale)
+  bool owned_loaded = false;
   std::vector<steam_library_item> fetched_items;
   for (int attempt = 0; attempt < 2 && !access_tok.empty(); ++attempt) {
     std::string resp, err;
@@ -1738,12 +1763,14 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
                   [](const steam_library_item& a, const steam_library_item& b) {
                     return a.title < b.title;
                   });
+        owned_loaded = true;
         char msg[128];
         snprintf(msg, sizeof(msg),
                  "steam: loaded %zu owned games for SteamID %llu",
                  fetched_items.size(), (unsigned long long)sid);
         log_line(msg);
       } else {
+        owned_loaded = r.HasKey(L"game_count") && r.GetNamedNumber(L"game_count") == 0;
         log_line("steam: GetOwnedGames returned empty response.games");
       }
     } catch (...) {
@@ -1837,9 +1864,11 @@ void fetch_remote_account_data(std::function<void()> on_library_updated) {
       item.download_pct = prior->download_pct;
       item.status_text = prior->status_text;
     }
+    family_catalog_ready = family_loaded;
+    owned_catalog_ready = owned_loaded;
     g_family_items = std::move(family_items);
     scan_installed_into_items(games_dir, &fetched_items);
-    if (!fetched_items.empty()) g_items = std::move(fetched_items);
+    if (owned_loaded) g_items = std::move(fetched_items);
     else scan_installed_into_items(games_dir, &g_items);
     g_acct.status_line = "steam: signed in as " +
                          (g_acct.persona.empty() ? g_acct.account_name
@@ -1929,6 +1958,7 @@ void steam_client_init(const std::string& state_dir,
         g_acct.status_line = "steam: signed in as " +
                              (g_acct.persona.empty() ? std::to_string(g_acct.steamid64)
                                                      : g_acct.persona);
+        restore_queue_locked();
         do_refresh = true;
       }
     }
@@ -1945,6 +1975,7 @@ void steam_client_sign_out() {
   trt_steam_set_identity(nullptr, nullptr);
   trt_steam_set_friends(nullptr, 0);
   g_queue.clear();
+  owned_catalog_ready = family_catalog_ready = false;
   g_queue_changed.notify_all();
   g_refresh_token.clear();
   g_access_token.clear();
@@ -2094,7 +2125,8 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
           log_line(okmsg);
           {
             std::lock_guard<std::mutex> lk(g_mu);
-            if (g_acct.steamid64 != sid) {
+            const bool switched = g_acct.steamid64 != sid;
+            if (switched) {
               g_queue.clear();
               g_queue_changed.notify_all();
               g_items.clear();
@@ -2106,6 +2138,7 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
             g_acct.account_name = aname;
             if (g_acct.persona.empty()) g_acct.persona = aname;
             g_acct.signed_in = (sid != 0);
+            if (switched) restore_queue_locked();
             g_acct.qr_url.clear();
             g_acct.status_line = "Signed in — loading your Steam library…";
             save_credentials(g_state_dir, sid, aname, g_acct.persona, ref, acc);
@@ -2139,6 +2172,16 @@ void steam_client_begin_qr(std::function<void()> on_library_updated) {
 bool steam_queue_action(uint64_t account, uint32_t app, const std::string& action, std::string& error) {
   std::lock_guard<std::mutex> lock(g_mu);
   if (!g_acct.signed_in || account != g_acct.steamid64) { error = "Steam account changed"; return false; }
+  const auto before = g_queue;
+  auto persist = [&]() {
+    if (save_queue_locked()) {
+      g_queue_changed.notify_all();
+      return true;
+    }
+    g_queue = before;
+    error = "Cannot save the download queue";
+    return false;
+  };
   auto it = std::find_if(g_queue.begin(), g_queue.end(), [app](const auto& q){ return q.app_id == app; });
   if (action == "add") {
     if (it != g_queue.end()) return true;
@@ -2147,7 +2190,7 @@ bool steam_queue_action(uint64_t account, uint32_t app, const std::string& actio
         if (game.app_id != app) continue;
         if (game.installed || game.downloading) { error = "Already installed or downloading"; return false; }
         g_queue.push_back({app, items == &g_family_items, game.title, "queued", "", ++g_queue_serial});
-        return true;
+        return persist();
       }
     }
     error = "Game is no longer in the library"; return false;
@@ -2161,8 +2204,7 @@ bool steam_queue_action(uint64_t account, uint32_t app, const std::string& actio
   else if (action == "resume" && (it->state == "paused" || it->state == "confirm" || it->state == "failed")) it->state = "queued";
   else if (action == "remove" && it->state != "running" && it->state != "holding") g_queue.erase(it);
   else { error = "Action unavailable"; return false; }
-  g_queue_changed.notify_all();
-  return true;
+  return persist();
 }
 
 std::vector<steam_queue_entry> steam_queue_snapshot(uint64_t& account, uint64_t& free_bytes) {
@@ -2187,6 +2229,7 @@ void steam_queue_pump(std::function<void()> on_complete) {
     if (g_dl_busy || !g_acct.signed_in) return;
     for (const auto& entry : g_queue) {
       if (entry.state == "confirm") return;
+      if (entry.family ? !family_catalog_ready : !owned_catalog_ready) continue;
       if (entry.state == "queued") { next = entry; break; }
     }
   }
@@ -2204,7 +2247,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
     if (queue_ticket && (job == g_queue.end() || job->state != "queued")) return;
     if (!g_acct.signed_in || g_refresh_token.empty() || sid == 0) {
       g_acct.status_line = "download blocked: sign in with Steam (Y) first";
-      if (queue_ticket) { job->state = "failed"; job->detail = g_acct.status_line; }
+      if (queue_ticket) { job->state = "failed"; job->detail = g_acct.status_line; save_queue_locked(); }
       return;
     }
     const auto& items = family_shared ? g_family_items : g_items;
@@ -2213,11 +2256,12 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
     });
     if (found == items.end()) {
       g_acct.status_line = "Steam library changed — refresh and select the game again";
-      if (queue_ticket) { job->state = "failed"; job->detail = g_acct.status_line; }
+      if (queue_ticket) { job->state = "failed"; job->detail = g_acct.status_line; save_queue_locked(); }
       return;
     }
     if (queue_ticket && found->installed) {
       g_queue.erase(job);
+      save_queue_locked();
       return;
     }
     if (g_dl_busy.exchange(true)) {
@@ -2263,6 +2307,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
       if (it != g_queue.end()) {
         if (!state) g_queue.erase(it);
         else { it->state = state; it->detail = detail; }
+        save_queue_locked();
       }
       g_dl_busy = false;
     };
@@ -2444,6 +2489,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
       }
       if (depots.empty()) return fail("No supported Windows depot for " + title);
       std::string install_dir = games_dir + "\\" + sanitize_dirname(title);
+      const auto incomplete = std::filesystem::path(install_dir) / ".tiramisu-steam-partial";
       std::filesystem::path family_root;
       if (family_shared) {
         pending_removal.clear();
@@ -2741,7 +2787,7 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
           family_partial += ".partial";
           std::filesystem::create_directories(family_partial);
         } else {
-          ensure_dir_recursive(install_dir);
+          std::filesystem::create_directories(incomplete);
         }
 
         // 8) Stream every chunk, AES-decrypt, decompress, Adler-32 verify, write
@@ -2750,33 +2796,25 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
         for (const auto& f : files) {
           if (!download_account_active())
             return fail("Steam account or library access changed during the download");
-          std::filesystem::path family_file;
-          if (family_shared) family_file = family_partial / u8to16(f.filename);
-          std::string fpath = install_dir + "\\" + f.filename;
+          if (f.linked_path || !valid_family_depot_path(f.filename))
+            return fail("Unsupported depot file path");
+          const auto target = family_shared ? family_partial / u8to16(f.filename)
+              : std::filesystem::path(install_dir) / u8to16(f.filename);
           if (f.flags & 0x40 /* directory flag */) {
-            if (family_shared) std::filesystem::create_directories(family_file);
-            else ensure_dir_recursive(fpath);
+            std::filesystem::create_directories(target);
             continue;
           }
-          if (family_shared) {
-            std::filesystem::create_directories(family_file.parent_path());
-            if (f.has_content_sha && std::filesystem::is_regular_file(family_file) &&
-                std::filesystem::file_size(family_file) == f.size) {
-              std::ifstream saved(family_file, std::ios::binary);
-              if (saved && steam_file_matches(saved, f.size, f.content_sha)) {
-                done_bytes += f.size;
-                update_remaining(done_bytes);
-                continue;
-              }
+          std::filesystem::create_directories(target.parent_path());
+          if (f.has_content_sha && std::filesystem::is_regular_file(target) &&
+              std::filesystem::file_size(target) == f.size) {
+            std::ifstream saved(target, std::ios::binary);
+            if (saved && steam_file_matches(saved, f.size, f.content_sha)) {
+              done_bytes += f.size;
+              update_remaining(done_bytes);
+              continue;
             }
-          } else {
-            const size_t sl = fpath.rfind('\\');
-            if (sl != std::string::npos) ensure_dir_recursive(fpath.substr(0, sl));
           }
-
-          std::unique_ptr<FILE, decltype(&fclose)> fp(
-              family_shared ? _wfopen(family_file.c_str(), L"wb") : fopen(fpath.c_str(), "wb"),
-              &fclose);
+          std::unique_ptr<FILE, decltype(&fclose)> fp(_wfopen(target.c_str(), L"wb"), &fclose);
           if (!fp) return fail("cannot create file: " + f.filename);
 
           for (const auto& ck : f.chunks) {
@@ -2865,8 +2903,8 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
                                format_bytes(total_bytes));
           }
           if (fclose(fp.release()) != 0) return fail("cannot finish depot file: " + f.filename);
-          if (family_shared && f.has_content_sha) {
-            std::ifstream saved(family_file, std::ios::binary);
+          if (f.has_content_sha) {
+            std::ifstream saved(target, std::ios::binary);
             if (!saved || !steam_file_matches(saved, f.size, f.content_sha))
               return fail("Downloaded file failed Steam manifest verification: " + f.filename);
           }
@@ -2889,11 +2927,11 @@ void steam_client_download_app(uint32_t app_id, bool family_shared,
 
       // 9) Write steam_appid.txt & run Engine Synthesizer + PC->Xbox translation
       {
-        FILE* af = fopen((install_dir + "\\steam_appid.txt").c_str(), "wb");
-        if (af) {
-          fprintf(af, "%u\n", app_id);
-          fclose(af);
-        }
+        std::ofstream id(std::filesystem::path(install_dir) / "steam_appid.txt", std::ios::trunc);
+        id << app_id << '\n';
+        id.close();
+        if (!id || !std::filesystem::remove(incomplete))
+          return fail("Cannot finalize the Steam installation");
       }
       set_item_state(true, 0.98f,
                      "synthesizing Xbox engine profile for " + title + "…");

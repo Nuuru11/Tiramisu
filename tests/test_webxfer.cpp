@@ -234,11 +234,14 @@ int main() {
           http_req(port, "POST", config_path, R"({"exe":"../bad.exe","video":"60 off"})").find("400 Bad Request") != std::string::npos &&
           read_str_file(root + "/games/HollowDemo/tiramisu_video.txt") == "30 on",
           "Invalid profile updates preserve the current settings");
+    CHECK(http_req(port, "POST", config_path, R"({"video":"default on 720p"})").find("200 OK") != std::string::npos &&
+          http_req(port, "POST", config_path, R"({"video":"30 on 999p"})").find("400 Bad Request") != std::string::npos,
+          "720p profile accepted and invalid resolution rejected");
     std::string rg = http_req(port, "GET", "/games", "");
     CHECK(rg.find("HollowDemo") != std::string::npos &&
               rg.find("ZipQuest") != std::string::npos &&
               rg.find("\"appid\":\"367520\"") != std::string::npos &&
-              rg.find("\"video\":\"30 on\"") != std::string::npos &&
+              rg.find("\"video\":\"default on 720p\"") != std::string::npos &&
               rg.find("\"input\":\"pad2kbm\"") != std::string::npos,
           "GET /games reflects uploaded games + persisted config");
   }

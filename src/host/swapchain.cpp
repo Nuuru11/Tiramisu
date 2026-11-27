@@ -163,6 +163,7 @@ int TRT_GUEST_ABI host_d3d12_create_device(void* adapter, u32 min_fl,
   const HRESULT hr = ::D3D12CreateDevice(
       (IUnknown*)adapter, (D3D_FEATURE_LEVEL)min_fl,
       riid ? *(const IID*)riid : k_dev_iid, out_dev);
+  if (out_dev) game_frames().dx_device(hr, SUCCEEDED(hr) && *out_dev);
   if (SUCCEEDED(hr) && out_dev && *out_dev && !g_d3d12_device) {
     ((IUnknown*)(*out_dev))->QueryInterface(__uuidof(ID3D12Device),
                                             g_d3d12_device.put_void());
@@ -232,18 +233,22 @@ DXGI_FORMAT sanitize_flip_fmt(u32 fmt) {
 
 // A flip-model swapchain takes an UNORM format. D3D11 still permits an
 // sRGB render-target view on that buffer when the guest requests sRGB.
-int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
+int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format, u32 width, u32 height) {
   if (!g_swap || !g_ctx || !g_device) return E_FAIL;
-  if (format == DXGI_FORMAT_UNKNOWN) return S_OK;
-  const auto wanted = sanitize_flip_fmt(format);
+
   DXGI_SWAP_CHAIN_DESC1 desc{};
   HRESULT hr = g_swap->GetDesc1(&desc);
-  if (FAILED(hr) || desc.Format == wanted) return hr;
+  if (FAILED(hr)) return hr;
+  if (!width) width = desc.Width;
+  if (!height) height = desc.Height;
+  const auto wanted = format == DXGI_FORMAT_UNKNOWN ? desc.Format : sanitize_flip_fmt(format);
+  if (desc.Format == wanted && width == desc.Width && height == desc.Height) return S_OK;
 
   g_ctx->ClearState();
   g_rtv = nullptr;
   g_ctx->Flush();
-  hr = g_swap->ResizeBuffers(0, desc.Width, desc.Height, wanted, desc.Flags);
+  hr = g_swap->ResizeBuffers(0, width, height, wanted, desc.Flags);
+  if (SUCCEEDED(hr)) trt_input_display_size(width, height);
   winrt::com_ptr<ID3D11Texture2D> back;
   if (SUCCEEDED(g_swap->GetBuffer(0, __uuidof(ID3D11Texture2D), back.put_void()))) {
     g_device->CreateRenderTargetView(back.get(), nullptr, g_rtv.put());
@@ -259,11 +264,18 @@ int TRT_GUEST_ABI set_d3d11_swapchain_format(u32 format) {
   return hr;
 }
 
-int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
+int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count, u32 width, u32 height) {
   if (!g_swap || !g_device) return E_FAIL;
-  const HRESULT hr = set_d3d11_swapchain_format(format);
+  const bool hd = game_video::hd720 && width == 1280 && height == 720;
+  const bool keep_size = game_video::hd720 && !width && !height;
+  const HRESULT hr = set_d3d11_swapchain_format(format, keep_size ? 0 : hd ? 1280 : g_w,
+                                                keep_size ? 0 : hd ? 720 : g_h);
   if (FAILED(hr)) return hr;
 
+  DXGI_SWAP_CHAIN_DESC1 desc{};
+  if (FAILED(g_swap->GetDesc1(&desc))) return E_FAIL;
+  game_frames().backbuffer(desc.Width, desc.Height);
+  trt_input_display_size(desc.Width, desc.Height);
   const bool single_buffer = buffer_count == 1 ||
                              (buffer_count == 0 && g_guest_backbuffer);
   if (!single_buffer) {
@@ -274,8 +286,6 @@ int TRT_GUEST_ABI configure_d3d11_swapchain(u32 format, u32 buffer_count) {
   // Desktop swap-effects can expose one stable buffer. UWP needs at
   // least two flip buffers. Keep the desktop render target stable and
   // copy its pixels into the CoreWindow buffer before each flip.
-  DXGI_SWAP_CHAIN_DESC1 desc{};
-  if (FAILED(g_swap->GetDesc1(&desc))) return E_FAIL;
   const bool srgb = format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
                     format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
   DXGI_FORMAT guest_format = srgb ? static_cast<DXGI_FORMAT>(format) : desc.Format;
@@ -412,6 +422,8 @@ void publish_gpu_hooks() {
     const HRESULT hr = g_factory->CreateSwapChainForCoreWindow(
         (IUnknown*)queue, g_window.get(), &sc, nullptr, sc1.put());
     if (FAILED(hr)) return (int)hr;
+    DXGI_SWAP_CHAIN_DESC1 actual{};
+    if (SUCCEEDED(sc1->GetDesc1(&actual))) game_frames().backbuffer(actual.Width, actual.Height);
     g_d3d12_swap = sc1.try_as<IDXGISwapChain3>();
     g_in_d3d12 = true;
     if (out_sc) *out_sc = g_d3d12_swap ? (void*)g_d3d12_swap.get() : (void*)sc1.get();
@@ -602,7 +614,7 @@ void swapchain_restore_d3d11() {
 
 void swapchain_restore_launcher_format() {
   g_guest_backbuffer = nullptr;
-  set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM);
+  set_d3d11_swapchain_format(DXGI_FORMAT_B8G8R8A8_UNORM, g_w, g_h);
 }
 
 void swapchain_render_frame(float t) {

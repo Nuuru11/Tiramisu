@@ -157,9 +157,12 @@ static void TRT_GUEST_ABI prepare_present() {
   ++g_prepare_presents;
 }
 static int g_swapchain_format_result;
-static int TRT_GUEST_ABI set_swapchain_format(u32 format, u32 buffer_count) {
+static u32 observed_width, observed_height;
+static int TRT_GUEST_ABI set_swapchain_format(u32 format, u32 buffer_count, u32 width, u32 height) {
   g_requested_swapchain_format = format;
   g_requested_swapchain_buffers = buffer_count;
+  observed_width = width;
+  observed_height = height;
   return g_swapchain_format_result;
 }
 
@@ -505,7 +508,7 @@ int main(int argc, char** argv) {
       const u32 rgba_srgb = 29;
       CHECK(((rb_t)svt[13])(proxy_sc, 1, 1920, 1080, rgba_srgb, 0) == 0 &&
                 g_requested_swapchain_format == rgba_srgb &&
-                g_requested_swapchain_buffers == 1,
+                g_requested_swapchain_buffers == 1 && observed_width == 1920 && observed_height == 1080,
             "D3D11 ResizeBuffers forwards the format and buffer count");
       hooks.get_d3d11_backbuffer = &get_alternate_backbuffer;
       hooks.prepare_d3d11_present = &prepare_present;

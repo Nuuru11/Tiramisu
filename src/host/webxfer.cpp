@@ -1102,6 +1102,7 @@ std::string games_json() {
     if (!d.is_dir) continue;
     const std::string gdir = g_games_dir + sep + d.name;
     std::vector<std::string> exes;
+    if (dir_exists(gdir + sep + ".tiramisu-steam-partial")) continue;
     std::string exe;
     bool epic = false;
     scan_game_exes(gdir, d.name, &exes, &exe, &epic);
@@ -1325,7 +1326,7 @@ const char* k_upload_page =
   "async function stopGame(){setLog('Stopping active game...');await fetch('/api/stop',{method:'POST'});refreshStatus();}"
   "async function rescan(){await fetch('/api/rescan',{method:'POST'});refresh();}"
   "async function delGame(n){if(!confirm('Delete '+n+'?'))return;await fetch('/api/game/'+encodeURIComponent(n),{method:'DELETE'});refresh();}"
-  "async function saveCfg(idx,name){const p={video:E('fps'+idx).value+' '+E('sync'+idx).value,exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
+  "async function saveCfg(idx,name){const p={video:E('fps'+idx).value+' '+E('sync'+idx).value+' '+E('res'+idx).value,exe:E('exe'+idx).value,input:E('inp'+idx).value,appid:E('app'+idx).value,args:E('arg'+idx).value};"
   "const saved=await fetch('/api/config/'+encodeURIComponent(name),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});"
   "if(!saved.ok){setLog(await saved.text());return;}setLog('Saved config for '+name);refresh();}"
   "function esc(s){return (s||'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',\"'\":'&#39;'}[c]));}"
@@ -1333,7 +1334,7 @@ const char* k_upload_page =
   "if(!g.length){el.innerHTML='<span style=\"color:#9e9699\">No games yet — drag a game folder or .zip above</span>';return;}"
   "el.innerHTML=g.map((x,i)=>{const opts=(x.exes||[x.exe]).map(e=>'<option value=\"'+esc(e)+'\"'+(e===x.exe?' selected':'')+'>'+esc(e)+'</option>').join('');"
   "const inps=['auto','controller','kbm','pad2kbm'].map(m=>'<option value=\"'+m+'\"'+(m===x.input?' selected':'')+'>Input: '+m+'</option>').join('');"
-  "const [fps,vsync]=(x.video||'default default').split(' ');const select=(values,cur)=>values.map(v=>'<option'+(v===cur?' selected':'')+'>'+v+'</option>').join('');"
+  "const [fps,vsync,res]=(x.video||'default default').split(' ');const select=(values,cur)=>values.map(v=>'<option'+(v===cur?' selected':'')+'>'+v+'</option>').join('');"
   "const ccol=(x.compat_ok===false)?'#ff9aa8':'#b6e3c6';"
   "const cbadge=x.compat?('<span class=pill style=\"color:'+ccol+';border-color:rgba(255,255,255,.16)\">'+esc(x.compat)+'</span>'):'';"
   "return '<div class=game><div class=game-top><div class=game-head>'"
@@ -1345,12 +1346,12 @@ const char* k_upload_page =
   "+'<button class=\"btn btn-sec\" onclick=\"saveCfg('+i+','+esc(JSON.stringify(x.name))+')\">Save</button>'"
   "+'<button class=\"btn btn-danger\" onclick=\"delGame('+esc(JSON.stringify(x.name))+')\">Delete</button></div></div>'"
   "+'<div class=game-cfg><select id=exe'+i+'>'+opts+'</select><select id=inp'+i+'>'+inps+'</select>'"
-  "+'<label>FPS cap <select id=fps'+i+'>'+select(['default','30','60','120'],fps)+'</select></label><label>VSync <select id=sync'+i+'>'+select(['default','on','off'],vsync)+'</select></label>'"
+  "+'<label>FPS cap <select id=fps'+i+'>'+select(['default','30','60','120'],fps)+'</select></label><label>VSync <select id=sync'+i+'>'+select(['default','on','off'],vsync)+'</select></label><label>Render profile (720p defaults to 30 FPS) <select id=res'+i+'>'+select(['default','720p'],res)+'</select></label>'"
   "+'<input id=app'+i+' placeholder=\"Steam AppID (optional)\" value=\"'+esc(x.appid)+'\">'"
   "+'<input id=arg'+i+' placeholder=\"Launch args (e.g. -windowed)\" value=\"'+esc(x.args)+'\"></div></div>';}).join('');}"
   "async function refreshStatus(){try{const r=await fetch('/api/status');if(!r.ok)throw Error(r.status);const s=await r.json();"
   "E('runpill').textContent=s.running_game?('Running: '+s.running_game):'Xbox Connected';"
-  "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
+  "E('frameperf').textContent='';if(s.running_game){const f=await(await fetch('/api/frame-metrics',{cache:'no-store'})).json();E('frameperf').textContent=f.ready?(f.fps.toFixed(1)+' FPS'+(f.mean_ms>=0?' · '+f.mean_ms.toFixed(1)+' ms/frame':'')+' · '+f.slow+' intervals above 33 ms (last 30 s)'):'Waiting for game frames';}"
   "if(s.control_code&&E('ctrlLink'))E('ctrlLink').href='/controls?pin='+encodeURIComponent(s.control_code);"
   "if(s.upload_total>0&&s.upload_done<s.upload_total){E('fill').style.width=Math.min(99,(s.upload_done/s.upload_total)*100)+'%';}}catch{E('runpill').textContent='Xbox Unavailable';E('frameperf').textContent='';}}"
   "async function loadLaunchReport(){try{const r=await fetch('/api/launch-report',{cache:'no-store'});if(!r.ok)return;const text=await r.text();E('launchdetail').textContent=text;E('launchdiag').hidden=!text;}catch{}}"
@@ -2296,6 +2297,22 @@ void handle_client(sock_t s) {
       if (g_launch_attempt) {
         report = g_launch_game + " — " + g_launch_stage;
         if (!g_launch_detail.empty()) report += "\n" + g_launch_detail;
+        const auto sample = game_frames().launch_info();
+        report += "\nDX12 device: ";
+        if (sample.dx_created) report += "created";
+        else if (sample.dx_attempted) {
+          char hr[32];
+          snprintf(hr, sizeof(hr), "failed (0x%08X)", static_cast<unsigned>(sample.dx_result));
+          report += hr;
+        } else report += "creation not observed";
+        report += "\nFirst guest Present: ";
+        report += sample.first_ms < 0 ? "not observed" : std::to_string(sample.first_ms) + " ms after launch";
+        if (sample.width && sample.height)
+          report += "\nDXGI backbuffer: " + std::to_string(sample.width) + " x " + std::to_string(sample.height);
+        if (sample.first_memory_mib >= 0)
+          report += "\nApp memory at first frame: " + std::to_string(sample.first_memory_mib) + " MiB";
+        else if (sample.last_memory_mib >= 0)
+          report += "\nLast app memory sample: " + std::to_string(sample.last_memory_mib) + " MiB";
       }
     }
     respond(s, "200 OK", "text/plain; charset=utf-8", report);
@@ -2304,8 +2321,8 @@ void handle_client(sock_t s) {
   if (strcmp(method, "GET") == 0 && url_path == "/api/frame-metrics") {
     const auto sample = game_frames().read();
     char data[128];
-    snprintf(data, sizeof(data), "{\"ready\":%s,\"fps\":%.2f,\"slow\":%u}",
-             sample.ready ? "true" : "false", sample.fps, sample.slow);
+    snprintf(data, sizeof(data), "{\"ready\":%s,\"fps\":%.2f,\"mean_ms\":%.2f,\"slow\":%u}",
+             sample.ready ? "true" : "false", sample.fps, sample.mean_ms, sample.slow);
     respond(s, "200 OK", "application/json", data);
     return;
   }
@@ -2696,6 +2713,14 @@ void handle_client(sock_t s) {
     if (parse_json_str_field(body, "video", &video)) {
       auto pos = video.find(' ');
       auto fps = video.substr(0, pos), sync = video.substr(pos + 1);
+      auto split = sync.find(' ');
+      if (split != std::string::npos) {
+        const auto profile = sync.substr(split + 1);
+        if (profile != "default" && profile != "720p") {
+          respond(s, "400 Bad Request", "text/plain", "Invalid render profile"); return;
+        }
+        sync.resize(split);
+      }
       if (pos == std::string::npos || (fps != "default" && fps != "30" && fps != "60" && fps != "120") ||
           (sync != "default" && sync != "on" && sync != "off")) {
         respond(s, "400 Bad Request", "text/plain", "Invalid video settings"); return;
@@ -3279,8 +3304,10 @@ void webxfer_autopilot_state(std::string* game, int* attempt,
   if (result) *result = g_ap.result;
 }
 
-unsigned long long webxfer_begin_launch_report(const std::string& game, const char* stage) {
+unsigned long long webxfer_begin_launch_report(const std::string& game, const char* stage,
+    long long (*memory_mib)()) {
   std::lock_guard<std::mutex> lk(g_mu);
+  game_frames().begin_report(memory_mib);
   g_launch_game = game;
   g_launch_stage = stage;
   g_launch_detail.clear();

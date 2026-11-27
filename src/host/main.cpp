@@ -856,6 +856,7 @@ void scan_game_entry(
     char drive_tag,
     const std::vector<std::pair<std::string, std::string>>& prev_choice) {
   if (n == "." || n == "..") return;
+  if (is_dir && GetFileAttributesA((root + "\\" + n + "\\.tiramisu-steam-partial").c_str()) != INVALID_FILE_ATTRIBUTES) return;
   if (!is_dir) {
     // A disc image dropped straight into the games folder: the exe list is
     // read out of the image and it mounts as D: on launch.
@@ -1239,6 +1240,7 @@ void log_guest_memory(const char* stage) {
     // for the VIDEO-SAMPLE appmem field (one WinRT call
     // shared with this line, not a second ~1s call inside
     // the sample).
+    longan::game_frames().memory_sample(usage / mib);
     trt_video_set_app_mem_mb(usage / mib);
     snprintf(line, sizeof(line), "guest memory (%s): app %llu/%llu MiB, %s",
              stage, (unsigned long long)(usage / mib),
@@ -1838,6 +1840,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
   // A game-shipped tiramisu_args.txt, or launch_args from the per-title
   // profile, both win over the synthesized arguments.
   bool has_user_args = false;
+  std::string launch_args;
   bool app_id_read = false;     // a non-zero steam_appid.txt was found
   {
     std::ifstream af(game_dir + "\\tiramisu_args.txt");
@@ -1850,16 +1853,14 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
         if (!args.empty()) args += ' ';
         args += ln;
       }
-      trt_bridge_set_cmd_args(args.c_str());
+      launch_args = args;
     } else {
       const std::string prof_args = longan::settings_get().launch_args;
       if (!prof_args.empty()) {
-        trt_bridge_set_cmd_args(prof_args.c_str());
+        launch_args = prof_args;
         has_user_args = true;  // tuned for this title, keep the synthesizer out
         longan::log_line(
             ("host: args from per-title profile: " + prof_args).c_str());
-      } else {
-        trt_bridge_set_cmd_args("");
       }
     }
     u32 app_id = 0;
@@ -1931,8 +1932,18 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
         if (!synth_args.empty()) synth_args += ' ';
         synth_args += a;
       }
-      trt_bridge_set_cmd_args(synth_args.c_str());
+      launch_args = synth_args;
       longan::log_line(("host: [ENGINE SYNTHESIZER] applied args: " + synth_args).c_str());
+    }
+    if (longan::game_video::hd720) {
+      const auto engine = synth_prof.engine_type;
+      std::string lower = launch_args;
+      std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return std::tolower(c); });
+      if ((engine == TRT_ENGINE_UNITY_MONO || engine == TRT_ENGINE_UNITY_IL2CPP) &&
+          lower.find("-screen-width") == std::string::npos && lower.find("-screen-height") == std::string::npos)
+        launch_args += " -screen-width 1280 -screen-height 720";
+      if (engine == TRT_ENGINE_UNREAL && lower.find("-resx=") == std::string::npos && lower.find("-resy=") == std::string::npos)
+        launch_args += " -ResX=1280 -ResY=720";
     }
     if (!app_id_read && synth_prof.has_steam) {
       limbus_report::select_app(synth_prof.steam_appid);
@@ -1956,6 +1967,7 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
     }
   }
 
+  trt_bridge_set_cmd_args(launch_args.c_str());
   const size_t exe_sl = exe_path.rfind('\\');
   const std::string exe_dir =
       (exe_sl == std::string::npos) ? game_dir : exe_path.substr(0, exe_sl);
@@ -4088,10 +4100,12 @@ struct tiramisu_host
                          g_host_ap.game.c_str());
                 longan::log_line(ap_msg);
               }
-              const auto attempt = longan::webxfer_begin_launch_report(want, "Başlatma isteği alındı");
+              const auto attempt = longan::webxfer_begin_launch_report(want, "Başlatma isteği alındı", []() -> long long {
+                try { return winrt::Windows::System::MemoryManager::AppMemoryUsage() >> 20; }
+                catch (...) { return -1; }
+              });
               g_active_launch_attempt = attempt;
               g_running_game_name = want;
-              longan::game_frames().reset(true);
               g_guest_running.store(true);
               const std::string exe = ge.exe;
               const std::string gdir = ge.dir;
@@ -4105,6 +4119,7 @@ struct tiramisu_host
                 const bool stack_charged =
                     trt_mem_budget_charge_va(1024ull * 1024ull) == 0;
                 const auto gr = run_game(want, exe, gdir, img, attempt);
+                log_guest_memory("launch returned");
                 longan::webxfer_update_launch_report(attempt, gr.stage,
                     gr.detail[0] ? gr.detail : trt_errstr(gr.map_rc));
                 char line[192];

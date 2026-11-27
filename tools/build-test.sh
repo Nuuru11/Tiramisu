@@ -767,6 +767,9 @@ clang++ -std=c++20 -O2 -Wall -no-pie \
 
 clang++ -std=c++20 -O2 tests/test_frame_window.cpp -o "$out/test_frame_window"
 "$out/test_frame_window"
+clang++ -std=c++20 -O2 tests/test_steam_queue_store.cpp -o "$out/test_steam_queue_store"
+"$out/test_steam_queue_store"
+
 
 # --- 36. D3D12 TRIANGLE GATE: full render path through a real guest PE ---
 # (device -> queue -> alloc -> list -> rootsig -> pso -> resource -> draw ->
