@@ -190,7 +190,7 @@ inline float sy(float v) { return v * (g_h / 810.0f); }
 inline float sc(float v) { return v * std::min(g_w / 1440.0f, g_h / 810.0f); }
 
 inline bool ptr_in(float l, float t, float w, float h) {
-  return !g_controller_active && g_ptr_x >= l && g_ptr_y >= t &&
+  return (!g_controller_active || g_cursor_visible) && g_ptr_x >= l && g_ptr_y >= t &&
          g_ptr_x < l + w && g_ptr_y < t + h;
 }
 

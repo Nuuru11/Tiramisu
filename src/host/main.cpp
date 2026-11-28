@@ -129,6 +129,7 @@ std::string g_pending_launch;
 // transitions; the repair/retry itself is applied by webxfer's state machine.
 static longan::host_autopilot_state& g_host_ap = longan::host_ap_state();
 bool g_mouse_mode = false;
+bool g_launcher_mouse_before_game = false;
 bool g_kbd_mouse_mode = false;
 // Set only when pad-as-mouse was chosen automatically because no pointer was
 // visible at boot. A mouse connected later clears it so the real device takes
@@ -2730,7 +2731,7 @@ struct tiramisu_host
         {L"Rescan Game Library", L"Internal SSD + USB Drives (D:–Y:)", L"RUN"},
         {L"Refresh Game Cover Art", L"Re-fetch HD Steam covers for all games", L"RUN"},
         {L"Run Runtime Self-Test", L"Verify PE64 loader & syscall hooks", L"RUN"},
-        {L"Gamepad-as-Mouse Mode", L"Right stick moves cursor (R3 / F1)",
+        {L"Kumanda imleci", L"Sağ çubuk: hareket • RT: tıkla • R3: aç/kapat",
          g_mouse_mode ? L"ON" : L"OFF"},
         {L"Keyboard Cursor Mode", L"Arrows/Numpad move cursor (F8)",
          g_kbd_mouse_mode ? L"ON" : L"OFF"},
@@ -2760,7 +2761,7 @@ struct tiramisu_host
       }
       case 3:
         g_mouse_mode = !g_mouse_mode;
-        g_tool_result = g_mouse_mode ? L"Gamepad-as-Mouse ON" : L"Gamepad-as-Mouse OFF";
+        g_tool_result = g_mouse_mode ? L"İmleç açık: sağ çubukla hareket et, RT ile tıkla" : L"Kumanda imleci kapalı";
         break;
       case 4:
         g_kbd_mouse_mode = !g_kbd_mouse_mode;
@@ -3432,19 +3433,12 @@ struct tiramisu_host
           trt_mouse_pos(&pmx, &pmy);
           longan::ui_set_pointer_pos(pmx, pmy);
         }
-        const bool mouse_recent =
-            (g_last_mouse_move_ms.load() != 0) &&
-            (now_input_ms - g_last_mouse_move_ms.load() < 15000);
-        // A real mouse owns the on-screen pointer now (the shell grants one to
-        // the Edge identity). Do not stack our D2D arrow on top of it; keep the
-        // drawn cursor only when there is no hardware pointer at all.
+        const bool launcher_pointer = pad_ok && g_mouse_mode && !g_guest_running.load();
         const bool hw_pointer = g_host_mouse_present.load() ||
                                 g_native_input.mouse_connected() ||
                                 g_last_raw_mouse_ms.load() != 0;
-        // The shell owns the pointer on the dashboard. Only draw our own arrow
-        // while an actual game is being driven by pad-as-mouse.
-        const bool show_cursor = !hw_pointer && g_guest_running.load() &&
-                                 g_mouse_mode;
+        const bool show_cursor = launcher_pointer ||
+                                 (!hw_pointer && g_guest_running.load() && g_mouse_mode);
         longan::ui_set_cursor_visible(show_cursor);
         longan::set_launcher_cursor_visible(false);
 
@@ -3659,7 +3653,8 @@ struct tiramisu_host
           if (guest_was_running) {
             trt_input_release_all();
             trt_input_reset_cursor_mode(false);
-            g_mouse_mode = false;
+            g_mouse_mode = g_launcher_mouse_before_game;
+            g_auto_pad_mouse.store(false);
             longan::webxfer_set_running_game("");
             const std::string gs = get_guest_status();
             if (!gs.empty() && gs != "idle") longan::ui_toast(u82ws(gs), 3.6f);
@@ -3876,10 +3871,12 @@ struct tiramisu_host
         if (want_mm && !rs_btn) {
           rs_btn = true;
           g_mouse_mode = !g_mouse_mode;
+          if (!g_guest_running.load() && g_screen == longan::UI_TOOLS) sync_tools_list();
         } else if (!want_mm) rs_btn = false;
 
         // gamepad-as-mouse + virtual KBM (KBM games without a real mouse/KB)
         if (pad_ok && g_mouse_mode) {
+          const bool starting = !mm_was_active;
           mm_was_active = true;
           const int dz = 8000;
           int sx = xs.Gamepad.sThumbRX;
@@ -3892,6 +3889,13 @@ struct tiramisu_host
           trt_display_size(&dw, &dh);
           if (dw <= 0) dw = 1920;
           if (dh <= 0) dh = 1080;
+          if (starting) {
+            trt_mouse_pos(&mouse_vx, &mouse_vy);
+            if (mouse_vx <= 0 && mouse_vy <= 0) {
+              mouse_vx = dw / 2;
+              mouse_vy = dh / 2;
+            }
+          }
           mouse_vx += ddx;
           mouse_vy += ddy;
           if (mouse_vx < 0) mouse_vx = 0;
@@ -3906,7 +3910,12 @@ struct tiramisu_host
           const bool lt = xs.Gamepad.bLeftTrigger >
                           XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
           const bool rb = (b & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
-          if (rt != mm_was_rt) { trt_input_mouse_button(0, rt); mm_was_rt = rt; }
+          if (!g_guest_running.load()) longan::ui_set_pointer_pos(mouse_vx, mouse_vy);
+          if (rt != mm_was_rt) {
+            mm_was_rt = rt;
+            trt_input_mouse_button(0, rt);
+            if (!rt && !g_guest_running.load()) launcher_click();
+          }
           if (lt != mm_was_lt) { trt_input_mouse_button(1, lt); mm_was_lt = lt; }
           if (rb != mm_was_rb) { trt_input_mouse_button(2, rb); mm_was_rb = rb; }
 
@@ -4081,6 +4090,7 @@ struct tiramisu_host
                 }
               }
               set_guest_status("running " + ge.name + "…");
+              g_launcher_mouse_before_game = g_mouse_mode;
               if (ge.input_mode == "pad2kbm" || ge.input_mode == "kbm") {
                 g_mouse_mode = true;
               } else if (ge.input_mode == "controller") {
