@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -146,6 +147,35 @@ std::wstring g_tool_result;
 // Steam state
 int g_steam_selected = 0;
 std::vector<ui_steam_item> g_steam_items;
+std::vector<ui_steam_item> g_catalog;
+std::vector<std::wstring> g_search_titles;
+std::wstring g_query, g_letters;
+int g_letter = 0;
+bool g_search_open = false;
+
+void filter_catalog() {
+  unsigned previous = ui_steam_selected_app();
+  g_steam_items.clear();
+  g_letters.clear();
+  g_letter = g_steam_selected = 0;
+  for (size_t i = 0; i < g_catalog.size(); ++i) {
+    const auto& title = g_search_titles[i];
+    size_t at = title.find(g_query);
+    if (at == std::wstring::npos) continue;
+    if (previous && previous == g_catalog[i].app_id)
+      g_steam_selected = (int)g_steam_items.size();
+    g_steam_items.push_back(g_catalog[i]);
+    while (at != std::wstring::npos) {
+      size_t next = at + g_query.size();
+      if (next < title.size() && g_letters.find(title[next]) == std::wstring::npos)
+        g_letters.push_back(title[next]);
+      if (at == title.size()) break;
+      at = title.find(g_query, at + 1);
+    }
+  }
+  std::sort(g_letters.begin(), g_letters.end());
+}
+
 bool g_steam_signed_in = false;
 uint64_t g_steam_id64 = 0;
 std::wstring g_steam_persona;
@@ -315,47 +345,15 @@ void draw_scrollbar(float x, float y, float h, int start, int vis, int total) {
 void draw_glass_card(float x, float y, float w, float h, float rad = 24.0f,
                      bool focused = false) {
   const float r = sc(rad);
-  // Crisp luminous obsidian frosted-glass gradient
-  D2D1_GRADIENT_STOP stops[2] = {
-      {0.0f, D2D1::ColorF(0.145f, 0.155f, 0.192f, 0.84f)},
-      {1.0f, D2D1::ColorF(0.082f, 0.088f, 0.112f, 0.90f)}};
-  ID2D1GradientStopCollection* gsc = nullptr;
-  if (SUCCEEDED(g_ctx->CreateGradientStopCollection(stops, 2, &gsc))) {
-    ID2D1LinearGradientBrush* lgb = nullptr;
-    if (SUCCEEDED(g_ctx->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties({x, y}, {x, y + h}), gsc,
-            &lgb))) {
-      fill_rrect(x, y, w, h, r, lgb);
-      lgb->Release();
-    }
-    gsc->Release();
-  } else {
-    fill_rrect(x, y, w, h, r, g_br_glass);
-  }
-  draw_top_specular_rim(x, y, w, r, focused ? 0.42f : 0.22f);
+  fill_rrect(x, y, w, h, r, g_br_glass);
   stroke_rrect(x, y, w, h, r, focused ? g_br_white : g_br_border,
                focused ? sc(2.4f) : sc(1.2f));
 }
 
 void draw_champagne_pill(float x, float y, float w, float h) {
   const float r = h * 0.5f;
-  D2D1_GRADIENT_STOP stops[2] = {
-      {0.0f, D2D1::ColorF(0.905f, 0.855f, 0.835f, 1.0f)},  // luminous pearl-champagne
-      {1.0f, D2D1::ColorF(0.796f, 0.725f, 0.702f, 1.0f)}}; // warm champagne
-  ID2D1GradientStopCollection* gsc = nullptr;
-  if (SUCCEEDED(g_ctx->CreateGradientStopCollection(stops, 2, &gsc))) {
-    ID2D1LinearGradientBrush* lgb = nullptr;
-    if (SUCCEEDED(g_ctx->CreateLinearGradientBrush(
-            D2D1::LinearGradientBrushProperties({x, y}, {x, y + h}), gsc,
-            &lgb))) {
-      fill_rrect(x, y, w, h, r, lgb);
-      lgb->Release();
-    }
-    gsc->Release();
-  } else {
-    fill_rrect(x, y, w, h, r, g_br_accent);
-  }
-  draw_top_specular_rim(x, y, w, r, 0.45f);
+  fill_rrect(x, y, w, h, r, g_br_accent);
+
 }
 
 // Crisp Xbox Controller face button badge (ONLY drawn when controller active!)
@@ -561,26 +559,21 @@ void draw_qr_in_box(float box_x, float box_y, float box_size) {
   const float qx = std::floor(box_x + (box_size - total) * 0.5f) + pad;
   const float qy = std::floor(box_y + (box_size - total) * 0.5f) + pad;
 
-  ID2D1SolidColorBrush* wbr = nullptr;
-  ID2D1SolidColorBrush* bbr = nullptr;
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.97f, 0.96f, 0.96f, 1.0f), &wbr);
-  g_ctx->CreateSolidColorBrush(D2D1::ColorF(0.05f, 0.05f, 0.07f, 1.0f), &bbr);
-  if (wbr && bbr) {
+  if (g_br_white && g_br_ink) {
     D2D1_ROUNDED_RECT bg{{qx - pad, qy - pad, qx + q + pad, qy + q + pad},
                          sc(14.0f), sc(14.0f)};
-    g_ctx->FillRoundedRectangle(&bg, wbr);
+    g_ctx->FillRoundedRectangle(&bg, g_br_white);
     for (int yy = 0; yy < g_qr_size; ++yy) {
       for (int xx = 0; xx < g_qr_size; ++xx) {
         if (qrcodegen_getModule(g_qr, xx, yy)) {
           D2D1_RECT_F c{qx + xx * cell, qy + yy * cell,
                         qx + (xx + 1) * cell, qy + (yy + 1) * cell};
-          g_ctx->FillRectangle(&c, bbr);
+          g_ctx->FillRectangle(&c, g_br_ink);
         }
       }
     }
   }
-  if (wbr) wbr->Release();
-  if (bbr) bbr->Release();
+
 }
 
 // Layout geometry constants (1440x810 design grid matching TopNavigation.tsx & App.tsx)
@@ -1367,12 +1360,28 @@ void draw_steam_screen() {
   draw_glass_card(pad_x, top_y, left_w, full_h, 24.0f);
   text_out(g_f_h2, pad_x + sx(24.0f), top_y + sy(20.0f), left_w - sx(48.0f),
            sy(32.0f),
-           g_steam_signed_in ? L"Your Steam Library" : L"Steam Library",
+           L"Steam kütüphanesi    ·    → Ara",
            g_br_white);
 
-  const float list_y0 = top_y + sy(66.0f);
+  const std::wstring search = (g_query.empty() ? L"Oyun ara" : g_query) +
+      L"   ·   " + std::to_wstring(g_steam_items.size()) + L" oyun";
+  fill_rrect(pad_x + sx(16), top_y + sy(60), left_w - sx(32), sy(46), sc(12), g_br_glass2);
+  text_out_line(g_f_nav, pad_x + sx(30), top_y + sy(62), left_w - sx(60), sy(42),
+                search.c_str(), g_br_white);
+  if (g_search_open) {
+    std::wstring letters;
+    for (int i = std::max(0, g_letter - 4); i < std::min((int)g_letters.size(), g_letter + 5); ++i) {
+      if (i == g_letter) letters += L"[";
+      letters += g_letters[i] == L' ' ? L'␣' : g_letters[i];
+      if (i == g_letter) letters += L"]";
+      letters += L"  ";
+    }
+    text_out_line(g_f_nav, pad_x + sx(24), top_y + sy(111), left_w - sx(48), sy(32),
+                  letters.c_str(), g_br_accent);
+  }
+  const float list_y0 = top_y + sy(g_search_open ? 150 : 114);
   const float row_h = sy(68.0f);
-  const int max_vis = std::max(1, (int)((full_h - sy(84.0f)) / row_h));
+  const int max_vis = std::max(1, (int)((top_y + full_h - list_y0 - sy(16)) / row_h));
   if (g_steam_items.empty()) {
     text_out(g_f_body, pad_x + sx(26.0f), list_y0 + sy(24.0f),
              left_w - sx(52.0f), sy(120.0f),
@@ -1409,7 +1418,7 @@ void draw_steam_screen() {
                  it.status_str.empty() ? L"Downloading..." : it.status_str.c_str());
         st = b;
       } else if (it.installed) {
-        st = L"Ready to Play  ·  " + it.size_str;
+        st = L"Oynamaya hazır  ·  " + it.size_str;
       } else {
         st = (it.status_str.empty() ? L"In Steam Account" : it.status_str) +
              L"  ·  " + it.size_str;
@@ -1436,7 +1445,7 @@ void draw_steam_screen() {
              g_steam_persona.empty() ? L"Steam User" : g_steam_persona.c_str(),
              (unsigned long long)g_steam_id64);
   } else {
-    swprintf(hdr, 160, L"Steam Account (Not Signed In)");
+    swprintf(hdr, 160, L"Steam hesabına giriş yap");
   }
   text_out(g_f_small, right_x + sx(24.0f), top_y + sy(22.0f), right_w - sx(48.0f),
            sy(24.0f), hdr, g_br_accent);
@@ -1454,9 +1463,9 @@ void draw_steam_screen() {
     }
     std::wstring bt = sel.downloading
                           ? (sel.status_str.empty() ? L"Downloading..." : sel.status_str)
-                          : (sel.installed ? L"▶  Launch on Xbox"
-                                           : L"Download from Steam to Xbox");
-    if (sel.family_shared && !sel.downloading) bt = L"Download for later";
+                          : (sel.installed ? L"Xbox’ta oyna"
+                                           : L"Xbox’a indir");
+    if (sel.family_shared && !sel.downloading) bt = L"Daha sonra oynamak için indir";
     text_out(g_f_nav, right_x + sx(24.0f), by, right_w - sx(48.0f), sy(48.0f),
              bt.c_str(), g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
@@ -1483,14 +1492,18 @@ void draw_steam_screen() {
     text_out(g_f_nav, right_x + sx(24.0f), qbtn_y, right_w - sx(48.0f),
              sy(46.0f),
              g_steam_signed_in ? L"Re-Link Steam QR Code"
-                               : L"Sign in with Steam Mobile QR",
+                               : L"Steam Mobile ile QR kodunu tara",
              g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
   }
 
-  draw_controller_footer({{L'A', L"Download / Play"},
-                          {L'Y', L"Steam QR Login"},
-                          {L'X', (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() && g_steam_items[g_steam_selected].family_shared) ? L"Storage" : L"Refresh Library"},
+  if (g_search_open) {
+    draw_controller_footer({{L'A', L"Harf ekle (← →)"}, {L'X', L"Son harfi sil"}, {L'B', L"Sonuçları göster"}});
+    return;
+  }
+  draw_controller_footer({{L'A', L"İndir / oyna"},
+                          {L'Y', L"QR ile giriş"},
+                          {L'X', (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() && g_steam_items[g_steam_selected].family_shared) ? L"Storage" : L"Listeyi yenile"},
                           {L'B', L"Ana sayfaya dön"}});
 }
 
@@ -2012,7 +2025,21 @@ void ui_steam_nav_down() {
     ui_sfx_move();
   }
 }
-int ui_steam_selected_index() { return g_steam_selected; }
+unsigned ui_steam_selected_app() {
+  return g_steam_items.empty() ? 0 : g_steam_items[g_steam_selected].app_id;
+}
+bool ui_steam_search_open() { return g_search_open; }
+void ui_steam_search_toggle() { g_search_open = !g_search_open; }
+void ui_steam_search_move(int delta) {
+  if (!g_letters.empty())
+    g_letter = (g_letter + delta + (int)g_letters.size()) % (int)g_letters.size();
+}
+void ui_steam_search_edit(bool erase) {
+  if (erase && !g_query.empty()) g_query.pop_back();
+  else if (!erase && !g_letters.empty()) g_query += g_letters[g_letter];
+  else return;
+  filter_catalog();
+}
 
 void ui_set_steam_account(bool signed_in, uint64_t steamid64,
                           std::wstring persona, std::wstring status_line) {
@@ -2023,10 +2050,27 @@ void ui_set_steam_account(bool signed_in, uint64_t steamid64,
 }
 
 void ui_set_steam_items(const std::vector<ui_steam_item>& items) {
-  g_steam_items = items;
-  if (g_steam_selected >= (int)g_steam_items.size()) {
-    g_steam_selected = items.empty() ? 0 : (int)items.size() - 1;
+  bool changed = items.size() != g_catalog.size();
+  for (size_t i = 0; !changed && i < items.size(); ++i)
+    changed = items[i].app_id != g_catalog[i].app_id || items[i].title != g_catalog[i].title;
+  g_catalog = items;
+  if (!changed) {
+    size_t match = 0;
+    for (const auto& item : items)
+      if (match < g_steam_items.size() && item.app_id == g_steam_items[match].app_id)
+        g_steam_items[match++] = item;
+    return;
   }
+  g_search_titles.clear();
+  for (const auto& item : items) {
+    auto title = item.title;
+    std::transform(title.begin(), title.end(), title.begin(), [](wchar_t c) { return std::towupper(c); });
+    g_search_titles.push_back(std::move(title));
+  }
+  const wchar_t letter = g_letters.empty() ? 0 : g_letters[g_letter];
+  filter_catalog();
+  auto found = g_letters.find(letter);
+  if (found != std::wstring::npos) g_letter = (int)found;
 }
 
 void ui_set_steam_friends(const std::vector<ui_steam_friend>& friends) {
@@ -2241,6 +2285,7 @@ void ui_set_transfer(std::wstring url, std::wstring status) {
 }
 void ui_set_screen(ui_screen s) {
   if (g_screen != s) {
+    g_search_open = false;
     g_screen = s;
     g_tab_t = 0.0f;
     if (s < UI_TAB_COUNT && g_intro_t > 0.15f) ui_sfx_tab();
@@ -2403,9 +2448,13 @@ ui_click ui_hit_test(int x, int y) {
     const float left_w = full_w * 0.54f;
     const float right_x = pad_x + left_w + gap;
     const float right_w = full_w - left_w - gap;
-    const float list_y0 = top_y + sy(66.0f);
+    const float list_y0 = top_y + sy(g_search_open ? 150 : 114);
     const float row_h = sy(68.0f);
-    const int max_vis = std::max(1, (int)((full_h - sy(84.0f)) / row_h));
+    const int max_vis = std::max(1, (int)((top_y + full_h - list_y0 - sy(16)) / row_h));
+    if (hits(pad_x + sx(16), top_y + sy(60), left_w - sx(32), sy(46))) {
+      ui_steam_search_toggle();
+      return {ui_click_type::none, 0};
+    }
     int start = ((int)g_steam_items.size() > max_vis)
                     ? std::clamp(g_steam_selected - max_vis / 2, 0,
                                  (int)g_steam_items.size() - max_vis)
@@ -2419,7 +2468,7 @@ ui_click ui_hit_test(int x, int y) {
     }
     if (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() &&
         hits(right_x + sx(24.0f), top_y + sy(104.0f), right_w - sx(48.0f), sy(48.0f))) {
-      return {ui_click_type::steam_action, g_steam_selected};
+      return {ui_click_type::steam_action, 0};
     }
     if (hits(right_x + sx(24.0f), top_y + full_h - sy(74.0f), right_w - sx(48.0f), sy(46.0f))) {
       return {ui_click_type::steam_qr, 0};

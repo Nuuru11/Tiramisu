@@ -60,7 +60,11 @@ struct ui_steam_ach {
 
 void ui_steam_nav_up();
 void ui_steam_nav_down();
-int ui_steam_selected_index();
+unsigned ui_steam_selected_app();
+bool ui_steam_search_open();
+void ui_steam_search_toggle();
+void ui_steam_search_move(int delta);
+void ui_steam_search_edit(bool erase);
 void ui_set_steam_account(bool signed_in, uint64_t steamid64,
                           std::wstring persona, std::wstring status_line);
 void ui_set_steam_items(const std::vector<ui_steam_item>& items);

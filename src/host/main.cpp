@@ -2113,6 +2113,11 @@ guest_run_result run_game(const std::string& name, const std::string& exe,
 void rescan_games();
 
 void sync_steam_to_ui() {
+  using clock = std::chrono::steady_clock;
+  static clock::time_point next_sync{};
+  const auto now = clock::now();
+  if (now < next_sync) return;
+  next_sync = now + std::chrono::milliseconds(250);
   const auto acct = longan::steam_client_account();
   g_steam_status = acct.status_line;
   g_steam_qr = acct.qr_url;
@@ -2689,10 +2694,11 @@ struct tiramisu_host
     }
   }
 
-  void trigger_steam_item_action(int idx) {
+  void trigger_steam_item_action(unsigned app_id) {
     const auto items = longan::steam_client_items();
-    if (idx < 0 || idx >= static_cast<int>(items.size())) return;
-    const auto& it = items[idx];
+    auto selected = std::find_if(items.begin(), items.end(), [app_id](const auto& item) { return item.app_id == app_id; });
+    if (selected == items.end()) return;
+    const auto& it = *selected;
     if (it.installed && !it.family_shared) {
       std::string launch_name;
       for (const auto& ge : g_games) {
@@ -2920,7 +2926,7 @@ struct tiramisu_host
       case longan::ui_click_type::select_steam:
         break;
       case longan::ui_click_type::steam_action:
-        trigger_steam_item_action(hit.index);
+        trigger_steam_item_action(longan::ui_steam_selected_app());
         break;
       case longan::ui_click_type::steam_qr:
         steam_begin();
@@ -3821,36 +3827,49 @@ struct tiramisu_host
         } else if (!g_guest_running.load() && g_screen == longan::UI_STEAM) {
           // on-console Steam screen: up/down select title (auto-repeat), A download/play,
           // X refresh library, Y QR login, B Home
-          if (step_up) longan::ui_steam_nav_up();
-          if (step_dn) longan::ui_steam_nav_down();
-          const bool want_ref = want_x || (!km_lock && launcher_key('R'));
-          if (want_ref && !x_btn) {
-            x_btn = true;
-            const auto items = longan::steam_client_items();
-            const int idx = longan::ui_steam_selected_index();
-            if (want_x && idx >= 0 && idx < static_cast<int>(items.size()) && items[idx].family_shared) {
-              longan::steam_client_family_storage(items[idx].app_id);
-            } else {
-              longan::steam_client_refresh_remote(
-                  []() { g_steam_needs_rescan.store(true); });
-              longan::ui_toast(L"Refreshing Steam library…", 2.4f);
+          if (longan::ui_steam_search_open()) {
+            if (step_lt || step_rt) longan::ui_steam_search_move(step_lt ? -1 : 1);
+            if (want_go && !a_btn) longan::ui_steam_search_edit(false);
+            if (want_x && !x_btn) longan::ui_steam_search_edit(true);
+            if (want_back && !b_btn) longan::ui_steam_search_toggle();
+            a_btn = want_go;
+            x_btn = want_x;
+            b_btn = want_back;
+          } else if (step_rt) {
+            longan::ui_steam_search_toggle();
+          } else {
+            if (step_up) longan::ui_steam_nav_up();
+            if (step_dn) longan::ui_steam_nav_down();
+            const bool want_ref = want_x || (!km_lock && launcher_key('R'));
+            if (want_ref && !x_btn) {
+              x_btn = true;
+              const auto items = longan::steam_client_items();
+              const unsigned app = longan::ui_steam_selected_app();
+              auto selected = std::find_if(items.begin(), items.end(), [app](const auto& item) { return item.app_id == app; });
+              if (want_x && selected != items.end() && selected->family_shared) {
+                longan::steam_client_family_storage(app);
+              } else {
+                longan::steam_client_refresh_remote(
+                    []() { g_steam_needs_rescan.store(true); });
+                longan::ui_toast(L"Refreshing Steam library…", 2.4f);
+              }
+            } else if (!want_ref) {
+              x_btn = false;
             }
-          } else if (!want_ref) {
-            x_btn = false;
+            if (want_go && !a_btn) {
+              a_btn = true;
+              trigger_steam_item_action(longan::ui_steam_selected_app());
+            } else if (!want_go) a_btn = false;
+            if (want_st && !y_btn) {
+              y_btn = true;
+              steam_begin();
+              longan::ui_toast(L"Generating Steam Mobile QR code…", 2.5f);
+            } else if (!want_st) y_btn = false;
+            if (want_back && !b_btn) {
+              b_btn = true;
+              on_screen_enter(longan::UI_SHELF);
+            } else if (!want_back) b_btn = false;
           }
-          if (want_go && !a_btn) {
-            a_btn = true;
-            trigger_steam_item_action(longan::ui_steam_selected_index());
-          } else if (!want_go) a_btn = false;
-          if (want_st && !y_btn) {
-            y_btn = true;
-            steam_begin();
-            longan::ui_toast(L"Generating Steam Mobile QR code…", 2.5f);
-          } else if (!want_st) y_btn = false;
-          if (want_back && !b_btn) {
-            b_btn = true;
-            on_screen_enter(longan::UI_SHELF);
-          } else if (!want_back) b_btn = false;
         } else {
           a_btn = b_btn = x_btn = y_btn = false;
         }
