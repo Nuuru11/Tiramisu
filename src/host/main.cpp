@@ -2846,14 +2846,18 @@ struct tiramisu_host
   }
 
   void launcher_click() {
+    int x, y;
+    trt_mouse_pos(&x, &y);
+    launcher_click_at(x, y);
+  }
+
+  void launcher_click_at(int x, int y) {
     if (longan::boot_anim_is_active()) {
       longan::boot_anim_skip();
       return;
     }
     if (g_guest_running.load() && !g_quick_menu_open) return;
     g_controller_active.store(false);
-    int x, y;
-    trt_mouse_pos(&x, &y);
     const auto hit = longan::ui_hit_test(x, y);
     switch (hit.type) {
       case longan::ui_click_type::quick_menu_item:
@@ -3903,7 +3907,7 @@ struct tiramisu_host
           if (mouse_vy < 0) mouse_vy = 0;
           if (mouse_vy >= dh) mouse_vy = dh - 1;
           trt_input_pointer_move(mouse_vx, mouse_vy, true);
-          if (ddx != 0 || ddy != 0) trt_input_mouse_delta_raw(ddx, ddy);
+          if (g_guest_running.load() && (ddx != 0 || ddy != 0)) trt_input_mouse_delta_raw(ddx, ddy);
 
           const bool rt = xs.Gamepad.bRightTrigger >
                           XINPUT_GAMEPAD_TRIGGER_THRESHOLD;
@@ -3914,7 +3918,7 @@ struct tiramisu_host
           if (rt != mm_was_rt) {
             mm_was_rt = rt;
             trt_input_mouse_button(0, rt);
-            if (!rt && !g_guest_running.load()) launcher_click();
+            if (!rt && !g_guest_running.load()) launcher_click_at(mouse_vx, mouse_vy);
           }
           if (lt != mm_was_lt) { trt_input_mouse_button(1, lt); mm_was_lt = lt; }
           if (rb != mm_was_rb) { trt_input_mouse_button(2, rb); mm_was_rb = rb; }
