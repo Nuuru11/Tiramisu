@@ -387,7 +387,7 @@ int main() {
     CHECK(page.find("200 OK") != std::string::npos &&
               page.find("id=settings") != std::string::npos &&
               page.find("/api/settings") != std::string::npos &&
-              page.find("Console connection") != std::string::npos &&
+              page.find("Konsol bağlantısı") != std::string::npos &&
               page.find("openDirPicker") != std::string::npos &&
               page.find("/api/backup-saves") != std::string::npos &&
               page.find("/api/debug-bundle") != std::string::npos,
