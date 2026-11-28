@@ -1493,6 +1493,12 @@ int trt_bridge_register_d3d(void) {
                       "(no DWM blur surface on console UWP; fail-visible)");
          return (int)0x80004001;  // E_NOTIMPL
        }},
+      {"DwmEnableMMCSS",
+       (void*)+[](int enable) TRT_GUEST_ABI -> i32 {
+         (void)enable;
+         // Xbox UWP does not expose DWM multimedia scheduling.
+         return (i32)0x80004001;  // E_NOTIMPL
+       }},
       {"DwmFlush",
        (void*)+[](void) TRT_GUEST_ABI -> i32 {
          return 0;  // S_OK (composition frame paced via DXGI Present)

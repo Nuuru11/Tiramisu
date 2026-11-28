@@ -514,7 +514,6 @@ void* system_bind(const char* module, const char* symbol) {
     if (!h) h = LoadLibraryW(wmod);
     wcscpy(last_mod, wmod);
   }
-  if (!h) return nullptr;
   LPCSTR sym = symbol;
   if (symbol[0] == '#') {
     char* endp = nullptr;
@@ -523,7 +522,15 @@ void* system_bind(const char* module, const char* symbol) {
       sym = (LPCSTR)(uintptr_t)ord;
     }
   }
-  return (void*)GetProcAddress(h, sym);
+  if (h) {
+    if (auto proc = GetProcAddress(h, sym)) return reinterpret_cast<void*>(proc);
+  }
+  if (_wcsicmp(wmod, L"vcruntime140.dll") == 0 &&
+      strcmp(symbol, "__C_specific_handler") == 0) {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll) return reinterpret_cast<void*>(GetProcAddress(ntdll, sym));
+  }
+  return nullptr;
 }
 
 // ---------------- smoke probes ----------------
@@ -1346,7 +1353,8 @@ static void describe_fault_pc(uintptr_t pc, char* out, size_t cap) {
   uintptr_t offset = pc;
   char native_name[MAX_PATH]{};
   MEMORY_BASIC_INFORMATION memory{};
-  if (VirtualQuery(reinterpret_cast<void*>(pc), &memory, sizeof(memory))) {
+  if (VirtualQuery(reinterpret_cast<void*>(pc), &memory, sizeof(memory)) &&
+      memory.AllocationBase) {
     offset = pc - reinterpret_cast<uintptr_t>(memory.AllocationBase);
     const char* guest = trt_images_name(memory.AllocationBase);
     if (guest) {
@@ -1438,8 +1446,15 @@ static int guest_seh_filter(EXCEPTION_POINTERS* ep) {
     memset(code, 0, sizeof(code));
     bool got_code = false;
     __try {
-      memcpy(code, record.ExceptionAddress, sizeof(code));
-      got_code = true;
+      MEMORY_BASIC_INFORMATION region{};
+      const auto pc = reinterpret_cast<uintptr_t>(record.ExceptionAddress);
+      if (pc && VirtualQuery(record.ExceptionAddress, &region, sizeof(region)) &&
+          region.State == MEM_COMMIT && !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+          region.RegionSize >= sizeof(code) &&
+          pc - reinterpret_cast<uintptr_t>(region.BaseAddress) <= region.RegionSize - sizeof(code)) {
+        memcpy(code, record.ExceptionAddress, sizeof(code));
+        got_code = true;
+      }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
       got_code = false;
     }
@@ -4164,7 +4179,9 @@ struct tiramisu_host
                 snprintf(line, sizeof(line), "launch %s: rc=%s (%s)",
                          want.c_str(), trt_errstr(gr.map_rc), gr.detail);
                 longan::log_line(line);
-                set_guest_status(want + ": " + trt_errstr(gr.map_rc));
+                const std::string outcome = gr.detail[0] ? gr.detail : trt_errstr(gr.map_rc);
+                longan::webxfer_set_launch_result(want, outcome);
+                set_guest_status(want + ": " + outcome);
                 if (stack_charged)
                   trt_mem_budget_discharge_va(1024ull * 1024ull);
                 g_running_game_name.clear();
