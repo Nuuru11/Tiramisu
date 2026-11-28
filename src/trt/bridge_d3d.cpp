@@ -1342,10 +1342,19 @@ extern "C" int TRT_GUEST_ABI trt_D3D11CreateDevice(void* adapter, u32 driver_typ
   u32 negotiated = 0;
   const int hr = trt_apply_fl_contract(feature_levels, feature_level_count,
                                        &negotiated);
-  if (hr != 0) return hr;
+  char result[128];
+  if (hr != 0) {
+    snprintf(result, sizeof(result), "d3d: D3D11CreateDevice failed hr=0x%08x",
+             static_cast<unsigned>(hr));
+    trt_core_log(result);
+    return hr;
+  }
   if (out_device) *out_device = retain_com_object(g_hooks.device);
   if (out_context) *out_context = retain_com_object(g_hooks.context);
   if (out_level) *out_level = negotiated;
+  snprintf(result, sizeof(result), "d3d: D3D11CreateDevice returned S_OK FL=0x%04x device=%p context=%p",
+           negotiated, out_device ? *out_device : nullptr, out_context ? *out_context : nullptr);
+  trt_core_log(result);
   return 0;  // S_OK
 }
 

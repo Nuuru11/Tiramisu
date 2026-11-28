@@ -21,6 +21,7 @@
 #include "settings.h"
 #include "crash_report.h"
 #include "../trt/trt.h"
+#include "../trt/bridge_msvcrt.h"
 #include "../trt/x86_cpu.h"
 #include "../trt/mono_host.h"
 #include "../trt/fna_platform.h"
@@ -500,6 +501,19 @@ void host_pump() {
 // ---------------- system-route binder (console real DLLs) ----------------
 std::mutex g_sys_mu;
 
+// MSVC x64 basic_streambuf<char> keeps pointers to the active read
+// position and count at these ABI offsets. The slots can refer to storage
+// owned by a derived streambuf, so use the indirect fields.
+static char* TRT_GUEST_ABI msvc_streambuf_egptr(const void* streambuf) {
+  const auto* object = static_cast<const unsigned char*>(streambuf);
+  char* const* read_position = nullptr;
+  const int* read_remaining = nullptr;
+  memcpy(&read_position, object + 0x38, sizeof(read_position));
+  memcpy(&read_remaining, object + 0x50, sizeof(read_remaining));
+  char* position = *read_position;
+  return position ? position + *read_remaining : nullptr;
+}
+
 void* system_bind(const char* module, const char* symbol) {
   if (!module || !symbol) return nullptr;
   std::lock_guard<std::mutex> lk(g_sys_mu);
@@ -529,6 +543,17 @@ void* system_bind(const char* module, const char* symbol) {
       strcmp(symbol, "__C_specific_handler") == 0) {
     HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
     if (ntdll) return reinterpret_cast<void*>(GetProcAddress(ntdll, sym));
+  }
+  // Aliases are tried after the desktop name. Preserve the native
+  // implementation when either DLL exports the symbol.
+  if (_wcsicmp(wmod, L"vcruntime140_app.dll") == 0 &&
+      strcmp(symbol, "wcsstr") == 0) {
+    return reinterpret_cast<void*>(&trt_crt_wcsstr);
+  }
+  if (_wcsicmp(wmod, L"msvcp140_app.dll") == 0 &&
+      strcmp(symbol, "?egptr@?$basic_streambuf@DU?$char_traits@D@std@@@std@@IEBAPEADXZ") == 0) {
+    longan::log_line("system: MSVCP140 streambuf::egptr -> x64 ABI fallback");
+    return reinterpret_cast<void*>(&msvc_streambuf_egptr);
   }
   return nullptr;
 }

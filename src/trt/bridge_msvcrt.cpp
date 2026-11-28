@@ -2998,6 +2998,10 @@ const trt_named_fn k_msvcrt_fns[] = {
 
 }  // namespace
 
+extern "C" u16* TRT_GUEST_ABI trt_crt_wcsstr(const u16* haystack, const u16* needle) {
+  return crt_wcsstr(haystack, needle);
+}
+
 extern "C" int trt_bridge_register_msvcrt(void) {
   trt_module_register("msvcrt.dll", TRT_ROUTE_BUILTIN, k_msvcrt_fns,
                       (int)(sizeof(k_msvcrt_fns) / sizeof(k_msvcrt_fns[0])));
