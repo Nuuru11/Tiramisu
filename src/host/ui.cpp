@@ -657,7 +657,7 @@ void draw_top_navigation() {
 
       // 5 Primary Tabs matching TopNavigation.tsx
       const wchar_t* names[UI_TAB_COUNT] = {
-          L"Home", L"Library", L"Steam", L"Tools", L"Settings"};
+          L"Ana sayfa", L"Oyunlar", L"Steam", L"Araçlar", L"Ayarlar"};
       for (int i = 0; i < UI_TAB_COUNT; ++i) {
         const float tx = nl.nav_x + inset + i * pill_w;
         const bool active = (target_tab == i);
@@ -891,7 +891,7 @@ void draw_home_screen() {
                           L"Tiramisu", g_br_white, DWRITE_TEXT_ALIGNMENT_LEADING,
                           DWRITE_PARAGRAPH_ALIGNMENT_CENTER, true);
             text_out(g_f_body, hp_x, top_y + sy(194.0f), hero_w * 0.72f, sy(50.0f),
-                     L"No games installed yet — Open Tools to transfer via QR / LAN, or open Steam.",
+                     L"Oyun eklemek için Aktarım’ı veya Steam sekmesini aç.",
                      g_br_sub);
           }
         }
@@ -910,33 +910,26 @@ void draw_home_screen() {
             draw_xbox_btn(hp_x + sx(28.0f), act_y + play_h * 0.5f, sc(12.0f), L'A',
                           g_br_xbox_a, true);
             text_out(g_f_nav, hp_x + sx(46.0f), act_y, play_w - sx(54.0f), play_h,
-                     has_game ? L"▶  Play" : L"Transfer", g_br_ink,
+                     has_game ? L"Oyna" : L"Aktarım", g_br_ink,
                      DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
           } else {
             text_out(g_f_nav, hp_x, act_y, play_w, play_h,
-                     has_game ? L"▶  Play" : L"Open Transfer", g_br_ink,
+                     has_game ? L"Oyna" : L"Aktarımı aç", g_br_ink,
                      DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
           }
 
-          const float cbtn_sz = play_h;
-          const float c1_x = hp_x + play_w + sx(16.0f);
-          fill_rrect(c1_x, act_y, cbtn_sz, cbtn_sz, cbtn_sz * 0.5f, g_br_glass2);
-          stroke_rrect(c1_x, act_y, cbtn_sz, cbtn_sz, cbtn_sz * 0.5f, g_br_border_hi, sc(1.1f));
-          text_out(g_f_h2, c1_x, act_y, cbtn_sz, cbtn_sz, L"≡", g_br_white,
-                   DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-          if (g_controller_active) {
-            draw_xbox_btn(c1_x + cbtn_sz - sc(4.0f), act_y + sc(4.0f), sc(10.0f), L'X',
-                          g_br_xbox_x, false);
-          }
-
-          const float c2_x = c1_x + cbtn_sz + sx(14.0f);
-          fill_rrect(c2_x, act_y, cbtn_sz, cbtn_sz, cbtn_sz * 0.5f, g_br_glass2);
-          stroke_rrect(c2_x, act_y, cbtn_sz, cbtn_sz, cbtn_sz * 0.5f, g_br_border_hi, sc(1.1f));
-          text_out(g_f_h2, c2_x, act_y, cbtn_sz, cbtn_sz, L"⚙", g_br_white,
-                   DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-          if (g_controller_active) {
-            draw_xbox_btn(c2_x + cbtn_sz - sc(4.0f), act_y + sc(4.0f), sc(10.0f), L'Y',
-                          g_br_xbox_y, true);
+          const float exe_x = hp_x + play_w + sx(16.0f);
+          const float action_w = sx(160.0f);
+          const auto action = [&](float x, const wchar_t* label) {
+            fill_rrect(x, act_y, action_w, play_h, play_h * 0.5f, g_br_ink);
+            stroke_rrect(x, act_y, action_w, play_h, play_h * 0.5f,
+                         ptr_in(x, act_y, action_w, play_h) ? g_br_white : g_br_border_hi);
+            text_out(g_f_nav, x, act_y, action_w, play_h, label, g_br_white,
+                     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+          };
+          if (has_game) {
+            action(exe_x, L"EXE değiştir");
+            action(exe_x + action_w + sx(14.0f), L"Aktarım / QR");
           }
         }
       }
@@ -967,7 +960,7 @@ void draw_home_screen() {
     if (lib_a.visible) {
       draw_glass_card(right_x, top_y, right_w, card_h, 24.0f, false);
       text_out(g_f_nav, right_x + sx(22.0f), top_y + sy(18.0f), right_w - sx(60.0f),
-               sy(28.0f), L"◫  Library", g_br_white);
+               sy(28.0f), L"Oyunlar", g_br_white);
       text_out(g_f_nav, right_x + right_w - sx(34.0f), top_y + sy(18.0f), sx(20.0f),
                sy(28.0f), L"›", g_br_dim, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
@@ -976,7 +969,7 @@ void draw_home_screen() {
       text_out(g_f_stat, right_x + sx(22.0f), top_y + sy(66.0f), sx(120.0f),
                sy(56.0f), cnt_buf, g_br_white);
       text_out(g_f_small, right_x + sx(22.0f), top_y + sy(124.0f), sx(120.0f),
-               sy(24.0f), g_games.size() == 1 ? L"Game" : L"Games", g_br_dim);
+               sy(24.0f), g_games.size() == 1 ? L"oyun" : L"oyun", g_br_dim);
 
       static const float kBars[7] = {0.24f, 0.34f, 0.48f, 0.56f, 0.86f, 0.62f, 0.68f};
       const float bars_max_h = sy(74.0f);
@@ -1005,7 +998,7 @@ void draw_home_screen() {
     if (sto_a.visible) {
       draw_glass_card(right_x, st_y, right_w, card_h, 24.0f, false);
       text_out(g_f_nav, right_x + sx(22.0f), st_y + sy(18.0f), right_w - sx(60.0f),
-               sy(28.0f), L"▤  Storage", g_br_white);
+               sy(28.0f), L"Depolama", g_br_white);
       text_out(g_f_nav, right_x + right_w - sx(34.0f), st_y + sy(18.0f), sx(20.0f),
                sy(28.0f), L"›", g_br_dim, DWRITE_TEXT_ALIGNMENT_TRAILING);
 
@@ -1046,7 +1039,7 @@ void draw_home_screen() {
     anim_scope hdr_a(anim_clk, 0.25f, 0.40f, -sx(20.0f), sy(8.0f));
     if (hdr_a.visible) {
       text_out(g_f_h2, pad_x + sx(4.0f), row_hdr_y, sx(320.0f), sy(32.0f),
-               L"🔖  Continue Playing", g_br_white);
+               L"Oyun seç", g_br_white);
 
       if (!g_transfer_url.empty()) {
         std::wstring lan_hint = L"LAN Transfer: " + g_transfer_url;
@@ -1077,11 +1070,11 @@ void draw_home_screen() {
     if (ec_a.visible) {
       draw_glass_card(pad_x, cards_y, full_w, card_h2, 22.0f, false);
       text_out_line(g_f_h2, pad_x + sx(24.0f), cards_y + sy(44.0f), full_w - sx(48.0f),
-                    sy(36.0f), L"Your installed Xbox games will appear here", g_br_white,
+                    sy(36.0f), L"Yüklediğin oyunlar burada görünür", g_br_white,
                     DWRITE_TEXT_ALIGNMENT_CENTER);
       text_out_line(g_f_body, pad_x + sx(24.0f), cards_y + sy(88.0f), full_w - sx(48.0f),
                     sy(32.0f),
-                    L"Open Tools to scan the QR code and drop a game from your phone/PC, or open Steam to download.",
+                    L"Telefondan aktarmak için Araçlar’daki QR kodunu tara. Steam oyunları için Steam sekmesini aç.",
                     g_br_dim, DWRITE_TEXT_ALIGNMENT_CENTER);
     }
   } else {
@@ -1125,6 +1118,7 @@ void draw_home_screen() {
                       mono_ch.c_str(), g_br_accent, DWRITE_TEXT_ALIGNMENT_CENTER);
       }
 
+      fill_rrect(cx + sx(6), cy + card_h2 - sy(40), card_w - sx(12), sy(32), sc(8), g_br_ink);
       text_out_line(g_f_nav, cx + sx(16.0f), cy + card_h2 - sy(40.0f),
                     card_w - sx(32.0f), sy(28.0f), gm.name.c_str(), g_br_white,
                     DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -1136,9 +1130,13 @@ void draw_home_screen() {
     }
   }
 
-  draw_controller_footer({{L'A', L"Launch Game"},
-                          {L'X', L"Switch Exe"},
-                          {L'Y', L"Transfer / QR"}});
+  if (g_games.empty()) {
+    draw_controller_footer({{L'A', L"Aktarımı aç"}});
+    return;
+  }
+  draw_controller_footer({{L'A', L"Oyna"},
+                          {L'X', L"EXE değiştir"},
+                          {L'Y', L"Aktarım / QR"}});
 }
 
 // ============================================================================
@@ -1158,9 +1156,9 @@ void draw_library_screen() {
   // Left Rail: Real Library Summary & Drives
   draw_glass_card(pad_x, top_y, left_w, full_h, 24.0f);
   text_out(g_f_h2, pad_x + sx(22.0f), top_y + sy(22.0f), left_w - sx(44.0f),
-           sy(34.0f), L"Game Library", g_br_white);
+           sy(34.0f), L"Oyun kütüphanesi", g_br_white);
   wchar_t sub[64];
-  swprintf(sub, 64, L"%zu Installed on Xbox", g_games.size());
+  swprintf(sub, 64, L"Xbox’ta %zu oyun yüklü", g_games.size());
   text_out(g_f_small, pad_x + sx(22.0f), top_y + sy(58.0f), left_w - sx(44.0f),
            sy(24.0f), sub, g_br_dim);
 
@@ -1168,14 +1166,14 @@ void draw_library_screen() {
   const float pill_y = top_y + sy(102.0f);
   draw_champagne_pill(pad_x + sx(18.0f), pill_y, left_w - sx(36.0f), sy(40.0f));
   text_out(g_f_body, pad_x + sx(34.0f), pill_y, left_w - sx(68.0f), sy(40.0f),
-           L"All Installed Titles", g_br_ink, DWRITE_TEXT_ALIGNMENT_LEADING,
+           L"Yüklü oyunlar", g_br_ink, DWRITE_TEXT_ALIGNMENT_LEADING,
            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
   text_out(g_f_small, pad_x + sx(24.0f), pill_y + sy(60.0f), left_w - sx(48.0f),
-           sy(26.0f), L"Add Games", g_br_accent);
+           sy(26.0f), L"Oyun ekle", g_br_accent);
   text_out(g_f_small, pad_x + sx(24.0f), pill_y + sy(90.0f), left_w - sx(48.0f),
            sy(90.0f),
-           L"• Open Tools tab to drop folders, .zip archives, or direct URLs over LAN.\n• Open Steam tab to download owned games.",
+           L"Telefondan aktarmak için Araçlar’ı aç.\nSteam oyunlarını Steam sekmesinden indir.",
            g_br_dim);
 
   // Right Top: Selected Game Inspector Banner
@@ -1256,7 +1254,7 @@ void draw_library_screen() {
                     g_br_xbox_a, true);
     }
     text_out(g_f_body, right_x + sx(g_controller_active ? 64.0f : 26.0f), by,
-             sx(g_controller_active ? 104.0f : 152.0f), sy(40.0f), L"▶  Play",
+             sx(g_controller_active ? 104.0f : 152.0f), sy(40.0f), L"Oyna",
              g_br_ink, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
@@ -1271,7 +1269,7 @@ void draw_library_screen() {
     }
     text_out(g_f_small, right_x + sx(g_controller_active ? 226.0f : 190.0f), by,
              sx(g_controller_active ? 124.0f : 168.0f), sy(40.0f),
-             L"Switch Exe", g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
+             L"EXE değiştir", g_br_white, DWRITE_TEXT_ALIGNMENT_CENTER,
              DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
 
     // Per-game Input Mode cycle button (auto / controller / kbm / pad2kbm)
@@ -1334,6 +1332,7 @@ void draw_library_screen() {
     draw_glass_card(cx, cy, cw, ch, 16.0f, sel);
     ID2D1Bitmap* cover = get_cover_bitmap(g_games[i].key_utf8);
     if (cover) draw_clipped_cover(cover, cx, cy, cw, ch, rad, 1.0f, true);
+    fill_rrect(cx + sx(5), cy + ch - sy(30), cw - sx(10), sy(25), sc(8), g_br_ink);
     text_out_line(g_f_small, cx + sx(12.0f), cy + ch - sy(30.0f), cw - sx(24.0f),
                   sy(24.0f), g_games[i].name.c_str(), g_br_white,
                   DWRITE_TEXT_ALIGNMENT_LEADING,
@@ -1344,10 +1343,10 @@ void draw_library_screen() {
                  sel ? sc(2.4f) : sc(1.1f));
   }
 
-  draw_controller_footer({{L'A', L"Play Selected"},
-                          {L'X', L"Switch Exe"},
-                          {L'Y', L"Rescan Library"},
-                          {L'B', L"Back to Home"}});
+  draw_controller_footer({{L'A', L"Oyna"},
+                          {L'X', L"EXE değiştir"},
+                          {L'Y', L"Yeniden tara"},
+                          {L'B', L"Ana sayfaya dön"}});
 }
 
 // ============================================================================
@@ -1492,7 +1491,7 @@ void draw_steam_screen() {
   draw_controller_footer({{L'A', L"Download / Play"},
                           {L'Y', L"Steam QR Login"},
                           {L'X', (g_steam_selected >= 0 && g_steam_selected < (int)g_steam_items.size() && g_steam_items[g_steam_selected].family_shared) ? L"Storage" : L"Refresh Library"},
-                          {L'B', L"Back to Home"}});
+                          {L'B', L"Ana sayfaya dön"}});
 }
 
 // ============================================================================
@@ -1644,7 +1643,7 @@ void draw_tools_screen() {
   draw_controller_footer({{L'A', L"Run Selected Tool"},
                           {L'X', L"Scroll Log Up"},
                           {L'Y', L"Scroll Log Down"},
-                          {L'B', L"Back to Home"}});
+                          {L'B', L"Ana sayfaya dön"}});
 }
 
 // ============================================================================
@@ -1768,7 +1767,7 @@ void draw_settings_screen() {
 
   draw_controller_footer({{L'A', L"Toggle / Change"},
                           {L'Y', L"Reset Defaults"},
-                          {L'B', L"Back to Home"}});
+                          {L'B', L"Ana sayfaya dön"}});
 }
 
 // ============================================================================
@@ -2338,11 +2337,11 @@ ui_click ui_hit_test(int x, int y) {
                              : ui_click{ui_click_type::play, g_selected};
     }
     const float c1_x = hp_x + play_w + sx(16.0f);
-    if (hits(c1_x, act_y, play_h, play_h)) {
+    if (!g_games.empty() && hits(c1_x, act_y, sx(160.0f), play_h)) {
       return {ui_click_type::cycle_exe, g_selected};
     }
-    const float c2_x = c1_x + play_h + sx(14.0f);
-    if (hits(c2_x, act_y, play_h, play_h)) {
+    const float c2_x = c1_x + sx(160.0f) + sx(14.0f);
+    if (!g_games.empty() && hits(c2_x, act_y, sx(160.0f), play_h)) {
       return {ui_click_type::open_transfer, 0};
     }
 

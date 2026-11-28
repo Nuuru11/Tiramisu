@@ -3732,11 +3732,13 @@ struct tiramisu_host
             longan::ui_set_delete_confirm(-1);
           }
           // Library screen: 4-column grid nav (L/R ±1, U/D ±4), A Play, X Exe, Y Rescan, Del Uninstall, B Home
-          if (step_lt && !g_games.empty() && g_selected > 0) --g_selected;
-          if (step_rt && !g_games.empty() && g_selected + 1 < (int)g_games.size()) ++g_selected;
-          if (step_up && !g_games.empty()) g_selected = std::max(0, g_selected - 4);
-          if (step_dn && !g_games.empty())
-            g_selected = std::min((int)g_games.size() - 1, g_selected + 4);
+          const int count = (int)g_games.size();
+          constexpr int columns = 4;
+          if (step_lt && g_selected % columns > 0) --g_selected;
+          else if (step_rt && g_selected % columns < columns - 1 && g_selected + 1 < count) ++g_selected;
+          else if (step_up && g_selected >= columns) g_selected -= columns;
+          else if (step_dn && (g_selected / columns + 1) * columns < count)
+            g_selected = std::min(count - 1, g_selected + columns);
           static bool del_k_was = false;
           const bool want_del = !km_lock && launcher_key(0x2E /*VK_DELETE*/);
           if (want_del && !del_k_was) {
